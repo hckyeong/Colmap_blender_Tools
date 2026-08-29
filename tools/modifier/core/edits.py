@@ -1,0 +1,81 @@
+"""기존 Core 편집 import 경로를 유지하는 호환 파사드입니다."""
+
+from .edit_history import (
+    deserialize_history,
+    image_operation_from_report,
+    operation_from_dict,
+    operation_from_report,
+    operation_to_dict,
+    point_operation_from_report,
+    serialize_history,
+)
+from .edit_types import (
+    EDIT_SCHEMA_VERSION,
+    LEGACY_EDIT_SCHEMA_VERSION,
+    REMOVE_IMAGES_OPERATION,
+    REMOVE_POINTS_OPERATION,
+    REMOVE_SELECTED_OPERATION,
+    AnyEditOperation,
+    EditOperation,
+    ImageObservationRemovalPlan,
+    ImageObservationRemovalReport,
+    LegacyEditOperation,
+    ModelCounts,
+    PointRemovalPlan,
+    PointRemovalReport,
+    RemovalPlan,
+    RemovalReport,
+)
+from .indexes import RelationshipIndexes, build_relationship_indexes
+from .legacy_removal import apply_removal, plan_removal
+from .model import (
+    ImageRecord,
+    Point2DRecord,
+    Point3DRecord,
+    Reconstruction,
+)
+from .removal import (
+    apply_image_observation_removal,
+    apply_point_removal,
+    plan_image_observation_removal,
+    plan_point_removal,
+    validate_image_observation_removal_request,
+)
+
+__all__ = [
+    "LEGACY_EDIT_SCHEMA_VERSION",
+    "EDIT_SCHEMA_VERSION",
+    "REMOVE_SELECTED_OPERATION",
+    "REMOVE_POINTS_OPERATION",
+    "REMOVE_IMAGES_OPERATION",
+    "ModelCounts",
+    "RemovalPlan",
+    "RemovalReport",
+    "PointRemovalPlan",
+    "PointRemovalReport",
+    "ImageObservationRemovalPlan",
+    "ImageObservationRemovalReport",
+    "LegacyEditOperation",
+    "EditOperation",
+    "AnyEditOperation",
+    "ImageRecord",
+    "Point2DRecord",
+    "Point3DRecord",
+    "RelationshipIndexes",
+    "build_relationship_indexes",
+    "Reconstruction",
+    "plan_point_removal",
+    "apply_point_removal",
+    "plan_image_observation_removal",
+    "apply_image_observation_removal",
+    "validate_image_observation_removal_request",
+    "plan_removal",
+    "apply_removal",
+    "point_operation_from_report",
+    "image_operation_from_report",
+    "operation_from_report",
+    "operation_to_dict",
+    "operation_from_dict",
+    "serialize_history",
+    "deserialize_history",
+]

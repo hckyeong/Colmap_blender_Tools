@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+/build/
+/dist/
+/.artifacts/
+/.build_addon/
+/.venv*/
+/.small-gicp-runtime/
+/.small-gicp-runtime-cache/
+/.small-gicp-runtime-build/
+*.zip
+.codex_*
+
+# 통합 전 원본 저장소는 검증이 끝날 때까지 작업 폴더에 보존합니다.
+/COLMAP_Align/
+/COLMAP_Modifier/
+/COLMAP_Projection_Paint/
+
+# 대용량 Native Runtime은 Build Staging에서만 생성합니다.
+/tools/align/runtime/

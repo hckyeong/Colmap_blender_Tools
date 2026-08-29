@@ -1,0 +1,41 @@
+schema_version = "1.0.0"
+
+id = "colmap_tools"
+version = "0.1.19"
+name = "COLMAP Tools"
+tagline = "독립적인 COLMAP 정렬 편집 프로젝션 페인트 도구 모음"
+maintainer = "COLMAP Tools Contributors"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+platforms = ["windows-x64"]
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "COLMAP 모델 이미지 메시와 텍스처 파일 입출력에 필요합니다"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.agents/",
+  "/.codex/",
+  "/.pytest_cache/",
+  "/.artifacts/",
+  "/.build_addon/",
+  "/.small-gicp-runtime/",
+  "/.small-gicp-runtime-cache/",
+  "/.small-gicp-runtime-build/",
+  "/.gitignore",
+  "/*.zip",
+  "/build/",
+  "/build_tools/",
+  "/docs/",
+  "/tests/",
+  "/COLMAP_Align/",
+  "/COLMAP_Modifier/",
+  "/COLMAP_Projection_Paint/",
+]
