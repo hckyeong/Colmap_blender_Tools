@@ -25,6 +25,54 @@ def _counts(model: Reconstruction) -> ModelCounts:
     )
 
 
+def _indexes_after_removal(
+    indexes: RelationshipIndexes,
+    *,
+    removed_point_ids: set[int],
+    removed_image_ids: set[int],
+    removed_camera_ids: set[int],
+    affected_point_ids: Iterable[int] = (),
+    affected_image_ids: Iterable[int] = (),
+) -> RelationshipIndexes:
+    """기존 관계 인덱스에서 제거 영향이 있는 항목만 copy-on-write로 갱신합니다."""
+
+    point_to_images = dict(indexes.point_to_images)
+    for point_id in removed_point_ids:
+        point_to_images.pop(point_id, None)
+    if removed_image_ids:
+        for point_id in affected_point_ids:
+            current = point_to_images.get(int(point_id))
+            if current is not None and current & removed_image_ids:
+                point_to_images[int(point_id)] = current - removed_image_ids
+
+    image_to_points = dict(indexes.image_to_points)
+    for image_id in removed_image_ids:
+        image_to_points.pop(image_id, None)
+    if removed_point_ids:
+        for image_id in affected_image_ids:
+            current = image_to_points.get(int(image_id))
+            if current is not None and current & removed_point_ids:
+                image_to_points[int(image_id)] = current - removed_point_ids
+
+    camera_to_images = dict(indexes.camera_to_images)
+    for camera_id in removed_camera_ids:
+        camera_to_images.pop(camera_id, None)
+    if removed_image_ids:
+        for camera_id, image_ids in tuple(camera_to_images.items()):
+            if image_ids & removed_image_ids:
+                camera_to_images[camera_id] = image_ids - removed_image_ids
+
+    image_to_frame = dict(indexes.image_to_frame)
+    for image_id in removed_image_ids:
+        image_to_frame.pop(image_id, None)
+    return RelationshipIndexes(
+        point_to_images=point_to_images,
+        image_to_points=image_to_points,
+        camera_to_images=camera_to_images,
+        image_to_frame=image_to_frame,
+    )
+
+
 def _normalized_ids(values: Iterable[int], label: str) -> tuple[int, ...]:
     normalized = tuple(sorted(set(int(value) for value in values)))
     if not normalized:
@@ -188,12 +236,14 @@ def plan_point_removal(
     )
 
 
-def apply_point_removal(
+def _apply_point_removal(
     model: Reconstruction,
     plan: PointRemovalPlan,
     current_revision: int,
+    *,
+    indexes: RelationshipIndexes | None = None,
 ) -> tuple[Reconstruction, RelationshipIndexes, PointRemovalReport]:
-    """Point-only 계획을 copy-on-write로 적용합니다."""
+    """Point-only 계획을 모델과 선택적 기존 인덱스에 copy-on-write로 적용합니다."""
     if plan.source_revision != current_revision:
         raise ValueError(
             "삭제 계획을 만든 revision과 현재 revision이 다릅니다. "
@@ -237,7 +287,17 @@ def apply_point_removal(
         rigs=dict(model.rigs),
         frames=dict(model.frames),
     )
-    result_indexes = build_relationship_indexes(result)
+    result_indexes = (
+        build_relationship_indexes(result)
+        if indexes is None
+        else _indexes_after_removal(
+            indexes,
+            removed_point_ids=removed_points,
+            removed_image_ids=set(),
+            removed_camera_ids=set(),
+            affected_image_ids=affected_images,
+        )
+    )
     report = PointRemovalReport(
         requested_point3d_ids=plan.requested_point3d_ids,
         affected_image_ids=plan.affected_image_ids,
@@ -248,6 +308,32 @@ def apply_point_removal(
     if report.after_counts != plan.after_counts:
         raise ValueError("삭제 후 개수가 PointRemovalPlan과 일치하지 않습니다.")
     return result, result_indexes, report
+
+
+def apply_point_removal(
+    model: Reconstruction,
+    plan: PointRemovalPlan,
+    current_revision: int,
+) -> tuple[Reconstruction, RelationshipIndexes, PointRemovalReport]:
+    """기존 공개 API대로 Point-only 계획을 적용하고 전체 인덱스를 검증 재생성합니다."""
+
+    return _apply_point_removal(model, plan, current_revision)
+
+
+def apply_point_removal_indexed(
+    model: Reconstruction,
+    plan: PointRemovalPlan,
+    current_revision: int,
+    indexes: RelationshipIndexes,
+) -> tuple[Reconstruction, RelationshipIndexes, PointRemovalReport]:
+    """검증된 기존 인덱스에서 Point 제거 영향 항목만 copy-on-write로 갱신합니다."""
+
+    return _apply_point_removal(
+        model,
+        plan,
+        current_revision,
+        indexes=indexes,
+    )
 
 
 def plan_image_observation_removal(
@@ -307,12 +393,14 @@ def plan_image_observation_removal(
     )
 
 
-def apply_image_observation_removal(
+def _apply_image_observation_removal(
     model: Reconstruction,
     plan: ImageObservationRemovalPlan,
     current_revision: int,
+    *,
+    indexes: RelationshipIndexes | None = None,
 ) -> tuple[Reconstruction, RelationshipIndexes, ImageObservationRemovalReport]:
-    """Image 기반 전역 Point 제거 계획을 copy-on-write로 적용합니다."""
+    """Image 기반 제거 계획을 모델과 선택적 기존 인덱스에 copy-on-write로 적용합니다."""
     if plan.source_revision != current_revision:
         raise ValueError(
             "삭제 계획을 만든 revision과 현재 revision이 다릅니다. "
@@ -381,7 +469,17 @@ def apply_image_observation_removal(
             if frame_id not in removed_frame_ids
         },
     )
-    result_indexes = build_relationship_indexes(result)
+    result_indexes = (
+        build_relationship_indexes(result)
+        if indexes is None
+        else _indexes_after_removal(
+            indexes,
+            removed_point_ids=removed_points,
+            removed_image_ids=removed_images,
+            removed_camera_ids=removed_camera_ids,
+            affected_image_ids=affected_images,
+        )
+    )
     report = ImageObservationRemovalReport(
         requested_image_ids=plan.requested_image_ids,
         observed_point3d_ids=plan.observed_point3d_ids,
@@ -396,3 +494,29 @@ def apply_image_observation_removal(
     if report.after_counts != plan.after_counts:
         raise ValueError("삭제 후 개수가 ImageObservationRemovalPlan과 일치하지 않습니다.")
     return result, result_indexes, report
+
+
+def apply_image_observation_removal(
+    model: Reconstruction,
+    plan: ImageObservationRemovalPlan,
+    current_revision: int,
+) -> tuple[Reconstruction, RelationshipIndexes, ImageObservationRemovalReport]:
+    """기존 공개 API대로 Image 제거 계획을 적용하고 전체 인덱스를 검증 재생성합니다."""
+
+    return _apply_image_observation_removal(model, plan, current_revision)
+
+
+def apply_image_observation_removal_indexed(
+    model: Reconstruction,
+    plan: ImageObservationRemovalPlan,
+    current_revision: int,
+    indexes: RelationshipIndexes,
+) -> tuple[Reconstruction, RelationshipIndexes, ImageObservationRemovalReport]:
+    """검증된 기존 인덱스에서 Image 제거 영향 항목만 copy-on-write로 갱신합니다."""
+
+    return _apply_image_observation_removal(
+        model,
+        plan,
+        current_revision,
+        indexes=indexes,
+    )

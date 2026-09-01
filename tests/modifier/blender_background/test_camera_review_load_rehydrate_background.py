@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import bpy
 
@@ -15,8 +17,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools import modifier as blender_colmap
 from tools.modifier.blender import (
-    camera_filter_queue,
     camera_review_timeline,
+    modifier_workspace,
+    runtime_state,
     state_handlers,
 )
 from tools.modifier.blender.camera_review_session import (
@@ -132,112 +135,65 @@ try:
             current_review_session(bpy.context) is None,
             "로드 복원 Timer 전 구 Camera Review Session이 남았습니다.",
         )
-        _process_load_restore()
-        session = current_review_session(bpy.context, strict=True)
+        with patch(
+            "tools.modifier.blender.runtime_state.ensure_runtime"
+        ) as ensure_runtime, patch(
+            "tools.modifier.core.loader.load_reconstruction"
+        ) as load_reconstruction:
+            state_handlers.invalidate_loaded_state()
+            state_handlers._schedule_load_restore()
+            _process_load_restore()
+        ensure_runtime.assert_not_called()
+        load_reconstruction.assert_not_called()
         assert_true(
-            not session.timeline_active
-            and not session.timeline_refresh_enabled
-            and session.current_image_id == 2
-            and settings.review_current_image_id == "2"
-            and scene.frame_current == 3
+            current_review_session(bpy.context) is None
+            and not bpy.app.timers.is_registered(
+                state_handlers.process_pending_load_restore
+            )
             and not _marker_snapshot(scene)
             and loaded_manifest_json == marker_manifest_before_save
             and settings.review_marker_manifest_json == loaded_manifest_json,
-            "비활성 Modifier 로드가 Marker를 분리하거나 Manifest를 보존하지 못했습니다.",
+            "비활성 Workspace 로드가 Runtime 없이 저장 표시 데이터를 유지하지 못했습니다.",
         )
 
-        camera_review_timeline.acquire_modifier_marker_session(scene)
-        assert_true(
-            camera_review_timeline.attach_review_timeline_markers(session) == 3,
-            "활성 Marker 세션이 저장 Manifest를 다시 연결하지 못했습니다.",
-        )
-        scene.frame_set(3)
-        camera_review_timeline.process_pending_timeline_updates()
-        scene.frame_set(2)
-        camera_review_timeline.process_pending_timeline_updates()
-        assert_true(
-            session.current_image_id == 5
-            and settings.review_current_image_id == "5"
-            and scene.camera is session.camera_objects[5],
-            "로드 복원 뒤 frame 이동이 Camera Review를 갱신하지 못했습니다.",
-        )
-
-        # Pending Marker가 빠진 저장 상태도 Pending을 먼저 복원한 뒤 재결합합니다.
-        scene.frame_set(2)
-        camera_review_timeline.process_pending_timeline_updates()
-        assert_true(
-            bpy.ops.colmap.review_filter_current() == {"FINISHED"},
-            settings.review_status,
-        )
-        pending_session = current_review_session(bpy.context, strict=True)
-        assert_true(
-            pending_session.pending_image_ids == frozenset({5})
-            and pending_session.current_image_id == 9,
-            "Pending 저장 기준 상태를 만들지 못했습니다.",
-        )
-        camera_review_timeline.detach_review_timeline_markers(pending_session)
-        camera_review_timeline.release_modifier_marker_session(scene)
-        pending_blend_path = Path(directory) / "review_pending.blend"
-        assert_true(
-            bpy.ops.wm.save_as_mainfile(filepath=str(pending_blend_path))
-            == {"FINISHED"}
-            and bpy.ops.wm.open_mainfile(filepath=str(pending_blend_path))
-            == {"FINISHED"},
-            "Pending Camera Review 파일 저장·재열기에 실패했습니다.",
-        )
-
-        scene = bpy.context.scene
-        settings = scene.colmap_import
-        pending_loaded_manifest = settings.review_marker_manifest_json
-        _process_load_restore()
-        pending_session = current_review_session(bpy.context, strict=True)
-        assert_true(
-            settings.review_pending_filter_status
-            == camera_filter_queue.PENDING_STATUS_READY
-            and settings.review_pending_filter_order_json == "[5]"
-            and pending_session.pending_image_ids == frozenset({5})
-            and not pending_session.timeline_active
-            and pending_session.current_image_id == 9
-            and pending_session.camera_objects[5].hide_get()
-            and not pending_session.timeline_manifest_signature
-            and not _marker_snapshot(scene)
-            and settings.review_marker_manifest_json == pending_loaded_manifest,
-            "비활성 로드에서 Pending 복원과 Marker 분리가 올바르지 않습니다.",
-        )
-        camera_review_timeline.acquire_modifier_marker_session(scene)
-        assert_true(
-            camera_review_timeline.attach_review_timeline_markers(pending_session) == 2
-            and len(pending_session.timeline_manifest_signature) == 2,
-            "활성 재진입에서 Pending Camera를 제외한 Marker를 복원하지 못했습니다.",
-        )
-
-        # 이전 generation의 Callback은 최신 Scene 상태를 변경하지 않습니다.
-        state_handlers._schedule_load_restore()
-        stale_pending = state_handlers._PENDING_LOAD_RESTORE
-        state_handlers._schedule_load_restore()
-        current_pending = state_handlers._PENDING_LOAD_RESTORE
-        assert_true(
-            stale_pending is not None
-            and current_pending is not None
-            and stale_pending.generation < current_pending.generation
-            and not state_handlers._pending_load_restore_is_current(
-                stale_pending,
-                scene,
-                settings,
+        fake_window = SimpleNamespace(scene=scene)
+        fake_area = object()
+        with patch.object(
+            modifier_workspace.SESSION,
+            "phase",
+            modifier_workspace.SESSION_ACTIVE,
+        ), patch.object(
+            modifier_workspace,
+            "is_session_active_for_window",
+            return_value=True,
+        ), patch.object(
+            modifier_workspace,
+            "_rehydrate_viewport_runtime",
+            return_value=(),
+        ) as rehydrate, patch.object(
+            modifier_workspace,
+            "_activate_modifier_marker_session",
+        ) as activate_markers:
+            modifier_workspace._schedule_runtime_restore(fake_window, fake_area)
+            assert_true(
+                modifier_workspace._RUNTIME_RESTORE_TASK is not None
+                and not runtime_state.cached_runtime_matches_scene(scene)
+                and settings.status_kind == "IMPORTING",
+                "Modifier Workspace 진입이 COLD Runtime 복원을 지연 시작하지 못했습니다.",
             )
-            and state_handlers._pending_load_restore_is_current(
-                current_pending,
-                scene,
-                settings,
-            ),
-            "로드 복원 generation token이 오래된 Callback을 구분하지 못했습니다.",
-        )
-        status_before_stale_callback = settings.review_status
-        state_handlers._PENDING_LOAD_RESTORE = stale_pending
-        _process_load_restore()
+            for _index in range(256):
+                if modifier_workspace._process_runtime_restore() is None:
+                    break
+            else:
+                raise AssertionError("Modifier Workspace Runtime 복원이 완료되지 않았습니다.")
+        if bpy.app.timers.is_registered(modifier_workspace._process_runtime_restore):
+            bpy.app.timers.unregister(modifier_workspace._process_runtime_restore)
         assert_true(
-            settings.review_status == status_before_stale_callback,
-            "오래된 로드 복원 Callback이 최신 Scene 상태를 변경했습니다.",
+            runtime_state.cached_runtime_matches_scene(scene)
+            and settings.status_kind == "SUCCESS"
+            and rehydrate.call_count == 1
+            and activate_markers.call_count == 1,
+            "Modifier Runtime 완료 뒤 Review·Marker를 정확히 한 번 연결하지 못했습니다.",
         )
 finally:
     try:

@@ -19,6 +19,14 @@ from .status_display import (
 )
 
 
+def _runtime_ready(context) -> bool:
+    """현재 Scene의 Modifier Runtime과 편집 token이 일치하는지 반환합니다."""
+
+    from .runtime_state import cached_runtime_matches_scene
+
+    return cached_runtime_matches_scene(context.scene)
+
+
 class _COLMAPModifierPanelMixin:
     """전용 Control View에서만 하위 패널을 표시합니다."""
 
@@ -57,6 +65,8 @@ class COLMAP_PT_status(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_order = 10
 
     def draw(self, context):
+        """상태 기록과 진행 중인 지연 Runtime 복원률을 표시합니다."""
+
         layout = self.layout
         settings = context.scene.colmap_import
 
@@ -73,6 +83,14 @@ class COLMAP_PT_status(_COLMAPModifierPanelMixin, bpy.types.Panel):
             maxrows=STATUS_VISIBLE_ROWS,
             sort_lock=True,
         )
+        from .runtime_state import runtime_restore_job
+
+        restore_job = runtime_restore_job(context.scene)
+        if restore_job is not None and not restore_job.done and not restore_job.failed:
+            status_box.label(
+                text=f"Runtime Restore: {restore_job.progress.fraction * 100.0:.1f}%",
+                icon="TIME",
+            )
 
 
 class COLMAP_PT_import(_COLMAPModifierPanelMixin, bpy.types.Panel):
@@ -120,7 +138,10 @@ class COLMAP_PT_point_selection(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
+        """Runtime 준비 여부에 따라 Point·Camera 편집 입력을 잠가 표시합니다."""
+
         layout = self.layout
+        layout.enabled = _runtime_ready(context)
         settings = context.scene.colmap_import
         pending = has_pending_filter_data(settings)
 
@@ -227,7 +248,10 @@ class COLMAP_PT_camera_review(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
+        """Runtime 준비 전 Camera Review 입력을 잠가 저장 상태만 보존합니다."""
+
         layout = self.layout
+        layout.enabled = _runtime_ready(context)
         settings = context.scene.colmap_import
         pending = has_pending_filter_data(settings)
         editing = (
@@ -371,7 +395,10 @@ class COLMAP_PT_export(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
+        """Runtime과 Scene token이 일치할 때만 Export 입력을 활성화합니다."""
+
         layout = self.layout
+        layout.enabled = _runtime_ready(context)
         settings = context.scene.colmap_import
 
         layout.prop(settings, "export_output_format", text="Format")

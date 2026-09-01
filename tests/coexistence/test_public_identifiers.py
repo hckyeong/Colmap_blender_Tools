@@ -67,6 +67,25 @@ class PublicIdentifierTests(unittest.TestCase):
             with self.subTest(tool=tool_name):
                 self.assertIn(property_name, sources[tool_name].read_text(encoding="utf-8"))
 
+    def test_shared_dataset_scene_property_is_neutral_and_unique(self) -> None:
+        """공용 Dataset은 기존 도구별 Scene 속성과 다른 중립 이름을 사용합니다."""
+
+        lifecycle = (
+            ROOT / "shared" / "colmap_dataset" / "blender" / "lifecycle.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("bpy.types.Scene.colmap_dataset", lifecycle)
+        self.assertEqual(
+            4,
+            len(
+                {
+                    "colmap_dataset",
+                    "colmap_align_settings",
+                    "colmap_import",
+                    "projection_paint",
+                }
+            ),
+        )
+
     def test_owner_keys_and_tokens_are_unique_across_tools(self) -> None:
         """Blender 데이터 소유권 식별 문자열은 다른 도구와 충돌하지 않아야 합니다."""
 

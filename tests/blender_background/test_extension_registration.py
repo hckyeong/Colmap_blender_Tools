@@ -52,7 +52,14 @@ def _assert_registered_contract() -> None:
             missing_operators.append(operator_id)
     if missing_operators:
         raise AssertionError(f"등록되지 않은 Blender Operator: {missing_operators}")
+    try:
+        bpy.ops.projection_paint.import_colmap.get_rna_type()
+    except (AttributeError, KeyError, RuntimeError):
+        pass
+    else:
+        raise AssertionError("Legacy projection_paint.import_colmap Operator가 등록되었습니다.")
     required_scene_properties = (
+        "colmap_dataset",
         "colmap_align_settings",
         "colmap_import",
         "projection_paint",
@@ -71,7 +78,12 @@ def _assert_unregistered_contract() -> None:
         raise AssertionError("공통 COLMAP Tools 메뉴가 해제되지 않았습니다.")
     leaked_properties = [
         name
-        for name in ("colmap_align_settings", "colmap_import", "projection_paint")
+        for name in (
+            "colmap_dataset",
+            "colmap_align_settings",
+            "colmap_import",
+            "projection_paint",
+        )
         if hasattr(bpy.types.Scene, name)
     ]
     if leaked_properties:

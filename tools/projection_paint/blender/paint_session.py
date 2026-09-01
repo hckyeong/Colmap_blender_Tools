@@ -43,8 +43,6 @@ from .progress_overlay import (
     request_progress_overlay_redraw,
 )
 from .ui_messages import draw_wrapped_confirmation, invoke_wrapped_confirmation
-
-
 class PaintSessionError(RuntimeError):
     """Texture Paint 자동화 수명주기 오류를 나타냅니다."""
 
@@ -247,8 +245,6 @@ _TARGET_SCENE_STATE_DEFAULTS = {
     "composite_source_schema_version": 0,
     "composite_layer_uuid": "",
     "composite_saved_active_layer_uuid": "",
-    "composite_saved_clone_image": None,
-    "composite_saved_use_clone_layer": False,
     "original_layer_name": "Original Layer",
     "original_layer_visible": True,
     "original_layer_preview": False,
@@ -262,7 +258,9 @@ _TARGET_SCENE_STATE_DEFAULTS = {
 
 
 def _paint_entry_has_foreign_state(settings: Any, target: Any) -> bool:
-    """Scene의 관리 Material·Image·Layer가 현재 Target 소유가 아니면 참을 반환합니다."""
+    """현재 Target과 다른 애드온 소유 Paint 자원이 남아 있는지 반환합니다."""
+
+    from .layer_shader import original_layer_is_read_only
 
     candidates = [
         getattr(settings, "paint_material", None),
@@ -270,7 +268,9 @@ def _paint_entry_has_foreign_state(settings: Any, target: Any) -> bool:
         getattr(settings, "active_paint_image", None),
     ]
     for layer in getattr(settings, "layers", ()):
-        candidates.extend((layer.image, layer.mask.image))
+        if not original_layer_is_read_only(settings, layer):
+            candidates.append(layer.image)
+        candidates.append(layer.mask.image)
         for adjustment in layer.adjustments:
             candidates.extend((adjustment.image, adjustment.mask.image))
     owned_candidates = tuple(item for item in candidates if _pointer(item))
@@ -430,6 +430,17 @@ def active_paint_session(scene: Any | None = None) -> PaintSession | None:
         return None
     state, _reason = derive_paint_state(active_scene)
     return PaintSession(active_scene, setup, state)
+
+
+def paint_runtime_is_active(scene: Any) -> bool:
+    """Paint 상태가 ACTIVE이고 실제 Scene Runtime이 설치된 경우에만 참을 반환합니다."""
+
+    settings = getattr(scene, "projection_paint", None)
+    if settings is None or str(settings.paint_state) != "ACTIVE":
+        return False
+    from .paint_runtime import active_paint_runtime
+
+    return active_paint_runtime(scene) is not None
 
 
 def validate_active_paint_session(_token: Any = None) -> PaintSession:
@@ -596,7 +607,7 @@ def _window_view_parts(window: Any):
 
 
 def _prepare_paint_view(context: Any, session: PaintSession) -> tuple[Any, Any]:
-    """전환된 작업공간에서 Target 가시성과 최종 합성 표시를 준비합니다."""
+    """전환된 작업공간에서 Target 가시성과 Diffuse Color 표시를 준비합니다."""
     target = session.setup.target
     window = getattr(context, "window", None)
     if window is None or _pointer(window) == 0:
@@ -624,10 +635,10 @@ def _prepare_paint_view(context: Any, session: PaintSession) -> tuple[Any, Any]:
         payload["paint_render_pass"] = str(space.shading.render_pass)
         payload["paint_shading_changed"] = bool(
             space.shading.type != "MATERIAL"
-            or space.shading.render_pass != "COMBINED"
+            or space.shading.render_pass != "DIFFUSE_COLOR"
         )
         space.shading.type = "MATERIAL"
-        space.shading.render_pass = "COMBINED"
+        space.shading.render_pass = "DIFFUSE_COLOR"
         _apply_captured_viewport_background(space, payload)
         if not target.visible_get(view_layer=context.view_layer, viewport=space):
             try:
@@ -658,7 +669,7 @@ def _restore_snapshot(context: Any, overlay: Any) -> None:
             if (
                 bool(payload.get("paint_shading_changed", False))
                 and paint_space.shading.type == "MATERIAL"
-                and paint_space.shading.render_pass == "COMBINED"
+                and paint_space.shading.render_pass == "DIFFUSE_COLOR"
             ):
                 paint_space.shading.type = str(payload.get("paint_shading", "SOLID"))
                 paint_space.shading.render_pass = str(
@@ -899,7 +910,6 @@ def _start_paint_session_steps(
                 f"대상: {target.name}",
             )
         _activate_current_paint_image(context)
-        settings.paint_enabled = True
         _set_target_active(context, target)
         yield PaintSessionProgress(
             "Switching paint workspace",
@@ -992,14 +1002,14 @@ def start_paint_session(
 
 
 def _complete_paint_entry(context: Any, scene_pointer: int) -> None:
-    """전환된 3D Viewport에서 현재 Frame Stencil을 정확히 한 번 연결합니다."""
+    """전환된 3D Viewport에서 Paint·Source 자원만 준비하고 Brush는 변경하지 않습니다."""
     session = active_paint_session()
     if session is None or _pointer(session.scene) != scene_pointer:
         raise PaintSessionError("Paint 진입 상태가 Workspace 전환 중 변경되었습니다.")
     area, region = _prepare_paint_view(context, session)
     window = context.window
     settings = session.scene.projection_paint
-    from .paint_runtime import reconnect_current_frame, start_paint_runtime
+    from .paint_runtime import start_paint_runtime
     from .stencil_session import start_stencil_session
 
     with context.temp_override(
@@ -1015,8 +1025,48 @@ def _complete_paint_entry(context: Any, scene_pointer: int) -> None:
             source_fingerprint=str(settings.source_fingerprint),
         )
         start_paint_runtime(bpy.context, session, reconnect_on_start=False)
-        reconnect_current_frame(bpy.context)
+    from .paint_runtime import active_paint_runtime
+
+    if active_paint_runtime(session.scene) is None:
+        raise PaintSessionError("Texture Paint Runtime 설치를 확인하지 못했습니다.")
+    settings.paint_enabled = True
     _set_status(session.scene, "Texture Paint 준비 완료", "SUCCESS", "ACTIVE")
+
+
+def _rollback_failed_paint_entry(context: Any, scene: Any) -> str:
+    """진입 단계와 무관하게 Paint·Stencil Runtime과 사용자 상태를 정식 복구합니다."""
+
+    settings = getattr(scene, "projection_paint", None)
+    target = getattr(settings, "paint_target", None) if settings is not None else None
+    snapshot_payload = str(
+        getattr(settings, "paint_snapshot_json", "") or ""
+    ) if settings is not None else ""
+    should_restore = bool(
+        settings is not None
+        and (
+            str(settings.paint_state) == "ENTERING"
+            or snapshot_payload not in {"", "{}"}
+            or str(getattr(target, "mode", "")) == "TEXTURE_PAINT"
+        )
+    )
+    if not should_restore:
+        if settings is not None:
+            settings.paint_enabled = False
+        return ""
+    try:
+        finish_paint_session(context)
+    except (
+        AttributeError,
+        PaintSessionError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as cleanup_error:
+        if settings is not None:
+            settings.paint_enabled = False
+        return str(cleanup_error)
+    return ""
 
 
 def _schedule_paint_entry(context: Any, session: PaintSession) -> None:
@@ -1061,13 +1111,23 @@ def _schedule_paint_entry(context: Any, session: PaintSession) -> None:
                 _enter_texture_paint(bpy.context, target)
                 return 0.025
             _complete_paint_entry(bpy.context, scene_pointer)
-        except (PaintSessionError, RuntimeError, ValueError) as exc:
+        except (
+            AttributeError,
+            PaintSessionError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             scene = current.scene
-            try:
-                finish_paint_session(bpy.context)
-            except (PaintSessionError, RuntimeError, ValueError):
-                pass
-            _set_status(scene, f"Texture Paint 준비 실패: {exc}", "ERROR", "ERROR")
+            cleanup_error = _rollback_failed_paint_entry(bpy.context, scene)
+            detail = f" | 정리 실패: {cleanup_error}" if cleanup_error else ""
+            _set_status(
+                scene,
+                f"Texture Paint 준비 실패: {exc}{detail}",
+                "ERROR",
+                "ERROR",
+            )
         return None
 
     from .lifecycle import lifecycle_registry
@@ -1189,11 +1249,10 @@ def _continue_paint_after_conversion(job_id: str) -> None:
             release_paint_progress_session(session.job_id)
         except Exception as cleanup_exc:
             exc = RuntimeError(f"{exc} | 정리 실패: {cleanup_exc}")
-        if settings is not None and bool(settings.paint_enabled):
-            try:
-                finish_paint_session(bpy.context)
-            except (PaintSessionError, RuntimeError, ValueError):
-                pass
+        if settings is not None:
+            cleanup_error = _rollback_failed_paint_entry(bpy.context, session.scene)
+            if cleanup_error:
+                exc = RuntimeError(f"{exc} | 정리 실패: {cleanup_error}")
         if settings is not None:
             settings.status = f"Texture Paint 진입 실패: {exc}"
             settings.status_kind = "ERROR"
@@ -1240,6 +1299,7 @@ class PP_OT_enter_paint(bpy.types.Operator):
         """Paint 진입 시작 실패를 Scene 상태와 Operator Report에 기록합니다."""
 
         settings = context.scene.projection_paint
+        settings.paint_enabled = False
         settings.status = str(exc)
         settings.status_kind = "ERROR"
         settings.paint_state = "ERROR"
@@ -1355,9 +1415,16 @@ class PP_OT_enter_paint(bpy.types.Operator):
                 replace_existing_overlay=bool(self.replace_existing_overlay),
             )
             _activate_paint_operator_runtime(context, session)
-        except (PaintSessionError, PaintSetupError, RuntimeError, ValueError) as exc:
-            if bool(settings.paint_enabled):
-                finish_paint_session(context)
+        except (
+            AttributeError,
+            PaintSessionError,
+            PaintSetupError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            _rollback_failed_paint_entry(context, context.scene)
             return self._start_error(context, exc)
         return {"FINISHED"}
 
@@ -1370,11 +1437,9 @@ class PP_OT_enter_paint(bpy.types.Operator):
         except Exception as cleanup_exc:
             cleanup_message = f" | 정리 실패: {cleanup_exc}"
         settings = context.scene.projection_paint
-        if bool(settings.paint_enabled):
-            try:
-                finish_paint_session(context)
-            except (PaintSessionError, RuntimeError, ValueError):
-                pass
+        rollback_error = _rollback_failed_paint_entry(context, context.scene)
+        if rollback_error:
+            cleanup_message = f"{cleanup_message} | 상태 복구 실패: {rollback_error}"
         settings.status = f"Paint 이미지 준비 실패: {exc}{cleanup_message}"
         settings.status_kind = "ERROR"
         settings.paint_state = "ERROR"
@@ -1408,7 +1473,15 @@ class PP_OT_enter_paint(bpy.types.Operator):
             return self._handoff(context, session)
         try:
             session.job.advance()
-        except (PaintSessionError, PaintSetupError, RuntimeError, ValueError) as exc:
+        except (
+            AttributeError,
+            PaintSessionError,
+            PaintSetupError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             return self._fail(context, session, exc)
         request_progress_overlay_redraw()
         if session.job.conversion_ready:
@@ -1474,10 +1547,26 @@ class PP_OT_toggle_paint(bpy.types.Operator):
         options={"HIDDEN", "SKIP_SAVE"},
     )
 
+    @classmethod
+    def poll(cls, context: Any) -> bool:
+        """활성 Paint 종료 또는 PP Snapshot이 준비된 신규 진입만 허용합니다."""
+
+        from .snapshot_update import snapshot_is_ready
+
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "projection_paint", None)
+        return bool(
+            settings is not None
+            and (
+                paint_runtime_is_active(scene)
+                or snapshot_is_ready(scene)
+            )
+        )
+
     def invoke(self, context, event):
         """해상도 교체가 필요하면 기존 작업 폐기 경고창을 먼저 표시합니다."""
         settings = context.scene.projection_paint
-        if bool(settings.paint_enabled):
+        if paint_runtime_is_active(context.scene):
             return self.execute(context)
         try:
             validate_paint_target(settings.paint_target)
@@ -1510,7 +1599,7 @@ class PP_OT_toggle_paint(bpy.types.Operator):
 
     def execute(self, context):
         """현재 Paint 활성 상태에 맞는 기존 진입 또는 종료 Operator를 실행합니다."""
-        if bool(context.scene.projection_paint.paint_enabled):
+        if paint_runtime_is_active(context.scene):
             return bpy.ops.projection_paint.exit_paint()
         settings = context.scene.projection_paint
         try:

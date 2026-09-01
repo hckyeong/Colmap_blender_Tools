@@ -34,6 +34,10 @@ from .camera_review_keymap import (
     register_camera_review_keymap,
     unregister_camera_review_keymap,
 )
+from .dataset_adapter import (
+    register_modifier_dataset_adapter,
+    unregister_modifier_dataset_adapter,
+)
 from .camera_review_timeline import (
     detach_modifier_timeline_markers_for_scenes,
     modifier_marker_session_owned,
@@ -59,6 +63,10 @@ from .operators_point_selection import CLASSES as POINT_SELECTION_OPERATOR_CLASS
 from .operators_modifier_workspace import CLASSES as MODIFIER_WORKSPACE_OPERATOR_CLASSES
 from .panels import CLASSES as PANEL_CLASSES
 from .point_display import register_point_scale_sync, unregister_point_scale_sync
+from .projection_snapshot_provider import (
+    register_projection_snapshot_provider,
+    unregister_projection_snapshot_provider,
+)
 from .properties import CLASSES as PROPERTY_CLASSES
 from .properties import COLMAP_PG_import_settings
 from .state_handlers import register_state_handlers, unregister_state_handlers
@@ -208,12 +216,18 @@ def register():
     camera_review_keymap_registered = False
     delete_keymaps_registered = False
     workspace_runtime_registered = False
+    dataset_adapter_registered = False
+    snapshot_provider_registered = False
     try:
         for cls in CLASSES:
             bpy.utils.register_class(cls)
             registered_classes.append(cls)
         bpy.types.Scene.colmap_import = PointerProperty(type=COLMAP_PG_import_settings)
         property_registered = True
+        register_modifier_dataset_adapter()
+        dataset_adapter_registered = True
+        register_projection_snapshot_provider()
+        snapshot_provider_registered = True
         schedule_axis_preset_migration()
         initialize_status_display(bpy.context)
         register_point_scale_sync()
@@ -234,6 +248,10 @@ def register():
         _REGISTERED = True
     except Exception:
         unregister_workspace_handoff_adapter("modifier")
+        if snapshot_provider_registered:
+            unregister_projection_snapshot_provider()
+        if dataset_adapter_registered:
+            unregister_modifier_dataset_adapter()
         if workspace_runtime_registered:
             unregister_modifier_workspace_runtime()
         if delete_keymaps_registered:
@@ -276,6 +294,8 @@ def unregister():
     from .runtime_state import clear_runtime
     from .selection import clear_snapshots
     unregister_workspace_handoff_adapter("modifier")
+    unregister_projection_snapshot_provider()
+    unregister_modifier_dataset_adapter()
     unregister_modifier_workspace_runtime()
     cancel_axis_preset_migration()
     unregister_delete_guard_keymaps()

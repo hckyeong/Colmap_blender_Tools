@@ -6,6 +6,17 @@ from typing import Any
 
 import bpy
 
+try:
+    from ....shared.colmap_dataset.blender.view_layers import (
+        is_dataset_view_layer,
+        mark_dataset_view_layer,
+    )
+except ImportError:
+    from shared.colmap_dataset.blender.view_layers import (
+        is_dataset_view_layer,
+        mark_dataset_view_layer,
+    )
+
 from .managed_scene import is_managed, iter_managed_roots
 from .ownership import OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
 
@@ -59,6 +70,7 @@ def ensure_modifier_data_view_layer(scene: Any) -> Any:
     if len(owned_layers) > 1:
         raise RuntimeError("Modifier 데이터 전용 View Layer가 중복되었습니다.")
     if owned_layers:
+        mark_dataset_view_layer(owned_layers[0], "modifier")
         return owned_layers[0]
     try:
         view_layer = scene.view_layers.new(MODIFIER_DATA_VIEW_LAYER_NAME)
@@ -67,6 +79,7 @@ def ensure_modifier_data_view_layer(scene: Any) -> Any:
         view_layer[MODIFIER_DATA_VIEW_LAYER_SCHEMA_KEY] = (
             MODIFIER_DATA_VIEW_LAYER_SCHEMA_VERSION
         )
+        mark_dataset_view_layer(view_layer, "modifier")
     except (AttributeError, ReferenceError, RuntimeError, TypeError) as error:
         raise RuntimeError(
             f"Modifier 데이터 전용 View Layer 생성에 실패했습니다: {error}"
@@ -141,7 +154,7 @@ def synchronize_modifier_data_visibility(
     modifier_view_layer = ensure_modifier_data_view_layer(scene)
     for view_layer in tuple(scene.view_layers):
         is_modifier_view_layer = _pointer(view_layer) == _pointer(modifier_view_layer)
-        should_exclude = not is_modifier_view_layer
+        should_exclude = not is_dataset_view_layer(view_layer, "modifier")
         for root in managed_roots:
             layer_collection = _layer_collection_for_collection(
                 view_layer.layer_collection,

@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import bpy
 
@@ -29,9 +30,26 @@ from tools.projection_paint.blender.camera_review import (
     sync_camera_review,
 )
 from tools.projection_paint.blender.camera_scene import (
+    FRAME_SOURCE_DEBOUNCE_SECONDS,
+    CameraSceneError,
+    _frame_source_debounce_tick,
     _repair_timer,
+    activate_managed_frame,
+    clear_camera_runtime,
+    queue_frame_change,
     runtime_for_scene,
 )
+from tools.projection_paint.blender import paint_runtime as paint_runtime_module
+from tools.projection_paint.blender.paint_tool_bridge import active_tool_id
+from tools.projection_paint.blender.paint_runtime import (
+    reconnect_current_frame,
+    refresh_frame_source,
+)
+from tools.projection_paint.blender.paint_session import (
+    finish_paint_session,
+    start_paint_session,
+)
+from tools.projection_paint.blender.stencil_session import start_stencil_session
 from shared.blender_runtime.scene_marker_session import (
     acquire_scene_marker_session,
     release_scene_marker_session,
@@ -88,7 +106,30 @@ def _request(images: Path) -> CameraImportRequest:
             10: str(images / "a.png"),
             30: str(images / "b.png"),
         },
+        snapshot_schema_version=1,
+        source_dataset_uuid="modifier-camera-review-test",
+        source_revision=0,
+        content_fingerprint="camera-review-fingerprint",
+        snapshot_created_at="2026-08-29T00:00:00+00:00",
     )
+
+
+def _new_paint_target():
+    """Frame Source 실 Commit 회귀에 사용할 64×32 UV Paint Target을 만듭니다."""
+
+    mesh = bpy.data.meshes.new("CameraDebouncePaintTargetMesh")
+    mesh.from_pydata(
+        ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
+        (),
+        ((0, 1, 2),),
+    )
+    mesh.uv_layers.new(name="UVMap")
+    target = bpy.data.objects.new("CameraDebouncePaintTarget", mesh)
+    bpy.context.scene.collection.objects.link(target)
+    material = bpy.data.materials.new("CameraDebouncePaintMaterial")
+    material.use_nodes = True
+    target.data.materials.append(material)
+    return target
 
 
 class CameraReviewBackgroundTests(unittest.TestCase):
@@ -160,8 +201,7 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         self.assertTrue(review_slot.show_background_image)
 
         self.scene.frame_current = 2
-        runtime.pending_frame = 2
-        _repair_timer()
+        activate_managed_frame(self.scene, 2, refresh_source=False)
         review_slot = camera_data.background_images[
             settings.review_background_slot_index
         ]
@@ -176,6 +216,254 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         )
         self.assertIs(user_slot.image, user_image)
         self.assertAlmostEqual(user_slot.alpha, 0.75)
+
+    def test_frame_source_debounce_commits_only_latest_of_twenty_changes(self) -> None:
+        """0.30초 이내 20회 변경은 0회, 최종 대기 후는 1회만 Commit합니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        base = 100.0
+        with patch(
+            "tools.projection_paint.blender.camera_scene._commit_pending_frame_source",
+            side_effect=lambda current, frame, _serial: current.entries_by_frame[frame],
+        ) as commit:
+            for index in range(20):
+                self.scene.frame_current = 1 + (index % 2)
+                changed_at = base + index * 0.01
+                queue_frame_change(self.scene, changed_at=changed_at)
+                _frame_source_debounce_tick(now=changed_at)
+            final_changed_at = base + 0.19
+            _frame_source_debounce_tick(now=final_changed_at + 0.29)
+            self.assertEqual(commit.call_count, 0)
+
+            _frame_source_debounce_tick(
+                now=final_changed_at + FRAME_SOURCE_DEBOUNCE_SECONDS
+            )
+
+        self.assertEqual(commit.call_count, 1)
+        self.assertEqual(commit.call_args.args[1], 2)
+        self.assertIsNone(runtime.pending_frame)
+
+    def test_new_frame_restarts_debounce_wait(self) -> None:
+        """대기 중 새 Frame이 들어오면 마지막 입력 시각부터 0.30초를 다시 기다립니다."""
+
+        with patch(
+            "tools.projection_paint.blender.camera_scene._commit_pending_frame_source",
+            side_effect=lambda current, frame, _serial: current.entries_by_frame[frame],
+        ) as commit:
+            self.scene.frame_current = 1
+            queue_frame_change(self.scene, changed_at=200.0)
+            _frame_source_debounce_tick(now=200.29)
+            self.scene.frame_current = 2
+            queue_frame_change(self.scene, changed_at=200.29)
+            _frame_source_debounce_tick(now=200.30)
+            _frame_source_debounce_tick(now=200.58)
+            self.assertEqual(commit.call_count, 0)
+
+            _frame_source_debounce_tick(now=200.59)
+
+        self.assertEqual(commit.call_count, 1)
+        self.assertEqual(commit.call_args.args[1], 2)
+
+    def test_source_failure_retries_twice_then_succeeds(self) -> None:
+        """동일 최신 Source는 초기 실패 후 최대 2회만 재시도하고 성공 후 소비합니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        entry = runtime.entries_by_frame[1]
+        with patch(
+            "tools.projection_paint.blender.camera_scene._commit_pending_frame_source",
+            side_effect=(
+                CameraSceneError("의도한 Source 실패 1"),
+                CameraSceneError("의도한 Source 실패 2"),
+                entry,
+            ),
+        ) as commit:
+            self.scene.frame_current = 1
+            queue_frame_change(self.scene, changed_at=300.0)
+            _frame_source_debounce_tick(now=300.30)
+            self.assertEqual(runtime.pending_frame_retry_count, 1)
+            self.assertEqual(commit.call_count, 1)
+            _frame_source_debounce_tick(now=runtime.pending_frame_next_attempt_at)
+            self.assertEqual(runtime.pending_frame_retry_count, 2)
+            self.assertEqual(commit.call_count, 2)
+            _frame_source_debounce_tick(now=runtime.pending_frame_next_attempt_at)
+
+        self.assertEqual(commit.call_count, 3)
+        self.assertIsNone(runtime.pending_frame)
+        self.assertEqual(runtime.pending_frame_retry_count, 0)
+        self.assertEqual(runtime.pending_frame_error, "")
+
+    def test_source_failure_keeps_pending_after_retry_limit(self) -> None:
+        """최대 2회 재시도가 모두 실패해도 Pending과 최종 오류를 유지합니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        with patch(
+            "tools.projection_paint.blender.camera_scene._commit_pending_frame_source",
+            side_effect=CameraSceneError("계속되는 Source 실패"),
+        ) as commit:
+            self.scene.frame_current = 1
+            queue_frame_change(self.scene, changed_at=350.0)
+            _frame_source_debounce_tick(now=350.30)
+            _frame_source_debounce_tick(now=runtime.pending_frame_next_attempt_at)
+            _frame_source_debounce_tick(now=runtime.pending_frame_next_attempt_at)
+            self.assertIsNone(_frame_source_debounce_tick(now=351.0))
+
+        self.assertEqual(commit.call_count, 3)
+        self.assertEqual(runtime.pending_frame, 1)
+        self.assertEqual(runtime.pending_frame_retry_count, 2)
+        self.assertEqual(runtime.pending_frame_error, "계속되는 Source 실패")
+
+    def test_new_frame_supersedes_old_retry(self) -> None:
+        """재시도 대기 중 새 Frame이 오면 이전 Serial은 Commit하지 않습니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        attempted_frames: list[int] = []
+
+        def commit_side_effect(current, frame, _serial):
+            """첫 Frame만 실패시키고 이후 최신 Frame을 성공 처리합니다."""
+
+            attempted_frames.append(frame)
+            if len(attempted_frames) == 1:
+                raise CameraSceneError("의도한 이전 Frame 실패")
+            return current.entries_by_frame[frame]
+
+        with patch(
+            "tools.projection_paint.blender.camera_scene._commit_pending_frame_source",
+            side_effect=commit_side_effect,
+        ):
+            self.scene.frame_current = 1
+            queue_frame_change(self.scene, changed_at=400.0)
+            _frame_source_debounce_tick(now=400.30)
+            old_retry_at = runtime.pending_frame_next_attempt_at
+            self.scene.frame_current = 2
+            queue_frame_change(self.scene, changed_at=400.31)
+            _frame_source_debounce_tick(now=old_retry_at)
+            self.assertEqual(attempted_frames, [1])
+            _frame_source_debounce_tick(now=400.61)
+
+        self.assertEqual(attempted_frames, [1, 2])
+        self.assertIsNone(runtime.pending_frame)
+
+    def test_normal_frame_changes_do_not_increment_guard_repairs(self) -> None:
+        """정상 Frame Pending은 Camera Guard 복구 횟수에 절대 포함되지 않습니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        self.scene.frame_current = 2
+        queue_frame_change(self.scene, changed_at=500.0)
+
+        for _index in range(7):
+            _repair_timer()
+
+        self.assertEqual(runtime.pending_frame, 2)
+        self.assertEqual(runtime.repair_attempts, 0)
+        self.assertEqual(runtime.error, "")
+
+    def test_guard_counts_only_actual_camera_repair(self) -> None:
+        """Camera Object 손상을 실제로 복구한 Tick만 Guard 횟수를 증가시킵니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        entry = runtime.entries_by_frame[1]
+        camera = runtime.objects[entry.camera_uuid]
+        camera.lock_location = (False, False, False)
+        runtime.dirty_objects.append(entry.camera_uuid)
+        runtime.queued.add(("OBJECT", entry.camera_uuid))
+
+        _repair_timer()
+
+        self.assertEqual(tuple(camera.lock_location), (True, True, True))
+        self.assertEqual(runtime.repair_attempts, 1)
+        self.assertEqual(runtime.error, "")
+
+    def test_real_debounce_commit_matches_camera_marker_and_source(self) -> None:
+        """실제 Source Commit 후 Camera·Marker·IMAGE_ID·Texture Pointer가 최종 Frame과 일치합니다."""
+
+        target = _new_paint_target()
+        start_paint_session(bpy.context, target, width=64, height=32)
+        start_stencil_session(
+            bpy.context,
+            dataset_uuid=str(self.scene.projection_paint.dataset_uuid),
+        )
+        try:
+            self.assertTrue(refresh_frame_source(self.scene))
+            settings = self.scene.projection_paint
+            paint_image = settings.active_paint_image
+            brush = self.scene.tool_settings.image_paint.brush
+            material = target.active_material
+            paint_slot = int(material.paint_active_slot)
+            tool_id = active_tool_id(bpy.context)
+            active_layer_index = int(settings.active_layer_index)
+
+            self.scene.frame_current = 2
+            queue_frame_change(self.scene, changed_at=700.0)
+            _frame_source_debounce_tick(now=700.30)
+
+            runtime = runtime_for_scene(self.scene)
+            entry = runtime.entries_by_frame[2]
+            camera = runtime.objects[entry.camera_uuid]
+            marker = runtime.markers[entry.image_id]
+            self.assertIsNone(runtime.pending_frame)
+            self.assertIs(self.scene.camera, camera)
+            self.assertEqual(int(marker.frame), 2)
+            self.assertIs(marker.camera, camera)
+            self.assertEqual(int(settings.active_image_id), 30)
+            self.assertEqual(str(settings.current_image_id), "30")
+            self.assertEqual(str(settings.current_image_name), "b.png")
+            self.assertEqual(
+                Path(settings.stencil_source_image.filepath).name,
+                "b.png",
+            )
+            self.assertIs(settings.stencil_texture.image, settings.stencil_source_image)
+            self.assertIs(settings.active_paint_image, paint_image)
+            self.assertIs(self.scene.tool_settings.image_paint.brush, brush)
+            self.assertEqual(int(material.paint_active_slot), paint_slot)
+            self.assertEqual(active_tool_id(bpy.context), tool_id)
+            self.assertEqual(int(settings.active_layer_index), active_layer_index)
+        finally:
+            finish_paint_session(bpy.context)
+
+    def test_explicit_reconnect_commits_immediately_and_consumes_pending(self) -> None:
+        """명시적 Reconnect는 0.30초 대기를 건너뛰고 현재 Frame Source를 즉시 완료합니다."""
+
+        target = _new_paint_target()
+        start_paint_session(bpy.context, target, width=64, height=32)
+        start_stencil_session(
+            bpy.context,
+            dataset_uuid=str(self.scene.projection_paint.dataset_uuid),
+        )
+        try:
+            self.assertTrue(refresh_frame_source(self.scene))
+            self.scene.frame_current = 2
+            queue_frame_change(self.scene, changed_at=800.0)
+            runtime = runtime_for_scene(self.scene)
+            self.assertEqual(runtime.pending_frame, 2)
+
+            with patch.object(
+                paint_runtime_module,
+                "_projection_runtime_is_active",
+                return_value=True,
+            ):
+                image_id = reconnect_current_frame(bpy.context)
+
+            self.assertEqual(image_id, 30)
+            self.assertEqual(int(self.scene.projection_paint.active_image_id), 30)
+            self.assertIsNone(runtime.pending_frame)
+            self.assertIsNone(_frame_source_debounce_tick(now=800.30))
+        finally:
+            finish_paint_session(bpy.context)
+
+    def test_camera_runtime_clear_unregisters_debounce_timer(self) -> None:
+        """Runtime 해제 경계에서 이전 Epoch Debounce Timer와 Pending을 함께 폐기합니다."""
+
+        from tools.projection_paint.blender.lifecycle import lifecycle_registry
+
+        self.scene.frame_current = 2
+        queue_frame_change(self.scene, changed_at=600.0)
+        registry = lifecycle_registry()
+        self.assertIn(_frame_source_debounce_tick, registry._timers)
+
+        clear_camera_runtime()
+
+        self.assertNotIn(_frame_source_debounce_tick, registry._timers)
+        self.assertIsNone(runtime_for_scene(self.scene))
 
     def test_saved_slot_state_recovers_after_runtime_cache_clear(self) -> None:
         """Runtime Cache 삭제 뒤 Blender Pointer와 Index로 같은 슬롯을 복구합니다."""
@@ -239,9 +527,18 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         )
         operator = SimpleNamespace(report=lambda *_args: None)
 
-        self.assertTrue(PP_OT_review_background_toggle.poll(projection_context))
-        self.assertFalse(PP_OT_review_background_toggle.poll(foreign_context))
-        self.assertFalse(PP_OT_review_background_toggle.poll(perspective_context))
+        with patch(
+            "tools.projection_paint.blender.snapshot_update.snapshot_is_ready",
+            return_value=True,
+        ):
+            self.assertTrue(PP_OT_review_background_toggle.poll(projection_context))
+            self.assertFalse(PP_OT_review_background_toggle.poll(foreign_context))
+            self.assertFalse(PP_OT_review_background_toggle.poll(perspective_context))
+        with patch(
+            "tools.projection_paint.blender.snapshot_update.snapshot_is_ready",
+            return_value=False,
+        ):
+            self.assertFalse(PP_OT_review_background_toggle.poll(projection_context))
         self.assertFalse(settings.review_background_enabled)
         self.assertEqual(
             PP_OT_review_background_toggle.execute(operator, camera_context),

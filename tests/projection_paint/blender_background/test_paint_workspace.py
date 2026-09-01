@@ -24,7 +24,9 @@ from tools.projection_paint.blender.paint_workspace import (  # noqa: E402
     PAINT_WORKSPACE_SPEC,
     WORKSPACE_KIND,
     _area_geometry_is_stable,
+    _configure_properties_context,
     _configure_viewport_visibility_contract,
+    _show_active_dataset_collection,
     ensure_paint_workspace,
     open_paint_workspace,
     paint_workspace_exit_settled,
@@ -180,6 +182,10 @@ class PaintWorkspaceGeometryTests(unittest.TestCase):
                 "tools.projection_paint.blender.paint_workspace."
                 "release_scene_marker_session",
             ) as release_markers,
+            patch(
+                "tools.projection_paint.blender.dataset_view_layer."
+                "restore_projection_source_view_layer",
+            ),
         ):
             request_paint_workspace_exit(context)
             settled = paint_workspace_exit_settled(scene, window)
@@ -227,6 +233,10 @@ class PaintWorkspaceGeometryTests(unittest.TestCase):
                 "tools.projection_paint.blender.paint_workspace.remove_paint_workspace",
                 return_value=True,
             ) as remove_workspace,
+            patch(
+                "tools.projection_paint.blender.dataset_view_layer."
+                "restore_projection_source_view_layer",
+            ),
         ):
             request_paint_workspace_exit(context)
 
@@ -299,15 +309,65 @@ class PaintWorkspaceGeometryTests(unittest.TestCase):
         )
         area = SimpleNamespace(spaces=SimpleNamespace(active=space))
 
-        _configure_viewport_visibility_contract(
-            SimpleNamespace(),
-            SimpleNamespace(),
-            area,
-        )
+        with patch(
+            "tools.projection_paint.blender.paint_workspace."
+            "_show_active_dataset_collection",
+        ) as show_collection:
+            _configure_viewport_visibility_contract(
+                SimpleNamespace(scene=object()),
+                SimpleNamespace(view_layer=object()),
+                area,
+            )
 
         self.assertTrue(space.show_object_viewport_mesh)
         self.assertTrue(space.show_object_viewport_camera)
         self.assertTrue(space.show_object_viewport_empty)
+        show_collection.assert_called_once()
+
+    def test_properties_context_falls_back_when_object_enum_is_missing(self) -> None:
+        """OBJECT enum이 없는 Blender Properties에서는 VIEW_LAYER를 안전하게 사용합니다."""
+
+        enum_items = (SimpleNamespace(identifier="VIEW_LAYER"),)
+        space = SimpleNamespace(
+            context="OBJECT",
+            bl_rna=SimpleNamespace(
+                properties={"context": SimpleNamespace(enum_items=enum_items)}
+            ),
+        )
+        _configure_properties_context(
+            space,
+            active_object=object(),
+            preserve_existing=False,
+        )
+        self.assertEqual("VIEW_LAYER", space.context)
+        _configure_properties_context(
+            space,
+            active_object=object(),
+            preserve_existing=True,
+        )
+        self.assertEqual("VIEW_LAYER", space.context)
+
+    def test_viewport_contract_restores_owned_dataset_collection(self) -> None:
+        """Paint 재진입 시 PP 전용 View Layer의 Snapshot Root 계약을 복구합니다."""
+
+        scene = SimpleNamespace()
+        view_layer = SimpleNamespace()
+        with (
+            patch(
+                "tools.projection_paint.blender.dataset_view_layer."
+                "synchronize_projection_dataset_visibility",
+                return_value=view_layer,
+            ) as synchronize,
+            patch(
+                "tools.projection_paint.blender.dataset_view_layer."
+                "is_projection_dataset_view_layer",
+                return_value=True,
+            ) as is_projection,
+        ):
+            _show_active_dataset_collection(scene, view_layer)
+
+        synchronize.assert_called_once_with(scene)
+        is_projection.assert_called_once_with(view_layer)
 
     def test_production_workspace_does_not_duplicate_active_workspace(self) -> None:
         """Projection Paint Production Source에는 활성 Workspace 복제 호출이 없습니다."""
@@ -363,6 +423,10 @@ class PaintWorkspaceGeometryTests(unittest.TestCase):
             patch(
                 "tools.projection_paint.blender.camera_scene."
                 "attach_projection_markers",
+            ),
+            patch(
+                "tools.projection_paint.blender.dataset_view_layer."
+                "activate_projection_dataset_view_layer",
             ),
         ):
             result = open_paint_workspace(context)

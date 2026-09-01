@@ -26,6 +26,8 @@ _OVERLAY_MINIMUM_WIDTH = 300
 _OVERLAY_VIEWPORT_MARGIN = 40
 _OVERLAY_PADDING = 22
 _DETAIL_LINE_OFFSETS = (61, 39, 17)
+_PROCESS_DOT_INTERVAL_SECONDS = 0.4
+_PROCESS_DOT_FRAME_COUNT = 4
 
 
 def _validate_single_line_text(
@@ -123,6 +125,51 @@ class ProgressOverlayView:
             )
 
 
+def activity_process_label(elapsed_seconds: float) -> str:
+    """경과 시간에 따라 점 한 개부터 네 개까지 반복되는 공통 활동 문구를 반환합니다."""
+    elapsed = float(elapsed_seconds)
+    if not isfinite(elapsed) or elapsed < 0.0:
+        elapsed = 0.0
+    frame = int(
+        elapsed / _PROCESS_DOT_INTERVAL_SECONDS + 1.0e-9
+    ) % _PROCESS_DOT_FRAME_COUNT
+    return f"Process{'.' * (frame + 1)}"
+
+
+def native_bake_progress_view(
+    *,
+    title: str,
+    phase: str,
+    elapsed_seconds: float,
+    detail: str,
+    device_detail: str,
+    image_size: tuple[int, int],
+    tile_count: int,
+    sample_count: int,
+) -> ProgressOverlayView:
+    """Native EMIT Bake의 장치·해상도·Samples·경과 시간을 공통 활동형 View로 만듭니다."""
+    width, height = (int(image_size[0]), int(image_size[1]))
+    elapsed = max(0.0, float(elapsed_seconds))
+    return ProgressOverlayView(
+        title=str(title),
+        phase=str(phase),
+        fraction=0.0,
+        completed_units=0,
+        total_units=0,
+        elapsed_seconds=elapsed,
+        detail_lines=(
+            str(detail),
+            f"Device: {device_detail}",
+            (
+                f"Image: {width} × {height} · 버퍼 {int(tile_count)}개 · "
+                f"Bake: EMIT · Samples {int(sample_count)} · 경과 {elapsed:.1f}초"
+            ),
+        ),
+        indeterminate=True,
+        activity_text=activity_process_label(elapsed),
+    )
+
+
 def progress_overlay_height(view: ProgressOverlayView) -> int:
     """활동 문구 전용 Overlay는 Process와 상세 설명 사이의 빈 공간을 제거합니다."""
     return ACTIVITY_OVERLAY_HEIGHT if view.activity_text else OVERLAY_HEIGHT
@@ -207,14 +254,48 @@ def _draw_text(
     y: float,
     size: int,
     color: tuple[float, float, float, float],
+    *,
+    maximum_width: float | None = None,
 ) -> None:
-    """BLF 기본 글꼴로 Overlay 문자열을 그립니다."""
+    """BLF 기본 글꼴로 폭을 제한한 Overlay 문자열을 그립니다."""
 
     font_id = 0
     blf.size(font_id, size)
     blf.color(font_id, *color)
     blf.position(font_id, x, y, 0)
-    blf.draw(font_id, text)
+    display_text = (
+        _fit_text_to_width(text, size, maximum_width)
+        if maximum_width is not None
+        else text
+    )
+    if display_text:
+        blf.draw(font_id, display_text)
+
+
+def _fit_text_to_width(text: str, size: int, maximum_width: float) -> str:
+    """한 줄 문자열을 지정한 픽셀 폭 안에서 말줄임표로 축약합니다."""
+
+    value = str(text)
+    available = max(0.0, float(maximum_width))
+    if not value or available <= 0.0:
+        return ""
+    font_id = 0
+    blf.size(font_id, int(size))
+    if float(blf.dimensions(font_id, value)[0]) <= available:
+        return value
+    ellipsis = "…"
+    if float(blf.dimensions(font_id, ellipsis)[0]) > available:
+        return ""
+    lower = 0
+    upper = len(value)
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        candidate = f"{value[:middle].rstrip()}{ellipsis}"
+        if float(blf.dimensions(font_id, candidate)[0]) <= available:
+            lower = middle
+        else:
+            upper = middle - 1
+    return f"{value[:lower].rstrip()}{ellipsis}"
 
 
 def compact_path(path: Path | str, maximum: int = 66) -> str:
@@ -293,14 +374,16 @@ def draw_progress_overlay(view: ProgressOverlayView) -> None:
             y + height - 36,
             18,
             (1.0, 1.0, 1.0, 1.0),
+            maximum_width=width - (_OVERLAY_PADDING * 2),
         )
         if view.activity_text:
             _draw_text(
-                view.activity_text,
+                f"{view.phase} · {view.activity_text}",
                 x + _OVERLAY_PADDING,
                 y + height - 68,
                 15,
                 (0.9, 0.9, 0.9, 1.0),
+                maximum_width=width - (_OVERLAY_PADDING * 2),
             )
         else:
             _draw_text(
@@ -309,6 +392,7 @@ def draw_progress_overlay(view: ProgressOverlayView) -> None:
                 y + height - 66,
                 15,
                 (0.9, 0.9, 0.9, 1.0),
+                maximum_width=width - (_OVERLAY_PADDING * 2),
             )
             _draw_text(
                 "Processing" if view.indeterminate else f"{view.fraction * 100.0:5.1f}%",
@@ -316,6 +400,7 @@ def draw_progress_overlay(view: ProgressOverlayView) -> None:
                 bar_y + 3,
                 13,
                 (1.0, 1.0, 1.0, 1.0),
+                maximum_width=60,
             )
         for line, offset in zip(view.detail_lines, _DETAIL_LINE_OFFSETS):
             size = 12 if offset == _DETAIL_LINE_OFFSETS[0] else 11
@@ -330,6 +415,7 @@ def draw_progress_overlay(view: ProgressOverlayView) -> None:
                 y + offset,
                 size,
                 color,
+                maximum_width=width - (_OVERLAY_PADDING * 2),
             )
     finally:
         gpu.state.blend_set("NONE")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import bpy
 
@@ -18,6 +19,7 @@ from tools.modifier.blender.modifier_session import (
     CONTROL_PANEL_CATEGORY,
     MAIN_SCREEN_OWNER_KEY,
     SESSION,
+    SESSION_ACTIVE,
     SESSION_INACTIVE,
     WORKSPACE_NAME,
     WORKSPACE_OWNER_KEY,
@@ -27,6 +29,7 @@ from tools.modifier.blender.modifier_session import (
 )
 from tools.modifier.blender.modifier_workspace import (
     TIMELINE_HEIGHT_FACTOR,
+    _record_runtime_restore_error,
     clear_modifier_session_before_load,
     restore_modifier_session_after_load,
 )
@@ -206,6 +209,22 @@ try:
         hasattr(bpy.types.Scene, "colmap_import")
         and not hasattr(bpy.types.Scene, "colmap_modifier"),
         "기존 .blend 호환 Scene.colmap_import 식별자가 유지되지 않았습니다.",
+    )
+    warning_settings = SimpleNamespace(warning_summary="기존 경고")
+    with patch.object(SESSION, "phase", SESSION_ACTIVE):
+        _record_runtime_restore_error(
+            SimpleNamespace(colmap_import=warning_settings),
+            ValueError("COLMAP source 파일이 변경되었습니다."),
+        )
+        workspace_remained_active = SESSION.phase == SESSION_ACTIVE
+    warning = warning_settings.warning_summary.splitlines()[-1]
+    assert_true(
+        workspace_remained_active
+        and "COLMAP source 파일이 변경되었습니다." in warning
+        and warning_settings.warning_summary.splitlines() == ["기존 경고", warning]
+        and warning_settings.status == warning
+        and warning_settings.status_kind == "ERROR",
+        "원본 변경 시 Workspace를 닫지 않고 Runtime 오류와 기존 경고를 보존하지 못했습니다.",
     )
 
     workspace = bpy.data.workspaces[0]

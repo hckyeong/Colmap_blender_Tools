@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..core.export_types import ExportTransactionError
 from .camera_edit_session import force_end_camera_mode
 from .camera_review_session import ensure_review_session
+from .dataset_adapter import refresh_shared_source_after_export
 from .point_edit_session import force_end_point_mode
 from .runtime_state import (
     install_state,
@@ -46,6 +47,12 @@ def commit_exported_runtime(context, state, result) -> tuple[str, ...]:
     settings.image_count = str(len(exported_state.current_reconstruction.images))
     settings.point3d_count = str(
         len(exported_state.current_reconstruction.points3d)
+    )
+    refresh_shared_source_after_export(
+        context.scene,
+        result.loaded,
+        exported_state.current_reconstruction,
+        settings,
     )
 
     clear_snapshots()

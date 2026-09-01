@@ -20,14 +20,17 @@ except ImportError:
 from .ui_messages import wrap_ui_message
 
 
-_AXIS_SUMMARIES = {
-    "REALITY_CAPTURE": ("Z", "-Y"),
-    "BLENDER": ("Y", "Z"),
-    "MAYA": ("-Z", "Y"),
-    "HOUDINI": ("-Z", "Y"),
-}
-
 _PANEL_WARNING_MAX_COLUMNS = 37
+
+_STENCIL_STATUS_SUMMARIES = {
+    "DISCONNECTED": "연결 필요",
+    "CONNECTED": "연결됨",
+    "CAMERA_SUSPENDED": "Camera View 밖",
+    "MASK_SUSPENDED": "Mask 편집 중",
+    "BRUSH_CHANGED": "다른 Brush 활성",
+    "MANUAL_DISABLED": "수동 해제",
+    "ERROR": "연결 오류",
+}
 
 
 def _panel_warning_lines(message: str) -> tuple[str, ...]:
@@ -54,9 +57,23 @@ def _preview_check_icon(active):
     return "CHECKMARK" if active else "BLANK1"
 
 
-def _layer_button_text(layer_name: str, active: bool) -> str:
-    """활성 Paint Layer 이름에만 같은 버튼 안의 체크 문자열을 붙여 반환합니다."""
-    return f"{layer_name}  ✓" if active else layer_name
+def _draw_active_tree_marker(layout, active_key: str, item_key: str) -> None:
+    """실제 활성 편집 대상만 고정폭 RADIOBUT_ON 열에 표시합니다."""
+
+    marker = layout.row(align=True)
+    marker.ui_units_x = 1.0
+    marker.label(
+        text="",
+        icon="RADIOBUT_ON" if str(active_key) == str(item_key) else "BLANK1",
+    )
+
+
+def _stencil_status_text(connection) -> str:
+    """Stencil 상태와 핵심 원인을 최상단 Status의 한 행으로 압축합니다."""
+
+    state = str(getattr(connection, "state", "DISCONNECTED") or "DISCONNECTED")
+    summary = _STENCIL_STATUS_SUMMARIES.get(state, "상태 확인 필요")
+    return f"Stencil: {state} · {summary}"
 
 
 def _layer_panel_display_layers(settings):
@@ -159,13 +176,23 @@ def _draw_composite_source_rows(tree, layer, source_layers, *, source_schema: in
             source_row.label(text="", icon=status_icon)
 
 
-def _axis_summary(settings):
-    """선택한 Camera 표시축을 참조 Import UI 형식으로 반환합니다."""
-    forward, up = _AXIS_SUMMARIES.get(
-        settings.camera_axis_preset,
-        (settings.camera_forward, settings.camera_up),
-    )
-    return f"Forward: {forward}, Up: {up}"
+def _snapshot_ready(scene) -> bool:
+    """현재 PP Manifest가 독립 Snapshot token과 일치하는지 반환합니다."""
+
+    from .snapshot_update import snapshot_is_ready
+
+    return snapshot_is_ready(scene)
+
+
+def _paint_runtime_active(scene) -> bool:
+    """Scene 상태가 ACTIVE이고 실제 폐기 가능 Paint Runtime이 존재하는지 반환합니다."""
+
+    settings = getattr(scene, "projection_paint", None)
+    if settings is None or str(settings.paint_state) != "ACTIVE":
+        return False
+    from .paint_runtime import active_paint_runtime
+
+    return active_paint_runtime(scene) is not None
 
 
 def _colmap_tools_menu_available() -> bool:
@@ -189,18 +216,25 @@ def _paint_workspace_active(context) -> bool:
     )
 
 
-def _draw_paint_mode_operator(layout, settings, *, text: str) -> None:
+def _draw_paint_mode_operator(layout, settings, *, text: str, runtime_active: bool) -> None:
     """Projection Painting 진입과 종료를 같은 Toggle Operator로 표시합니다."""
 
     layout.operator(
         "projection_paint.toggle_paint",
         text=str(text),
         icon="TPAINT_HLT",
-        depress=bool(settings.paint_enabled),
+        depress=bool(runtime_active),
     )
 
 
-def _draw_paint_setup(layout, settings, *, include_paint_mode: bool) -> None:
+def _draw_paint_setup(
+    layout,
+    scene,
+    settings,
+    *,
+    include_paint_mode: bool,
+    dataset_ready: bool,
+) -> None:
     """Paint Target과 해상도 및 세션 제어를 지정한 Layout에 표시합니다."""
 
     layout.prop(settings, "paint_target")
@@ -208,18 +242,42 @@ def _draw_paint_setup(layout, settings, *, include_paint_mode: bool) -> None:
     resolution_row = layout.row()
     resolution_row.enabled = not bool(settings.use_base_resolution)
     resolution_row.prop(settings, "overlay_resolution")
+    runtime_active = _paint_runtime_active(scene)
     if include_paint_mode:
-        _draw_paint_mode_operator(layout, settings, text="Painting Mode")
-    layout.operator(
+        paint_mode = layout.column(align=True)
+        paint_mode.enabled = bool(dataset_ready or runtime_active)
+        _draw_paint_mode_operator(
+            paint_mode,
+            settings,
+            text="Painting Mode",
+            runtime_active=runtime_active,
+        )
+    dataset_actions = layout.column(align=True)
+    dataset_actions.enabled = bool(dataset_ready and runtime_active)
+    dataset_actions.operator(
         "projection_paint.reconnect_stencil",
         icon="FILE_REFRESH",
     )
-    layout.operator(
+    dataset_actions.operator(
         "projection_paint.project_stencil",
         icon="IMAGE_DATA",
     )
     if settings.recovery_available:
         layout.operator("projection_paint.recover_overlay", icon="RECOVER_LAST")
+
+
+class _ProjectionPaintPanelMixin:
+    """Projection Paint 전용 Workspace에서만 도구 패널을 표시합니다."""
+
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Projection Paint"
+
+    @classmethod
+    def poll(cls, context):
+        """현재 Window가 Scene에 연결된 Projection Paint Workspace인지 확인합니다."""
+
+        return _paint_workspace_active(context)
 
 
 def draw_colmap_tools_projection_paint(self, context) -> None:
@@ -260,23 +318,24 @@ class PP_OT_open_paint_workspace(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class PP_PT_status(bpy.types.Panel):
+class PP_PT_status(_ProjectionPaintPanelMixin, bpy.types.Panel):
     """현재 Dataset, Paint와 Overlay 내구성 상태를 표시합니다."""
 
     bl_label = "Projection Painting"
     bl_idname = "PP_PT_status"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Projection Paint"
     bl_options = {"HIDE_HEADER"}
 
     def draw(self, context):
         """현재 자동화 상태를 읽기 전용으로 표시합니다."""
         settings = context.scene.projection_paint
+        from .stencil_session import resolve_stencil_connection
+
+        connection = resolve_stencil_connection(context.scene, context)
         box = self.layout.box()
         box.label(text="Status")
         box.label(text=settings.status, icon="ERROR" if settings.status_kind == "ERROR" else "INFO")
         box.label(text=f"Paint: {settings.paint_state}")
+        box.label(text=_stencil_status_text(connection))
         box.label(text=f"Overlay: {settings.durability_state}")
         if settings.current_image_id:
             box.label(text=f"IMAGE_ID: {settings.current_image_id}")
@@ -284,32 +343,29 @@ class PP_PT_status(bpy.types.Panel):
             box.label(text=f"Image: {settings.current_image_name}")
 
 
-class PP_PT_colmap(bpy.types.Panel):
-    """참조 COLMAP Importer와 같은 Import UI를 표시합니다."""
+class PP_PT_colmap(_ProjectionPaintPanelMixin, bpy.types.Panel):
+    """Modifier 데이터를 PP 독립 Snapshot으로 업데이트하는 UI를 제공합니다."""
 
-    bl_label = "COLMAP Import"
+    bl_label = "COLMAP Dataset"
     bl_idname = "PP_PT_colmap"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Projection Paint"
 
     def draw(self, context):
-        """Dataset, Import와 Point·Camera 표시 설정을 참조 순서로 표시합니다."""
-        settings = context.scene.projection_paint
-        layout = self.layout
-        layout.prop(settings, "dataset_root", text="Dataset Root")
-        layout.prop(settings, "input_format")
-        layout.operator("projection_paint.import_colmap", icon="IMPORT")
+        """수동 업데이트 버튼과 Point·Camera 표시 크기를 제공합니다."""
 
-        axis_box = layout.box()
-        axis_box.label(text="Display Axis")
-        axis_box.prop(settings, "camera_axis_preset", text="Preset")
-        if settings.camera_axis_preset == "CUSTOM":
-            axis_box.prop(settings, "camera_forward", text="Forward Axis")
-            axis_box.prop(settings, "camera_up", text="Up Axis")
-        else:
-            axis_box.label(text=_axis_summary(settings))
-        axis_box.label(text="COLMAP 원본 축 유지", icon="INFO")
+        from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
+
+        layout = self.layout
+        settings = context.scene.projection_paint
+        update_row = layout.row(align=True)
+        update_row.enabled = modifier_snapshot_available(context)
+        update_row.operator("projection_paint.update_colmap_snapshot", icon="FILE_REFRESH")
+        if not modifier_snapshot_available(context):
+            layout.label(
+                text="COLMAP Modifier에서 데이터를 먼저 불러오세요.",
+                icon="INFO",
+            )
+        if not snapshot_is_ready(context.scene):
+            return
 
         display_box = layout.box()
         display_box.label(text="Point Display")
@@ -318,14 +374,11 @@ class PP_PT_colmap(bpy.types.Panel):
         display_box.prop(settings, "camera_frustum_size")
 
 
-class PP_PT_paint(bpy.types.Panel):
+class PP_PT_paint(_ProjectionPaintPanelMixin, bpy.types.Panel):
     """Paint Target, Overlay와 Texture Paint 진입 UI를 표시합니다."""
 
     bl_label = "Paint Setup"
     bl_idname = "PP_PT_paint"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Projection Paint"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
@@ -333,22 +386,21 @@ class PP_PT_paint(bpy.types.Panel):
         settings = context.scene.projection_paint
         _draw_paint_setup(
             self.layout,
+            context.scene,
             settings,
             include_paint_mode=(
                 _paint_workspace_active(context)
                 or not _colmap_tools_menu_available()
             ),
+            dataset_ready=_snapshot_ready(context.scene),
         )
 
 
-class PP_PT_camera_review(bpy.types.Panel):
+class PP_PT_camera_review(_ProjectionPaintPanelMixin, bpy.types.Panel):
     """현재 Frame의 COLMAP 이미지를 Camera Background로 검토하는 UI를 표시합니다."""
 
     bl_label = "Camera Review"
     bl_idname = "PP_PT_camera_review"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Projection Paint"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
@@ -356,6 +408,7 @@ class PP_PT_camera_review(bpy.types.Panel):
 
         settings = context.scene.projection_paint
         layout = self.layout
+        layout.enabled = _snapshot_ready(context.scene)
         info = layout.box()
         info.label(
             text=(
@@ -385,14 +438,11 @@ class PP_PT_camera_review(bpy.types.Panel):
         )
 
 
-class PP_PT_layers(bpy.types.Panel):
+class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
     """Paint Setup 아래에 논리 Paint Layer 목록을 표시합니다."""
 
     bl_label = "Layers"
     bl_idname = "PP_PT_layers"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Projection Paint"
     bl_parent_id = "PP_PT_paint"
     bl_options = {"DEFAULT_CLOSED"}
 
@@ -400,6 +450,7 @@ class PP_PT_layers(bpy.types.Panel):
         """Layer 부모와 들여쓴 보조 자식 행 및 관리 버튼을 표시합니다."""
         settings = context.scene.projection_paint
         from .layers import (
+            active_layer_tree_item_key,
             active_layer_adjustment,
             adjustment_mask_row_selected,
             adjustment_row_selected,
@@ -407,16 +458,20 @@ class PP_PT_layers(bpy.types.Panel):
             layer_mask_row_selected,
             layer_preview_active,
             layer_row_selected,
+            layer_tree_selected_item_count,
             mask_preview_active,
         )
         from .layer_shader import (
             composite_layer_is_editable,
             composite_state_locks_layer_edits,
+            original_layer_is_read_only,
         )
 
         row = self.layout.row()
         tree = row.column(align=True)
+        tree.context_pointer_set("projection_paint_layer_tree", settings)
         active_index = int(settings.active_layer_index)
+        active_item_key = active_layer_tree_item_key(settings)
         composite_active = str(settings.composite_state) == "ACTIVE"
         source_session_uuid = str(settings.active_composite_session_uuid or "")
         source_schema = int(getattr(settings, "composite_source_schema_version", 0))
@@ -460,17 +515,18 @@ class PP_PT_layers(bpy.types.Panel):
             )
             toggle.layer_uuid = str(layer.layer_uuid)
             parent_selected = layer_row_selected(settings, layer_index)
+            layer_item_key = str(layer.layer_uuid)
+            _draw_active_tree_marker(parent, active_item_key, layer_item_key)
             parent.operator_context = "INVOKE_DEFAULT"
             select = parent.operator(
                 "projection_paint.layer_select",
-                text=_layer_button_text(
-                    str(layer.name),
-                    layer_index == active_index,
-                ),
+                text=str(layer.name),
                 depress=parent_selected,
                 emboss=parent_selected,
             )
             select.layer_uuid = str(layer.layer_uuid)
+            if original_layer_is_read_only(settings, layer):
+                parent.label(text="", icon="LOCKED")
             layer_preview = parent.operator(
                 "projection_paint.layer_preview_toggle",
                 text="",
@@ -512,7 +568,14 @@ class PP_PT_layers(bpy.types.Panel):
                 branch.alignment = "RIGHT"
                 branch.label(text="↳")
                 child_content = child_split.row(align=True)
+                child_content.operator_context = "INVOKE_DEFAULT"
                 selected = layer_mask_row_selected(settings, layer_index)
+                mask_item_key = f"LAYER_MASK:{layer.mask.mask_uuid}"
+                _draw_active_tree_marker(
+                    child_content,
+                    active_item_key,
+                    mask_item_key,
+                )
                 select_mask = child_content.operator(
                     "projection_paint.layer_mask_select",
                     text="Mask",
@@ -552,6 +615,7 @@ class PP_PT_layers(bpy.types.Panel):
                 branch.alignment = "RIGHT"
                 branch.label(text="↳")
                 child_content = child_split.row(align=True)
+                child_content.operator_context = "INVOKE_DEFAULT"
                 if str(adjustment.mask.mask_uuid or ""):
                     adjustment_toggle = child_content.operator(
                         "projection_paint.adjustment_toggle",
@@ -569,6 +633,12 @@ class PP_PT_layers(bpy.types.Panel):
                     settings,
                     layer_index,
                     adjustment_index,
+                )
+                adjustment_item_key = f"ADJUSTMENT:{adjustment.adjustment_uuid}"
+                _draw_active_tree_marker(
+                    child_content,
+                    active_item_key,
+                    adjustment_item_key,
                 )
                 child_operator = child_content.operator(
                     "projection_paint.layer_adjustment_select",
@@ -598,10 +668,19 @@ class PP_PT_layers(bpy.types.Panel):
                     mask_branch.alignment = "RIGHT"
                     mask_branch.label(text="↳")
                     mask_content = mask_split.row(align=True)
+                    mask_content.operator_context = "INVOKE_DEFAULT"
                     mask_selected = adjustment_mask_row_selected(
                         settings,
                         layer_index,
                         adjustment_index,
+                    )
+                    adjustment_mask_item_key = (
+                        f"ADJUSTMENT_MASK:{adjustment.mask.mask_uuid}"
+                    )
+                    _draw_active_tree_marker(
+                        mask_content,
+                        active_item_key,
+                        adjustment_mask_item_key,
                     )
                     select_mask = mask_content.operator(
                         "projection_paint.adjustment_mask_select",
@@ -652,11 +731,7 @@ class PP_PT_layers(bpy.types.Panel):
             if 0 <= active_index < len(settings.layers)
             else None
         )
-        remove_button.enabled = bool(
-            active_layer is not None
-            and composite_layer_is_editable(settings, active_layer)
-            and str(getattr(active_layer, "layer_role", "NORMAL")) != "COMPOSITE"
-        )
+        remove_button.enabled = layer_tree_selected_item_count(settings) > 0
         remove_button.operator("projection_paint.layer_remove", text="", icon="REMOVE")
         buttons.separator()
         move_up = buttons.column(align=True)

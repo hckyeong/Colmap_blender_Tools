@@ -276,6 +276,11 @@ function Test-BuiltArchive {
             "shell/lifecycle.py",
             "shared/blender_runtime/workspace_factory.py",
             "shared/blender_runtime/scene_marker_session.py",
+            "shared/colmap_dataset/blender/registry.py",
+            "shared/colmap_dataset/blender/view_layers.py",
+            "shared/colmap_dataset/contracts.py",
+            "shared/colmap_transfer/contracts.py",
+            "shared/colmap_transfer/registry.py",
             "tools/align/_build_profile.py",
             "tools/align/registration.py",
             "tools/align/alignment/icp_external_contract.py",
@@ -283,10 +288,16 @@ function Test-BuiltArchive {
             "tools/align/alignment/icp_small_gicp_worker.py",
             "tools/align/resources/workspaces/colmap_align_seed_5_2.blend",
             "tools/modifier/blender/lifecycle.py",
+            "tools/modifier/blender/dataset_adapter.py",
+            "tools/modifier/blender/projection_snapshot_provider.py",
             "tools/modifier/blender/camera_review_keymap.py",
             "tools/modifier/blender/modifier_data_visibility.py",
             "tools/modifier/resources/workspaces/colmap_modifier_seed_5_2.blend",
             "tools/projection_paint/blender/lifecycle.py",
+            "tools/projection_paint/blender/dataset_adapter.py",
+            "tools/projection_paint/blender/dataset_view_layer.py",
+            "tools/projection_paint/blender/snapshot_scene_transaction.py",
+            "tools/projection_paint/blender/snapshot_update.py",
             "tools/projection_paint/resources/workspaces/projection_paint_seed_5_2.blend"
         )) {
             if ($entryNames -notcontains $required) {

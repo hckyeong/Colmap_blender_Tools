@@ -30,6 +30,7 @@ from .axis_display import (
     update_display_axis_preset,
 )
 from .camera_display import update_camera_frustum_size_from_settings
+from .dataset_adapter import synchronize_display_from_modifier
 from .point_display import update_point_scale_from_settings
 
 
@@ -111,13 +112,17 @@ def _update_dataset_root_paths(settings, context):
 
 
 def _update_point_scale(settings, context):
+    """Modifier Point Scale을 Scene 요소와 공용 Dataset에 함께 반영합니다."""
+
     update_point_scale_from_settings(settings, context)
+    synchronize_display_from_modifier(settings, context, "point_size")
 
 
 def _update_camera_frustum_size(settings, context):
     """Camera Frustum Size 변경을 관리 Camera Data에 즉시 반영합니다."""
 
     update_camera_frustum_size_from_settings(settings, context)
+    synchronize_display_from_modifier(settings, context, "camera_frustum_size")
 
 
 def _update_review_background(settings, context):
@@ -130,18 +135,39 @@ def _update_axis_forward(settings, context):
     """Forward Axis 변경을 표시 변환에 반영합니다."""
 
     update_display_axis(settings, context, "FORWARD")
+    synchronize_display_from_modifier(
+        settings,
+        context,
+        "axis_preset",
+        "axis_forward",
+        "axis_up",
+    )
 
 
 def _update_axis_up(settings, context):
     """Up Axis 변경을 표시 변환에 반영합니다."""
 
     update_display_axis(settings, context, "UP")
+    synchronize_display_from_modifier(
+        settings,
+        context,
+        "axis_preset",
+        "axis_forward",
+        "axis_up",
+    )
 
 
 def _update_axis_preset(settings, context):
     """Display Axis 프리셋을 실제 Forward와 Up 축에 적용합니다."""
 
     update_display_axis_preset(settings, context)
+    synchronize_display_from_modifier(
+        settings,
+        context,
+        "axis_preset",
+        "axis_forward",
+        "axis_up",
+    )
 
 
 class COLMAP_PG_status_display_line(bpy.types.PropertyGroup):

@@ -54,7 +54,6 @@ _SETTINGS_IMAGE_ATTRIBUTES = (
     "review_background_image",
     "overlay_image",
     "active_paint_image",
-    "composite_saved_clone_image",
     "original_source_image",
     "stencil_source_image",
     "original_canvas",
@@ -142,15 +141,14 @@ def _collect_persistent_references(scene: Any, material: Any, source: Any) -> tu
             )
     image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
     if image_paint is not None:
-        for attribute in ("canvas", "clone_image"):
-            _append_reference(
-                references,
-                seen,
-                image_paint,
-                attribute,
-                f"ImagePaint.{attribute}",
-                source,
-            )
+        _append_reference(
+            references,
+            seen,
+            image_paint,
+            "canvas",
+            "ImagePaint.canvas",
+            source,
+        )
     if material is None or material.node_tree is None:
         raise OverlayMigrationError("관리 Overlay 참조를 교체할 Material이 없습니다.")
     for node in material.node_tree.nodes:
@@ -228,6 +226,7 @@ def _adopt_legacy_single_backend(
         SINGLE_BACKEND,
         image_contract,
     )
+    from .layer_shader import original_layer_is_read_only
     from .ownership import OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
 
     settings = scene.projection_paint
@@ -239,10 +238,9 @@ def _adopt_legacy_single_backend(
     images = []
     seen = set()
     for layer in settings.layers:
-        candidates = [
-            layer.image,
-            layer.mask.image,
-        ]
+        candidates = [layer.mask.image]
+        if not original_layer_is_read_only(settings, layer):
+            candidates.insert(0, layer.image)
         for adjustment in layer.adjustments:
             candidates.append(adjustment.mask.image)
             if str(adjustment.adjustment_type) == "MASK":

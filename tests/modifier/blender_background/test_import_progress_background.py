@@ -40,6 +40,7 @@ from tools.modifier.core.import_types import ImportPlan
 from tools.modifier.core.loader import load_reconstruction
 from tools.modifier.core.model import Reconstruction
 from tests.modifier.fixture_utils import make_legacy_text
+from shared.colmap_dataset.blender.ownership import is_dataset_owned
 
 
 def assert_true(condition, message):
@@ -144,14 +145,37 @@ try:
             all(first <= second for first, second in zip(fractions, fractions[1:])),
             "Scene Job 진행률이 단조 증가하지 않았습니다.",
         )
-        camera_ids = tuple(
-            int(obj["colmap_image_id_text"])
+        camera_objects = tuple(
+            obj
             for obj in scene_job._cameras_collection.objects
             if obj.get(RECORD_KIND_KEY) == "CAMERA"
+        )
+        camera_ids = tuple(
+            int(obj["colmap_image_id_text"])
+            for obj in camera_objects
         )
         assert_true(
             camera_ids == tuple(range(1, 21)),
             f"Camera가 IMAGE_ID 오름차순으로 생성되지 않았습니다: {camera_ids}",
+        )
+        assert_true(
+            len({obj.data.as_pointer() for obj in camera_objects}) == 20
+            and all(
+                is_dataset_owned(
+                    obj,
+                    dataset_uuid=loaded.source.dataset_uuid,
+                    role="CAMERA",
+                    record_id=image_id,
+                )
+                and is_dataset_owned(
+                    obj.data,
+                    dataset_uuid=loaded.source.dataset_uuid,
+                    role="CAMERA_DATA",
+                    record_id=image_id,
+                )
+                for image_id, obj in zip(camera_ids, camera_objects)
+            ),
+            "Camera Object와 Data가 IMAGE_ID별 독립 공용 소유 구조가 아닙니다.",
         )
         scene_job.abort()
         assert_true(

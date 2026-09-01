@@ -747,8 +747,19 @@ def _schedule_open_workspace_configuration(
             settings.status_kind = "ERROR"
             settings.paint_state = "ERROR"
             return None
-        settings.status = "Projection Paint 작업공간 준비 완료"
-        settings.status_kind = "SUCCESS"
+        from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
+
+        if not snapshot_is_ready(current_scene) and not modifier_snapshot_available(
+            bpy.context
+        ):
+            settings.status = "COLMAP Modifier에서 데이터를 먼저 불러오세요."
+            settings.status_kind = "READY"
+        elif not snapshot_is_ready(current_scene):
+            settings.status = "COLMAP 데이터 업데이트 버튼을 눌러 Snapshot을 만드세요."
+            settings.status_kind = "READY"
+        else:
+            settings.status = "Projection Paint 작업공간 준비 완료"
+            settings.status_kind = "SUCCESS"
         if not bool(settings.paint_enabled):
             settings.paint_state = "IDLE"
         return None
@@ -771,18 +782,25 @@ def open_paint_workspace(context: Any) -> Any:
     settings = context.scene.projection_paint
     if str(settings.paint_state) in {"ENTERING", "EXITING"}:
         raise PaintWorkspaceError("Paint 진입 또는 종료가 끝난 뒤 작업공간을 여십시오.")
+    from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
+    from .dataset_view_layer import (
+        activate_projection_dataset_view_layer,
+        restore_projection_source_view_layer,
+    )
+
+    activate_projection_dataset_view_layer(context.scene, window)
     if not acquire_scene_marker_session(
         context.scene,
         _MARKER_TOOL_ID,
         window=window,
     ):
-        raise PaintWorkspaceError(
-            "현재 Scene의 Camera Marker를 다른 COLMAP 도구가 사용 중입니다."
-        )
+        restore_projection_source_view_layer(context.scene, window)
+        raise PaintWorkspaceError("현재 Scene의 Camera Marker를 다른 COLMAP 도구가 사용 중입니다.")
     try:
         from .camera_scene import attach_projection_markers, detach_projection_markers
 
-        attach_projection_markers(context.scene)
+        if snapshot_is_ready(context.scene):
+            attach_projection_markers(context.scene)
         workspace = _stored_workspace(settings)
         if workspace is None:
             workspace = ensure_paint_workspace(context)
@@ -800,11 +818,20 @@ def open_paint_workspace(context: Any) -> Any:
             detach_projection_markers(context.scene)
         finally:
             release_scene_marker_session(context.scene, _MARKER_TOOL_ID)
+            restore_projection_source_view_layer(context.scene, window)
         raise
+    from .state_handlers import recover_lazy_runtime
+
+    recover_lazy_runtime(context.scene, "workspace_enter")
     if not bool(settings.paint_enabled):
         workspace.object_mode = "OBJECT"
-    settings.status = "Projection Paint 작업공간 준비 중"
-    settings.status_kind = "RUNNING"
+    if not (
+        modifier_snapshot_available(context)
+        and not snapshot_is_ready(context.scene)
+        and str(settings.status_kind) == "ERROR"
+    ):
+        settings.status = "Projection Paint 작업공간 준비 중"
+        settings.status_kind = "RUNNING"
     _schedule_open_workspace_configuration(
         context.scene,
         window,
@@ -870,6 +897,9 @@ def request_paint_workspace_exit(context: Any) -> None:
     settings.paint_state = "EXITING"
     if getattr(window, "workspace", None) is workspace:
         window.workspace = source
+    from .dataset_view_layer import restore_projection_source_view_layer
+
+    restore_projection_source_view_layer(scene, window)
 
     workspace_state = str(workspace.get(WORKSPACE_STATE_KEY, "") or "")
     if workspace_state != STATE_READY:
@@ -1051,8 +1081,52 @@ def _split_properties(context: Any, window: Any) -> None:
         raise PaintWorkspaceError("Paint 화면에 Outliner와 Properties 영역을 만들지 못했습니다.")
 
 
-def _paint_areas(window: Any) -> tuple[Any, Any, Any, Any]:
-    """현재 네 Area를 위치 기준으로 Paint 편집기 역할에 대응시킵니다."""
+def _supported_properties_contexts(space: Any) -> frozenset[str]:
+    """현재 Blender의 Properties Space context enum 식별자를 안전하게 반환합니다."""
+
+    try:
+        prop = space.bl_rna.properties.get("context")
+        return frozenset(str(item.identifier) for item in prop.enum_items)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return frozenset()
+
+
+def _configure_properties_context(
+    space: Any,
+    *,
+    active_object: Any,
+    preserve_existing: bool,
+) -> None:
+    """지원 enum과 기존 선택을 확인해 Properties context를 비파괴적으로 설정합니다."""
+
+    supported = _supported_properties_contexts(space)
+    try:
+        current = str(space.context or "")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        current = ""
+    if preserve_existing and current and (not supported or current in supported):
+        return
+    candidates = (
+        "OBJECT" if active_object is not None else "VIEW_LAYER",
+        current,
+        "VIEW_LAYER",
+    )
+    for candidate in candidates:
+        if not candidate or (supported and candidate not in supported):
+            continue
+        try:
+            space.context = candidate
+            return
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+
+
+def _paint_areas(
+    window: Any,
+    *,
+    preserve_properties_context: bool = False,
+) -> tuple[Any, Any, Any, Any]:
+    """현재 네 Area를 역할에 대응시키고 Properties context를 지원 enum으로 설정합니다."""
     screen = window.screen
     areas = _ready_areas(screen, 4)
     if not areas:
@@ -1078,7 +1152,12 @@ def _paint_areas(window: Any) -> tuple[Any, Any, Any, Any]:
     viewport_area.type = "VIEW_3D"
     properties_area.type = "PROPERTIES"
     outliner_area.type = "OUTLINER"
-    properties_area.spaces.active.context = "OBJECT"
+    active_object = getattr(window.view_layer.objects, "active", None)
+    _configure_properties_context(
+        properties_area.spaces.active,
+        active_object=active_object,
+        preserve_existing=preserve_properties_context,
+    )
     outliner_area.spaces.active.display_mode = "VIEW_LAYER"
     if int(timeline_area.height) >= int(viewport_area.height):
         raise PaintWorkspaceError("Timeline Area가 화면 하단의 작은 영역으로 생성되지 않았습니다.")
@@ -1097,6 +1176,22 @@ def _disable_local_view(context: Any, window: Any, viewport_area: Any) -> None:
         result = bpy.ops.view3d.localview(frame_selected=False)
     if result != {"FINISHED"} or getattr(space, "local_view", None) is not None:
         raise PaintWorkspaceError("Projection Paint Viewport의 Local View를 해제하지 못했습니다.")
+
+
+def _show_active_dataset_collection(scene: Any, view_layer: Any) -> None:
+    """PP 전용 View Layer에서 독립 Snapshot Root 표시 계약을 다시 적용합니다."""
+
+    from .dataset_view_layer import (
+        is_projection_dataset_view_layer,
+        synchronize_projection_dataset_visibility,
+    )
+
+    expected = synchronize_projection_dataset_visibility(scene)
+    if (
+        _pointer(expected) != _pointer(view_layer)
+        or not is_projection_dataset_view_layer(view_layer)
+    ):
+        raise PaintWorkspaceError("Projection Paint 전용 View Layer가 활성 상태가 아닙니다.")
 
 
 def _configure_viewport_visibility_contract(
@@ -1119,6 +1214,7 @@ def _configure_viewport_visibility_contract(
     if not all(bool(getattr(space, filter_name)) for filter_name in filter_names):
         raise PaintWorkspaceError("Projection Paint Viewport Object 필터를 활성화하지 못했습니다.")
     _disable_local_view(context, window, viewport_area)
+    _show_active_dataset_collection(context.scene, window.view_layer)
 
 
 def _finalize_workspace_contract(
@@ -1183,7 +1279,10 @@ def configure_paint_workspace(context: Any) -> bool:
         _advance_layout_stage(workspace, "COMPLETE")
         return True
     if stage == "COMPLETE":
-        viewport_area, _timeline, _outliner, _properties = _paint_areas(window)
+        viewport_area, _timeline, _outliner, _properties = _paint_areas(
+            window,
+            preserve_properties_context=True,
+        )
         _finalize_workspace_contract(
             context,
             window,

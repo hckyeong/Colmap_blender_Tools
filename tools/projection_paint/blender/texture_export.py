@@ -1,4 +1,4 @@
-"""활성 Composite의 최종 Base Color를 UDIM 또는 Atlas 파일로 내보냅니다."""
+"""현재 가시 Base Color Layer Graph를 UDIM 또는 Atlas 파일로 내보냅니다."""
 
 from __future__ import annotations
 
@@ -17,10 +17,17 @@ from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
 
 from .composite_layer import (
-    CompositeLayerError,
+    COMPOSITE_BAKE_SAMPLES,
+    combine_color_alpha_numpy,
+    composite_native_bake_pending,
     create_final_texture_export_image,
+    create_texture_export_bake_images,
+    invoke_prepared_emit_bake,
+    native_object_bake_running,
+    prepare_emit_bake,
     remove_final_texture_export_image,
-    validate_composite_session,
+    restore_emit_bake_persistent_state,
+    restore_emit_bake_ui_state,
 )
 from .image_backend import (
     PaintImageContract,
@@ -29,9 +36,15 @@ from .image_backend import (
     UDIM_BACKEND,
     image_contract,
 )
+from .layer_shader import (
+    LayerShaderError,
+    active_base_color_graph_layers,
+    validate_active_layer_graph,
+)
 from .progress_overlay import (
     ProgressOverlayView,
     add_progress_overlay_draw_handler,
+    native_bake_progress_view,
     remove_progress_overlay_draw_handler,
     request_progress_overlay_redraw,
 )
@@ -70,20 +83,6 @@ class AtomicCommitResult:
     cleanup_errors: tuple[str, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class ExportSceneSnapshot:
-    """Export 도중 바뀌면 결과 확정을 중단할 Composite·Layer 계약을 보관합니다."""
-
-    scene_pointer: int
-    target_pointer: int
-    material_pointer: int
-    session_uuid: str
-    composite_uuid: str
-    composite_image_pointer: int
-    composite_image_contract: PaintImageContract
-    layer_signature: tuple[tuple[Any, ...], ...]
-
-
 @dataclass(slots=True)
 class TextureExportProgress:
     """중앙 진행 Overlay의 단계와 수명주기 자원을 보관합니다."""
@@ -91,10 +90,15 @@ class TextureExportProgress:
     session_id: str
     started_at: float
     phase: str = "Preparing"
-    detail: str = "최종 결과를 검증하는 중입니다"
+    detail: str = "가시 Layer Graph와 출력 경로를 준비합니다"
     completed_steps: int = 0
-    total_steps: int = 4
+    total_steps: int = 5
     overlay_handle: Any = None
+    indeterminate: bool = False
+    bake_device_detail: str = ""
+    image_size: tuple[int, int] = (0, 0)
+    tile_count: int = 0
+    sample_count: int = COMPOSITE_BAKE_SAMPLES
 
     @property
     def elapsed_seconds(self) -> float:
@@ -102,9 +106,54 @@ class TextureExportProgress:
         return max(0.0, monotonic() - self.started_at)
 
 
+@dataclass(slots=True)
+class TextureExportJob:
+    """GUI Texture Export의 Native Bake·파일 Transaction·정리 상태를 보관합니다."""
+
+    session_id: str
+    scene: Any
+    settings: Any
+    paint_target: Any
+    paint_target_pointer: int
+    view_layer: Any
+    visible_layer_uuids: tuple[str, ...]
+    source_contract: PaintImageContract
+    plan: ExportPathPlan
+    output_mode: str
+    file_format: str
+    color_mode: str
+    udim_naming: str
+    atlas_max_size: int
+    png_compression: int
+    jpeg_quality: int
+    overwrite: bool
+    progress: TextureExportProgress | None = None
+    phase: str = "PREPARING"
+    color_image: Any = None
+    alpha_image: Any = None
+    bake_preparation: Any = None
+    ui_bake_preparation: Any = None
+    native_bake_stage: str = ""
+    native_bake_outcome: str = "PENDING"
+    native_bake_started: bool = False
+    native_bake_job_stopped: bool = False
+    cancel_requested: bool = False
+    abort_after_bake: bool = False
+    pending_error: str = ""
+    temporary_directory: Path | None = None
+    tile_paths: tuple[Path, ...] = ()
+    staged_paths: tuple[Path, ...] = ()
+    committed_paths: tuple[Path, ...] = ()
+    commit_result: AtomicCommitResult | None = None
+    error_message: str = ""
+    cleanup_errors: tuple[str, ...] = ()
+    cleanup_complete: bool = False
+    ui_restored: bool = False
+
+
 _EXPORT_PROGRESS: dict[str, TextureExportProgress] = {}
-_MODAL_EXPORT_STEPS: set[Any] = set()
 _MODAL_EXPORT_OPERATORS: dict[int, Any] = {}
+_EXPORT_JOBS: dict[str, TextureExportJob] = {}
 _EXPORT_RUNNING = False
 _TOKEN_PATTERN = re.compile(r"(?i)(?:[._-]?<(?:UDIM|UVTILE)>[._-]?)")
 _VALID_STEM_PATTERN = re.compile(r"^[^<>:\"/\\|?*\x00-\x1f]+$")
@@ -241,85 +290,40 @@ def _image_tile_numbers(image: Any) -> tuple[int, ...]:
         raise
 
 
-def _layer_signature(settings: Any) -> tuple[tuple[Any, ...], ...]:
-    """Export 확정 전 비교할 Layer·Mask·Adjustment의 가벼운 서명을 계산합니다."""
-    return tuple(
-        (
-            str(layer.layer_uuid),
-            str(layer.layer_role),
-            bool(layer.visible),
-            _pointer(layer.image),
-            str(layer.mask.mask_uuid or ""),
-            bool(layer.mask.enabled),
-            _pointer(layer.mask.image),
-            tuple(
-                (
-                    str(item.adjustment_uuid),
-                    str(item.adjustment_type),
-                    bool(item.enabled),
-                    str(item.mask.mask_uuid or ""),
-                    bool(item.mask.enabled),
-                    _pointer(item.mask.image),
-                )
-                for item in layer.adjustments
-            ),
-        )
-        for layer in settings.layers
-    )
-
-
-def capture_export_snapshot(scene: Any) -> tuple[ExportSceneSnapshot, Any, Any]:
-    """활성 Composite를 검증하고 Export Source와 불변성 Snapshot을 고정합니다."""
+def _export_graph_inputs(scene: Any) -> tuple[Any, tuple[Any, ...], tuple[Any, ...], Any]:
+    """현재 Base Color Graph와 그중 가시 Layer 및 출력 계약 기준 Image를 읽습니다."""
     settings = getattr(scene, "projection_paint", None)
     if settings is None:
         raise TextureExportError("Projection Painting 설정이 없습니다.")
-    if any(
-        (
-            str(settings.layer_preview_uuid or ""),
-            str(settings.mask_preview_adjustment_uuid or ""),
-            bool(settings.original_layer_preview),
-        )
-    ):
-        raise TextureExportError("Layer 또는 Mask 단독 미리보기를 해제한 뒤 내보내십시오.")
+    state = str(getattr(settings, "composite_state", "NONE"))
+    if state not in {"NONE", "ACTIVE"}:
+        raise TextureExportError("Composite 처리 중이거나 손상된 상태에서는 Texture를 내보낼 수 없습니다.")
+    target = getattr(settings, "paint_target", None)
+    material = getattr(settings, "paint_material", None)
+    if _pointer(target) == 0 or _pointer(material) == 0 or material.node_tree is None:
+        raise TextureExportError("Texture Export에 필요한 Paint Target과 관리 Material이 없습니다.")
+    if len(settings.layers) == 0:
+        raise TextureExportError("Texture Export에 필요한 논리 Layer가 없습니다.")
     try:
-        session = validate_composite_session(scene)
-    except CompositeLayerError as exc:
-        raise TextureExportError(str(exc)) from exc
-    image = session.composite.image
-    snapshot = ExportSceneSnapshot(
-        scene_pointer=_pointer(scene),
-        target_pointer=_pointer(settings.paint_target),
-        material_pointer=_pointer(settings.paint_material),
-        session_uuid=str(session.session_uuid),
-        composite_uuid=str(session.composite.layer_uuid),
-        composite_image_pointer=_pointer(image),
-        composite_image_contract=_export_image_contract(image),
-        layer_signature=_layer_signature(settings),
+        validate_active_layer_graph(scene, material)
+        graph_layers = active_base_color_graph_layers(settings)
+    except LayerShaderError as exc:
+        raise TextureExportError(f"활성 Layer Graph가 유효하지 않습니다: {exc}") from exc
+    if not graph_layers or any(
+        not str(getattr(layer, "layer_uuid", "") or "")
+        or _pointer(getattr(layer, "image", None)) == 0
+        for layer in graph_layers
+    ):
+        raise TextureExportError("활성 Layer Graph의 논리 Layer 또는 Image가 유효하지 않습니다.")
+    contracts = tuple(_export_image_contract(layer.image) for layer in graph_layers)
+    if any(contract != contracts[0] for contract in contracts[1:]):
+        raise TextureExportError("활성 Layer Graph의 Image 백엔드 계약이 서로 다릅니다.")
+    visible_layers = tuple(
+        layer for layer in graph_layers if bool(getattr(layer, "visible", False))
     )
-    return snapshot, session, image
-
-
-def validate_export_snapshot(scene: Any, snapshot: ExportSceneSnapshot) -> None:
-    """파일 확정 직전에 Scene·Composite·Layer 계약이 시작 때와 같은지 확인합니다."""
-    current, _session, _image = capture_export_snapshot(scene)
-    if current != snapshot:
-        raise TextureExportError("내보내는 동안 Composite 또는 Layer 상태가 변경되었습니다.")
-
-
-def final_result_requires_bake(settings: Any, session: Any) -> bool:
-    """Composite Image만으로 최종 가시 결과를 표현할 수 없으면 비파괴 Bake를 요청합니다."""
-    source_pointers = {_pointer(layer) for layer in session.sources}
-    composite = session.composite
-    outside_visible = any(
-        bool(layer.visible)
-        and _pointer(layer) not in source_pointers
-        and _pointer(layer) != _pointer(composite)
-        for layer in settings.layers
-        if str(getattr(layer, "layer_role", "NORMAL")) == "NORMAL"
-    )
-    composite_mask = bool(composite.mask.mask_uuid) and bool(composite.mask.enabled)
-    composite_adjustment = any(bool(item.enabled) for item in composite.adjustments)
-    return bool(outside_visible or composite_mask or composite_adjustment)
+    if not visible_layers:
+        raise TextureExportError("내보낼 Layer가 없습니다. 하나 이상의 Layer 눈을 켜십시오.")
+    return settings, graph_layers, visible_layers, graph_layers[0].image
 
 
 def _restore_dirty_state(image: Any, was_dirty: bool, active_tile_index: int) -> None:
@@ -564,6 +568,17 @@ def commit_staged_files(
 
 def _progress_view(progress: TextureExportProgress) -> ProgressOverlayView:
     """Texture Export 진행 상태를 공용 중앙 Overlay View로 변환합니다."""
+    if progress.indeterminate:
+        return native_bake_progress_view(
+            title="Final Texture Export",
+            phase=progress.phase,
+            elapsed_seconds=progress.elapsed_seconds,
+            detail=progress.detail,
+            device_detail=progress.bake_device_detail,
+            image_size=progress.image_size,
+            tile_count=progress.tile_count,
+            sample_count=progress.sample_count,
+        )
     return ProgressOverlayView(
         title="Final Texture Export",
         phase=progress.phase,
@@ -597,9 +612,40 @@ def create_export_progress() -> TextureExportProgress:
 
 def update_export_progress(progress: TextureExportProgress, step: int, phase: str, detail: str) -> None:
     """실제로 완료된 Export 단계만 중앙 진행 Overlay에 반영합니다."""
+    progress.indeterminate = False
     progress.completed_steps = max(0, min(int(step), progress.total_steps))
     progress.phase = str(phase)
     progress.detail = str(detail)
+    request_progress_overlay_redraw()
+
+
+def begin_export_native_bake(
+    progress: TextureExportProgress | None,
+    *,
+    stage: str,
+    detail: str,
+    device_detail: str,
+    image: Any,
+) -> None:
+    """Color·Alpha Native Bake를 가짜 백분율 없는 공통 활동형 Overlay에 표시합니다."""
+    if progress is None:
+        return
+    contract = _export_image_contract(image)
+    progress.indeterminate = True
+    progress.phase = "Color Bake" if str(stage) == "COLOR" else "Alpha Bake"
+    progress.detail = str(detail)
+    progress.bake_device_detail = str(device_detail)
+    progress.image_size = tuple(int(value) for value in getattr(image, "size", (0, 0)))
+    progress.tile_count = len(contract.tile_numbers)
+    progress.sample_count = COMPOSITE_BAKE_SAMPLES
+    request_progress_overlay_redraw()
+
+
+def end_export_native_bake(progress: TextureExportProgress | None) -> None:
+    """Native Bake 종료 뒤 실제 후처리 단계 표시로 Overlay를 되돌립니다."""
+    if progress is None:
+        return
+    progress.indeterminate = False
     request_progress_overlay_redraw()
 
 
@@ -618,6 +664,14 @@ def texture_export_running() -> bool:
     return bool(_EXPORT_RUNNING)
 
 
+def texture_export_native_bake_pending() -> bool:
+    """수명주기 경계가 조기 정리하면 안 되는 Export OBJECT_BAKE Job 여부를 반환합니다."""
+    return any(
+        job.phase in {"COLOR_BAKING", "ALPHA_BAKING"}
+        for job in _EXPORT_JOBS.values()
+    )
+
+
 def reserve_texture_export_job() -> None:
     """File Browser와 첫 Modal Timer 사이에도 다른 Export가 시작되지 않도록 Job을 예약합니다."""
     global _EXPORT_RUNNING
@@ -634,13 +688,414 @@ def release_texture_export_reservation() -> None:
 
 def clear_texture_export_jobs(*_args: Any) -> None:
     """Load·Undo·Redo·Extension 해제 경계에서 Modal Export의 안전 취소를 요청합니다."""
-    global _EXPORT_RUNNING
-    for operator in tuple(_MODAL_EXPORT_OPERATORS.values()):
-        operator._export_cancel_requested = True
-    if not _MODAL_EXPORT_OPERATORS:
-        _EXPORT_RUNNING = False
+    for operator_id, operator in tuple(_MODAL_EXPORT_OPERATORS.items()):
+        try:
+            operator._export_cancel_requested = True
+        except (AttributeError, ReferenceError, RuntimeError):
+            _MODAL_EXPORT_OPERATORS.pop(operator_id, None)
+    for job in tuple(_EXPORT_JOBS.values()):
+        job.cancel_requested = True
+        job.abort_after_bake = True
+    if _MODAL_EXPORT_OPERATORS or _EXPORT_JOBS:
+        return
     for progress in tuple(_EXPORT_PROGRESS.values()):
         release_export_progress(progress)
+    release_texture_export_reservation()
+
+
+def _texture_export_target_belongs_to_scene(job: TextureExportJob, target: Any) -> bool:
+    """Handler Object가 Job의 Scene과 Paint Target 양쪽에 정확히 속하는지 확인합니다."""
+    if _pointer(target) != job.paint_target_pointer:
+        return False
+    try:
+        return any(_pointer(candidate) == job.paint_target_pointer for candidate in job.scene.objects)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
+def mark_texture_export_native_bake_outcome(
+    scene_or_target: Any,
+    target_or_outcome: Any,
+    outcome: str | None = None,
+) -> None:
+    """Bake Handler 신호를 Scene·Paint Target·활성 단계가 일치하는 Export Job에만 기록합니다."""
+    if outcome is None:
+        scene = None
+        target = scene_or_target
+        outcome = str(target_or_outcome)
+    elif target_or_outcome is None:
+        scene = None
+        target = scene_or_target
+    else:
+        scene = scene_or_target
+        target = target_or_outcome
+    if outcome not in {"RUNNING", "COMPLETE", "CANCELLED"}:
+        return
+    for job in tuple(_EXPORT_JOBS.values()):
+        if (
+            job.phase not in {"COLOR_BAKING", "ALPHA_BAKING"}
+            or not job.native_bake_stage
+            or (scene is not None and _pointer(scene) != _pointer(job.scene))
+            or not _texture_export_target_belongs_to_scene(job, target)
+        ):
+            continue
+        if outcome == "RUNNING":
+            if job.native_bake_outcome == "PENDING":
+                job.native_bake_outcome = "RUNNING"
+            return
+        if job.native_bake_outcome in {"COMPLETE", "CANCELLED"}:
+            return
+        job.native_bake_outcome = outcome
+        return
+
+
+def _start_texture_export_native_bake(
+    context: Any,
+    job: TextureExportJob,
+    stage: str,
+) -> None:
+    """Color 또는 Alpha 준비 상태를 고정하고 INVOKE_DEFAULT OBJECT_BAKE Job을 시작합니다."""
+    normalized_stage = str(stage)
+    if normalized_stage not in {"COLOR", "ALPHA"}:
+        raise TextureExportError("Texture Export Native Bake 단계가 유효하지 않습니다.")
+    if native_object_bake_running():
+        raise TextureExportError("다른 OBJECT_BAKE Job이 실행 중입니다.")
+    if job.bake_preparation is not None or job.native_bake_stage:
+        raise TextureExportError("이전 Texture Export Native Bake 상태가 아직 복구되지 않았습니다.")
+    image = job.color_image if normalized_stage == "COLOR" else job.alpha_image
+    if _pointer(image) == 0:
+        raise TextureExportError(f"{normalized_stage.title()} Bake 대상 Image가 없습니다.")
+    preparation = prepare_emit_bake(
+        context,
+        image,
+        job.settings,
+        job.visible_layer_uuids,
+        channel=normalized_stage,
+    )
+    job.bake_preparation = preparation
+    if job.ui_bake_preparation is None:
+        job.ui_bake_preparation = preparation
+    job.native_bake_stage = normalized_stage
+    job.native_bake_outcome = "PENDING"
+    job.native_bake_started = False
+    job.native_bake_job_stopped = False
+    job.phase = "COLOR_BAKING" if normalized_stage == "COLOR" else "ALPHA_BAKING"
+    begin_export_native_bake(
+        job.progress,
+        stage=normalized_stage,
+        detail=(
+            "가시 Layer Graph의 Color를 EMIT로 계산하고 Blender Image로 변환 중"
+            if normalized_stage == "COLOR"
+            else "가시 Layer Graph의 Alpha coverage를 EMIT로 계산하고 Blender Image로 변환 중"
+        ),
+        device_detail=preparation.device_detail,
+        image=image,
+    )
+    try:
+        invoke_prepared_emit_bake(preparation, execution_mode="INVOKE_DEFAULT")
+    except Exception as exc:
+        if native_object_bake_running():
+            job.abort_after_bake = True
+            job.pending_error = str(exc)
+            return
+        raise
+    job.native_bake_started = True
+
+
+def start_texture_export_job(
+    context: Any,
+    filepath: str,
+    *,
+    output_mode: str,
+    file_format: str,
+    color_mode: str,
+    udim_naming: str,
+    atlas_max_size: int,
+    png_compression: int,
+    jpeg_quality: int,
+    overwrite: bool,
+    progress: TextureExportProgress | None = None,
+    reserved: bool = False,
+) -> TextureExportJob:
+    """GUI Export 입력과 임시 Image를 고정하고 첫 Color Native Bake를 시작합니다."""
+    if not reserved:
+        reserve_texture_export_job()
+    elif not _EXPORT_RUNNING:
+        raise TextureExportError("예약한 Texture Export Job 상태가 유실되었습니다.")
+    if _EXPORT_JOBS:
+        raise TextureExportError("동시에 실행할 수 있는 GUI Texture Export Job은 하나뿐입니다.")
+    settings, _graph_layers, visible_layers, source_image = _export_graph_inputs(context.scene)
+    source_contract = _export_image_contract(source_image)
+    if source_contract.backend == SINGLE_BACKEND and output_mode != "SINGLE":
+        raise TextureExportError("SINGLE Paint Image는 SINGLE 출력으로만 저장할 수 있습니다.")
+    if source_contract.backend == UDIM_BACKEND and output_mode == "SINGLE":
+        raise TextureExportError("UDIM Paint Image를 SINGLE 출력으로 변환할 수 없습니다.")
+    plan = build_export_path_plan(
+        filepath,
+        file_format=file_format,
+        output_mode=output_mode,
+        udim_naming=udim_naming,
+        tile_numbers=source_contract.tile_numbers,
+    )
+    if not plan.directory.is_dir():
+        raise TextureExportError("선택한 Texture Export 폴더가 존재하지 않습니다.")
+    if not overwrite and any(path.exists() for path in plan.output_paths):
+        raise TextureExportError("같은 이름의 파일이 이미 있습니다. 덮어쓰기를 허용하십시오.")
+    job = TextureExportJob(
+        session_id=uuid4().hex,
+        scene=context.scene,
+        settings=settings,
+        paint_target=settings.paint_target,
+        paint_target_pointer=_pointer(settings.paint_target),
+        view_layer=context.view_layer,
+        visible_layer_uuids=tuple(str(layer.layer_uuid) for layer in visible_layers),
+        source_contract=source_contract,
+        plan=plan,
+        output_mode=str(output_mode),
+        file_format=str(file_format),
+        color_mode=str(color_mode),
+        udim_naming=str(udim_naming),
+        atlas_max_size=int(atlas_max_size),
+        png_compression=int(png_compression),
+        jpeg_quality=int(jpeg_quality),
+        overwrite=bool(overwrite),
+        progress=progress,
+    )
+    _EXPORT_JOBS[job.session_id] = job
+    try:
+        update_export_progress(
+            progress,
+            1,
+            "Preparing",
+            "가시 Layer Graph와 출력 경로를 검증했습니다",
+        ) if progress is not None else None
+        color_image, alpha_image, layer_uuids = create_texture_export_bake_images(
+            context,
+            visible_layers,
+        )
+        job.color_image = color_image
+        job.alpha_image = alpha_image
+        if layer_uuids != job.visible_layer_uuids:
+            raise TextureExportError("Texture Export Bake Layer UUID가 준비 입력과 다릅니다.")
+        if (
+            _export_image_contract(color_image) != source_contract
+            or _export_image_contract(alpha_image) != source_contract
+        ):
+            raise TextureExportError("최종 Bake Image가 Layer Graph 백엔드 계약을 변경했습니다.")
+        _start_texture_export_native_bake(context, job, "COLOR")
+        return job
+    except Exception:
+        if not native_object_bake_running():
+            cleanup_texture_export_job(context, job)
+        raise
+
+
+def _write_texture_export_job(context: Any, job: TextureExportJob) -> None:
+    """결합된 임시 Image를 기존 포맷 규칙대로 Transaction 임시 폴더에 기록합니다."""
+    job.temporary_directory = job.plan.directory / f".pp_texture_export_{uuid4().hex}"
+    tile_directory = job.temporary_directory / "tiles"
+    intermediate_format = "PNG" if job.output_mode == "ATLAS" else job.file_format
+    intermediate_color = "RGBA" if job.output_mode == "ATLAS" else job.color_mode
+    intermediate_extension = "png" if intermediate_format == "PNG" else "jpg"
+    save_options = {
+        "file_format": intermediate_format,
+        "color_mode": intermediate_color,
+        "png_compression": job.png_compression,
+        "jpeg_quality": job.jpeg_quality,
+    }
+    if job.source_contract.backend == SINGLE_BACKEND:
+        job.tile_paths = save_single_image(
+            context,
+            job.color_image,
+            tile_directory / f"{job.plan.stem}.{intermediate_extension}",
+            **save_options,
+        )
+    else:
+        job.tile_paths = save_image_tiles(
+            context,
+            job.color_image,
+            tile_directory / f"{job.plan.stem}.<UDIM>.{intermediate_extension}",
+            **save_options,
+        )
+
+
+def _stage_texture_export_job(job: TextureExportJob) -> None:
+    """기록된 타일을 Atlas 또는 최종 파일명 묶음으로 Staging합니다."""
+    if job.temporary_directory is None:
+        raise TextureExportError("Texture Export Staging 임시 폴더가 없습니다.")
+    staged_directory = job.temporary_directory / "staged"
+    staged_directory.mkdir(exist_ok=False)
+    if job.output_mode == "ATLAS":
+        job.staged_paths = (staged_directory / job.plan.output_paths[0].name,)
+        create_atlas(
+            job.tile_paths,
+            job.source_contract.tile_numbers,
+            job.staged_paths[0],
+            max_size=job.atlas_max_size,
+            color_mode="RGB" if job.file_format == "JPEG" else job.color_mode,
+            png_compression=job.png_compression,
+            jpeg_quality=job.jpeg_quality,
+        )
+        return
+    job.staged_paths = tuple(
+        staged_directory / path.name for path in job.plan.output_paths
+    )
+    for source, staged in zip(job.tile_paths, job.staged_paths):
+        os.replace(source, staged)
+
+
+def _commit_texture_export_job(job: TextureExportJob) -> None:
+    """Staged 출력 전체를 기존 Backup·Rollback 규칙으로 원자 확정합니다."""
+    job.commit_result = commit_staged_files(
+        job.staged_paths,
+        job.plan.output_paths,
+        overwrite=job.overwrite,
+    )
+    job.committed_paths = job.commit_result.output_paths
+
+
+def _set_texture_export_failed(job: TextureExportJob, exc: Exception) -> None:
+    """Texture Export 실패 원인을 보존하고 정리 대기 상태로 전환합니다."""
+    job.error_message = str(exc)
+    job.phase = "FAILED"
+    end_export_native_bake(job.progress)
+
+
+def advance_texture_export_job(context: Any, job: TextureExportJob) -> str:
+    """Modal TIMER 한 틱에서 Native Bake 또는 후처리 한 단계만 안전하게 진행합니다."""
+    try:
+        if job.phase in {"COLOR_BAKING", "ALPHA_BAKING"}:
+            if native_object_bake_running():
+                request_progress_overlay_redraw()
+                return job.phase
+            if not job.native_bake_job_stopped:
+                job.native_bake_job_stopped = True
+                return job.phase
+            if job.cancel_requested or job.abort_after_bake:
+                end_export_native_bake(job.progress)
+                job.phase = "CANCELLED"
+                return job.phase
+            if job.pending_error:
+                raise TextureExportError(job.pending_error)
+            if job.native_bake_outcome == "CANCELLED":
+                end_export_native_bake(job.progress)
+                job.phase = "CANCELLED"
+                return job.phase
+            if job.native_bake_outcome != "COMPLETE":
+                raise TextureExportError(
+                    f"{job.native_bake_stage.title()} Bake 결과 신호를 확인하지 못했습니다."
+                )
+            stage = str(job.native_bake_stage)
+            image = job.color_image if stage == "COLOR" else job.alpha_image
+            preparation = job.bake_preparation
+            if preparation is None or _pointer(image) == 0:
+                raise TextureExportError(f"{stage.title()} Bake 복구 상태가 없습니다.")
+            restore_emit_bake_persistent_state(preparation)
+            image.update()
+            job.bake_preparation = None
+            job.native_bake_stage = ""
+            if stage == "COLOR":
+                _start_texture_export_native_bake(context, job, "ALPHA")
+                return job.phase
+            job.phase = "COMBINING"
+            if job.progress is not None:
+                update_export_progress(
+                    job.progress,
+                    2,
+                    "Combining",
+                    "Color와 Alpha Image 채널을 결합합니다",
+                )
+            return job.phase
+        if job.phase == "COMBINING":
+            combine_color_alpha_numpy(job.color_image, job.alpha_image)
+            remove_final_texture_export_image(job.alpha_image)
+            job.alpha_image = None
+            job.phase = "WRITING"
+            if job.progress is not None:
+                update_export_progress(
+                    job.progress,
+                    3,
+                    "Writing",
+                    "Texture 파일을 임시 경로에 기록합니다",
+                )
+            return job.phase
+        if job.phase == "WRITING":
+            _write_texture_export_job(context, job)
+            job.phase = "STAGING"
+            if job.progress is not None:
+                update_export_progress(
+                    job.progress,
+                    3,
+                    "Staging",
+                    f"Texture 파일 {len(job.tile_paths)}개를 Staging합니다",
+                )
+            return job.phase
+        if job.phase == "STAGING":
+            _stage_texture_export_job(job)
+            job.phase = "COMMITTING"
+            if job.progress is not None:
+                update_export_progress(
+                    job.progress,
+                    4,
+                    "Committing",
+                    "기존 출력 Backup 뒤 Staged 파일 전체를 확정합니다",
+                )
+            return job.phase
+        if job.phase == "COMMITTING":
+            _commit_texture_export_job(job)
+            job.phase = "SUCCESS"
+            if job.progress is not None:
+                detail = f"Texture 파일 {len(job.plan.output_paths)}개를 확정했습니다"
+                if job.commit_result is not None and job.commit_result.cleanup_errors:
+                    detail += " · 이전 Backup은 임시 폴더 정리에서 다시 제거합니다"
+                update_export_progress(job.progress, 5, "Complete", detail)
+            return job.phase
+        return job.phase
+    except Exception as exc:
+        _set_texture_export_failed(job, exc)
+        return job.phase
+
+
+def cleanup_texture_export_job(context: Any, job: TextureExportJob) -> tuple[str, ...]:
+    """Native Job 종료 뒤 Blender 상태·임시 Image·파일을 정확히 한 번 정리합니다."""
+    if job.cleanup_complete:
+        return job.cleanup_errors
+    if native_object_bake_running() and job.phase in {"COLOR_BAKING", "ALPHA_BAKING"}:
+        raise TextureExportError("OBJECT_BAKE Job 종료 전에는 Texture Export를 정리할 수 없습니다.")
+    errors: list[str] = []
+    if job.bake_preparation is not None:
+        try:
+            restore_emit_bake_persistent_state(job.bake_preparation)
+        except Exception as exc:
+            errors.append(f"Bake 임시 상태: {exc}")
+        job.bake_preparation = None
+    if job.ui_bake_preparation is not None and not job.ui_restored:
+        try:
+            restore_emit_bake_ui_state(context, job.ui_bake_preparation)
+            job.ui_restored = True
+        except Exception as exc:
+            errors.append(f"선택·Mode 상태: {exc}")
+    for label, image in (
+        ("Alpha Image", job.alpha_image),
+        ("Color Image", job.color_image),
+    ):
+        if _pointer(image) == 0:
+            continue
+        try:
+            remove_final_texture_export_image(image)
+        except Exception as exc:
+            errors.append(f"임시 Export {label}: {exc}")
+    job.alpha_image = None
+    job.color_image = None
+    if job.temporary_directory is not None and job.temporary_directory.is_dir():
+        try:
+            shutil.rmtree(job.temporary_directory)
+        except OSError as exc:
+            errors.append(f"임시 출력 폴더 {job.temporary_directory}: {exc}")
+    job.cleanup_errors = tuple(errors)
+    job.cleanup_complete = True
+    _EXPORT_JOBS.pop(job.session_id, None)
+    return job.cleanup_errors
 
 
 def texture_export_steps(
@@ -668,8 +1123,9 @@ def texture_export_steps(
     temporary_directory = None
     committed_paths: tuple[Path, ...] = ()
     try:
-        snapshot, session, source_image = capture_export_snapshot(context.scene)
-        settings = context.scene.projection_paint
+        _settings, _graph_layers, visible_layers, source_image = _export_graph_inputs(
+            context.scene
+        )
         source_contract = _export_image_contract(source_image)
         if source_contract.backend == SINGLE_BACKEND and output_mode != "SINGLE":
             raise TextureExportError("SINGLE Paint Image는 SINGLE 출력으로만 저장할 수 있습니다.")
@@ -688,12 +1144,14 @@ def texture_export_steps(
         if not overwrite and any(path.exists() for path in plan.output_paths):
             raise TextureExportError("같은 이름의 파일이 이미 있습니다. 덮어쓰기를 허용하십시오.")
         if progress is not None:
-            update_export_progress(progress, 1, "Preparing", "최종 Composite 계약을 검증했습니다")
-        if final_result_requires_bake(settings, session):
-            export_image = create_final_texture_export_image(context)
-            source_image = export_image
-            if _export_image_contract(source_image) != snapshot.composite_image_contract:
-                raise TextureExportError("최종 Bake Image가 Composite 백엔드 계약을 변경했습니다.")
+            update_export_progress(progress, 1, "Preparing", "가시 Layer Graph와 출력 경로를 검증했습니다")
+            update_export_progress(progress, 1, "Compositing", "가시 Layer Graph를 임시 RGBA Image로 합성합니다")
+        export_image = create_final_texture_export_image(context, visible_layers)
+        source_image = export_image
+        if _export_image_contract(source_image) != source_contract:
+            raise TextureExportError("최종 Bake Image가 Layer Graph 백엔드 계약을 변경했습니다.")
+        if progress is not None:
+            update_export_progress(progress, 2, "Compositing", "가시 Layer Graph 임시 합성을 완료했습니다")
         yield "PREPARED"
         temporary_directory = plan.directory / f".pp_texture_export_{uuid4().hex}"
         tile_directory = temporary_directory / "tiles"
@@ -706,6 +1164,8 @@ def texture_export_steps(
             "png_compression": png_compression,
             "jpeg_quality": jpeg_quality,
         }
+        if progress is not None:
+            update_export_progress(progress, 2, "Writing", "Texture 파일을 임시 경로에 기록합니다")
         if source_contract.backend == SINGLE_BACKEND:
             tile_paths = save_single_image(
                 context,
@@ -721,7 +1181,7 @@ def texture_export_steps(
                 **save_options,
             )
         if progress is not None:
-            update_export_progress(progress, 2, "Writing", f"Texture 파일 {len(tile_paths)}개를 임시 경로에 기록했습니다")
+            update_export_progress(progress, 3, "Writing", f"Texture 파일 {len(tile_paths)}개를 임시 경로에 기록했습니다")
         yield "WRITTEN"
         staged_directory = temporary_directory / "staged"
         staged_directory.mkdir(exist_ok=False)
@@ -737,15 +1197,16 @@ def texture_export_steps(
                 jpeg_quality=jpeg_quality,
             )
             if progress is not None:
-                update_export_progress(progress, 3, "Atlas", "UDIM 배치 비율을 유지한 Atlas를 생성했습니다")
+                update_export_progress(progress, 3, "Writing", "UDIM 배치 비율을 유지한 Atlas를 생성했습니다")
         else:
             staged_paths = tuple(staged_directory / path.name for path in plan.output_paths)
             for source, staged in zip(tile_paths, staged_paths):
                 os.replace(source, staged)
             if progress is not None:
-                update_export_progress(progress, 3, "Validating", "전체 Texture 파일 수와 크기를 검증했습니다")
+                update_export_progress(progress, 3, "Writing", "전체 Texture 파일 수와 크기를 검증했습니다")
         yield "STAGED"
-        validate_export_snapshot(context.scene, snapshot)
+        if progress is not None:
+            update_export_progress(progress, 3, "Committing", "임시 출력을 원자적으로 확정합니다")
         commit_result = commit_staged_files(
             staged_paths,
             plan.output_paths,
@@ -753,10 +1214,11 @@ def texture_export_steps(
         )
         committed_paths = commit_result.output_paths
         if progress is not None:
+            update_export_progress(progress, 4, "Committing", f"Texture 파일 {len(plan.output_paths)}개를 확정했습니다")
             detail = f"Texture 파일 {len(plan.output_paths)}개를 확정했습니다"
             if commit_result.cleanup_errors:
                 detail += " · 이전 Backup은 임시 폴더 정리에서 다시 제거합니다"
-            update_export_progress(progress, 4, "Complete", detail)
+            update_export_progress(progress, 5, "Complete", detail)
         return plan.output_paths
     finally:
         primary_error = sys.exc_info()[1]
@@ -803,9 +1265,15 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
 
     bl_idname = "projection_paint.texture_export"
     bl_label = "Export Texture"
-    bl_options = {"REGISTER"}
+    bl_options = {"REGISTER", "BLOCKING"}
 
     filename_ext = ".png"
+    check_existing: BoolProperty(
+        name="Check Existing",
+        description="애드온의 Overwrite Existing 옵션만 덮어쓰기 권한으로 사용합니다",
+        default=False,
+        options={"HIDDEN"},
+    )
     filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg", options={"HIDDEN"})
     output_mode: EnumProperty(
         name="Output",
@@ -838,22 +1306,33 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
 
     @classmethod
     def poll(cls, context):
-        """빠른 Pointer·Composite 상태·Job 상태만으로 Export 버튼 활성 여부를 판정합니다."""
+        """준비된 Paint Layer Graph와 배타 Job 상태로 Export 버튼 활성 여부를 판정합니다."""
         settings = getattr(getattr(context, "scene", None), "projection_paint", None)
-        if settings is None or texture_export_running():
+        if settings is None or texture_export_running() or composite_native_bake_pending():
             return False
-        if str(getattr(settings, "composite_state", "NONE")) != "ACTIVE":
+        if str(getattr(settings, "composite_state", "NONE")) not in {"NONE", "ACTIVE"}:
             return False
-        if _pointer(getattr(settings, "paint_target", None)) == 0:
+        material = getattr(settings, "paint_material", None)
+        if (
+            _pointer(getattr(settings, "paint_target", None)) == 0
+            or _pointer(material) == 0
+            or getattr(material, "node_tree", None) is None
+            or len(settings.layers) == 0
+        ):
             return False
-        composite_uuid = str(getattr(settings, "composite_layer_uuid", "") or "")
-        return sum(
-            1
-            for layer in settings.layers
-            if str(getattr(layer, "layer_role", "NORMAL")) == "COMPOSITE"
-            and str(getattr(layer, "layer_uuid", "")) == composite_uuid
-            and _pointer(getattr(layer, "image", None))
-        ) == 1
+        try:
+            validate_active_layer_graph(context.scene, material)
+            graph_layers = active_base_color_graph_layers(settings)
+            return bool(
+                graph_layers
+                and all(
+                    str(getattr(layer, "layer_uuid", "") or "")
+                    and _pointer(getattr(layer, "image", None))
+                    for layer in graph_layers
+                )
+            )
+        except (LayerShaderError, ReferenceError, RuntimeError, TypeError, ValueError):
+            return False
 
     def invoke(self, context, event):
         """Blend 파일 인접 textures 폴더와 Paint Target 기반 기본 파일명을 제안합니다."""
@@ -862,7 +1341,11 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
         if not directory.is_dir():
             directory = blend_path.parent if blend_path else Path(bpy.app.tempdir)
         target = context.scene.projection_paint.paint_target
-        _snapshot, _session, image = capture_export_snapshot(context.scene)
+        try:
+            _settings, _graph_layers, _visible_layers, image = _export_graph_inputs(context.scene)
+        except TextureExportError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         self.output_mode = (
             "SINGLE" if _export_image_contract(image).backend == SINGLE_BACKEND else "UDIM"
         )
@@ -880,7 +1363,7 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
     def draw(self, context):
         """Blender 파일 탐색기 오른쪽 Export Options에 출력·포맷별 세부 설정을 표시합니다."""
         layout = self.layout
-        _snapshot, _session, image = capture_export_snapshot(context.scene)
+        _settings, _graph_layers, _visible_layers, image = _export_graph_inputs(context.scene)
         backend = _export_image_contract(image).backend
         if backend == SINGLE_BACKEND:
             self.output_mode = "SINGLE"
@@ -893,20 +1376,9 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
             layout.prop(self, "atlas_max_size")
             box = layout.box()
             box.label(text="Atlas는 현재 Object의 UDIM UV를 변경하지 않습니다.", icon="INFO")
-            settings = getattr(context.scene, "projection_paint", None)
-            composite = next(
-                (
-                    layer
-                    for layer in getattr(settings, "layers", ())
-                    if str(getattr(layer, "layer_role", "NORMAL")) == "COMPOSITE"
-                    and str(getattr(layer, "layer_uuid", ""))
-                    == str(getattr(settings, "composite_layer_uuid", ""))
-                ),
-                None,
-            )
-            if composite is not None and _pointer(getattr(composite, "image", None)):
+            if _pointer(image):
                 width, height, _cell = atlas_dimensions(
-                    _image_tile_numbers(composite.image),
+                    _image_tile_numbers(image),
                     int(self.atlas_max_size),
                 )
                 channels = 4 if self.file_format == "PNG" and self.color_mode == "RGBA" else 3
@@ -926,34 +1398,29 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
         layout.prop(self, "overwrite")
 
     def execute(self, context):
-        """파일 탐색기 설정을 고정하고 Modal 단계형 Texture Export를 시작합니다."""
+        """Background는 동기 실행하고 GUI는 Native Bake 상태 머신으로 시작합니다."""
         progress = create_export_progress()
         try:
             reserve_texture_export_job()
-            steps = texture_export_steps(
-                context,
-                self.filepath,
-                output_mode=self.output_mode,
-                file_format=self.file_format,
-                color_mode=self.color_mode,
-                udim_naming=self.udim_naming,
-                atlas_max_size=int(self.atlas_max_size),
-                png_compression=self.png_compression,
-                jpeg_quality=self.jpeg_quality,
-                overwrite=self.overwrite,
-                progress=progress,
-                reserved=True,
-            )
         except Exception as exc:
             release_export_progress(progress)
             self.report({"ERROR"}, f"Texture Export 실패: {exc}")
             return {"CANCELLED"}
-        if getattr(context, "window", None) is None:
+        options = {
+            "output_mode": self.output_mode,
+            "file_format": self.file_format,
+            "color_mode": self.color_mode,
+            "udim_naming": self.udim_naming,
+            "atlas_max_size": int(self.atlas_max_size),
+            "png_compression": self.png_compression,
+            "jpeg_quality": self.jpeg_quality,
+            "overwrite": self.overwrite,
+            "progress": progress,
+            "reserved": True,
+        }
+        if bpy.app.background or getattr(context, "window", None) is None:
             try:
-                while True:
-                    next(steps)
-            except StopIteration as completed:
-                paths = tuple(completed.value)
+                paths = export_texture_sync(context, self.filepath, **options)
                 release_export_progress(progress)
                 self.report({"INFO"}, f"Texture Export 완료: {len(paths)}개 파일 · {paths[0].parent}")
                 return {"FINISHED"}
@@ -965,17 +1432,22 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
                 release_export_progress(progress)
                 self.report({"ERROR"}, f"Texture Export 실패: {exc}")
                 return {"CANCELLED"}
+        job = None
         try:
-            self._export_steps = steps
+            job = start_texture_export_job(
+                context,
+                self.filepath,
+                **options,
+            )
+            self._export_job = job
             self._export_progress = progress
             self._export_timer = context.window_manager.event_timer_add(0.05, window=context.window)
-            _MODAL_EXPORT_STEPS.add(steps)
             _MODAL_EXPORT_OPERATORS[id(self)] = self
             self._export_cancel_requested = False
             context.window_manager.modal_handler_add(self)
         except Exception as exc:
-            steps.close()
-            _MODAL_EXPORT_STEPS.discard(steps)
+            if job is not None and not job.cleanup_complete and not native_object_bake_running():
+                cleanup_texture_export_job(context, job)
             _MODAL_EXPORT_OPERATORS.pop(id(self), None)
             release_export_progress(progress)
             release_texture_export_reservation()
@@ -984,7 +1456,7 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
         return {"RUNNING_MODAL"}
 
     def _finish_modal(self, context: Any) -> None:
-        """Modal Export의 Event Timer와 중앙 Overlay를 중복 없이 해제합니다."""
+        """복원·임시 자원 정리 뒤 Event Timer·Overlay·단일 실행 예약을 해제합니다."""
         timer = getattr(self, "_export_timer", None)
         if timer is not None:
             try:
@@ -994,9 +1466,8 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
             self._export_timer = None
         release_export_progress(getattr(self, "_export_progress", None))
         self._export_progress = None
-        _MODAL_EXPORT_STEPS.discard(getattr(self, "_export_steps", None))
         _MODAL_EXPORT_OPERATORS.pop(id(self), None)
-        self._export_steps = None
+        self._export_job = None
         release_texture_export_reservation()
         try:
             from .lifecycle import lifecycle_registry
@@ -1006,32 +1477,70 @@ class PP_OT_texture_export(bpy.types.Operator, ExportHelper):
             pass
 
     def modal(self, context, event):
-        """실제 작업 단계 사이의 TIMER에서 진행하고 ESC는 다음 안전 경계에서 취소합니다."""
-        steps = getattr(self, "_export_steps", None)
-        if event.type == "ESC" or bool(getattr(self, "_export_cancel_requested", False)):
-            if steps is not None:
-                steps.close()
+        """일반 입력을 차단하고 ESC만 Native Bake 취소로 전달한 뒤 TIMER에서 정리합니다."""
+        job = getattr(self, "_export_job", None)
+        if job is None:
             self._finish_modal(context)
-            self.report({"WARNING"}, "Texture Export를 취소했습니다.")
             return {"CANCELLED"}
+        lifecycle_cancel = bool(getattr(self, "_export_cancel_requested", False))
+        if event.type == "ESC":
+            job.cancel_requested = True
+            if job.phase in {"COLOR_BAKING", "ALPHA_BAKING"}:
+                if native_object_bake_running():
+                    return {"PASS_THROUGH"}
+                return {"RUNNING_MODAL"}
+            job.phase = "CANCELLED"
+        elif lifecycle_cancel:
+            job.cancel_requested = True
+            job.abort_after_bake = True
+            if (
+                job.phase in {"COLOR_BAKING", "ALPHA_BAKING"}
+                and native_object_bake_running()
+            ):
+                return {"RUNNING_MODAL"}
+            if job.phase not in {"COLOR_BAKING", "ALPHA_BAKING"}:
+                job.phase = "CANCELLED"
         if event.type != "TIMER":
-            return {"PASS_THROUGH"}
-        try:
-            next(steps)
-        except StopIteration as completed:
-            paths = tuple(completed.value)
+            return {"RUNNING_MODAL"}
+        if job.phase not in {"SUCCESS", "CANCELLED", "FAILED"}:
+            if _pointer(getattr(context, "scene", None)) != _pointer(job.scene):
+                if job.phase in {"COLOR_BAKING", "ALPHA_BAKING"} and native_object_bake_running():
+                    job.abort_after_bake = True
+                    return {"RUNNING_MODAL"}
+                _set_texture_export_failed(
+                    job,
+                    TextureExportError("Texture Export 중 활성 Scene이 변경되었습니다."),
+                )
+            else:
+                advance_texture_export_job(context, job)
+        if job.phase in {"SUCCESS", "CANCELLED", "FAILED"}:
+            terminal_phase = job.phase
+            cleanup_errors = cleanup_texture_export_job(context, job)
             self._finish_modal(context)
-            self.report({"INFO"}, f"Texture Export 완료: {len(paths)}개 파일 · {paths[0].parent}")
-            return {"FINISHED"}
-        except TextureExportCommittedCleanupError as exc:
-            self._finish_modal(context)
-            self.report({"WARNING"}, str(exc))
-            return {"FINISHED"}
-        except Exception as exc:
-            if steps is not None:
-                steps.close()
-            self._finish_modal(context)
-            self.report({"ERROR"}, f"Texture Export 실패: {exc}")
+            if terminal_phase == "SUCCESS":
+                paths = job.plan.output_paths
+                if cleanup_errors:
+                    self.report(
+                        {"WARNING"},
+                        "새 Texture 출력은 확정되었지만 Texture Export 정리 실패: "
+                        + "; ".join(cleanup_errors),
+                    )
+                else:
+                    self.report(
+                        {"INFO"},
+                        f"Texture Export 완료: {len(paths)}개 파일 · {paths[0].parent}",
+                    )
+                return {"FINISHED"}
+            if terminal_phase == "CANCELLED":
+                message = "Texture Export를 취소했습니다."
+                if cleanup_errors:
+                    message += " 정리 경고: " + "; ".join(cleanup_errors)
+                self.report({"WARNING"}, message)
+                return {"CANCELLED"}
+            message = job.error_message or "Texture Export 상태가 유효하지 않습니다."
+            if cleanup_errors:
+                message += " / 정리 실패: " + "; ".join(cleanup_errors)
+            self.report({"ERROR"}, f"Texture Export 실패: {message}")
             return {"CANCELLED"}
         return {"RUNNING_MODAL"}
 
@@ -1043,6 +1552,8 @@ __all__ = [
     "CLASSES",
     "PP_OT_texture_export",
     "AtomicCommitResult",
+    "TextureExportJob",
+    "TextureExportProgress",
     "TextureExportCommittedCleanupError",
     "TextureExportError",
     "atlas_output_attribute",
@@ -1051,13 +1562,18 @@ __all__ = [
     "build_export_path_plan",
     "blender_png_compression_to_oiio",
     "clear_texture_export_jobs",
+    "cleanup_texture_export_job",
     "commit_staged_files",
     "create_atlas",
+    "create_export_progress",
+    "advance_texture_export_job",
     "export_texture_sync",
-    "final_result_requires_bake",
     "normalize_export_filepath",
+    "mark_texture_export_native_bake_outcome",
     "save_image_tiles",
     "save_single_image",
     "texture_export_running",
+    "texture_export_native_bake_pending",
+    "start_texture_export_job",
     "udim_to_uvtile",
 ]

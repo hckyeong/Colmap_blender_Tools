@@ -12,27 +12,38 @@ from ..core.import_types import DEFAULT_CAMERA_FRUSTUM_SIZE
 from ..core.model import LoadedReconstruction
 from .axis_display import display_axis_matrix
 from .ownership import (
+    COMMON_RECORD_ID_KEY,
+    DATASET_METADATA_KEYS,
     DATASET_UUID_KEY,
+    LEGACY_METADATA_KEYS,
     OWNER_KEY,
     OWNER_TOKEN,
     RECORD_KIND_KEY,
     SCHEMA_KEY,
     SOURCE_FINGERPRINT_KEY,
+    copy_dataset_metadata,
+    mark_dataset_owned,
 )
 
 
-MANAGED_METADATA_KEYS = (
-    OWNER_KEY,
-    SCHEMA_KEY,
-    DATASET_UUID_KEY,
-    RECORD_KIND_KEY,
-    SOURCE_FINGERPRINT_KEY,
-)
+MANAGED_METADATA_KEYS = (*LEGACY_METADATA_KEYS, *DATASET_METADATA_KEYS)
 PENDING_FILTER_ATTRIBUTE = "colmap_pending_filtered"
 
 
 def mark_managed(data_block, loaded: LoadedReconstruction, kind: str) -> None:
-    """생성한 데이터블록에 기존 관리 소유권 메타데이터를 기록합니다."""
+    """생성 데이터에 공용 소유권과 Legacy Modifier 식별자를 함께 기록합니다."""
+
+    record_id = None
+    if kind in {"CAMERA", "CAMERA_DATA"}:
+        # Camera 생성 직후 IMAGE_ID를 보강하므로 초기 표시는 빈 record로 둡니다.
+        record_id = ""
+    mark_dataset_owned(
+        data_block,
+        dataset_uuid=loaded.source.dataset_uuid,
+        role=kind,
+        record_id=record_id,
+        source_fingerprint=loaded.source.source_fingerprint,
+    )
     data_block[OWNER_KEY] = OWNER_TOKEN
     data_block[SCHEMA_KEY] = loaded.source.schema_version
     data_block[DATASET_UUID_KEY] = loaded.source.dataset_uuid
@@ -42,6 +53,7 @@ def mark_managed(data_block, loaded: LoadedReconstruction, kind: str) -> None:
 
 def copy_managed_metadata(source, target) -> None:
     """commit 대상 identity를 유지하면서 staging 메타데이터를 복사합니다."""
+    copy_dataset_metadata(source, target)
     for key in MANAGED_METADATA_KEYS:
         if key in source:
             target[key] = source[key]
@@ -397,13 +409,17 @@ def _create_camera(
     camera_object = None
     try:
         mark_managed(camera_data, loaded, "CAMERA_DATA")
+        camera_data[COMMON_RECORD_ID_KEY] = str(image.image_id)
         _configure_intrinsics(camera_data, camera_record)
         camera_data.display_size = camera_frustum_size
         camera_object = bpy.data.objects.new(f"IMAGE_{image.image_id}", camera_data)
         mark_managed(camera_object, loaded, "CAMERA")
+        camera_object[COMMON_RECORD_ID_KEY] = str(image.image_id)
         camera_object["colmap_image_id_text"] = str(image.image_id)
         camera_object["colmap_camera_id_text"] = str(image.camera_id)
         camera_object["colmap_image_name"] = image.name
+        camera_object["colmap_qvec"] = list(image.qvec)
+        camera_object["colmap_tvec"] = list(image.tvec)
         camera_object.parent = axis_root
         camera_object.matrix_parent_inverse = Matrix.Identity(4)
         camera_object.matrix_basis = _camera_matrix(image.qvec, image.tvec)

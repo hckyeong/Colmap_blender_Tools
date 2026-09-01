@@ -11,24 +11,23 @@ from unittest import mock
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[3] / "tools" / "projection_paint"
-sys.path.insert(0, str(ROOT.parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools import projection_paint as addon  # noqa: E402
 from tools.projection_paint.blender import layer_shader  # noqa: E402
 from tools.projection_paint.blender.layer_shader import (  # noqa: E402
+    LAYER_IMAGE_NODE_ROLE,
+    LAYER_IMAGE_ROLE,
     LAYER_MIX_NODE_ROLE,
     LayerShaderError,
     ORIGINAL_GATE_NODE_ROLE,
+    ORIGINAL_LAYER_SCHEMA_VERSION,
+    _new_image,
     reconcile_layer_graph,
     remove_layer_resources,
     restore_original_layer,
     validate_active_layer_graph,
-)
-from tools.projection_paint.blender.image_backend import (  # noqa: E402
-    SINGLE_BACKEND,
-    image_contract,
-    managed_staging_paths,
 )
 from tools.projection_paint.blender.material_setup import (  # noqa: E402
     prepare_active_material,
@@ -40,6 +39,9 @@ from tools.projection_paint.blender.ownership import (  # noqa: E402
 )
 from tools.projection_paint.blender.paint_state import (  # noqa: E402
     commit_paint_setup,
+)
+from tools.projection_paint.blender.paint_session import (  # noqa: E402
+    _paint_entry_has_foreign_state,
 )
 
 
@@ -220,10 +222,15 @@ class OriginalLayerTests(unittest.TestCase):
         _target, setup = _prepare_backend("OriginalLayerOnlyDelete")
         settings = bpy.context.scene.projection_paint
         original = next(layer for layer in settings.layers if layer.is_original_layer)
+        original_uuid = str(original.layer_uuid)
         ordinary = next(layer for layer in settings.layers if not layer.is_original_layer)
         remove_layer_resources(bpy.context, str(ordinary.layer_uuid))
         self.assertEqual(len(settings.layers), 1)
         self.assertTrue(settings.layers[0].is_original_layer)
+        self.assertEqual(
+            bpy.ops.projection_paint.layer_select(layer_uuid=original_uuid),
+            {"FINISHED"},
+        )
         self.assertEqual(
             bpy.ops.projection_paint.layer_remove(),
             {"FINISHED"},
@@ -286,17 +293,20 @@ class OriginalLayerTests(unittest.TestCase):
         validate_active_layer_graph(bpy.context.scene, setup.material)
 
     def test_external_texture_source_file_is_not_modified(self) -> None:
-        """파일 기반 원본은 관리 Original Layer 전환 뒤에도 경로와 소유 태그가 바뀌지 않습니다."""
+        """외부 원본은 복제·패킹 없이 실제 Original Layer에서 직접 참조합니다."""
         target = _new_target("OriginalLayerExternal")
         material = target.data.materials[0]
         tree = material.node_tree
         principled = next(node for node in tree.nodes if node.type == "BSDF_PRINCIPLED")
-        with tempfile.TemporaryDirectory(dir=str(ROOT)) as directory:
+        with tempfile.TemporaryDirectory(dir=str(PROJECT_ROOT)) as directory:
             bpy.ops.wm.save_as_mainfile(
                 filepath=str(Path(directory) / "relative_source.blend"),
             )
             source = bpy.data.images.new("OriginalLayerExternalSource", 8, 8, alpha=True)
             external_path = str(Path(directory) / "external.png")
+            pixels = [0.25, 0.5, 0.75, 1.0] * (8 * 8)
+            source.pixels.foreach_set(pixels)
+            source.update()
             source.filepath_raw = external_path
             source.file_format = "PNG"
             source.save()
@@ -323,17 +333,200 @@ class OriginalLayerTests(unittest.TestCase):
             original = next(layer for layer in settings.layers if layer.is_original_layer)
             self.assertEqual(str(source.filepath), source_path)
             self.assertNotEqual(source.get(OWNER_KEY), OWNER_TOKEN)
-            staging_root, staging_paths = managed_staging_paths(original.image)
-            self.assertIn(staging_root, staging_paths[0].parents)
-            self.assertEqual(image_contract(original.image).backend, SINGLE_BACKEND)
-            self.assertEqual(Path(original.image.filepath_raw).name, "paint.png")
-            self.assertIsNotNone(original.image.packed_file)
-            self.assertEqual(tuple(int(value) for value in original.image.size), (4, 4))
-            self.assertEqual(original.image.colorspace_settings.name, "Non-Color")
-            self.assertEqual(original.image.alpha_mode, "PREMUL")
+            self.assertIs(settings.original_source_image, source)
+            self.assertIs(original.image, source)
+            self.assertIsNone(source.packed_file)
             self.assertEqual(tuple(int(value) for value in source.size), (8, 8))
             self.assertEqual(source.colorspace_settings.name, "sRGB")
             self.assertEqual(source.alpha_mode, "STRAIGHT")
+            self.assertEqual(tuple(int(value) for value in setup.overlay.size), (4, 4))
+
+            original_uuid = str(original.layer_uuid)
+            self.assertEqual(
+                bpy.ops.projection_paint.layer_select(layer_uuid=original_uuid),
+                {"FINISHED"},
+            )
+            self.assertIsNone(settings.active_paint_image)
+            self.assertIs(settings.overlay_image, setup.overlay)
+            self.assertEqual(
+                bpy.ops.projection_paint.layer_mask_add(layer_uuid=original_uuid),
+                {"FINISHED"},
+            )
+            self.assertEqual(
+                bpy.ops.projection_paint.layer_mask_select(
+                    layer_uuid=original_uuid,
+                    mask_uuid=str(original.mask.mask_uuid),
+                ),
+                {"FINISHED"},
+            )
+            self.assertTrue(settings.paint_mask_mode)
+            self.assertIs(settings.active_paint_image, original.mask.image)
+            self.assertIs(settings.overlay_image, setup.overlay)
+            self.assertEqual(
+                bpy.ops.projection_paint.layer_preview_toggle(
+                    layer_uuid=original_uuid,
+                ),
+                {"FINISHED"},
+            )
+            self.assertEqual(settings.layer_preview_uuid, original_uuid)
+
+            blend_path = str(Path(directory) / "external_reference.blend")
+            self.assertEqual(
+                bpy.ops.wm.save_as_mainfile(filepath=blend_path, check_existing=False),
+                {"FINISHED"},
+            )
+            self.assertEqual(
+                bpy.ops.wm.open_mainfile(filepath=blend_path),
+                {"FINISHED"},
+            )
+            restored = bpy.context.scene.projection_paint
+            restored_original = next(
+                layer for layer in restored.layers if layer.is_original_layer
+            )
+            self.assertEqual(restored.layer_preview_uuid, restored_original.layer_uuid)
+            self.assertIs(restored_original.image, restored.original_source_image)
+            self.assertIsNone(restored_original.image.packed_file)
+            self.assertEqual(
+                Path(bpy.path.abspath(restored_original.image.filepath)).resolve(),
+                Path(external_path).resolve(),
+            )
+            restored_pixel = tuple(float(value) for value in restored_original.image.pixels[:4])
+            for actual, expected in zip(restored_pixel, (0.25, 0.5, 0.75, 1.0)):
+                self.assertAlmostEqual(actual, expected, delta=1.0 / 255.0)
+            self.assertTrue(restored.paint_mask_mode)
+            self.assertIs(restored.active_paint_image, restored_original.mask.image)
+            self.assertIsNot(restored.overlay_image, restored_original.image)
+            self.assertFalse(
+                _paint_entry_has_foreign_state(restored, restored.paint_target),
+                "외부 Original 직접 참조를 다른 Paint Target 자원으로 오판했습니다.",
+            )
+            reconcile_layer_graph(bpy.context.scene)
+            preview = next(
+                node
+                for node in restored.paint_material.node_tree.nodes
+                if node.get(RECORD_KIND_KEY)
+                == layer_shader.LAYER_SOLO_PREVIEW_MIX_NODE_ROLE
+            )
+            principled = next(
+                node
+                for node in restored.paint_material.node_tree.nodes
+                if node.type == "BSDF_PRINCIPLED"
+            )
+            self.assertEqual(
+                principled.inputs["Base Color"].links[0].from_node.as_pointer(),
+                preview.as_pointer(),
+            )
+            validate_active_layer_graph(bpy.context.scene, restored.paint_material)
+
+            writable = next(
+                layer for layer in restored.layers if not layer.is_original_layer
+            )
+            self.assertEqual(
+                bpy.ops.projection_paint.layer_select(
+                    layer_uuid=str(writable.layer_uuid),
+                ),
+                {"FINISHED"},
+            )
+            self.assertEqual(
+                bpy.ops.projection_paint.layer_remove(),
+                {"FINISHED"},
+            )
+            self.assertEqual(len(restored.layers), 2)
+            reset_original = next(
+                layer for layer in restored.layers if layer.is_original_layer
+            )
+            reset_writable = next(
+                layer for layer in restored.layers if not layer.is_original_layer
+            )
+            self.assertIs(reset_original.image, restored.original_source_image)
+            self.assertIsNot(reset_writable.image, reset_original.image)
+
+    def test_legacy_managed_original_migrates_to_external_reference(self) -> None:
+        """기존 Schema 1 복제 Original을 Source 직접 참조로 한 번만 이관합니다."""
+        target = _new_target("OriginalLayerExternalMigration")
+        material = target.data.materials[0]
+        tree = material.node_tree
+        principled = next(node for node in tree.nodes if node.type == "BSDF_PRINCIPLED")
+        with tempfile.TemporaryDirectory(dir=str(PROJECT_ROOT)) as directory:
+            source = bpy.data.images.new("OriginalLayerMigrationSource", 8, 8, alpha=True)
+            source.filepath_raw = str(Path(directory) / "migration_source.png")
+            source.file_format = "PNG"
+            source.save()
+            source_node = tree.nodes.new("ShaderNodeTexImage")
+            source_node.image = source
+            tree.links.new(source_node.outputs["Color"], principled.inputs["Base Color"])
+            setup = prepare_active_material(target, 4, 4, use_base_resolution=False)
+            commit_paint_setup(bpy.context.scene, setup)
+            reconcile_layer_graph(
+                bpy.context.scene,
+                material=setup.material,
+                overlay=setup.overlay,
+            )
+            setup.commit()
+            settings = bpy.context.scene.projection_paint
+            original = next(layer for layer in settings.layers if layer.is_original_layer)
+            legacy = _new_image(
+                target,
+                "LegacyOriginalClone",
+                (4, 4),
+                role=LAYER_IMAGE_ROLE,
+                layer_uuid=str(original.layer_uuid),
+                color=(0.0, 0.0, 0.0, 0.0),
+                reference=setup.overlay,
+            )
+            legacy_name = str(legacy.name)
+            original.image = legacy
+            image_node = next(
+                node
+                for node in setup.material.node_tree.nodes
+                if node.get(RECORD_KIND_KEY) == LAYER_IMAGE_NODE_ROLE
+                and str(node.get("pp_layer_uuid", "")) == str(original.layer_uuid)
+            )
+            image_node.image = legacy
+            settings.original_layer_schema_version = 1
+
+            reconcile_layer_graph(bpy.context.scene)
+
+            migrated = next(layer for layer in settings.layers if layer.is_original_layer)
+            self.assertIs(migrated.image, source)
+            self.assertEqual(
+                int(settings.original_layer_schema_version),
+                ORIGINAL_LAYER_SCHEMA_VERSION,
+            )
+            self.assertIsNone(bpy.data.images.get(legacy_name))
+
+    def test_missing_external_original_stops_without_replacing_reference(self) -> None:
+        """외부 원본 파일이 없으면 직접 참조를 유지하고 명확한 오류로 중단합니다."""
+        target = _new_target("OriginalLayerMissingExternal")
+        material = target.data.materials[0]
+        tree = material.node_tree
+        principled = next(node for node in tree.nodes if node.type == "BSDF_PRINCIPLED")
+        with tempfile.TemporaryDirectory(dir=str(PROJECT_ROOT)) as directory:
+            path = Path(directory) / "missing_source.png"
+            source = bpy.data.images.new("OriginalLayerMissingSource", 8, 8, alpha=True)
+            source.filepath_raw = str(path)
+            source.file_format = "PNG"
+            source.save()
+            source_node = tree.nodes.new("ShaderNodeTexImage")
+            source_node.image = source
+            tree.links.new(source_node.outputs["Color"], principled.inputs["Base Color"])
+            setup = prepare_active_material(target, 4, 4, use_base_resolution=False)
+            commit_paint_setup(bpy.context.scene, setup)
+            reconcile_layer_graph(
+                bpy.context.scene,
+                material=setup.material,
+                overlay=setup.overlay,
+            )
+            setup.commit()
+            settings = bpy.context.scene.projection_paint
+            original = next(layer for layer in settings.layers if layer.is_original_layer)
+            path.unlink()
+
+            with self.assertRaisesRegex(LayerShaderError, "파일을 찾을 수 없습니다"):
+                reconcile_layer_graph(bpy.context.scene)
+
+            self.assertIs(original.image, source)
+            self.assertIs(settings.original_source_image, source)
 
     def test_material_socket_provenance_restores_without_working_image_backup(self) -> None:
         """Material Socket Restore는 별도 대형 Image 없이 보존한 Node provenance를 다시 Bake합니다."""
@@ -535,4 +728,4 @@ class OriginalLayerTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(argv=[__file__], verbosity=2)

@@ -20,13 +20,18 @@ from tools import projection_paint as addon
 from tools.projection_paint.blender import layers as layers_module
 from tools.projection_paint.blender import lifecycle as lifecycle_module
 from tools.projection_paint.blender.lifecycle import lifecycle_registry
-from tools.projection_paint.blender.camera_import import PP_OT_import_colmap
 from tools.projection_paint.blender.camera_review import (
     PP_OT_review_background_toggle,
     PP_OT_review_look_through,
 )
 from tools.projection_paint.blender.stencil_session import (
     PP_OT_project_stencil,
+)
+from tools.projection_paint.blender import viewport_navigation
+from tools.projection_paint.blender.viewport_navigation import (
+    PP_OT_industry_orbit,
+    PP_OT_industry_pan,
+    PP_OT_industry_zoom,
 )
 from tools.projection_paint.blender.layers import (
     draw_layer_list_context_menu,
@@ -65,6 +70,28 @@ class LifecycleRegistryTest(unittest.TestCase):
         ]
 
     @staticmethod
+    def _reconnect_stencil_keymap_items():
+        """등록된 Stencil 재연결 F6 단축키 항목을 반환합니다."""
+
+        keyconfig = bpy.context.window_manager.keyconfigs.addon
+        return [
+            item
+            for keymap in keyconfig.keymaps
+            for item in keymap.keymap_items
+            if (
+                keymap.name == "3D View"
+                and keymap.space_type == "VIEW_3D"
+                and keymap.region_type == "WINDOW"
+                and item.idname == "projection_paint.reconnect_stencil"
+                and item.type == "F6"
+                and item.value == "PRESS"
+                and not item.alt
+                and not item.ctrl
+                and not item.shift
+            )
+        ]
+
+    @staticmethod
     def _viewport_zoom_keymap_items(keymap_name="3D View"):
         """지정한 Keymap에 등록된 Industry Compatible View Zoom을 반환합니다."""
 
@@ -84,6 +111,48 @@ class LifecycleRegistryTest(unittest.TestCase):
                 and item.alt
                 and not item.ctrl
                 and not item.shift
+            )
+        ]
+
+    @staticmethod
+    def _industry_navigation_keymap_items():
+        """Projection Paint 전용 Industry Compatible 탐색 단축키를 반환합니다."""
+
+        expected = {
+            ("projection_paint.industry_orbit", "LEFTMOUSE"),
+            ("projection_paint.industry_pan", "MIDDLEMOUSE"),
+            ("projection_paint.industry_zoom", "RIGHTMOUSE"),
+        }
+        keyconfig = bpy.context.window_manager.keyconfigs.addon
+        return [
+            (keymap.name, item)
+            for keymap in keyconfig.keymaps
+            for item in keymap.keymap_items
+            if (
+                keymap.name in {"3D View", "Image Paint"}
+                and (item.idname, item.type) in expected
+                and item.value == "PRESS"
+                and item.alt
+                and not item.ctrl
+                and not item.shift
+            )
+        ]
+
+    @staticmethod
+    def _multiselect_stroke_block_keymap_items():
+        """Image Paint에 등록된 복수 선택 스트로크 차단 항목을 반환합니다."""
+        keyconfig = bpy.context.window_manager.keyconfigs.addon
+        return [
+            item
+            for keymap in keyconfig.keymaps
+            for item in keymap.keymap_items
+            if (
+                keymap.name == "Image Paint"
+                and keymap.region_type == "WINDOW"
+                and item.idname
+                == "projection_paint.block_multiselect_paint_stroke"
+                and item.type in {"LEFTMOUSE", "PEN", "ERASER"}
+                and item.value == "PRESS"
             )
         ]
 
@@ -146,11 +215,70 @@ class LifecycleRegistryTest(unittest.TestCase):
         ]
         self.assertEqual(len(delete_items), 1)
         self.assertEqual(len(self._camera_review_toggle_keymap_items()), 1)
-        self.assertEqual(len(self._viewport_zoom_keymap_items()), 1)
-        self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 1)
+        self.assertEqual(len(self._reconnect_stencil_keymap_items()), 1)
+        self.assertEqual(len(self._viewport_zoom_keymap_items()), 0)
+        self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
+        self.assertEqual(len(self._industry_navigation_keymap_items()), 6)
+        self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 3)
+
+    def test_industry_navigation_is_scoped_to_projection_viewport(self) -> None:
+        """Industry Compatible 입력은 Projection Paint의 3D Viewport에서만 활성화됩니다."""
+
+        paint_workspace = object()
+        settings = SimpleNamespace(paint_workspace=paint_workspace)
+        scene = SimpleNamespace(projection_paint=settings)
+        active_context = SimpleNamespace(
+            scene=scene,
+            window=SimpleNamespace(workspace=paint_workspace),
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="WINDOW"),
+        )
+        foreign_context = SimpleNamespace(
+            scene=scene,
+            window=SimpleNamespace(workspace=object()),
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="WINDOW"),
+        )
+        panel_context = SimpleNamespace(
+            scene=scene,
+            window=SimpleNamespace(workspace=paint_workspace),
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="UI"),
+        )
+
+        for operator in (
+            PP_OT_industry_orbit,
+            PP_OT_industry_pan,
+            PP_OT_industry_zoom,
+        ):
+            self.assertTrue(operator.poll(active_context))
+            self.assertFalse(operator.poll(foreign_context))
+            self.assertFalse(operator.poll(panel_context))
+
+    def test_industry_navigation_delegates_to_native_view3d_operators(self) -> None:
+        """세 탐색 입력은 자체 계산 없이 Blender 기본 rotate·move·zoom을 시작합니다."""
+
+        for operator_class, native_name in (
+            (PP_OT_industry_orbit, "rotate"),
+            (PP_OT_industry_pan, "move"),
+            (PP_OT_industry_zoom, "zoom"),
+        ):
+            owner = SimpleNamespace(
+                native_operator=native_name,
+                report=mock.Mock(),
+            )
+            with mock.patch.object(
+                viewport_navigation,
+                "_invoke_native_navigation",
+                return_value={"RUNNING_MODAL"},
+            ) as invoke_native:
+                result = operator_class.invoke(owner, SimpleNamespace(), SimpleNamespace())
+            self.assertEqual(result, {"RUNNING_MODAL"})
+            invoke_native.assert_called_once_with(native_name)
+            owner.report.assert_not_called()
 
     def test_panel_default_open_states_match_ui_contract(self) -> None:
-        """Status·Import·Camera Review·Paint Setup의 독립성과 기본 상태를 검증합니다."""
+        """Status·Dataset·Camera Review·Paint Setup의 독립성과 기본 상태를 검증합니다."""
 
         self.assertIn("HIDE_HEADER", PP_PT_status.bl_options)
         self.assertNotIn(
@@ -168,12 +296,20 @@ class LifecycleRegistryTest(unittest.TestCase):
         ):
             self.assertFalse(str(getattr(panel, "bl_parent_id", "") or ""))
             self.assertEqual("Projection Paint", panel.bl_category)
-        self.assertEqual("Import", PP_OT_import_colmap.bl_label)
+        self.assertFalse(hasattr(bpy.types, "PP_OT_import_colmap"))
         colmap_draw_source = inspect.getsource(PP_PT_colmap.draw)
         self.assertIn(
             'display_box.prop(settings, "camera_frustum_size")',
             colmap_draw_source,
         )
+        self.assertIn("projection_paint.update_colmap_snapshot", colmap_draw_source)
+        self.assertIn("COLMAP Modifier에서 데이터를 먼저 불러오세요.", colmap_draw_source)
+        self.assertNotIn("Snapshot Revision", colmap_draw_source)
+        self.assertNotIn("Display Axis", colmap_draw_source)
+        self.assertNotIn("camera_axis_preset", colmap_draw_source)
+        self.assertNotIn("projection_paint.import_colmap", colmap_draw_source)
+        self.assertNotIn('prop(settings, "dataset_root")', colmap_draw_source)
+        self.assertNotIn('prop(settings, "input_format")', colmap_draw_source)
         self.assertNotIn("camera_display_box", colmap_draw_source)
         self.assertNotIn("display_box.separator()", colmap_draw_source)
         self.assertEqual("Look Through Camera", PP_OT_review_look_through.bl_label)
@@ -182,6 +318,31 @@ class LifecycleRegistryTest(unittest.TestCase):
             PP_OT_review_background_toggle.bl_label,
         )
         self.assertEqual("Project Stencil to Target", PP_OT_project_stencil.bl_label)
+
+    def test_panels_are_visible_only_in_projection_paint_workspace(self) -> None:
+        """Projection Paint 패널이 다른 도구 Workspace에 노출되지 않는지 검증합니다."""
+
+        paint_workspace = object()
+        settings = SimpleNamespace(paint_workspace=paint_workspace)
+        scene = SimpleNamespace(projection_paint=settings)
+        active_context = SimpleNamespace(
+            scene=scene,
+            window=SimpleNamespace(workspace=paint_workspace),
+        )
+        foreign_context = SimpleNamespace(
+            scene=scene,
+            window=SimpleNamespace(workspace=object()),
+        )
+
+        for panel in (
+            PP_PT_status,
+            PP_PT_colmap,
+            PP_PT_camera_review,
+            PP_PT_paint,
+            PP_PT_layers,
+        ):
+            self.assertTrue(panel.poll(active_context))
+            self.assertFalse(panel.poll(foreign_context))
 
     def test_projection_paint_entry_is_drawn_in_colmap_tools_menu(self) -> None:
         """COLMAP Tools 메뉴가 Paint 실행 대신 전용 작업공간을 여는지 검증합니다."""
@@ -210,20 +371,28 @@ class LifecycleRegistryTest(unittest.TestCase):
         """Viewport Keymap이 해제와 재등록 뒤에도 하나씩 유지되는지 검증합니다."""
 
         self.assertEqual(len(self._camera_review_toggle_keymap_items()), 1)
-        self.assertEqual(len(self._viewport_zoom_keymap_items()), 1)
-        self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 1)
+        self.assertEqual(len(self._viewport_zoom_keymap_items()), 0)
+        self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
+        self.assertEqual(len(self._industry_navigation_keymap_items()), 6)
+        self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 3)
         addon.unregister()
         self.assertEqual(len(self._camera_review_toggle_keymap_items()), 0)
         self.assertEqual(len(self._viewport_zoom_keymap_items()), 0)
         self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
+        self.assertEqual(len(self._industry_navigation_keymap_items()), 0)
+        self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 0)
         addon.unregister()
         self.assertEqual(len(self._camera_review_toggle_keymap_items()), 0)
         self.assertEqual(len(self._viewport_zoom_keymap_items()), 0)
         self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
+        self.assertEqual(len(self._industry_navigation_keymap_items()), 0)
+        self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 0)
         addon.register()
         self.assertEqual(len(self._camera_review_toggle_keymap_items()), 1)
-        self.assertEqual(len(self._viewport_zoom_keymap_items()), 1)
-        self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 1)
+        self.assertEqual(len(self._viewport_zoom_keymap_items()), 0)
+        self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
+        self.assertEqual(len(self._industry_navigation_keymap_items()), 6)
+        self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 3)
 
     def test_epoch_token_is_invalid_after_barrier(self) -> None:
         """중단 장벽 뒤 이전 Epoch Token이 Commit되지 않는지 확인합니다."""
@@ -239,6 +408,23 @@ class LifecycleRegistryTest(unittest.TestCase):
             registry.token_is_current(token, scene, dataset_revision=1)
         )
         registry.rebuild(scene, "test_post")
+
+    def test_lifecycle_barrier_clears_layer_double_click_candidates(self) -> None:
+        """Load·Undo·Redo 장벽이 창별 Layer 더블클릭 후보를 모두 폐기합니다."""
+
+        registry = lifecycle_registry()
+        layers_module._layer_ui_double_click_candidates[123] = (
+            layers_module._LayerUIDoubleClickCandidate(
+                window_key=123,
+                scene_key=456,
+                workspace_key=789,
+                item_key="layer-a",
+                clicked_at=1.0,
+            )
+        )
+        registry.barrier("undo_pre")
+        self.assertFalse(layers_module._layer_ui_double_click_candidates)
+        registry.rebuild(bpy.context.scene, "undo_post")
 
     def test_handler_failure_is_deduplicated(self) -> None:
         """같은 Handler 예외가 한 번만 기록되고 밖으로 전파되지 않는지 확인합니다."""

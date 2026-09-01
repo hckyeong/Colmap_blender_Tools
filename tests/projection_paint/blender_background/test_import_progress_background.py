@@ -16,10 +16,16 @@ if str(PROJECT_PARENT) not in sys.path:
 
 from tools import projection_paint as addon
 from tools.projection_paint.blender.camera_import import (
+    CameraImportJob,
     CameraImportRequest,
     _advance_import_session,
     _import_progress_overlay_view,
     _progress_values,
+)
+from tools.projection_paint.blender.snapshot_update import (
+    _combined_progress_values,
+    _snapshot_progress_overlay_view,
+    _snapshot_progress_values,
 )
 from tools.projection_paint.blender.import_progress_session import (
     clear_import_progress_sessions,
@@ -31,6 +37,7 @@ from shared.blender_runtime.scene_marker_session import (
     acquire_scene_marker_session,
     release_scene_marker_session,
 )
+from shared.colmap_transfer.registry import ProviderProgress
 
 
 def _request(dataset_uuid: str) -> CameraImportRequest:
@@ -166,6 +173,49 @@ class ImportProgressBackgroundTest(unittest.TestCase):
                 for collection in bpy.data.collections
             )
         )
+
+    def test_snapshot_update_progress_is_monotonic_and_complete(self) -> None:
+        """Snapshot 업데이트 진행률이 단계별로 증가하고 완료 시 100%인지 확인합니다."""
+
+        acquire_scene_marker_session(self.scene, "projection_paint")
+        job = CameraImportJob(self.scene, _request("snapshot-progress"))
+        fractions = [_snapshot_progress_values(job)[1]]
+        phases = [_snapshot_progress_values(job)[0]]
+        while not job.step(time_budget=1.0, hard_cap=1_000_000):
+            phase, fraction, _completed, _total = _snapshot_progress_values(job)
+            phases.append(phase)
+            fractions.append(fraction)
+        phase, fraction, _completed, _total = _snapshot_progress_values(job)
+        phases.append(phase)
+        fractions.append(fraction)
+        job.commit()
+        view = _snapshot_progress_overlay_view(job, 0.0)
+
+        self.assertEqual(sorted(fractions), fractions)
+        self.assertIn("Preparing Point3D buffers", phases)
+        self.assertIn("Creating Point3D mesh", phases)
+        self.assertIn("Writing Point3D colors", phases)
+        self.assertEqual("Snapshot update complete", view.phase)
+        self.assertEqual(1.0, view.fraction)
+        self.assertEqual(view.completed_units, view.total_units)
+        self.assertEqual("COLMAP Data Update", view.title)
+
+    def test_snapshot_progress_starts_with_modifier_restore(self) -> None:
+        """COLD Provider의 Runtime 복원 단계부터 PP 전체 진행률에 표시합니다."""
+
+        provider = SimpleNamespace(
+            progress=ProviderProgress(
+                "RUNTIME_RESTORE",
+                0.4,
+                40,
+                100,
+                "Modifier Runtime 복원 중",
+            )
+        )
+        phase, fraction, completed, total = _combined_progress_values(provider, None)
+        self.assertEqual("Modifier Runtime 복원 중", phase)
+        self.assertAlmostEqual(0.18, fraction)
+        self.assertEqual((40, 100), (completed, total))
 
 
 if __name__ == "__main__":

@@ -11,11 +11,9 @@ import unittest
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[3] / "tools" / "projection_paint"
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools import projection_paint as addon  # noqa: E402
 from tools.projection_paint.blender.composite_layer import (  # noqa: E402
@@ -34,7 +32,7 @@ from tools.projection_paint.blender.texture_export import (  # noqa: E402
     export_texture_sync,
     save_single_image,
 )
-from tests.blender_background.test_composite_layer import (  # noqa: E402
+from tests.projection_paint.blender_background.test_composite_layer import (  # noqa: E402
     _fill_image,
     _prepare_backend,
 )

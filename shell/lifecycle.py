@@ -18,7 +18,9 @@ _TOOL_MODULE_NAMES = (
     ".tools.modifier",
     ".tools.projection_paint",
 )
+_SHARED_MODULE_NAMES = (".shared.colmap_dataset",)
 _SHELL_CLASSES = PREFERENCE_CLASSES + MENU_CLASSES
+_REGISTERED_SHARED_MODULES: list[ModuleType] = []
 _REGISTERED_TOOL_MODULES: list[ModuleType] = []
 _REGISTERED_SHELL_CLASSES: list[type] = []
 _WINDOW_MENU_REGISTERED = False
@@ -36,6 +38,13 @@ def _load_tool_modules() -> tuple[ModuleType, ...]:
 
     package_name = _root_package_name()
     return tuple(import_module(name, package=package_name) for name in _TOOL_MODULE_NAMES)
+
+
+def _load_shared_modules() -> tuple[ModuleType, ...]:
+    """도구보다 먼저 등록할 중립 공용 제품 도메인을 불러옵니다."""
+
+    package_name = _root_package_name()
+    return tuple(import_module(name, package=package_name) for name in _SHARED_MODULE_NAMES)
 
 
 def _tool_callback(module: ModuleType, name: str) -> Callable[[], None]:
@@ -80,6 +89,12 @@ def _rollback_registration() -> None:
         except Exception:
             pass
     _REGISTERED_TOOL_MODULES.clear()
+    for module in reversed(_REGISTERED_SHARED_MODULES):
+        try:
+            _tool_callback(module, "unregister")()
+        except Exception:
+            pass
+    _REGISTERED_SHARED_MODULES.clear()
     for cls in reversed(_REGISTERED_SHELL_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
@@ -98,6 +113,9 @@ def register() -> None:
         for cls in _SHELL_CLASSES:
             bpy.utils.register_class(cls)
             _REGISTERED_SHELL_CLASSES.append(cls)
+        for module in _load_shared_modules():
+            _tool_callback(module, "register")()
+            _REGISTERED_SHARED_MODULES.append(module)
         for module in _load_tool_modules():
             _tool_callback(module, "register")()
             _REGISTERED_TOOL_MODULES.append(module)
@@ -113,7 +131,12 @@ def unregister() -> None:
     """공통 메뉴와 세 도구 및 Shell Class를 역순으로 모두 해제합니다."""
 
     global _REGISTERED
-    if not _REGISTERED and not _REGISTERED_TOOL_MODULES and not _REGISTERED_SHELL_CLASSES:
+    if (
+        not _REGISTERED
+        and not _REGISTERED_TOOL_MODULES
+        and not _REGISTERED_SHARED_MODULES
+        and not _REGISTERED_SHELL_CLASSES
+    ):
         return
     _REGISTERED = False
     failures: list[BaseException] = []
@@ -124,6 +147,12 @@ def unregister() -> None:
         except BaseException as error:
             failures.append(error)
     _REGISTERED_TOOL_MODULES.clear()
+    for module in reversed(_REGISTERED_SHARED_MODULES):
+        try:
+            _tool_callback(module, "unregister")()
+        except BaseException as error:
+            failures.append(error)
+    _REGISTERED_SHARED_MODULES.clear()
     for cls in reversed(_REGISTERED_SHELL_CLASSES):
         try:
             bpy.utils.unregister_class(cls)

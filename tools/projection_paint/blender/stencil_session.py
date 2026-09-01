@@ -5,18 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
-from pathlib import Path
 from typing import Any
 
 import bpy
 from bpy_extras import view3d_utils
 
-from .ownership import OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY, tag_owned
+from .ownership import PROJECT_STENCIL_DRAW_BRUSH_ROLE, is_owned, tag_owned
 from .paint_state import resolve_stencil_texture, validate_paint_contract
+from .paint_tool_bridge import (
+    BrushAssetChoice,
+    activate_brush_asset,
+    active_brush_choice,
+)
 
 
 TEXTURE_ROLE = "STENCIL_TEXTURE"
-BRUSH_ROLE = "STENCIL_BRUSH"
+PROJECT_STENCIL_BRUSH_NAME = "Projection Paint Stencil Draw"
 
 
 class StencilSessionError(RuntimeError):
@@ -32,12 +36,13 @@ def _pointer(value: Any) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class BrushAssetReference:
-    """원래 Brush Asset을 다시 활성화할 경로를 보관합니다."""
+class StencilConnectionStatus:
+    """현재 Blender Pointer에서 계산한 Stencil 연결 상태와 안내 문구를 보관합니다."""
 
-    library_type: str
-    library_identifier: str
-    relative_identifier: str
+    state: str
+    reason: str
+    bound_brush: Any | None
+    active_brush: Any | None
 
 
 @dataclass(slots=True)
@@ -97,18 +102,21 @@ class StencilSession:
         """Camera View 이탈 상태를 Scene에 기록합니다."""
         self.scene.projection_paint.stencil_outside_camera_view = bool(value)
 
-    @property
-    def follow_active_brush(self) -> bool:
-        """활성 Brush 승계 정책을 반환합니다."""
-        return bool(self.scene.projection_paint.stencil_follow_active_brush)
-
-    def validate(self) -> None:
-        """Scene의 Material·Brush·Texture 권위 Pointer를 검증합니다."""
+    def validate_resources(self) -> None:
+        """Scene의 Paint Material과 관리 Texture 자원만 검증합니다."""
         validate_paint_contract(self.scene)
-        if _pointer(self.brush) == 0:
-            raise StencilSessionError("활성 Texture Paint Brush가 없습니다.")
         if resolve_stencil_texture(self.scene) is None:
             raise StencilSessionError("관리 Stencil Texture가 삭제되거나 변경되었습니다.")
+
+    def validate_binding(self) -> None:
+        """기존에 명시적으로 연결한 Draw Brush Pointer를 검증합니다."""
+        self.validate_resources()
+        if _pointer(self.brush) == 0:
+            raise StencilSessionError("Reconnect로 연결한 Draw Brush가 없습니다.")
+
+    def validate(self) -> None:
+        """호환 호출에서 기존 연결 Brush까지 포함한 계약을 검증합니다."""
+        self.validate_binding()
 
 
 def camera_frame_stencil(
@@ -194,6 +202,137 @@ def active_stencil_session(scene: Any | None = None) -> StencilSession | None:
     return _snapshot(bpy.context, active_scene)
 
 
+def active_image_paint_tool(context: Any):
+    """현재 Workspace의 Texture Paint 도구를 변경 없이 조회합니다."""
+
+    workspace = getattr(context, "workspace", None)
+    if workspace is None:
+        workspace = getattr(getattr(context, "window", None), "workspace", None)
+    tools = getattr(workspace, "tools", None)
+    if tools is None:
+        return None
+    try:
+        return tools.from_space_view3d_mode("PAINT_TEXTURE", create=False)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def active_draw_brush_for_reconnect(context: Any, scene: Any | None = None):
+    """실제 Workspace Tool과 활성 Brush가 모두 Draw인지 검증해 반환합니다."""
+
+    active_scene = scene if scene is not None else getattr(context, "scene", None)
+    image_paint = getattr(
+        getattr(active_scene, "tool_settings", None),
+        "image_paint",
+        None,
+    )
+    tool = active_image_paint_tool(context)
+    brush = getattr(image_paint, "brush", None)
+    tool_id = str(getattr(tool, "idname", "") or "")
+    tool_type = str(getattr(tool, "brush_type", "") or "")
+    brush_type = str(getattr(brush, "image_brush_type", "") or "")
+    draw_tool = tool_type == "DRAW" or tool_id == "builtin.brush"
+    if tool is None or not draw_tool or _pointer(brush) == 0 or brush_type != "DRAW":
+        raise StencilSessionError(
+            "Blender의 Draw Brush 도구를 선택한 뒤 Reconnect를 실행하십시오."
+        )
+    return tool, brush
+
+
+def resolve_stencil_connection(scene: Any, context: Any = None) -> StencilConnectionStatus:
+    """저장 상태보다 현재 Texture·Bound Brush·Active Brush Pointer를 우선 판정합니다."""
+
+    settings = getattr(scene, "projection_paint", None)
+    if settings is None:
+        return StencilConnectionStatus(
+            "DISCONNECTED",
+            "Projection Paint 설정이 없습니다.",
+            None,
+            None,
+        )
+    image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
+    active = getattr(image_paint, "brush", None)
+    bound = getattr(settings, "stencil_brush", None)
+    texture = resolve_stencil_texture(scene)
+    if bool(settings.paint_mask_mode):
+        status = StencilConnectionStatus(
+            "MASK_SUSPENDED",
+            "Projection Paint Mask 편집 중입니다. 일반 Layer에서 다시 연결하십시오.",
+            bound if _pointer(bound) else None,
+            active if _pointer(active) else None,
+        )
+    elif _pointer(bound) == 0:
+        status = StencilConnectionStatus(
+            "DISCONNECTED",
+            "Draw Brush를 선택하고 Reconnect를 실행하십시오.",
+            None,
+            active if _pointer(active) else None,
+        )
+    elif active is not bound:
+        status = StencilConnectionStatus(
+            "BRUSH_CHANGED",
+            "다른 Brush가 활성 상태입니다. 연결한 Draw Brush로 돌아가면 Stencil이 유지됩니다.",
+            bound,
+            active if _pointer(active) else None,
+        )
+    elif bool(settings.manual_stencil_disabled):
+        status = StencilConnectionStatus(
+            "MANUAL_DISABLED",
+            "Stencil 연결이 수동으로 해제되었습니다. Reconnect를 실행하십시오.",
+            bound,
+            active,
+        )
+    elif bool(settings.stencil_outside_camera_view):
+        status = StencilConnectionStatus(
+            "CAMERA_SUSPENDED",
+            "Camera View로 돌아가면 같은 Brush 연결을 복구합니다.",
+            bound,
+            active,
+        )
+    elif texture is None:
+        status = StencilConnectionStatus(
+            "ERROR",
+            "관리 Stencil Texture가 삭제되거나 변경되었습니다.",
+            bound,
+            active,
+        )
+    elif _pointer(settings.stencil_source_image) == 0 or int(settings.active_image_id) <= 0:
+        status = StencilConnectionStatus(
+            "DISCONNECTED",
+            "현재 Camera Frame Source가 준비되지 않았습니다.",
+            bound,
+            active,
+        )
+    elif bound.texture is texture and str(bound.texture_slot.map_mode) == "STENCIL":
+        status = StencilConnectionStatus("CONNECTED", "", bound, active)
+    else:
+        status = StencilConnectionStatus(
+            "DISCONNECTED",
+            "기존 Draw Brush의 Stencil 연결이 해제되었습니다. Reconnect를 실행하십시오.",
+            bound,
+            active,
+        )
+    try:
+        settings.stencil_state = status.state
+        settings.stencil_reason = status.reason
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return status
+
+
+def stencil_connection_allowed(scene: Any) -> bool:
+    """일반 Layer가 활성이고 Scene Camera가 연결된 경우에만 Stencil 연결을 허용합니다."""
+    settings = getattr(scene, "projection_paint", None)
+    camera = getattr(scene, "camera", None)
+    return bool(
+        settings is not None
+        and not bool(settings.paint_mask_mode)
+        and camera is not None
+        and _pointer(camera)
+        and getattr(camera, "data", None) is not None
+    )
+
+
 def project_camera_frame(session: StencilSession, camera) -> tuple[tuple[float, float], ...]:
     """현재 Snapshot Viewport에서 Camera Frame 네 모서리를 투영합니다."""
     if (
@@ -250,287 +389,94 @@ def ensure_stencil_texture(
     return texture
 
 
-def _path_is_relative_to(path: Path, parent: Path) -> bool:
-    """경로가 지정한 상위 경로 안에 있는지 확인합니다."""
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
+def _project_stencil_brush_is_valid(brush: Any) -> bool:
+    """Brush가 저장 가능한 프로젝트 전용 Draw Brush인지 확인합니다."""
 
-
-def _brush_asset_reference(brush: Any) -> BrushAssetReference:
-    """연결된 Brush Asset을 다시 활성화할 식별자를 구성합니다."""
-    library = getattr(brush, "library", None)
-    if library is None:
-        raise StencilSessionError("편집 불가 Brush의 원본 Asset Library가 없습니다.")
-    library_path = Path(bpy.path.abspath(library.filepath)).resolve()
-    version = f"{bpy.app.version[0]}.{bpy.app.version[1]}"
-    essentials_root = (
-        Path(bpy.app.binary_path).resolve().parent / version / "datafiles" / "assets"
-    ).resolve()
-    if _path_is_relative_to(library_path, essentials_root):
-        relative_library = library_path.relative_to(essentials_root).as_posix()
-        return BrushAssetReference(
-            "ESSENTIALS",
-            "",
-            f"{relative_library}/Brush/{brush.name}",
-        )
-    for asset_library in bpy.context.preferences.filepaths.asset_libraries:
-        root = Path(asset_library.path).expanduser().resolve()
-        if _path_is_relative_to(library_path, root):
-            relative_library = library_path.relative_to(root).as_posix()
-            return BrushAssetReference(
-                "CUSTOM",
-                str(asset_library.name),
-                f"{relative_library}/Brush/{brush.name}",
-            )
-    raise StencilSessionError("현재 Brush의 Asset Library를 식별하지 못했습니다.")
-
-
-def _activate_brush_asset(context: Any, reference: BrushAssetReference):
-    """보관한 Asset 식별자로 원래 Brush를 활성화합니다."""
-    window, area, region, _space, _rv3d = _viewport_parts(context)
-    if window is None or area is None or region is None:
-        raise StencilSessionError("원래 Brush를 복구할 3D Viewport가 없습니다.")
-    with context.temp_override(
-        window=window,
-        screen=window.screen,
-        area=area,
-        region=region,
-    ):
-        result = bpy.ops.brush.asset_activate(
-            asset_library_type=reference.library_type,
-            asset_library_identifier=reference.library_identifier,
-            relative_asset_identifier=reference.relative_identifier,
-        )
-    if result != {"FINISHED"}:
-        raise StencilSessionError(f"원래 Brush Asset 활성화에 실패했습니다: {result}")
-    brush = context.scene.tool_settings.image_paint.brush
-    if brush is None or _pointer(brush) == 0:
-        raise StencilSessionError("활성화된 원래 Brush를 찾지 못했습니다.")
-    return brush
-
-
-def _capture_brush_state(scene: Any, brush: Any) -> None:
-    """현재 Brush의 Texture·색상·Stencil 배치를 Scene Property에 저장합니다."""
-    if brush is None or _pointer(brush) == 0:
-        raise StencilSessionError("활성 Texture Paint Brush가 없습니다.")
-    settings = scene.projection_paint
-    settings.original_brush_texture = brush.texture
-    settings.original_brush_map_mode = str(brush.texture_slot.map_mode)
-    settings.original_brush_color = tuple(float(value) for value in brush.color)
-    settings.original_stencil_pos = tuple(float(value) for value in brush.stencil_pos)
-    settings.original_stencil_dimension = tuple(
-        float(value) for value in brush.stencil_dimension
-    )
-    settings.stencil_original_state_valid = True
-
-
-def _restore_brush_state(scene: Any, brush: Any) -> None:
-    """Scene에 저장된 사용자 Brush 상태를 해당 Brush에 복구합니다."""
-    settings = scene.projection_paint
-    if not bool(settings.stencil_original_state_valid) or _pointer(brush) == 0:
-        return
-    brush.texture = settings.original_brush_texture
-    if settings.original_brush_map_mode:
-        brush.texture_slot.map_mode = settings.original_brush_map_mode
-    brush.color = tuple(settings.original_brush_color)
-    brush.stencil_pos = tuple(settings.original_stencil_pos)
-    brush.stencil_dimension = tuple(settings.original_stencil_dimension)
-
-
-def _store_asset_reference(scene: Any, reference: BrushAssetReference | None) -> None:
-    """임시 Brush의 원본 Asset 식별자를 Scene Property에 저장합니다."""
-    settings = scene.projection_paint
-    settings.original_brush_asset_library_type = (
-        reference.library_type if reference is not None else ""
-    )
-    settings.original_brush_asset_library_identifier = (
-        reference.library_identifier if reference is not None else ""
-    )
-    settings.original_brush_asset_relative_identifier = (
-        reference.relative_identifier if reference is not None else ""
+    return bool(
+        _pointer(brush)
+        and is_owned(brush, kind=PROJECT_STENCIL_DRAW_BRUSH_ROLE)
+        and getattr(brush, "library", None) is None
+        and bool(getattr(brush, "is_editable", False))
+        and str(getattr(brush, "image_brush_type", "") or "") == "DRAW"
+        and getattr(brush, "asset_data", None) is not None
     )
 
 
-def _stored_asset_reference(scene: Any) -> BrushAssetReference | None:
-    """Scene Property에 완전한 원본 Asset 식별자가 있으면 반환합니다."""
-    settings = scene.projection_paint
-    if not settings.original_brush_asset_library_type:
-        return None
-    return BrushAssetReference(
-        str(settings.original_brush_asset_library_type),
-        str(settings.original_brush_asset_library_identifier),
-        str(settings.original_brush_asset_relative_identifier),
+def _activate_project_stencil_brush(context: Any, scene: Any, brush: Any):
+    """저장된 프로젝트 전용 Draw Brush Asset을 현재 Draw Tool에 활성화합니다."""
+
+    active = activate_brush_asset(
+        context,
+        scene,
+        BrushAssetChoice("LOCAL", "", f"Brush/{brush.name}"),
+        expected_tool_id="builtin.brush",
+        expected_brush_type="DRAW",
     )
+    if active is not brush:
+        raise StencilSessionError("프로젝트 전용 Draw Brush Pointer가 일치하지 않습니다.")
+    return active
 
 
-def _new_editable_brush(context: Any, scene: Any, source: Any):
-    """연결 Asset Brush의 편집 가능한 임시 인스턴스를 활성화합니다."""
-    reference = _brush_asset_reference(source)
+def _create_project_stencil_brush(context: Any, scene: Any, source: Any):
+    """현재 Draw 설정을 복제한 프로젝트 전용 Stencil Brush를 한 번 생성합니다."""
+
+    source_choice = active_brush_choice(scene)
     brush = source.copy()
-    brush.name = f"{source.name} [Stencil]"
+    brush.name = PROJECT_STENCIL_BRUSH_NAME
+    if getattr(brush, "asset_data", None) is None:
+        brush.asset_mark()
     tag_owned(
         brush,
-        BRUSH_ROLE,
-        dataset_uuid=str(scene.projection_paint.dataset_uuid),
-        source_fingerprint=str(scene.projection_paint.source_fingerprint),
+        PROJECT_STENCIL_DRAW_BRUSH_ROLE,
+        dataset_uuid=str(scene.projection_paint.dataset_uuid or ""),
     )
-    brush.use_fake_user = False
-    window, area, region, _space, _rv3d = _viewport_parts(context)
-    if window is None or area is None or region is None:
-        raise StencilSessionError("임시 Brush를 활성화할 3D Viewport가 없습니다.")
+    _configure_project_stencil_brush(brush)
     try:
-        brush.asset_mark()
-        with context.temp_override(
-            window=window,
-            screen=window.screen,
-            area=area,
-            region=region,
-        ):
-            result = bpy.ops.brush.asset_activate(
-                asset_library_type="LOCAL",
-                relative_asset_identifier=f"Brush/{brush.name}",
-            )
-        if result != {"FINISHED"} or scene.tool_settings.image_paint.brush is not brush:
-            raise StencilSessionError("임시 Brush 활성화에 실패했습니다.")
-        brush.asset_clear()
-        brush.use_fake_user = False
-        return brush, reference
+        return _activate_project_stencil_brush(context, scene, brush)
     except Exception:
-        if brush.asset_data is not None:
-            brush.asset_clear()
-        brush.use_fake_user = False
-        if brush.users == 0:
-            bpy.data.brushes.remove(brush)
+        try:
+            if source_choice is not None:
+                activate_brush_asset(
+                    context,
+                    scene,
+                    source_choice,
+                    expected_tool_id="builtin.brush",
+                    expected_brush_type="DRAW",
+                )
+            if scene.tool_settings.image_paint.brush is not brush:
+                bpy.data.brushes.remove(brush)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
         raise
 
 
-def _remove_owned_brush(brush: Any, active_brush: Any) -> None:
-    """비활성 애드온 소유 임시 Brush만 Blender 데이터에서 제거합니다."""
-    if (
-        brush is None
-        or brush is active_brush
-        or _pointer(brush) == 0
-        or brush.get(OWNER_KEY) != OWNER_TOKEN
-        or brush.get(RECORD_KIND_KEY) != BRUSH_ROLE
-    ):
-        return
-    if brush.asset_data is not None:
-        brush.asset_clear()
-    brush.use_fake_user = False
-    bpy.data.brushes.remove(brush)
+def _configure_project_stencil_brush(brush: Any) -> None:
+    """Camera Texture 원색 투영을 위해 전용 Draw Brush 색상을 흰색으로 맞춥니다."""
 
-
-def _migrate_legacy_brushes(context: Any, active_brush: Any):
-    """활성 구버전 임시 Brush를 기본 Brush로 바꾸고 비활성 소유 Brush를 정리합니다."""
-    legacy_active = bool(
-        active_brush is not None
-        and active_brush.get(OWNER_KEY) == OWNER_TOKEN
-        and active_brush.get(RECORD_KIND_KEY) == BRUSH_ROLE
-    )
-    if legacy_active:
-        window, area, region, _space, _rv3d = _viewport_parts(context)
-        if window is None or area is None or region is None:
-            raise StencilSessionError("구버전 Brush를 복구할 3D Viewport가 없습니다.")
-        with context.temp_override(
-            window=window,
-            screen=window.screen,
-            area=area,
-            region=region,
-        ):
-            result = bpy.ops.brush.asset_activate(
-                asset_library_type="ESSENTIALS",
-                relative_asset_identifier=(
-                    "brushes/essentials_brushes-mesh_texture.blend/Brush/Paint Hard"
-                ),
-            )
-        if result != {"FINISHED"}:
-            raise StencilSessionError(f"기본 Paint Hard Brush 복구에 실패했습니다: {result}")
-        active_brush = context.scene.tool_settings.image_paint.brush
-    for brush in tuple(bpy.data.brushes):
-        if (
-            brush is active_brush
-            or brush.get(OWNER_KEY) != OWNER_TOKEN
-            or brush.get(RECORD_KIND_KEY) != BRUSH_ROLE
-        ):
-            continue
-        _remove_owned_brush(brush, active_brush)
-    return active_brush
-
-
-def ensure_editable_brush(
-    context: Any,
-    scene: Any,
-    *,
-    brush_override: Any = None,
-    migrate_legacy: bool = False,
-):
-    """현재 Brush를 직접 사용하거나 임시 편집 Brush 한 개로 전환합니다."""
-    settings = scene.projection_paint
-    source = (
-        brush_override
-        if brush_override is not None
-        else scene.tool_settings.image_paint.brush
-    )
-    if migrate_legacy and brush_override is None:
-        source = _migrate_legacy_brushes(context, source)
-    if source is None or _pointer(source) == 0:
-        raise StencilSessionError("활성 Texture Paint Brush가 없습니다.")
-    previous = settings.stencil_brush
-    if previous is not None and previous is not source:
-        restore_original_brush(context, scene, remove_texture=False)
-    _capture_brush_state(scene, source)
-    if source.library is None and bool(source.is_editable):
-        brush, reference, owns_brush = source, None, False
-    else:
-        brush, reference = _new_editable_brush(context, scene, source)
-        _capture_brush_state(scene, brush)
-        owns_brush = True
     brush.color = (1.0, 1.0, 1.0)
-    settings.stencil_brush = brush
-    settings.stencil_owns_brush = owns_brush
-    settings.stencil_follow_active_brush = brush_override is None
-    _store_asset_reference(scene, reference)
-    return brush
 
 
-def restore_original_brush(
-    context: Any,
-    scene: Any,
-    *,
-    remove_texture: bool = False,
-    activate_original: bool = True,
-) -> None:
-    """현재 Brush 설정과 원본 Asset을 복구하고 임시 Brush를 정리합니다."""
-    settings = scene.projection_paint
+def bind_active_draw_brush(context: Any, scene: Any = None):
+    """명시 Reconnect에서 프로젝트 전용 Draw Brush를 생성하거나 다시 활성화합니다."""
+
+    active_scene = scene if scene is not None else getattr(context, "scene", None)
+    if active_scene is None:
+        raise StencilSessionError("Stencil을 연결할 Scene이 없습니다.")
+    _tool, active = active_draw_brush_for_reconnect(context, active_scene)
+    settings = active_scene.projection_paint
     brush = settings.stencil_brush
-    _restore_brush_state(scene, brush)
-    active_brush = scene.tool_settings.image_paint.brush
-    if bool(settings.stencil_owns_brush):
-        reference = _stored_asset_reference(scene)
-        if activate_original and reference is not None:
-            try:
-                active_brush = _activate_brush_asset(context, reference)
-            except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                active_brush = scene.tool_settings.image_paint.brush
-        _remove_owned_brush(brush, active_brush)
-    settings.stencil_brush = None
-    settings.original_brush_texture = None
-    settings.stencil_original_state_valid = False
-    settings.stencil_owns_brush = False
-    _store_asset_reference(scene, None)
-    if remove_texture:
-        texture = settings.stencil_texture
-        settings.stencil_texture = None
-        if (
-            _pointer(texture)
-            and texture.users == 0
-            and texture.get(OWNER_KEY) == OWNER_TOKEN
-            and texture.get(RECORD_KIND_KEY) == TEXTURE_ROLE
-        ):
-            bpy.data.textures.remove(texture)
+    if not _project_stencil_brush_is_valid(brush):
+        brush = active if _project_stencil_brush_is_valid(active) else None
+    if brush is None:
+        brush = _create_project_stencil_brush(context, active_scene, active)
+    elif active is not brush:
+        brush = _activate_project_stencil_brush(context, active_scene, brush)
+    _configure_project_stencil_brush(brush)
+    settings.stencil_brush = brush
+    settings.manual_stencil_disabled = False
+    settings.stencil_outside_camera_view = False
+    resolve_stencil_connection(active_scene, context)
+    return brush
 
 
 def start_stencil_session(
@@ -541,29 +487,25 @@ def start_stencil_session(
     source_fingerprint: str = "",
     brush_override: Any = None,
 ) -> StencilSession:
-    """Blender Scene에 Brush와 단일 Stencil Texture 권위 Pointer를 준비합니다."""
+    """Paint 진입에서 Brush를 변경하지 않고 단일 Stencil Texture 자원만 준비합니다."""
     scene = context.scene
     validate_paint_contract(scene)
     settings = scene.projection_paint
-    image_paint = scene.tool_settings.image_paint
-    settings.stencil_original_use_unified_color = bool(
-        image_paint.unified_paint_settings.use_unified_color
-    )
     ensure_stencil_texture(
         scene,
         dataset_uuid=dataset_uuid,
         source_fingerprint=source_fingerprint,
     )
-    ensure_editable_brush(
-        context,
-        scene,
-        brush_override=brush_override,
-        migrate_legacy=True,
-    )
-    image_paint.unified_paint_settings.use_unified_color = False
+    if brush_override is not None:
+        raise StencilSessionError(
+            "Paint 진입에서는 Brush를 연결할 수 없습니다. Reconnect를 실행하십시오."
+        )
     settings.manual_stencil_disabled = False
     settings.stencil_outside_camera_view = False
-    return _snapshot(context, scene)
+    session = _snapshot(context, scene)
+    session.validate_resources()
+    resolve_stencil_connection(scene, context)
+    return session
 
 
 def stage_stencil_source(
@@ -575,7 +517,7 @@ def stage_stencil_source(
     frame_corners: tuple[tuple[float, float], ...] | None = None,
 ) -> None:
     """현재 Frame Source와 Camera를 Blender Pointer 상태에 기록합니다."""
-    session.validate()
+    session.validate_resources()
     if image is None or _pointer(image) == 0 or min(int(value) for value in image.size) <= 0:
         raise StencilSessionError("현재 Frame Source Image가 유효하지 않습니다.")
     settings = session.scene.projection_paint
@@ -624,8 +566,8 @@ def _stored_frame_corners(scene: Any):
 def _enter_camera_view(session: StencilSession) -> None:
     """현재 Scene Camera로 작업 Viewport의 Camera View를 확정합니다."""
     camera = session.scene.camera
-    if camera is None or _pointer(camera) == 0:
-        return
+    if camera is None or _pointer(camera) == 0 or getattr(camera, "data", None) is None:
+        raise StencilSessionError("Stencil을 연결할 Scene Camera가 없습니다.")
     if session.space is not None and _pointer(session.space):
         session.space.camera = camera
     if session.rv3d is not None and _pointer(session.rv3d):
@@ -635,7 +577,8 @@ def _enter_camera_view(session: StencilSession) -> None:
 def align_stencil_to_camera(context: Any, scene: Any) -> None:
     """현재 Camera Frame에 활성 Brush Stencil 위치와 크기를 맞춥니다."""
     session = _snapshot(context, scene)
-    session.validate()
+    session.validate_binding()
+    settings = scene.projection_paint
     image = session.source_image
     if image is None or _pointer(image) == 0:
         raise StencilSessionError("현재 Stencil Source Image가 삭제되었습니다.")
@@ -648,6 +591,8 @@ def align_stencil_to_camera(context: Any, scene: Any) -> None:
     )
     texture = session.managed_texture
     brush = session.brush
+    if _project_stencil_brush_is_valid(brush):
+        _configure_project_stencil_brush(brush)
     texture.image = image
     brush.texture_slot.map_mode = "STENCIL"
     brush.stencil_pos = position
@@ -657,30 +602,18 @@ def align_stencil_to_camera(context: Any, scene: Any) -> None:
         raise StencilSessionError("관리 Stencil Texture 연결을 확정하지 못했습니다.")
 
 
-def _switch_active_brush(context: Any, scene: Any, active: Any) -> None:
-    """이전 Brush를 복구하고 새 활성 Brush에 같은 관리 Texture를 준비합니다."""
-    restore_original_brush(
-        context,
-        scene,
-        remove_texture=False,
-        activate_original=False,
-    )
-    ensure_editable_brush(context, scene, brush_override=active)
-    scene.projection_paint.stencil_follow_active_brush = True
-
-
 def disconnect_stencil(scene: Any) -> bool:
-    """Camera View 이탈 시 Source를 유지하고 Brush Texture 연결만 해제합니다."""
+    """Source와 Paint 활성 상태를 유지한 채 기존 Brush Texture 연결만 해제합니다."""
     settings = scene.projection_paint
     brush = settings.stencil_brush
     texture = resolve_stencil_texture(scene)
-    if brush is None or texture is None:
-        return False
-    if brush.texture is texture:
+    resources_ready = brush is not None and texture is not None
+    if resources_ready and brush.texture is texture:
         brush.texture = None
-    settings.stencil_outside_camera_view = True
-    settings.paint_state = "FROZEN"
-    return True
+    if not bool(settings.paint_mask_mode):
+        settings.stencil_outside_camera_view = True
+    resolve_stencil_connection(scene)
+    return resources_ready
 
 
 def disconnect_stencil_for_camera_exit(
@@ -695,36 +628,41 @@ def reconnect_stencil_texture(
     context: Any,
     session: StencilSession | None = None,
 ) -> int:
-    """Python Session 없이 현재 Blender Source를 STENCIL Mapping으로 복구합니다."""
+    """명시 Reconnect에서 프로젝트 전용 Draw Brush에 STENCIL Mapping을 연결합니다."""
     current = session if session is not None else _snapshot(context)
     scene = current.scene
     settings = scene.projection_paint
     validate_paint_contract(scene)
+    if bool(settings.paint_mask_mode):
+        raise StencilSessionError("Mask 레이어에서는 Stencil을 연결할 수 없습니다.")
+    if not stencil_connection_allowed(scene):
+        raise StencilSessionError("Stencil을 연결할 Scene Camera가 없습니다.")
     if settings.stencil_source_image is None or int(settings.active_image_id) <= 0:
         raise StencilSessionError("현재 Frame Source가 준비되지 않았습니다.")
     active = scene.tool_settings.image_paint.brush
     brush = settings.stencil_brush
-    if bool(settings.stencil_follow_active_brush) and active is not brush:
-        _switch_active_brush(context, scene, active)
+    if _pointer(brush) == 0:
+        raise StencilSessionError("Draw Brush를 선택하고 Reconnect를 실행하십시오.")
+    if active is not brush:
+        raise StencilSessionError(
+            "활성 Brush가 연결 Brush와 다릅니다. Draw Brush에서 Reconnect를 실행하십시오."
+        )
+    if not _project_stencil_brush_is_valid(brush):
+        raise StencilSessionError(
+            "프로젝트 전용 Draw Brush가 준비되지 않았습니다. Draw에서 Reconnect를 다시 실행하십시오."
+        )
     ensure_stencil_texture(
         scene,
         dataset_uuid=str(settings.dataset_uuid),
         source_fingerprint=str(settings.source_fingerprint),
     )
-    try:
-        current = _snapshot(context, scene)
-        _enter_camera_view(current)
-        align_stencil_to_camera(context, scene)
-        settings.manual_stencil_disabled = False
-        settings.stencil_outside_camera_view = False
-        settings.paint_state = "ACTIVE"
-        return int(settings.active_image_id)
-    except Exception:
-        brush = settings.stencil_brush
-        if brush is not None and _pointer(brush):
-            brush.texture = None
-        settings.manual_stencil_disabled = True
-        raise
+    current = _snapshot(context, scene)
+    _enter_camera_view(current)
+    align_stencil_to_camera(context, scene)
+    settings.manual_stencil_disabled = False
+    settings.stencil_outside_camera_view = False
+    resolve_stencil_connection(scene, context)
+    return int(settings.active_image_id)
 
 
 def refresh_stencil(
@@ -733,44 +671,17 @@ def refresh_stencil(
     *,
     refresh_viewport: bool = True,
 ) -> bool:
-    """수동 해제를 존중하며 현재 Blender Source의 Stencil 정렬만 갱신합니다."""
+    """자동 복구 없이 현재 Stencil 연결 여부만 확인합니다."""
+
+    del refresh_viewport
     current = session if session is not None else _snapshot(context or bpy.context)
-    scene = current.scene
-    settings = scene.projection_paint
-    active = scene.tool_settings.image_paint.brush
-    brush = settings.stencil_brush
-    switched_brush = False
-    if bool(settings.stencil_follow_active_brush) and active is not brush:
-        _switch_active_brush(context or bpy.context, scene, active)
-        brush = settings.stencil_brush
-        switched_brush = True
-    texture = resolve_stencil_texture(scene)
-    if (
-        not switched_brush
-        and not bool(settings.stencil_outside_camera_view)
-        and (
-            brush is None
-            or brush.texture is not texture
-            or brush.texture_slot.map_mode != "STENCIL"
-        )
-    ):
-        settings.manual_stencil_disabled = True
-        settings.paint_state = "MANUAL_DISABLED"
-        return False
-    if bool(settings.manual_stencil_disabled) or settings.stencil_source_image is None:
-        return False
-    if refresh_viewport:
-        current = _snapshot(context or bpy.context, scene)
-    align_stencil_to_camera(context or bpy.context, scene)
-    settings.stencil_outside_camera_view = False
-    settings.paint_state = "ACTIVE"
-    return True
+    return resolve_stencil_connection(current.scene, context).state == "CONNECTED"
 
 
 def stencil_view_token(session: StencilSession) -> tuple[object, ...]:
     """저비용 비교용 Camera View·Stencil 연결 상태 Token을 반환합니다."""
     current = _snapshot(bpy.context, session.scene)
-    current.validate()
+    current.validate_resources()
     region = current.region
     space = current.space
     rv3d = current.rv3d
@@ -794,7 +705,10 @@ def stencil_view_token(session: StencilSession) -> tuple[object, ...]:
     texture = current.managed_texture
     render = current.scene.render
     return (
-        str(rv3d.view_perspective) == "CAMERA",
+        bool(
+            stencil_connection_allowed(current.scene)
+            and str(rv3d.view_perspective) == "CAMERA"
+        ),
         _pointer(region),
         int(region.width),
         int(region.height),
@@ -816,7 +730,7 @@ def stencil_view_token(session: StencilSession) -> tuple[object, ...]:
         float(render.pixel_aspect_y),
         _pointer(current.scene.tool_settings.image_paint.brush),
         _pointer(getattr(brush, "texture", None)),
-        str(brush.texture_slot.map_mode),
+        str(getattr(getattr(brush, "texture_slot", None), "map_mode", "")),
         _pointer(getattr(texture, "image", None)),
     )
 
@@ -840,28 +754,14 @@ def detach_source_image(image: Any) -> None:
 
 
 def finish_stencil_session(context: Any = None, scene: Any = None) -> None:
-    """사용자 Brush를 복구하고 Scene의 임시 Stencil Pointer를 정리합니다."""
+    """Paint 종료에서도 Blender가 저장한 Draw Brush Stencil 연결을 그대로 유지합니다."""
     active_context = context if context is not None else bpy.context
     active_scene = scene if scene is not None else getattr(active_context, "scene", None)
     if active_scene is None:
         return
-    settings = getattr(active_scene, "projection_paint", None)
-    if settings is None:
+    if getattr(active_scene, "projection_paint", None) is None:
         return
-    texture = settings.stencil_texture
-    if texture is not None and _pointer(texture):
-        texture.image = None
-    restore_original_brush(active_context, active_scene, remove_texture=True)
-    unified = active_scene.tool_settings.image_paint.unified_paint_settings
-    if not unified.use_unified_color:
-        unified.use_unified_color = bool(settings.stencil_original_use_unified_color)
-    settings.stencil_source_image = None
-    settings.active_image_id = 0
-    settings.current_image_id = ""
-    settings.current_image_name = ""
-    settings.stencil_frame_corners_json = ""
-    settings.manual_stencil_disabled = False
-    settings.stencil_outside_camera_view = False
+    resolve_stencil_connection(active_scene, active_context)
 
 
 def project_current_stencil(context: Any) -> int:
@@ -872,9 +772,18 @@ def project_current_stencil(context: Any) -> int:
         raise StencilSessionError("먼저 Painting Mode를 활성화하십시오.")
     if bool(settings.paint_mask_mode):
         raise StencilSessionError("Layer를 선택한 뒤 Stencil을 투영하십시오.")
+    connection = resolve_stencil_connection(scene, context)
+    if connection.state != "CONNECTED":
+        raise StencilSessionError(
+            "현재 Stencil이 연결되지 않았습니다. Draw Brush에서 Reconnect를 먼저 실행하십시오."
+        )
     from .paint_runtime import reconnect_current_frame
 
     image_id = reconnect_current_frame(context)
+    if resolve_stencil_connection(scene, context).state != "CONNECTED":
+        raise StencilSessionError(
+            "현재 Stencil 연결을 복구하지 못했습니다. Reconnect를 다시 실행하십시오."
+        )
     session = active_stencil_session(scene)
     if session is None or session.source_image is None:
         raise StencilSessionError("현재 Frame의 Stencil Source Image가 없습니다.")
@@ -920,12 +829,34 @@ class PP_OT_reconnect_stencil(bpy.types.Operator):
     bl_description = "현재 시점에서 위치와 방향이 가장 가까운 COLMAP Camera와 Stencil을 연결합니다"
     bl_options = {"REGISTER"}
 
+    @classmethod
+    def poll(cls, context: Any) -> bool:
+        """실제 ACTIVE Paint Runtime과 일반 Layer가 준비됐을 때만 재연결을 허용합니다."""
+
+        from .snapshot_update import snapshot_is_ready
+        from .paint_runtime import active_paint_runtime
+
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "projection_paint", None) if scene is not None else None
+        window = getattr(context, "window", None)
+        return bool(
+            scene is not None
+            and settings is not None
+            and window is not None
+            and getattr(window, "workspace", None)
+            is getattr(settings, "paint_workspace", None)
+            and not bool(settings.paint_mask_mode)
+            and str(settings.paint_state) == "ACTIVE"
+            and active_paint_runtime(scene) is not None
+            and snapshot_is_ready(scene)
+        )
+
     def execute(self, context):
         """KDB-tree로 Camera를 선택하고 해당 Frame의 STENCIL Mapping을 복구합니다."""
         try:
             from .paint_runtime import reconnect_nearest_camera
 
-            candidate = reconnect_nearest_camera(context)
+            candidate = reconnect_nearest_camera(context, bind_active_brush=True)
         except (StencilSessionError, RuntimeError, ValueError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -949,13 +880,20 @@ class PP_OT_project_stencil(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: Any) -> bool:
-        """Painting Mode와 유효한 Target·Source가 있을 때만 버튼을 활성화합니다."""
+        """일반 Layer의 Painting Mode와 유효한 Target·Source에서만 활성화합니다."""
+        from .snapshot_update import snapshot_is_ready
+        from .paint_runtime import active_paint_runtime
+
+        scene = getattr(context, "scene", None)
         settings = getattr(getattr(context, "scene", None), "projection_paint", None)
         return bool(
             settings is not None
-            and settings.paint_enabled
+            and scene is not None
+            and snapshot_is_ready(scene)
+            and str(settings.paint_state) == "ACTIVE"
+            and active_paint_runtime(scene) is not None
+            and not bool(settings.paint_mask_mode)
             and settings.paint_target is not None
-            and settings.stencil_source_image is not None
         )
 
     def execute(self, context):
@@ -974,24 +912,28 @@ CLASSES = (PP_OT_reconnect_stencil, PP_OT_project_stencil)
 
 __all__ = [
     "CLASSES",
+    "StencilConnectionStatus",
     "StencilSession",
     "StencilSessionError",
+    "active_draw_brush_for_reconnect",
+    "active_image_paint_tool",
     "active_stencil_session",
     "align_stencil_to_camera",
+    "bind_active_draw_brush",
     "bind_stencil_source",
     "camera_frame_stencil",
     "detach_source_image",
     "disconnect_stencil",
     "disconnect_stencil_for_camera_exit",
-    "ensure_editable_brush",
     "ensure_stencil_texture",
     "finish_stencil_session",
     "project_camera_frame",
     "project_current_stencil",
     "reconnect_stencil_texture",
     "refresh_stencil",
-    "restore_original_brush",
+    "resolve_stencil_connection",
     "stage_stencil_source",
     "start_stencil_session",
+    "stencil_connection_allowed",
     "stencil_view_token",
 ]

@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import tomllib
 import traceback
 
 import bpy
@@ -26,7 +27,7 @@ def _operator_is_registered(operator_id: str) -> bool:
     category, name = operator_id.split(".", 1)
     try:
         getattr(getattr(bpy.ops, category), name).get_rna_type()
-    except (AttributeError, RuntimeError):
+    except (AttributeError, KeyError, RuntimeError):
         return False
     return True
 
@@ -50,6 +51,24 @@ def _modifier_f7_keymap_items() -> tuple[object, ...]:
     )
 
 
+def _projection_paint_multiselect_block_keymap_items() -> tuple[object, ...]:
+    """설치본이 등록한 Projection Paint 복수 선택 입력 차단 항목을 반환합니다."""
+
+    keyconfig = getattr(bpy.context.window_manager.keyconfigs, "addon", None)
+    if keyconfig is None:
+        return ()
+    return tuple(
+        item
+        for keymap in keyconfig.keymaps
+        for item in keymap.keymap_items
+        if keymap.name == "Image Paint"
+        and keymap.region_type == "WINDOW"
+        and item.idname == "projection_paint.block_multiselect_paint_stroke"
+        and item.type in {"LEFTMOUSE", "PEN", "ERASER"}
+        and item.value == "PRESS"
+    )
+
+
 def _assert_installed_location(module) -> None:
     """불러온 Root Module이 격리 설치 Repository 아래에 있는지 확인합니다."""
 
@@ -60,6 +79,19 @@ def _assert_installed_location(module) -> None:
     repository_root = Path(expected_root).resolve()
     if repository_root not in module_path.parents:
         raise AssertionError(f"격리 설치본이 아닌 Module이 로드되었습니다: {module_path}")
+
+
+def _assert_manifest_version(module) -> None:
+    """설치본 Python 버전과 같은 패키지의 Manifest 버전이 일치하는지 확인합니다."""
+
+    manifest_path = Path(module.__file__).resolve().parent / "blender_manifest.toml"
+    with manifest_path.open("rb") as manifest_file:
+        manifest_version = str(tomllib.load(manifest_file).get("version", ""))
+    if not manifest_version or module.__version__ != manifest_version:
+        raise AssertionError(
+            "설치본 Python·Manifest 버전이 일치하지 않습니다: "
+            f"python={module.__version__}, manifest={manifest_version}"
+        )
 
 
 def _assert_small_gicp_runtime(module) -> None:
@@ -350,6 +382,7 @@ def main() -> int:
                 raise AssertionError("설치한 COLMAP Tools Extension을 활성화하지 못했습니다.")
         module = import_module(MODULE_NAME)
         _assert_installed_location(module)
+        _assert_manifest_version(module)
         if not hasattr(bpy.types, "COLMAP_MT_tools"):
             raise AssertionError("설치본의 공통 COLMAP Tools 메뉴가 등록되지 않았습니다.")
         missing_operators = [
@@ -359,6 +392,8 @@ def main() -> int:
                 "colmap.open_modifier_workspace",
                 "colmap.review_background_toggle",
                 "projection_paint.open_workspace",
+                "projection_paint.update_colmap_snapshot",
+                "projection_paint.block_multiselect_paint_stroke",
             )
             if not _operator_is_registered(operator_id)
         ]
@@ -366,21 +401,51 @@ def main() -> int:
             raise AssertionError(f"설치본 Operator가 등록되지 않았습니다: {missing_operators}")
         missing_properties = [
             name
-            for name in ("colmap_align_settings", "colmap_import", "projection_paint")
+            for name in (
+                "colmap_dataset",
+                "colmap_align_settings",
+                "colmap_import",
+                "projection_paint",
+            )
             if not hasattr(bpy.types.Scene, name)
         ]
         if missing_properties:
             raise AssertionError(f"설치본 Scene 속성이 등록되지 않았습니다: {missing_properties}")
+        if _operator_is_registered("projection_paint.import_colmap"):
+            raise AssertionError("설치본에 Projection Painting 중복 Import Operator가 등록되었습니다.")
+        projection_settings = bpy.context.scene.projection_paint
+        missing_snapshot_properties = [
+            name
+            for name in (
+                "snapshot_uuid",
+                "snapshot_revision",
+                "source_modifier_dataset_uuid",
+                "source_modifier_revision",
+                "source_modifier_fingerprint",
+                "snapshot_state",
+            )
+            if not hasattr(projection_settings, name)
+        ]
+        if missing_snapshot_properties:
+            raise AssertionError(
+                f"설치본 Snapshot 속성이 등록되지 않았습니다: {missing_snapshot_properties}"
+            )
         if len(_modifier_f7_keymap_items()) != 1:
             raise AssertionError("설치본 Modifier F7 키맵이 정확히 하나가 아닙니다.")
+        if len(_projection_paint_multiselect_block_keymap_items()) != 3:
+            raise AssertionError("설치본 Projection Paint 입력 차단 키맵이 정확히 세 개가 아닙니다.")
         _assert_workspace_seeds(module)
         _assert_small_gicp_runtime(module)
         _assert_obj_uv_roundtrip()
         addon_utils.disable(MODULE_NAME, default_set=False)
         if hasattr(bpy.types, "COLMAP_MT_tools"):
             raise AssertionError("설치본 비활성화 뒤 공통 메뉴가 남았습니다.")
+        if hasattr(bpy.types.Scene, "colmap_dataset"):
+            raise AssertionError("설치본 비활성화 뒤 공용 Dataset 속성이 남았습니다.")
         if _modifier_f7_keymap_items():
             raise AssertionError("설치본 비활성화 뒤 Modifier F7 키맵이 남았습니다.")
+        if _projection_paint_multiselect_block_keymap_items():
+            raise AssertionError("설치본 비활성화 뒤 Projection Paint 입력 차단 키맵이 남았습니다.")
     except Exception:
         traceback.print_exc()
         try:

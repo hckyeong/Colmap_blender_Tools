@@ -89,7 +89,18 @@ class WorkspaceSetupTask:
     screen_wait_attempts: int = 0
 
 
+@dataclass
+class RuntimeRestoreTask:
+    """활성 Modifier Workspace에 연결할 증분 Runtime 복원 상태를 보관합니다."""
+
+    window: Any
+    area: Any
+    scene_pointer: int
+    job: Any
+
+
 _SETUP_TASK: WorkspaceSetupTask | None = None
+_RUNTIME_RESTORE_TASK: RuntimeRestoreTask | None = None
 _RECOVERY_ATTEMPTS = 0
 _SIDEBAR_ATTEMPTS = 0
 _MSGBUS_OWNER = object()
@@ -455,7 +466,7 @@ def configure_sidebar(window: Any) -> bool:
         return False
 
 
-def _rehydrate_viewport_runtime(window: Any, area: Any) -> tuple[str, ...]:
+def _rehydrate_viewport_runtime(window: Any, area: Any, state: Any) -> tuple[str, ...]:
     """현재 Control View에 Review와 Pending 파생 상태를 다시 연결합니다."""
 
     region = _window_region(area)
@@ -472,23 +483,130 @@ def _rehydrate_viewport_runtime(window: Any, area: Any) -> tuple[str, ...]:
         if settings is None or not settings.dataset_uuid or not settings.active_model_directory:
             return ()
         from .camera_filter_queue import restore_pending_filters
-        from .camera_review_session import ensure_review_session
-        from .runtime_state import ensure_runtime
+        from .camera_review_session import (
+            ensure_review_session,
+            update_review_background_from_settings,
+        )
 
-        state = ensure_runtime(bpy.context.scene)
         review_session = ensure_review_session(bpy.context, state=state)
         restore_pending_filters(
             bpy.context,
             state=state,
             session=review_session,
         )
+        update_review_background_from_settings(settings, bpy.context)
         if settings.warning_summary:
             warnings.extend(settings.warning_summary.splitlines())
     return tuple(warnings)
 
 
+def _record_runtime_restore_error(scene: Any, error: Exception) -> None:
+    """Runtime 오류를 경고와 상태에 기록하되 활성 Workspace는 그대로 유지합니다."""
+
+    settings = getattr(scene, "colmap_import", None)
+    if settings is None:
+        return
+    warning = f"Viewport Runtime 복원을 건너뜁니다: {error}"
+    existing = tuple(
+        line.strip() for line in str(settings.warning_summary or "").splitlines() if line.strip()
+    )
+    settings.warning_summary = "\n".join(dict.fromkeys((*existing, warning)))
+    settings.status = warning
+    settings.status_kind = "ERROR"
+
+
+def _process_runtime_restore() -> float | None:
+    """활성 Workspace의 Runtime을 전진시키고 완료 뒤 파생 UI를 한 번 연결합니다."""
+
+    global _RUNTIME_RESTORE_TASK
+    task = _RUNTIME_RESTORE_TASK
+    if task is None:
+        return None
+    window = task.window
+    scene = getattr(window, "scene", None)
+    if (
+        scene is None
+        or _pointer(scene) != task.scene_pointer
+        or SESSION.phase != SESSION_ACTIVE
+        or not is_session_active_for_window(window)
+    ):
+        _RUNTIME_RESTORE_TASK = None
+        return None
+    settings = getattr(scene, "colmap_import", None)
+    try:
+        if task.job.failed:
+            raise task.job.error or ModifierWorkspaceError(
+                "Modifier Runtime 복원이 완료 전에 중단되었습니다."
+            )
+        if not task.job.done:
+            progress = task.job.advance(20.0)
+            settings.status = (
+                f"Modifier Runtime 복원 중: {float(progress.fraction) * 100.0:.1f}% · "
+                f"{progress.message}"
+            )
+            settings.status_kind = "IMPORTING"
+            request_redraw()
+            return SETUP_INTERVAL_SECONDS
+        state = task.job.result
+        if state is None:
+            raise ModifierWorkspaceError("완료된 Modifier Runtime 복원 결과가 없습니다.")
+        _rehydrate_viewport_runtime(window, task.area, state)
+        _activate_modifier_marker_session(window)
+        settings.status = "COLMAP Modifier Runtime과 Review 연결이 준비되었습니다."
+        settings.status_kind = "SUCCESS"
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        ModifierWorkspaceError,
+    ) as error:
+        _record_runtime_restore_error(scene, error)
+        try:
+            from .camera_review_timeline import release_modifier_marker_session
+
+            release_modifier_marker_session(scene)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+    _RUNTIME_RESTORE_TASK = None
+    request_redraw()
+    return None
+
+
+def _schedule_runtime_restore(window: Any, area: Any) -> None:
+    """Runtime이 필요한 Modifier Workspace에서 공유 복원 Job Timer를 예약합니다."""
+
+    global _RUNTIME_RESTORE_TASK
+    scene = window.scene
+    settings = getattr(scene, "colmap_import", None)
+    if settings is None or not settings.dataset_uuid or not settings.active_model_directory:
+        _activate_modifier_marker_session(window)
+        _set_status("COLMAP Modifier Workspace가 준비되었습니다.")
+        return
+    from .runtime_state import cached_runtime, cached_runtime_matches_scene, request_runtime_restore
+
+    if cached_runtime_matches_scene(scene):
+        state = cached_runtime(str(settings.dataset_uuid))
+        if state is None:
+            raise ModifierWorkspaceError("Modifier Runtime Cache를 찾지 못했습니다.")
+        _rehydrate_viewport_runtime(window, area, state)
+        _activate_modifier_marker_session(window)
+        _set_status("COLMAP Modifier Runtime과 Review 연결이 준비되었습니다.")
+        return
+    job = request_runtime_restore(scene)
+    _RUNTIME_RESTORE_TASK = RuntimeRestoreTask(window, area, _pointer(scene), job)
+    settings.status = "Modifier Runtime 복원 중: 0.0%"
+    settings.status_kind = "IMPORTING"
+    if not bpy.app.timers.is_registered(_process_runtime_restore):
+        bpy.app.timers.register(
+            _process_runtime_restore,
+            first_interval=SETUP_INTERVAL_SECONDS,
+        )
+
+
 def _complete_workspace_activation(window: Any) -> None:
-    """Control View와 Runtime을 검증한 뒤 Session을 ACTIVE로 확정합니다."""
+    """Control View를 먼저 활성화하고 필요한 Runtime 복원을 별도 Timer로 시작합니다."""
 
     area = _control_area(window)
     if area is None:
@@ -497,7 +615,6 @@ def _complete_workspace_activation(window: Any) -> None:
     if workspace is None or not screen_matches_workspace(window.screen, workspace):
         raise ModifierWorkspaceError("Modifier Workspace와 활성 Screen의 소유 UUID가 일치하지 않습니다.")
     activate_modifier_data_view_layer(window)
-    _rehydrate_viewport_runtime(window, area)
     hide_default_startup_objects(window)
     set_modifier_perspective_view(area)
     normalize_modifier_viewport(window, area)
@@ -506,13 +623,9 @@ def _complete_workspace_activation(window: Any) -> None:
     mark_workspace_ready(workspace, window.screen, MODIFIER_WORKSPACE_SPEC)
     activate_session(window, area)
     try:
-        _activate_modifier_marker_session(window)
-    except Exception:
-        from .camera_review_timeline import release_modifier_marker_session
-
-        release_modifier_marker_session(window.scene)
-        raise
-    _set_status("COLMAP Modifier Workspace가 준비되었습니다.")
+        _schedule_runtime_restore(window, area)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        _record_runtime_restore_error(window.scene, error)
     request_redraw()
 
 
@@ -605,6 +718,7 @@ def _process_workspace_setup() -> float | None:
         AttributeError,
         ReferenceError,
         RuntimeError,
+        ValueError,
         ModifierWorkspaceError,
         WorkspaceFactoryError,
     ) as error:
@@ -933,18 +1047,20 @@ def _subscribe_workspace_changes() -> None:
 
 
 def cancel_workspace_tasks() -> None:
-    """Workspace Setup, Sidebar와 Recovery Timer를 모두 취소합니다."""
+    """Workspace Setup, Runtime 복원 UI, Sidebar와 Recovery Timer를 모두 취소합니다."""
 
-    global _RECOVERY_ATTEMPTS, _SETUP_TASK, _SIDEBAR_ATTEMPTS
+    global _RECOVERY_ATTEMPTS, _RUNTIME_RESTORE_TASK, _SETUP_TASK, _SIDEBAR_ATTEMPTS
     for callback in (
         _process_workspace_setup,
         _process_sidebar_activation,
         _process_workspace_recovery,
+        _process_runtime_restore,
         _restore_session_after_load,
     ):
         if bpy.app.timers.is_registered(callback):
             bpy.app.timers.unregister(callback)
     _SETUP_TASK = None
+    _RUNTIME_RESTORE_TASK = None
     _RECOVERY_ATTEMPTS = 0
     _SIDEBAR_ATTEMPTS = 0
 

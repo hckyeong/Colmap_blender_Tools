@@ -216,13 +216,15 @@ class FrameSourceCache:
         )
         return self.session_epoch
 
-    def close(self) -> None:
-        """Pending 요청을 취소하고 애드온 소유 Source만 안전하게 해제합니다."""
+    def close(self, *, preserve_pinned: bool = False) -> None:
+        """Pending 요청을 취소하고 필요하면 현재 Stencil Source는 Blender 데이터로 보존합니다."""
         if self._closed:
             return
         self.invalidate()
         self._closed = True
         for record in tuple(self._records.values()):
+            if preserve_pinned and record.pinned:
+                continue
             if record.owned and record.valid():
                 self._detach(record.image)
                 self._release_owned(record.image)

@@ -129,7 +129,7 @@ def derive_paint_state(scene: Any) -> tuple[str, str]:
         return "STALE", str(exc)
     if setup.target.mode != "TEXTURE_PAINT":
         return "READY", "Paint Target이 Texture Paint Mode가 아닙니다."
-    if bool(settings.paint_mask_mode) and _pointer(settings.active_paint_image):
+    if bool(settings.paint_enabled) and _pointer(settings.active_paint_image):
         return "ACTIVE", ""
     texture = resolve_stencil_texture(scene)
     source = settings.stencil_source_image
@@ -223,7 +223,9 @@ def _managed_material_overlay(material: Any):
 def migrate_paint_state(scene: Any) -> bool:
     """구버전 Blender 데이터를 안전한 Scene Pointer 스키마로 한 번 이전합니다."""
     settings = getattr(scene, "projection_paint", None)
-    if settings is None or int(settings.state_schema_version) >= STATE_SCHEMA_VERSION:
+    if settings is None:
+        return False
+    if int(settings.state_schema_version) >= STATE_SCHEMA_VERSION:
         return False
     target = settings.paint_target
     material = getattr(target, "active_material", None) if _pointer(target) else None
@@ -259,20 +261,6 @@ def migrate_paint_state(scene: Any) -> bool:
         settings.stencil_texture = textures[0]
         if _pointer(textures[0].image):
             settings.stencil_source_image = textures[0].image
-    active_brush = resolve_active_brush(scene)
-    if (
-        active_brush is not None
-        and settings.stencil_texture is not None
-        and active_brush.texture is settings.stencil_texture
-    ):
-        settings.stencil_brush = active_brush
-        if _owned(active_brush, "STENCIL_BRUSH"):
-            settings.stencil_owns_brush = True
-            settings.original_brush_asset_library_type = "ESSENTIALS"
-            settings.original_brush_asset_library_identifier = ""
-            settings.original_brush_asset_relative_identifier = (
-                "brushes/essentials_brushes-mesh_texture.blend/Brush/Paint Hard"
-            )
     try:
         valid_actual_paint = bool(
             _pointer(target)

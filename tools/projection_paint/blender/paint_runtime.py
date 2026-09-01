@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .camera_scene import (
     CameraManifestEntry,
     activate_managed_frame,
+    consume_committed_frame_request,
     install_camera_runtime,
     runtime_for_scene,
     scene_manifest,
@@ -30,23 +31,31 @@ from .ownership import (
     DATASET_REVISION_KEY,
     OWNER_KEY,
     OWNER_TOKEN,
+    PROJECT_STENCIL_DRAW_BRUSH_ROLE,
     RECORD_KIND_KEY,
     ensure_scene_uuid,
+    is_owned,
 )
 from .stencil_session import (
     StencilSessionError,
+    active_draw_brush_for_reconnect,
     active_stencil_session,
+    align_stencil_to_camera,
+    bind_active_draw_brush,
     bind_stencil_source,
     detach_source_image,
     disconnect_stencil,
     reconnect_stencil_texture,
+    resolve_stencil_connection,
     refresh_stencil,
+    stencil_connection_allowed,
     stencil_view_token,
 )
 
 
 VIEWPORT_TRACK_INTERVAL = 0.1
 OUTSIDE_CAMERA_VIEW_INTERVAL = 0.5
+TOOL_EDGE_INTERVAL = 0.25
 MAX_VIEWPORT_TRACK_RETRIES = 5
 
 
@@ -67,6 +76,7 @@ class PaintRuntime:
     camera_index: CameraKDBIndex | None = None
     viewport_token: tuple[object, ...] | None = None
     viewport_retry_count: int = 0
+    tool_bridge: Any | None = None
     view_subscription_owner: Any | None = None
     projection_workspace_active: bool = False
 
@@ -80,15 +90,76 @@ _RUNTIMES: dict[str, PaintRuntime] = {}
 
 
 @dataclass(frozen=True, slots=True)
+class _FrameSourceCommitSnapshot:
+    """Frame Source Commit 실패 시 기존 Source metadata와 Render 상태를 복구합니다."""
+
+    scene_camera: Any
+    stencil_texture: Any
+    stencil_texture_image: Any
+    stencil_source_image: Any
+    active_image_id: int
+    current_image_id: str
+    current_image_name: str
+    frame_corners_json: str
+    render_resolution: tuple[int, int]
+    render_resolution_overridden: bool
+    original_render_resolution: tuple[int, int]
+    applied_render_resolution: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconnectBrushSnapshot:
+    """한 Reconnect 호출이 바꿀 현재 Draw Brush 필드만 원자 복구용으로 보관합니다."""
+
+    brush: Any
+    texture: Any
+    map_mode: str
+    angle: float
+    color: tuple[float, float, float]
+    stencil_pos: tuple[float, float]
+    stencil_dimension: tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _PaintTargetSnapshot:
+    """Reconnect와 무관한 Paint Target·Canvas·활성 Object·Material 상태를 보관합니다."""
+
+    canvas: Any
+    material: Any
+    paint_active_slot: int | None
+    active_object: Any
+    active_material: Any
+    active_material_index: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class _ReconnectSnapshot:
-    """최근접 Camera 적용 실패 시 복구할 Scene과 Viewport 상태를 보관합니다."""
+    """최근접 Camera·Source·Brush 연결 호출의 원자 Rollback 상태를 보관합니다."""
 
     frame: int
     scene_camera: Any
     navigation: ViewportNavigationState
+    tool_id: str
+    active_brush: Any
+    active_brush_choice: Any
+    brush: _ReconnectBrushSnapshot
+    bound_brush_state: _ReconnectBrushSnapshot | None
+    paint_target: _PaintTargetSnapshot
+    bound_brush: Any
     manual_stencil_disabled: bool
     stencil_outside_camera_view: bool
     paint_state: str
+    stencil_texture: Any
+    stencil_texture_image: Any
+    stencil_source_image: Any
+    active_image_id: int
+    current_image_id: str
+    current_image_name: str
+    frame_corners_json: str
+    render_resolution: tuple[int, int]
+    render_resolution_overridden: bool
+    original_render_resolution: tuple[int, int]
+    applied_render_resolution: tuple[int, int]
 
 
 def _pointer(value: Any) -> int:
@@ -152,11 +223,11 @@ def _frame_source_is_current(runtime: PaintRuntime) -> bool:
 
 def _apply_camera_resolution(runtime: PaintRuntime, camera: Any, image: Any) -> None:
     """Source 해상도를 검증하고 Camera Frame의 Render 종횡비에 적용합니다."""
+
+    from .camera_review import camera_dimensions
+
     width, height = (int(value) for value in image.size)
-    expected = (
-        int(camera.data.get("pp_camera_width", 0)),
-        int(camera.data.get("pp_camera_height", 0)),
-    )
+    expected = camera_dimensions(camera.data)
     if min(width, height) <= 0 or expected != (width, height):
         raise PaintRuntimeError(
             f"Camera 해상도 {expected}와 Source Image 해상도 {(width, height)}가 일치하지 않습니다."
@@ -187,14 +258,118 @@ def _camera_for_entry(runtime: PaintRuntime, entry: CameraManifestEntry):
     return camera
 
 
-def _stage_current_source(runtime: PaintRuntime, context: Any = None) -> int:
-    """현재 Frame의 Image와 Camera를 Blender Stencil Pointer에 Commit합니다."""
+def _capture_frame_source_commit_snapshot(
+    runtime: PaintRuntime,
+) -> _FrameSourceCommitSnapshot:
+    """Source Pointer를 쓰기 직전의 복구 상태를 불변 Snapshot으로 고정합니다."""
+
+    scene = runtime.scene
+    settings = scene.projection_paint
+    texture = settings.stencil_texture
+    return _FrameSourceCommitSnapshot(
+        scene_camera=scene.camera,
+        stencil_texture=texture,
+        stencil_texture_image=(getattr(texture, "image", None) if _pointer(texture) else None),
+        stencil_source_image=settings.stencil_source_image,
+        active_image_id=int(settings.active_image_id),
+        current_image_id=str(settings.current_image_id or ""),
+        current_image_name=str(settings.current_image_name or ""),
+        frame_corners_json=str(settings.stencil_frame_corners_json or ""),
+        render_resolution=(int(scene.render.resolution_x), int(scene.render.resolution_y)),
+        render_resolution_overridden=bool(settings.render_resolution_overridden),
+        original_render_resolution=(
+            int(settings.original_render_width),
+            int(settings.original_render_height),
+        ),
+        applied_render_resolution=(
+            int(settings.applied_render_width),
+            int(settings.applied_render_height),
+        ),
+    )
+
+
+def _restore_frame_source_commit_snapshot(
+    runtime: PaintRuntime,
+    snapshot: _FrameSourceCommitSnapshot,
+) -> None:
+    """실패한 Source Commit의 Pointer·metadata·Render 변경을 전 상태로 돌립니다."""
+
+    scene = runtime.scene
+    settings = scene.projection_paint
+    scene.camera = snapshot.scene_camera
+    settings.stencil_texture = snapshot.stencil_texture
+    if _pointer(snapshot.stencil_texture):
+        snapshot.stencil_texture.image = snapshot.stencil_texture_image
+    settings.stencil_source_image = snapshot.stencil_source_image
+    settings.active_image_id = snapshot.active_image_id
+    settings.current_image_id = snapshot.current_image_id
+    settings.current_image_name = snapshot.current_image_name
+    settings.stencil_frame_corners_json = snapshot.frame_corners_json
+    scene.render.resolution_x, scene.render.resolution_y = snapshot.render_resolution
+    settings.render_resolution_overridden = snapshot.render_resolution_overridden
+    settings.original_render_width, settings.original_render_height = (
+        snapshot.original_render_resolution
+    )
+    settings.applied_render_width, settings.applied_render_height = (
+        snapshot.applied_render_resolution
+    )
+    runtime.cache.pin(snapshot.active_image_id)
+
+
+def _validate_frame_source_commit(
+    runtime: PaintRuntime,
+    entry: CameraManifestEntry,
+    image: Any,
+    camera: Any,
+) -> None:
+    """Commit된 Source Pointer·IMAGE_ID·Camera·Render 해상도 일치를 검증합니다."""
+
+    scene = runtime.scene
+    settings = scene.projection_paint
+    texture = settings.stencil_texture
+    if int(scene.frame_current) != int(entry.frame):
+        raise PaintRuntimeError("Source Commit Frame이 최신 요청과 다릅니다.")
+    if scene.camera is not camera:
+        raise PaintRuntimeError("Source Commit Camera Pointer가 변경되었습니다.")
+    if settings.stencil_source_image is not image or _pointer(image) == 0:
+        raise PaintRuntimeError("Source Commit Image Pointer가 일치하지 않습니다.")
+    if texture is None or not _pointer(texture) or texture.image is not image:
+        raise PaintRuntimeError("Source Commit Texture Pointer가 일치하지 않습니다.")
+    if int(settings.active_image_id) != int(entry.image_id):
+        raise PaintRuntimeError("Source Commit IMAGE_ID가 일치하지 않습니다.")
+    if str(settings.current_image_id or "") != str(entry.image_id):
+        raise PaintRuntimeError("Source Commit IMAGE_ID metadata가 일치하지 않습니다.")
+    if str(settings.current_image_name or "") != str(entry.image_name):
+        raise PaintRuntimeError("Source Commit Image 이름 metadata가 일치하지 않습니다.")
+    if (int(scene.render.resolution_x), int(scene.render.resolution_y)) != tuple(
+        int(value) for value in image.size
+    ):
+        raise PaintRuntimeError("Source Commit Render 해상도가 Image와 다릅니다.")
+
+
+def _stage_current_source(
+    runtime: PaintRuntime,
+    context: Any = None,
+    *,
+    expected_frame: int | None = None,
+    expected_image_id: int | None = None,
+    request_is_current: Callable[[], bool] | None = None,
+    commit_validator: Callable[[], None] | None = None,
+) -> int:
+    """최신 Frame Token을 재검증하며 Image와 metadata를 원자적으로 Commit합니다."""
     import bpy
 
     frame = int(runtime.scene.frame_current)
+    if expected_frame is not None and frame != int(expected_frame):
+        raise PaintRuntimeError("예약한 Frame Source 요청이 변경되었습니다.")
     entry = runtime.entries.get(frame)
     if entry is None:
         raise PaintRuntimeError(f"현재 Frame {frame}에 관리 Camera가 없습니다.")
+    if expected_image_id is not None and int(entry.image_id) != int(expected_image_id):
+        raise PaintRuntimeError("예약한 IMAGE_ID Source 요청이 변경되었습니다.")
+    current_request = request_is_current or (lambda: True)
+    if not current_request():
+        raise PaintRuntimeError("최신 Frame Source 요청이 변경되었습니다.")
     path = runtime.image_paths.get(entry.image_id)
     if path is None:
         raise PaintRuntimeError(f"IMAGE_ID {entry.image_id}의 Source Image 경로가 없습니다.")
@@ -221,11 +396,14 @@ def _stage_current_source(runtime: PaintRuntime, context: Any = None) -> int:
             image = runtime.cache.add_borrowed(entry.image_id, existing)
         else:
             image = runtime.cache.load_owned(token, path)
-    _apply_camera_resolution(runtime, camera, image)
     active_context = context if context is not None else bpy.context
+    snapshot = _capture_frame_source_commit_snapshot(runtime)
 
     def apply_source(current_image: Any, image_id: int) -> None:
         """검증된 최신 Image를 Blender 권위 Stencil Pointer에 기록합니다."""
+        if not current_request():
+            raise PaintRuntimeError("최신 Frame Source 요청이 변경되었습니다.")
+        _apply_camera_resolution(runtime, camera, current_image)
         bind_stencil_source(
             active_context,
             runtime.scene,
@@ -233,17 +411,32 @@ def _stage_current_source(runtime: PaintRuntime, context: Any = None) -> int:
             image_id,
             camera,
         )
+        settings = runtime.scene.projection_paint
+        settings.current_image_id = str(entry.image_id)
+        settings.current_image_name = str(entry.image_name)
+        if not current_request():
+            raise PaintRuntimeError("최신 Frame Source 요청이 변경되었습니다.")
+        _validate_frame_source_commit(runtime, entry, current_image, camera)
+        if commit_validator is not None:
+            commit_validator()
+        if not current_request():
+            raise PaintRuntimeError("최신 Frame Source 요청이 변경되었습니다.")
 
-    if not runtime.cache.commit(
-        token,
-        image,
-        current_frame=int(runtime.scene.frame_current),
-        apply=apply_source,
-    ):
-        raise PaintRuntimeError("최신 Frame Source 요청이 변경되어 연결을 취소했습니다.")
-    settings = runtime.scene.projection_paint
-    settings.current_image_id = str(entry.image_id)
-    settings.current_image_name = str(entry.image_name)
+    try:
+        committed = runtime.cache.commit(
+            token,
+            image,
+            current_frame=int(runtime.scene.frame_current),
+            apply=apply_source,
+        )
+        if not committed or not current_request():
+            raise PaintRuntimeError(
+                "최신 Frame Source 요청이 변경되어 연결을 취소했습니다."
+            )
+        _validate_frame_source_commit(runtime, entry, image, camera)
+    except Exception:
+        _restore_frame_source_commit_snapshot(runtime, snapshot)
+        raise
     return entry.image_id
 
 
@@ -340,19 +533,148 @@ def _camera_index_for_paint(runtime: PaintRuntime) -> CameraKDBIndex:
     return index
 
 
-def _capture_reconnect_snapshot(context: Any) -> _ReconnectSnapshot:
-    """최근접 Camera 적용 전 Scene과 호출 Viewport 상태를 캡처합니다."""
+def _capture_reconnect_brush(brush: Any) -> _ReconnectBrushSnapshot:
+    """현재 Draw Brush에서 Reconnect가 직접 바꿀 필드만 캡처합니다."""
+
+    if _pointer(brush) == 0:
+        raise PaintRuntimeError("Reconnect 대상 Draw Brush가 삭제되었습니다.")
+    return _ReconnectBrushSnapshot(
+        brush=brush,
+        texture=brush.texture,
+        map_mode=str(brush.texture_slot.map_mode),
+        angle=float(brush.texture_slot.angle),
+        color=tuple(float(value) for value in brush.color),
+        stencil_pos=tuple(float(value) for value in brush.stencil_pos),
+        stencil_dimension=tuple(float(value) for value in brush.stencil_dimension),
+    )
+
+
+def _capture_paint_target_snapshot(context: Any) -> _PaintTargetSnapshot:
+    """Paint Target의 Canvas·활성 Slot·Object·Material 상태를 캡처합니다."""
 
     scene = context.scene
     settings = scene.projection_paint
+    image_paint = scene.tool_settings.image_paint
+    material = getattr(settings, "paint_material", None)
+    active_object = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_object = getattr(active_object, "active", None)
+    return _PaintTargetSnapshot(
+        canvas=getattr(image_paint, "canvas", None),
+        material=material,
+        paint_active_slot=(
+            int(material.paint_active_slot) if _pointer(material) else None
+        ),
+        active_object=active_object,
+        active_material=(
+            getattr(active_object, "active_material", None)
+            if _pointer(active_object)
+            else None
+        ),
+        active_material_index=(
+            int(active_object.active_material_index)
+            if _pointer(active_object)
+            else None
+        ),
+    )
+
+
+def _capture_reconnect_snapshot(context: Any) -> _ReconnectSnapshot:
+    """최근접 Camera 적용 전 직접 변경 가능한 상태만 원자 복구용으로 캡처합니다."""
+
+    scene = context.scene
+    settings = scene.projection_paint
+    active_brush = scene.tool_settings.image_paint.brush
+    from .paint_tool_bridge import active_brush_choice, active_tool_id
+
+    texture = settings.stencil_texture
+    bound_brush = settings.stencil_brush
     return _ReconnectSnapshot(
         frame=int(scene.frame_current),
         scene_camera=scene.camera,
         navigation=capture_viewport_navigation(context),
+        tool_id=active_tool_id(context),
+        active_brush=active_brush,
+        active_brush_choice=active_brush_choice(scene),
+        brush=_capture_reconnect_brush(active_brush),
+        bound_brush_state=(
+            _capture_reconnect_brush(bound_brush)
+            if _pointer(bound_brush) and bound_brush is not active_brush
+            else None
+        ),
+        paint_target=_capture_paint_target_snapshot(context),
+        bound_brush=bound_brush,
         manual_stencil_disabled=bool(settings.manual_stencil_disabled),
         stencil_outside_camera_view=bool(settings.stencil_outside_camera_view),
         paint_state=str(settings.paint_state),
+        stencil_texture=texture,
+        stencil_texture_image=(
+            getattr(texture, "image", None) if _pointer(texture) else None
+        ),
+        stencil_source_image=settings.stencil_source_image,
+        active_image_id=int(settings.active_image_id),
+        current_image_id=str(settings.current_image_id or ""),
+        current_image_name=str(settings.current_image_name or ""),
+        frame_corners_json=str(settings.stencil_frame_corners_json or ""),
+        render_resolution=(int(scene.render.resolution_x), int(scene.render.resolution_y)),
+        render_resolution_overridden=bool(settings.render_resolution_overridden),
+        original_render_resolution=(
+            int(settings.original_render_width),
+            int(settings.original_render_height),
+        ),
+        applied_render_resolution=(
+            int(settings.applied_render_width),
+            int(settings.applied_render_height),
+        ),
     )
+
+
+def _restore_reconnect_brush(snapshot: _ReconnectBrushSnapshot) -> None:
+    """Reconnect가 실제로 바꾼 Brush 필드만 원래 값으로 되돌립니다."""
+
+    brush = snapshot.brush
+    if _pointer(brush) == 0:
+        raise PaintRuntimeError("Rollback 대상 Draw Brush가 삭제되었습니다.")
+    if brush.texture is not snapshot.texture:
+        brush.texture = snapshot.texture
+    if str(brush.texture_slot.map_mode) != snapshot.map_mode:
+        brush.texture_slot.map_mode = snapshot.map_mode
+    if float(brush.texture_slot.angle) != snapshot.angle:
+        brush.texture_slot.angle = snapshot.angle
+    if tuple(float(value) for value in brush.color) != snapshot.color:
+        brush.color = snapshot.color
+    if tuple(float(value) for value in brush.stencil_pos) != snapshot.stencil_pos:
+        brush.stencil_pos = snapshot.stencil_pos
+    if (
+        tuple(float(value) for value in brush.stencil_dimension)
+        != snapshot.stencil_dimension
+    ):
+        brush.stencil_dimension = snapshot.stencil_dimension
+
+
+def _restore_reconnect_active_brush(
+    context: Any,
+    scene: Any,
+    snapshot: _ReconnectSnapshot,
+) -> None:
+    """첫 Reconnect 실패 시 원래 Blender Draw Brush Asset을 다시 활성화합니다."""
+
+    image_paint = scene.tool_settings.image_paint
+    if image_paint.brush is snapshot.active_brush:
+        return
+    if snapshot.active_brush_choice is None:
+        image_paint.brush = snapshot.active_brush
+        return
+    from .paint_tool_bridge import activate_brush_asset
+
+    restored = activate_brush_asset(
+        context,
+        scene,
+        snapshot.active_brush_choice,
+        expected_tool_id=snapshot.tool_id,
+        expected_brush_type="DRAW",
+    )
+    if restored is not snapshot.active_brush:
+        raise PaintRuntimeError("Rollback 뒤 원래 Draw Brush Pointer가 일치하지 않습니다.")
 
 
 def _restore_reconnect_snapshot(
@@ -360,43 +682,124 @@ def _restore_reconnect_snapshot(
     context: Any,
     snapshot: _ReconnectSnapshot,
 ) -> str:
-    """실패한 최근접 Camera 적용을 이전 Frame·Source·Viewport 상태로 되돌립니다."""
+    """실패한 Reconnect가 바꾼 Camera·Source·Brush·Paint Target만 되돌립니다."""
 
     scene = runtime.scene
     settings = scene.projection_paint
     errors: list[str] = []
+    active_after_failure = scene.tool_settings.image_paint.brush
+    bound_after_failure = settings.stencil_brush
+    created_brush = next(
+        (
+            brush
+            for brush in (bound_after_failure, active_after_failure)
+            if (
+                _pointer(brush)
+                and brush is not snapshot.bound_brush
+                and brush is not snapshot.active_brush
+                and is_owned(brush, kind=PROJECT_STENCIL_DRAW_BRUSH_ROLE)
+            )
+        ),
+        None,
+    )
     runtime.cache.invalidate()
     try:
-        if snapshot.frame in runtime.entries:
-            activate_managed_frame(
-                scene,
-                snapshot.frame,
-                context,
-                refresh_source=False,
-            )
-            _stage_current_source(runtime, context)
-            if snapshot.manual_stencil_disabled or snapshot.stencil_outside_camera_view:
-                disconnect_stencil(scene)
-            else:
-                reconnect_stencil_texture(context)
-        else:
-            scene.frame_set(snapshot.frame)
+        scene.frame_set(snapshot.frame)
+        scene.camera = snapshot.scene_camera
+        restore_viewport_navigation(context, snapshot.navigation)
     except Exception as exc:
         errors.append(str(exc))
     try:
-        scene.camera = snapshot.scene_camera
-        restore_viewport_navigation(context, snapshot.navigation)
+        _restore_reconnect_active_brush(context, scene, snapshot)
+        _restore_reconnect_brush(snapshot.brush)
+        if snapshot.bound_brush_state is not None:
+            _restore_reconnect_brush(snapshot.bound_brush_state)
+    except Exception as exc:
+        errors.append(str(exc))
+    try:
+        settings.stencil_texture = snapshot.stencil_texture
+        if _pointer(snapshot.stencil_texture):
+            snapshot.stencil_texture.image = snapshot.stencil_texture_image
+        settings.stencil_source_image = snapshot.stencil_source_image
+        settings.active_image_id = snapshot.active_image_id
+        settings.current_image_id = snapshot.current_image_id
+        settings.current_image_name = snapshot.current_image_name
+        settings.stencil_frame_corners_json = snapshot.frame_corners_json
+        settings.stencil_brush = snapshot.bound_brush
+    except Exception as exc:
+        errors.append(str(exc))
+    if _pointer(created_brush):
+        try:
+            import bpy
+
+            if scene.tool_settings.image_paint.brush is created_brush:
+                raise PaintRuntimeError("새 프로젝트 전용 Brush가 아직 활성 상태입니다.")
+            bpy.data.brushes.remove(created_brush)
+        except Exception as exc:
+            errors.append(str(exc))
+    try:
+        paint_target = snapshot.paint_target
+        image_paint = scene.tool_settings.image_paint
+        image_paint.canvas = paint_target.canvas
+        if _pointer(paint_target.material) and paint_target.paint_active_slot is not None:
+            paint_target.material.paint_active_slot = paint_target.paint_active_slot
+        view_layer = getattr(context, "view_layer", None)
+        if view_layer is not None:
+            view_layer.objects.active = paint_target.active_object
+        active_object = paint_target.active_object
+        if _pointer(active_object):
+            if paint_target.active_material_index is not None:
+                active_object.active_material_index = paint_target.active_material_index
+            if getattr(active_object, "active_material", None) is not paint_target.active_material:
+                active_object.active_material = paint_target.active_material
+    except Exception as exc:
+        errors.append(str(exc))
+    try:
+        scene.render.resolution_x, scene.render.resolution_y = snapshot.render_resolution
+        settings.render_resolution_overridden = snapshot.render_resolution_overridden
+        settings.original_render_width, settings.original_render_height = (
+            snapshot.original_render_resolution
+        )
+        settings.applied_render_width, settings.applied_render_height = (
+            snapshot.applied_render_resolution
+        )
     except Exception as exc:
         errors.append(str(exc))
     settings.manual_stencil_disabled = snapshot.manual_stencil_disabled
     settings.stencil_outside_camera_view = snapshot.stencil_outside_camera_view
     settings.paint_state = snapshot.paint_state
-    if not snapshot.manual_stencil_disabled:
-        try:
-            start_viewport_tracking(scene)
-        except Exception as exc:
-            errors.append(str(exc))
+    resolve_stencil_connection(scene, context)
     return "; ".join(error for error in errors if error)
+
+
+def _validate_reconnect_invariants(
+    context: Any,
+    scene: Any,
+    snapshot: _ReconnectSnapshot,
+    expected_active_brush: Any,
+) -> None:
+    """Reconnect가 전용 Draw Brush 외 Tool·Paint Target을 바꾸지 않았는지 검증합니다."""
+
+    from .paint_tool_bridge import active_tool_id
+
+    if active_tool_id(context) != snapshot.tool_id:
+        raise PaintRuntimeError("Reconnect가 Blender Workspace Tool을 변경했습니다.")
+    active = scene.tool_settings.image_paint.brush
+    if active is not expected_active_brush:
+        raise PaintRuntimeError("Reconnect 결과 Draw Brush Pointer가 일치하지 않습니다.")
+    paint_target = snapshot.paint_target
+    if scene.tool_settings.image_paint.canvas is not paint_target.canvas:
+        raise PaintRuntimeError("Reconnect가 Paint Canvas를 변경했습니다.")
+    if _pointer(paint_target.material) and (
+        int(paint_target.material.paint_active_slot) != paint_target.paint_active_slot
+    ):
+        raise PaintRuntimeError("Reconnect가 Material 활성 Paint Slot을 변경했습니다.")
+    active_object = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_object = getattr(active_object, "active", None)
+    if active_object is not paint_target.active_object:
+        raise PaintRuntimeError("Reconnect가 활성 Paint Object를 변경했습니다.")
+    if _pointer(active_object) and active_object.active_material is not paint_target.active_material:
+        raise PaintRuntimeError("Reconnect가 활성 Paint Material을 변경했습니다.")
 
 
 def _clear_view_subscription(runtime: PaintRuntime) -> None:
@@ -410,31 +813,13 @@ def _clear_view_subscription(runtime: PaintRuntime) -> None:
 
 
 def _camera_view_changed(scene_uuid: str) -> None:
-    """Camera View 이탈·복귀를 Blender Pointer 상태에서 즉시 반영합니다."""
-    runtime = _RUNTIMES.get(str(scene_uuid))
-    if runtime is None:
-        return
-    if not _projection_runtime_is_active(runtime):
-        return
-    try:
-        session = active_stencil_session(runtime.scene)
-        if session is None:
-            return
-        token = stencil_view_token(session)
-        if not bool(token[0]):
-            disconnect_stencil(runtime.scene)
-        elif (
-            bool(runtime.scene.projection_paint.stencil_outside_camera_view)
-            and not bool(runtime.scene.projection_paint.manual_stencil_disabled)
-        ):
-            refresh_stencil(None, session, refresh_viewport=False)
-        runtime.viewport_token = stencil_view_token(session)
-    except (AttributeError, ReferenceError, RuntimeError, TypeError):
-        runtime.scene.projection_paint.paint_state = "ERROR"
+    """Camera View 변경은 Blender가 저장한 현재 Draw Brush Stencil을 그대로 유지합니다."""
+
+    del scene_uuid
 
 
 def _paint_context_changed(scene_uuid: str) -> None:
-    """Workspace 또는 Object Mode 변경에 따라 Projection Stencil을 동결·재개합니다."""
+    """Workspace 복귀 Edge에서 Tool 기준선과 Camera View 추적을 다시 시작합니다."""
     import bpy
 
     runtime = _RUNTIMES.get(str(scene_uuid))
@@ -442,42 +827,21 @@ def _paint_context_changed(scene_uuid: str) -> None:
         return
     active = _projection_runtime_is_active(runtime)
     if not active:
-        if runtime.projection_workspace_active:
-            disconnect_stencil(runtime.scene)
         runtime.projection_workspace_active = False
         runtime.viewport_retry_count = 0
         return
     if runtime.projection_workspace_active:
         return
-    runtime.projection_workspace_active = True
-    settings = runtime.scene.projection_paint
-    if bool(settings.manual_stencil_disabled):
-        return
-    try:
-        _sync_stencil_connection_for_current_view(runtime, bpy.context)
-        from .lifecycle import lifecycle_registry
-
-        lifecycle_registry().register_timer(
-            _viewport_tracking_tick,
-            component="stencil_view_tracking",
-            first_interval=VIEWPORT_TRACK_INTERVAL,
-        )
-    except (AttributeError, ReferenceError, RuntimeError, StencilSessionError, TypeError):
-        settings.paint_state = "ERROR"
+    _start_runtime_paint_tool_edge_tracking(runtime)
+    _start_runtime_viewport_tracking(runtime)
 
 
 def _subscribe_camera_view(runtime: PaintRuntime) -> None:
-    """Camera View·Workspace·Object Mode 변경을 Scene UUID 기반 Callback에 구독합니다."""
+    """Workspace·Object Mode 복귀만 Tool 기준선 재설정을 위해 구독합니다."""
     import bpy
 
     _clear_view_subscription(runtime)
     owner = object()
-    bpy.msgbus.subscribe_rna(
-        key=(bpy.types.RegionView3D, "view_perspective"),
-        owner=owner,
-        args=(runtime.scene_uuid,),
-        notify=_camera_view_changed,
-    )
     bpy.msgbus.subscribe_rna(
         key=(bpy.types.Window, "workspace"),
         owner=owner,
@@ -517,58 +881,76 @@ def _projection_runtime_is_active(runtime: PaintRuntime) -> bool:
 
 
 def _sync_stencil_connection_for_current_view(runtime: PaintRuntime, context: Any) -> bool:
-    """현재 View가 Camera일 때만 Stencil을 연결하고 그 외에는 즉시 해제합니다."""
-    session = active_stencil_session(runtime.scene)
-    if session is None:
+    """Camera View에서는 같은 Draw Brush만 정렬하고 이탈 시 연결만 해제합니다."""
+
+    scene = runtime.scene
+    settings = scene.projection_paint
+    session = active_stencil_session(scene)
+    if session is None or bool(settings.paint_mask_mode):
         return False
-    if bool(stencil_view_token(session)[0]):
-        reconnect_stencil_texture(context, session)
-        connected = True
-    else:
-        disconnect_stencil(runtime.scene)
-        connected = False
-    runtime.viewport_token = stencil_view_token(session)
-    return connected
+    token = stencil_view_token(session)
+    if not bool(token[0]):
+        disconnect_stencil(scene)
+        return False
+    status = resolve_stencil_connection(scene, context)
+    same_brush = status.active_brush is status.bound_brush and status.bound_brush is not None
+    can_restore = status.state == "CONNECTED" or (
+        status.state == "CAMERA_SUSPENDED"
+        and bool(settings.stencil_outside_camera_view)
+    )
+    if not same_brush or not can_restore:
+        return False
+    align_stencil_to_camera(context, scene)
+    settings.stencil_outside_camera_view = False
+    resolve_stencil_connection(scene, context)
+    return True
 
 
 def _track_runtime(runtime: PaintRuntime) -> float | None:
-    """한 Scene Runtime의 View Token을 비교하고 변경된 Stencil만 갱신합니다."""
+    """Camera View 이동·확대만 추적하고 Camera View 이탈 때 연결을 해제합니다."""
+
     import bpy
 
     settings = runtime.scene.projection_paint
     if not _projection_runtime_is_active(runtime):
-        if runtime.projection_workspace_active:
-            disconnect_stencil(runtime.scene)
-            runtime.projection_workspace_active = False
-        return None
-    if not runtime.projection_workspace_active:
-        runtime.projection_workspace_active = True
-        if not bool(settings.manual_stencil_disabled):
-            _sync_stencil_connection_for_current_view(runtime, bpy.context)
-    if bool(settings.manual_stencil_disabled):
-        return None
-    if not _frame_source_is_current(runtime):
+        runtime.projection_workspace_active = False
+        runtime.viewport_token = None
         runtime.viewport_retry_count = 0
-        return VIEWPORT_TRACK_INTERVAL
+        window = getattr(bpy.context, "window", None)
+        return (
+            OUTSIDE_CAMERA_VIEW_INTERVAL
+            if window is not None
+            and getattr(window, "workspace", None) is getattr(settings, "paint_workspace", None)
+            else None
+        )
+    runtime.projection_workspace_active = True
+    if bool(settings.paint_mask_mode) or bool(settings.manual_stencil_disabled):
+        return OUTSIDE_CAMERA_VIEW_INTERVAL
     session = active_stencil_session(runtime.scene)
     if session is None:
-        return None
+        return OUTSIDE_CAMERA_VIEW_INTERVAL
     try:
         token = stencil_view_token(session)
-        if token == runtime.viewport_token:
-            runtime.viewport_retry_count = 0
-            return VIEWPORT_TRACK_INTERVAL if bool(token[0]) else OUTSIDE_CAMERA_VIEW_INTERVAL
-        runtime.viewport_token = token
         if not bool(token[0]):
             disconnect_stencil(runtime.scene)
             runtime.viewport_token = stencil_view_token(session)
             runtime.viewport_retry_count = 0
             return OUTSIDE_CAMERA_VIEW_INTERVAL
-        if not refresh_stencil(None, session, refresh_viewport=False):
-            return None
+        if not _frame_source_is_current(runtime):
+            runtime.viewport_retry_count = 0
+            return VIEWPORT_TRACK_INTERVAL
+        if token == runtime.viewport_token:
+            runtime.viewport_retry_count = 0
+            return VIEWPORT_TRACK_INTERVAL
+        runtime.viewport_token = token
+        connected = _sync_stencil_connection_for_current_view(runtime, bpy.context)
         runtime.viewport_token = stencil_view_token(session)
         runtime.viewport_retry_count = 0
-        return VIEWPORT_TRACK_INTERVAL
+        return (
+            VIEWPORT_TRACK_INTERVAL
+            if connected or bool(runtime.viewport_token[0])
+            else OUTSIDE_CAMERA_VIEW_INTERVAL
+        )
     except StencilSessionError:
         runtime.viewport_retry_count += 1
         if runtime.viewport_retry_count <= MAX_VIEWPORT_TRACK_RETRIES:
@@ -587,31 +969,114 @@ def _viewport_tracking_tick() -> float | None:
     return min(delays) if delays else None
 
 
-def start_viewport_tracking(scene: Any | None = None) -> None:
-    """현재 Scene Runtime의 Message Bus와 단일 View Timer를 시작합니다."""
+def _track_paint_tool_edge(runtime: PaintRuntime) -> float | None:
+    """활성 Runtime에서 실제 Tool ID Edge만 저빈도로 Bridge에 전달합니다."""
+
+    import bpy
+
+    if not _projection_runtime_is_active(runtime):
+        runtime.projection_workspace_active = False
+        return None
+    from .paint_tool_bridge import (
+        detect_paint_tool_edge,
+        initialize_paint_tool_bridge,
+    )
+
+    if runtime.tool_bridge is None:
+        runtime.tool_bridge = initialize_paint_tool_bridge(bpy.context, runtime.scene)
+        runtime.projection_workspace_active = True
+        return TOOL_EDGE_INTERVAL
+    try:
+        detect_paint_tool_edge(
+            bpy.context,
+            runtime.scene,
+            runtime.tool_bridge,
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as exc:
+        settings = runtime.scene.projection_paint
+        settings.status = f"Blender Paint Tool 전환 연결 실패: {exc}"
+        settings.status_kind = "ERROR"
+    return TOOL_EDGE_INTERVAL
+
+
+def _paint_tool_edge_tick() -> float | None:
+    """등록된 Runtime 중 활성 작업공간의 Blender Paint 도구 전환만 감지합니다."""
+
+    delays = tuple(
+        delay
+        for runtime in tuple(_RUNTIMES.values())
+        for delay in (_track_paint_tool_edge(runtime),)
+        if delay is not None
+    )
+    return min(delays) if delays else None
+
+
+def _start_runtime_paint_tool_edge_tracking(runtime: PaintRuntime) -> None:
+    """검증된 Runtime의 현재 Tool 기준선과 Tool Edge Timer를 함께 시작합니다."""
+
+    import bpy
+    from .paint_tool_bridge import initialize_paint_tool_bridge
+
+    runtime.tool_bridge = initialize_paint_tool_bridge(
+        bpy.context,
+        runtime.scene,
+        runtime.tool_bridge,
+    )
+    runtime.projection_workspace_active = True
+    from .lifecycle import lifecycle_registry
+
+    lifecycle_registry().register_timer(
+        _paint_tool_edge_tick,
+        component="paint_tool_edge_tracking",
+        first_interval=0.0,
+    )
+
+
+def start_paint_tool_edge_tracking(scene: Any | None = None) -> None:
+    """현재 Tool을 기준선으로 기록한 뒤 저빈도 Tool Edge Timer를 시작합니다."""
+
     import bpy
 
     active_scene = scene if scene is not None else getattr(bpy.context, "scene", None)
     if active_scene is None:
         return
     runtime = ensure_paint_runtime(active_scene)
-    session = active_stencil_session(active_scene)
-    if (
-        session is None
-        or not _projection_runtime_is_active(runtime)
-        or bool(active_scene.projection_paint.manual_stencil_disabled)
-    ):
+    if not _projection_runtime_is_active(runtime):
         return
-    runtime.viewport_token = stencil_view_token(session)
+    _start_runtime_paint_tool_edge_tracking(runtime)
+
+
+def _start_runtime_viewport_tracking(runtime: PaintRuntime) -> None:
+    """검증된 Runtime에 Camera View Message Bus와 추적 Timer를 연결합니다."""
+
     runtime.projection_workspace_active = True
     _subscribe_camera_view(runtime)
+    settings = runtime.scene.projection_paint
+    if bool(settings.paint_mask_mode) or bool(settings.manual_stencil_disabled):
+        return
+    if active_stencil_session(runtime.scene) is None:
+        return
+    runtime.viewport_token = None
     from .lifecycle import lifecycle_registry
 
     lifecycle_registry().register_timer(
         _viewport_tracking_tick,
         component="stencil_view_tracking",
-        first_interval=VIEWPORT_TRACK_INTERVAL,
+        first_interval=0.0,
     )
+
+
+def start_viewport_tracking(scene: Any | None = None) -> None:
+    """Camera View 이동·확대와 이탈을 감지하는 저비용 Timer를 시작합니다."""
+    import bpy
+
+    active_scene = scene if scene is not None else getattr(bpy.context, "scene", None)
+    if active_scene is None:
+        return
+    runtime = ensure_paint_runtime(active_scene)
+    if not _projection_runtime_is_active(runtime):
+        return
+    _start_runtime_viewport_tracking(runtime)
 
 
 def start_paint_runtime(
@@ -620,13 +1085,13 @@ def start_paint_runtime(
     *,
     reconnect_on_start: bool = True,
 ) -> PaintRuntime:
-    """Blender Paint 상태에서 Scene별 Frame Cache를 생성하고 Source를 연결합니다."""
+    """Scene별 Frame Cache와 Source metadata를 준비하고 Tool 기준선만 기록합니다."""
     scene = getattr(paint_session, "scene", None) or context.scene
     runtime = ensure_paint_runtime(scene)
     try:
         _stage_current_source(runtime, context)
+        start_paint_tool_edge_tracking(scene)
         if reconnect_on_start:
-            reconnect_stencil_texture(context)
             start_viewport_tracking(scene)
     except Exception:
         stop_paint_runtime(context, scene=scene, restore_resolution=False)
@@ -634,37 +1099,43 @@ def start_paint_runtime(
     return runtime
 
 
-def refresh_frame_source(scene: Any) -> bool:
-    """Frame 변경 시 Blender 활성 의도를 확인하고 Source와 Stencil을 갱신합니다."""
+def refresh_frame_source(
+    scene: Any,
+    *,
+    expected_frame: int | None = None,
+    expected_image_id: int | None = None,
+    request_is_current: Callable[[], bool] | None = None,
+    commit_validator: Callable[[], None] | None = None,
+) -> bool:
+    """Frame Source를 최신 요청으로 원자 갱신하고 성공 여부를 반환합니다."""
+
     settings = getattr(scene, "projection_paint", None)
     if settings is None:
         return False
     try:
         runtime = ensure_paint_runtime(scene)
-        _stage_current_source(runtime)
-        if not _projection_runtime_is_active(runtime):
-            return True
-        session = active_stencil_session(scene)
-        if session is None:
-            return False
-        if not bool(stencil_view_token(session)[0]):
-            disconnect_stencil(scene)
-            start_viewport_tracking(scene)
-            return True
-        refreshed = refresh_stencil(None, session)
-        if refreshed:
-            start_viewport_tracking(scene)
-        return refreshed
+        _stage_current_source(
+            runtime,
+            expected_frame=expected_frame,
+            expected_image_id=expected_image_id,
+            request_is_current=request_is_current,
+            commit_validator=commit_validator,
+        )
+        resolve_stencil_connection(scene)
+        return True
     except Exception as exc:
         settings.status = f"Frame Source 갱신 실패: {exc}"
         settings.status_kind = "ERROR"
-        settings.paint_state = "ERROR"
+        settings.stencil_state = "ERROR"
+        settings.stencil_reason = str(exc)
         return False
 
 
 def reconnect_current_frame(context: Any) -> int:
-    """Runtime 존재 여부와 무관하게 현재 Frame Source를 Stencil로 복구합니다."""
+    """현재 Frame Source만 준비하고 사용자의 Brush Stencil 설정은 변경하지 않습니다."""
     scene = context.scene
+    if bool(scene.projection_paint.paint_mask_mode):
+        raise PaintRuntimeError("Mask 레이어에서는 Stencil을 연결할 수 없습니다.")
     try:
         from .overlay_migration import repair_managed_overlay_if_needed
 
@@ -675,71 +1146,40 @@ def reconnect_current_frame(context: Any) -> int:
     if not _projection_runtime_is_active(runtime):
         raise PaintRuntimeError("전용 작업공간의 실제 Texture Paint Target이 아닙니다.")
     image_id = _stage_current_source(runtime, context)
-    reconnect_stencil_texture(context)
-    start_viewport_tracking(scene)
+    consume_committed_frame_request(
+        scene,
+        int(scene.frame_current),
+        int(image_id),
+    )
     return image_id
 
 
 def resume_stencil_after_layer_selection(context: Any) -> bool:
-    """Camera View의 실제 Paint Runtime에서 Layer 선택 뒤 Projection Stencil을 복구합니다."""
+    """일반 Layer 복귀 시 자동 연결 없이 Stencil 상태와 View 추적만 재개합니다."""
     scene = getattr(context, "scene", None)
     if scene is None:
         return False
     runtime = active_paint_runtime(scene)
     if runtime is None or not _projection_runtime_is_active(runtime):
         return False
-    try:
-        settings = getattr(scene, "projection_paint", None)
-        if (
-            settings is None
-            or _pointer(settings.stencil_source_image) == 0
-            or int(settings.active_image_id) <= 0
-            or not _frame_source_is_current(runtime)
-        ):
-            return False
-        session = active_stencil_session(scene)
-        if session is None:
-            return False
-        if not bool(stencil_view_token(session)[0]):
-            return False
-        reconnect_stencil_texture(context, session)
-        brush = settings.stencil_brush
-        texture = settings.stencil_texture
-        if (
-            _pointer(brush) == 0
-            or _pointer(texture) == 0
-            or brush.texture is not texture
-            or brush.texture_slot.map_mode != "STENCIL"
-        ):
-            raise PaintRuntimeError("관리 Stencil Brush 상태를 복구하지 못했습니다.")
-        scene.tool_settings.image_paint.unified_paint_settings.use_unified_color = False
-        brush.color = (1.0, 1.0, 1.0)
-        runtime.viewport_token = stencil_view_token(session)
-        start_viewport_tracking(scene)
-        return True
-    except (
-        AttributeError,
-        ReferenceError,
-        RuntimeError,
-        StencilSessionError,
-        TypeError,
-        ValueError,
-    ):
-        # Layer 선택 Transaction은 완료했으므로 Stencil 복구 실패로 되돌리지 않습니다.
-        return False
+    resolve_stencil_connection(scene, context)
+    start_viewport_tracking(scene)
+    return False
 
 
-def reconnect_nearest_camera(context: Any) -> CameraCandidate:
-    """현재 Viewport 시점에 가장 적합한 Camera Frame과 Stencil Source를 연결합니다."""
+def reconnect_nearest_camera(
+    context: Any,
+    *,
+    bind_active_brush: bool = False,
+) -> CameraCandidate:
+    """최근접 Camera Transaction에서 Operator 권한일 때만 활성 Draw Brush를 채택합니다."""
 
     scene = context.scene
     settings = scene.projection_paint
-    try:
-        from .overlay_migration import repair_managed_overlay_if_needed
-
-        repair_managed_overlay_if_needed(context)
-    except RuntimeError as exc:
-        raise PaintRuntimeError(f"관리 Overlay UDIM 복구 실패: {exc}") from exc
+    if bool(settings.paint_mask_mode):
+        raise PaintRuntimeError("Mask 레이어에서는 Stencil을 연결할 수 없습니다.")
+    if bind_active_brush:
+        active_draw_brush_for_reconnect(context, scene)
     runtime = ensure_paint_runtime(scene)
     if not _projection_runtime_is_active(runtime):
         raise PaintRuntimeError("전용 작업공간의 실제 Texture Paint Target이 아닙니다.")
@@ -751,10 +1191,11 @@ def reconnect_nearest_camera(context: Any) -> CameraCandidate:
         raise PaintRuntimeError(
             f"IMAGE_ID {candidate.entry.image_id}의 Source Image 파일이 없습니다."
         )
-    _camera_for_entry(runtime, candidate.entry)
     mutated = False
+    expected_active_brush = snapshot.active_brush
     try:
         mutated = True
+        _camera_for_entry(runtime, candidate.entry)
         activate_managed_frame(
             scene,
             candidate.entry.frame,
@@ -764,8 +1205,24 @@ def reconnect_nearest_camera(context: Any) -> CameraCandidate:
         image_id = _stage_current_source(runtime, context)
         if int(image_id) != int(candidate.entry.image_id):
             raise PaintRuntimeError("선택한 Camera와 연결된 IMAGE_ID가 일치하지 않습니다.")
+        if bind_active_brush:
+            expected_active_brush = bind_active_draw_brush(context, scene)
         reconnect_stencil_texture(context)
+        _validate_reconnect_invariants(
+            context,
+            scene,
+            snapshot,
+            expected_active_brush,
+        )
         start_viewport_tracking(scene)
+        from .overlay_migration import repair_managed_overlay_if_needed
+
+        repair_managed_overlay_if_needed(context)
+        consume_committed_frame_request(
+            scene,
+            int(candidate.entry.frame),
+            int(candidate.entry.image_id),
+        )
     except Exception as exc:
         rollback_error = (
             _restore_reconnect_snapshot(runtime, context, snapshot) if mutated else ""
@@ -785,6 +1242,7 @@ def pause_paint_runtimes(_reason: str = "", _epoch: int = 0) -> None:
     from .lifecycle import lifecycle_registry
 
     lifecycle_registry().unregister_timer(_viewport_tracking_tick)
+    lifecycle_registry().unregister_timer(_paint_tool_edge_tick)
     for runtime in tuple(_RUNTIMES.values()):
         _clear_view_subscription(runtime)
         runtime.cache.invalidate(session_epoch=int(_epoch) if _epoch else None)
@@ -806,8 +1264,11 @@ def schedule_paint_reconcile(scene: Any, reason: str) -> None:
         snapshot = reconcile_paint_state(bpy.context, reason)
         if snapshot.scene is scene and snapshot.state in {"ACTIVE", "FROZEN", "MANUAL_DISABLED"}:
             ensure_paint_runtime(scene)
-            if snapshot.state == "ACTIVE":
-                reconnect_current_frame(bpy.context)
+            start_paint_tool_edge_tracking(scene)
+            if bool(scene.projection_paint.paint_mask_mode):
+                disconnect_stencil(scene)
+            elif snapshot.state == "ACTIVE":
+                refresh_frame_source(scene)
             elif snapshot.state == "FROZEN":
                 start_viewport_tracking(scene)
         return None
@@ -837,11 +1298,12 @@ def stop_paint_runtime(
     runtime = _RUNTIMES.pop(key, None)
     if runtime is not None:
         _clear_view_subscription(runtime)
-        runtime.cache.close()
+        runtime.cache.close(preserve_pinned=True)
     if not _RUNTIMES:
         from .lifecycle import lifecycle_registry
 
         lifecycle_registry().unregister_timer(_viewport_tracking_tick)
+        lifecycle_registry().unregister_timer(_paint_tool_edge_tick)
     settings = getattr(active_scene, "projection_paint", None)
     if settings is None or not restore_resolution:
         return
@@ -886,6 +1348,7 @@ __all__ = [
     "resume_stencil_after_layer_selection",
     "schedule_paint_reconcile",
     "start_paint_runtime",
+    "start_paint_tool_edge_tracking",
     "start_viewport_tracking",
     "stop_paint_runtime",
 ]

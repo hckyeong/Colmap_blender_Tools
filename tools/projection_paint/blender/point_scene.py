@@ -467,6 +467,16 @@ def remove_point_scene_resources(resources: PointSceneResources | None) -> None:
             pass
 
 
+def _tag_point_display_update(obj: Any) -> None:
+    """Point Geometry 재평가와 열린 3D Viewport 다시 그리기를 요청합니다."""
+
+    obj.update_tag(refresh={"DATA"})
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
 def update_dataset_point_scale(scene: Any, point_scale: float) -> None:
     """현재 Dataset의 Point 표시 반지름을 관리 Modifier에 반영합니다."""
     settings = getattr(scene, "projection_paint", None)
@@ -493,6 +503,7 @@ def update_dataset_point_scale(scene: Any, point_scale: float) -> None:
         if modifier is not None:
             set_modifier_point_scale(modifier, modifier.node_group, point_scale)
             obj["colmap_point_size"] = float(point_scale)
+            _tag_point_display_update(obj)
 
 
 def hide_dataset_points(scene: Any, view_layer: Any) -> list[dict[str, Any]]:

@@ -9,6 +9,7 @@ from .indexes import RelationshipIndexes, build_relationship_indexes
 from .model import Point3DRecord, Reconstruction
 from .removal import (
     _counts,
+    _indexes_after_removal,
     _normalized_ids,
     _plan_container_cleanup,
     _validate_rig_removal,
@@ -77,12 +78,14 @@ def plan_removal(
     )
 
 
-def apply_removal(
+def _apply_removal(
     model: Reconstruction,
     removal_plan: RemovalPlan,
     current_revision: int,
+    *,
+    indexes: RelationshipIndexes | None = None,
 ) -> tuple[Reconstruction, RelationshipIndexes, RemovalReport]:
-    """0.2.1 schema 1 작업을 당시 의미 그대로 적용합니다."""
+    """0.2.1 작업을 모델과 선택적 기존 인덱스에 당시 의미 그대로 적용합니다."""
     if removal_plan.source_revision != current_revision:
         raise ValueError(
             "삭제 계획을 만든 revision과 현재 revision이 다릅니다. "
@@ -144,7 +147,17 @@ def apply_removal(
             if frame_id not in removed_frame_ids
         },
     )
-    result_indexes = build_relationship_indexes(result)
+    result_indexes = (
+        build_relationship_indexes(result)
+        if indexes is None
+        else _indexes_after_removal(
+            indexes,
+            removed_point_ids=removed_points,
+            removed_image_ids=observing,
+            removed_camera_ids=removed_camera_ids,
+            affected_point_ids=affected - removed_points,
+        )
+    )
     report = RemovalReport(
         requested_point3d_ids=removal_plan.requested_point3d_ids,
         observing_image_ids=removal_plan.observing_image_ids,
@@ -158,3 +171,29 @@ def apply_removal(
     if report.after_counts != removal_plan.after_counts:
         raise ValueError("삭제 후 개수가 RemovalPlan과 일치하지 않습니다.")
     return result, result_indexes, report
+
+
+def apply_removal(
+    model: Reconstruction,
+    removal_plan: RemovalPlan,
+    current_revision: int,
+) -> tuple[Reconstruction, RelationshipIndexes, RemovalReport]:
+    """기존 공개 API대로 schema 1 작업을 적용하고 전체 인덱스를 재생성합니다."""
+
+    return _apply_removal(model, removal_plan, current_revision)
+
+
+def apply_removal_indexed(
+    model: Reconstruction,
+    removal_plan: RemovalPlan,
+    current_revision: int,
+    indexes: RelationshipIndexes,
+) -> tuple[Reconstruction, RelationshipIndexes, RemovalReport]:
+    """검증된 기존 인덱스에서 schema 1 제거 영향 항목만 갱신합니다."""
+
+    return _apply_removal(
+        model,
+        removal_plan,
+        current_revision,
+        indexes=indexes,
+    )

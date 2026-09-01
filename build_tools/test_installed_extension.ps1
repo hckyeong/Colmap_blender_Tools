@@ -70,7 +70,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "격리 Extension Repository 생성에 실패했습니다."
     }
-    & $BlenderPath --background --command extension install-file -r colmap_test -e $resolvedPackage
+    # 설치 Process에서 즉시 활성화하지 않고 다음 검증 Process에서 활성화해 Windows 파일 잠금을 피합니다.
+    & $BlenderPath --background --command extension install-file -r colmap_test $resolvedPackage
     if ($LASTEXITCODE -ne 0) {
         throw "COLMAP Tools ZIP 격리 설치에 실패했습니다."
     }

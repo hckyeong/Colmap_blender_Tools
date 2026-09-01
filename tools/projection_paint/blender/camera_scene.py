@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 import json
 import math
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Iterable, Mapping
 
 import bpy
@@ -38,6 +38,11 @@ MANIFEST_SCHEMA = 1
 REPAIR_INTERVAL = 0.30
 REPAIR_TIME_BUDGET = 0.001
 MAX_REPAIR_ATTEMPTS = 4
+FRAME_SOURCE_DEBOUNCE_SECONDS = 0.30
+FRAME_SOURCE_RETRY_INTERVAL = 0.05
+MAX_FRAME_SOURCE_RETRIES = 2
+RESOURCE_OWNER_PROJECTION_PAINT = "PROJECTION_PAINT"
+RESOURCE_OWNER_SHARED_DATASET = "SHARED_DATASET"
 
 
 class CameraSceneError(RuntimeError):
@@ -90,6 +95,7 @@ class CameraManifest:
     frame_end: int
     camera_data: tuple[CameraDataManifest, ...]
     entries: tuple[CameraManifestEntry, ...]
+    resource_owner: str = RESOURCE_OWNER_PROJECTION_PAINT
 
 
 @dataclass(slots=True)
@@ -111,6 +117,11 @@ class CameraRuntime:
     queued: set[tuple[str, str]]
     marker_cursor: int = 0
     pending_frame: int | None = None
+    pending_frame_serial: int = 0
+    pending_frame_changed_at: float = 0.0
+    pending_frame_retry_count: int = 0
+    pending_frame_next_attempt_at: float = 0.0
+    pending_frame_error: str = ""
     repair_depth: int = 0
     repair_attempts: int = 0
     error: str = ""
@@ -165,6 +176,18 @@ def _matrix_from_flat(values: Iterable[float]) -> Matrix:
     if len(items) != 16 or not all(math.isfinite(value) for value in items):
         raise CameraSceneError("Camera Matrix가 유효하지 않습니다.")
     return Matrix(tuple(items[index : index + 4] for index in range(0, 16, 4)))
+
+
+def shared_camera_uuid(image_id: int) -> str:
+    """공용 Dataset Camera Object의 IMAGE_ID 기반 Runtime 식별자를 반환합니다."""
+
+    return f"shared-camera:{int(image_id)}"
+
+
+def shared_camera_data_uuid(image_id: int) -> str:
+    """공용 Dataset Camera Data의 IMAGE_ID 기반 Runtime 식별자를 반환합니다."""
+
+    return f"shared-camera-data:{int(image_id)}"
 
 
 def colmap_camera_matrix(qvec: Iterable[float], tvec: Iterable[float]) -> Matrix:
@@ -363,6 +386,9 @@ def manifest_from_json(payload: str) -> CameraManifest:
             frame_end=int(raw["frame_end"]),
             camera_data=camera_data,
             entries=entries,
+            resource_owner=str(
+                raw.get("resource_owner", RESOURCE_OWNER_PROJECTION_PAINT)
+            ),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise CameraSceneError(f"Camera Manifest가 손상되었습니다: {exc}") from exc
@@ -370,6 +396,11 @@ def manifest_from_json(payload: str) -> CameraManifest:
         raise CameraSceneError("Camera Manifest Schema 또는 Dataset UUID가 올바르지 않습니다.")
     if len({entry.image_id for entry in manifest.entries}) != len(manifest.entries):
         raise CameraSceneError("Camera Manifest IMAGE_ID가 중복되었습니다.")
+    if manifest.resource_owner not in {
+        RESOURCE_OWNER_PROJECTION_PAINT,
+        RESOURCE_OWNER_SHARED_DATASET,
+    }:
+        raise CameraSceneError("Camera Manifest Resource 소유자가 올바르지 않습니다.")
     return manifest
 
 
@@ -383,14 +414,96 @@ def scene_manifest(scene: Any) -> CameraManifest | None:
     return manifest_from_json(payload) if payload else None
 
 
-def managed_marker_candidates(scene: Any, manifest: CameraManifest) -> set[int]:
-    """현재 Manifest와 정확히 일치하는 관리 Marker 포인터를 반환합니다."""
+def _shared_resources_for_manifest(scene: Any, manifest: CameraManifest):
+    """Manifest Revision과 정확히 일치하는 공용 Dataset Resource를 반환합니다."""
 
-    object_by_uuid = {
+    try:
+        from ....shared.colmap_dataset.blender.registry import (
+            resources as dataset_resources,
+            snapshot as dataset_snapshot,
+        )
+    except ImportError:
+        from shared.colmap_dataset.blender.registry import (
+            resources as dataset_resources,
+            snapshot as dataset_snapshot,
+        )
+
+    current = dataset_snapshot(scene)
+    if (
+        not current.available
+        or current.dataset_uuid != manifest.dataset_uuid
+        or int(current.dataset_revision) != int(manifest.dataset_revision)
+    ):
+        raise CameraSceneError("공용 Dataset UUID 또는 Revision이 Camera Manifest와 다릅니다.")
+    resources = dataset_resources(scene)
+    if resources is None:
+        raise CameraSceneError("공용 Dataset Blender Resource가 없습니다.")
+    return resources
+
+
+def _objects_for_manifest(scene: Any, manifest: CameraManifest) -> dict[str, Any]:
+    """Legacy 또는 공용 소유 방식에 맞춰 Camera Object Runtime Map을 만듭니다."""
+
+    if manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET:
+        resources = _shared_resources_for_manifest(scene, manifest)
+        return {
+            shared_camera_uuid(image_id): camera
+            for image_id, camera in resources.camera_objects.items()
+        }
+    return {
         owned_uuid_of(obj): obj
         for obj in scene.objects
         if is_owned(obj, kind="CAMERA_OBJECT", dataset_uuid=manifest.dataset_uuid)
     }
+
+
+def _camera_data_for_manifest(scene: Any, manifest: CameraManifest) -> dict[str, Any]:
+    """Legacy 또는 공용 소유 방식에 맞춰 Camera Data Runtime Map을 만듭니다."""
+
+    if manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET:
+        resources = _shared_resources_for_manifest(scene, manifest)
+        return {
+            shared_camera_data_uuid(image_id): camera.data
+            for image_id, camera in resources.camera_objects.items()
+        }
+    return {
+        owned_uuid_of(data): data
+        for data in bpy.data.cameras
+        if is_owned(data, kind="CAMERA_DATA", dataset_uuid=manifest.dataset_uuid)
+    }
+
+
+def managed_marker_candidates(scene: Any, manifest: CameraManifest) -> set[int]:
+    """현재 Manifest와 정확히 일치하는 관리 Marker 포인터를 반환합니다."""
+
+    if manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET:
+        try:
+            from ....shared.colmap_dataset.blender.ownership import (
+                is_dataset_owned,
+            )
+        except ImportError:
+            from shared.colmap_dataset.blender.ownership import is_dataset_owned
+
+        expected = {
+            (entry.marker_name, entry.frame): entry.image_id
+            for entry in manifest.entries
+        }
+        result: set[int] = set()
+        for marker in scene.timeline_markers:
+            image_id = expected.get((str(marker.name), int(marker.frame)))
+            if image_id is None:
+                continue
+            camera = getattr(marker, "camera", None)
+            if camera is not None and not is_dataset_owned(
+                camera,
+                dataset_uuid=manifest.dataset_uuid,
+                role="CAMERA",
+                record_id=image_id,
+            ):
+                continue
+            result.add(_pointer(marker))
+        return result
+    object_by_uuid = _objects_for_manifest(scene, manifest)
     expected = {
         (
             entry.marker_name,
@@ -417,11 +530,7 @@ def projection_markers_attached(scene: Any) -> bool:
     manifest = scene_manifest(scene)
     if manifest is None:
         return _marker_session_is_active(scene)
-    object_by_uuid = {
-        owned_uuid_of(obj): obj
-        for obj in scene.objects
-        if is_owned(obj, kind="CAMERA_OBJECT", dataset_uuid=manifest.dataset_uuid)
-    }
+    object_by_uuid = _objects_for_manifest(scene, manifest)
     if any(entry.camera_uuid not in object_by_uuid for entry in manifest.entries):
         return False
     expected = {
@@ -460,6 +569,11 @@ def detach_projection_markers(scene: Any) -> None:
         return
     runtime = runtime_for_scene(scene)
     candidates = managed_marker_candidates(scene, manifest)
+    object_by_uuid = (
+        {}
+        if manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET
+        else _objects_for_manifest(scene, manifest)
+    )
     snapshots: list[tuple[int, str, int, Any]] = []
     for marker in tuple(scene.timeline_markers):
         if _pointer(marker) not in candidates:
@@ -470,7 +584,11 @@ def detach_projection_markers(scene: Any) -> None:
                 for item in manifest.entries
                 if item.marker_name == str(marker.name)
                 and item.frame == int(marker.frame)
-                and item.camera_uuid == owned_uuid_of(getattr(marker, "camera", None))
+                and (
+                    manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET
+                    or object_by_uuid.get(item.camera_uuid)
+                    is getattr(marker, "camera", None)
+                )
             ),
             None,
         )
@@ -512,11 +630,7 @@ def attach_projection_markers(scene: Any) -> None:
     if manifest is None:
         return
     runtime = runtime_for_scene(scene) or install_camera_runtime(scene, manifest)
-    object_by_uuid = {
-        owned_uuid_of(obj): obj
-        for obj in scene.objects
-        if is_owned(obj, kind="CAMERA_OBJECT", dataset_uuid=manifest.dataset_uuid)
-    }
+    object_by_uuid = _objects_for_manifest(scene, manifest)
     expected_names = {entry.marker_name for entry in manifest.entries}
     target_frames = {entry.frame for entry in manifest.entries}
     exact_pointers = managed_marker_candidates(scene, manifest)
@@ -620,6 +734,9 @@ def clear_camera_runtime(_reason: str = "", _epoch: int = 0) -> None:
     """Undo·Load 경계를 넘지 않도록 모든 직접 RNA Runtime 참조를 폐기합니다."""
 
     _RUNTIMES.clear()
+    registry = lifecycle_registry()
+    registry.unregister_timer(_frame_source_debounce_tick)
+    registry.unregister_timer(_repair_timer)
 
 
 def _runtime_key(scene: Any) -> int:
@@ -648,16 +765,8 @@ def runtime_for_scene(scene: Any) -> CameraRuntime | None:
 def _resolve_runtime(scene: Any, manifest: CameraManifest) -> CameraRuntime:
     """Load·Undo 뒤 UUID와 복합 Marker 조건으로 Runtime을 다시 만듭니다."""
 
-    objects = {
-        owned_uuid_of(obj): obj
-        for obj in scene.objects
-        if is_owned(obj, kind="CAMERA_OBJECT", dataset_uuid=manifest.dataset_uuid)
-    }
-    camera_data = {
-        owned_uuid_of(data): data
-        for data in bpy.data.cameras
-        if is_owned(data, kind="CAMERA_DATA", dataset_uuid=manifest.dataset_uuid)
-    }
+    objects = _objects_for_manifest(scene, manifest)
+    camera_data = _camera_data_for_manifest(scene, manifest)
     marker_index: dict[tuple[str, int, int], list[Any]] = {}
     for marker in scene.timeline_markers:
         key = (
@@ -709,10 +818,11 @@ def install_camera_runtime(scene: Any, manifest: CameraManifest) -> CameraRuntim
     ensure_scene_uuid(scene)
     runtime = _resolve_runtime(scene, manifest)
     _RUNTIMES[_runtime_key(scene)] = runtime
-    apply_camera_frustum_size(
-        scene,
-        dataset_uuid=manifest.dataset_uuid,
-    )
+    if manifest.resource_owner != RESOURCE_OWNER_SHARED_DATASET:
+        apply_camera_frustum_size(
+            scene,
+            dataset_uuid=manifest.dataset_uuid,
+        )
     _ensure_repair_timer()
     return runtime
 
@@ -763,6 +873,8 @@ def collect_dirty_camera_ids(scene: Any, depsgraph: Any) -> None:
     runtime = runtime_for_scene(scene)
     if runtime is None or runtime.repair_depth or runtime.error:
         return
+    if runtime.manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET:
+        return
     for update in depsgraph.updates:
         changed = getattr(update, "id", None)
         if is_owned(
@@ -789,14 +901,55 @@ def collect_dirty_camera_ids(scene: Any, depsgraph: Any) -> None:
         _ensure_repair_timer(first_interval=0.05)
 
 
-def queue_frame_change(scene: Any) -> None:
-    """Frame Handler에서 현재 Frame 검증만 예약하고 Blender 데이터는 쓰지 않습니다."""
+def queue_frame_change(scene: Any, *, changed_at: float | None = None) -> None:
+    """최신 Frame과 입력 시각만 교체하고 trailing-edge Commit을 예약합니다."""
 
     runtime = runtime_for_scene(scene)
-    if runtime is None or runtime.error:
+    if runtime is None:
         return
     runtime.pending_frame = int(scene.frame_current)
-    _ensure_repair_timer(first_interval=0.0)
+    runtime.pending_frame_serial += 1
+    runtime.pending_frame_changed_at = (
+        monotonic() if changed_at is None else float(changed_at)
+    )
+    runtime.pending_frame_retry_count = 0
+    runtime.pending_frame_next_attempt_at = 0.0
+    runtime.pending_frame_error = ""
+    settings = getattr(scene, "projection_paint", None)
+    if settings is not None:
+        settings.status = (
+            f"Camera Image 연결 대기 중: Frame {runtime.pending_frame}"
+        )
+        settings.status_kind = "RUNNING"
+    _ensure_frame_source_debounce_timer()
+
+
+def consume_committed_frame_request(
+    scene: Any,
+    frame: int,
+    image_id: int,
+) -> bool:
+    """명시적 즉시 Source Commit이 같은 Pending Frame을 완료했으면 소비합니다."""
+
+    runtime = runtime_for_scene(scene)
+    if runtime is None or runtime.pending_frame != int(frame):
+        return False
+    entry = runtime.entries_by_frame.get(int(frame))
+    settings = getattr(scene, "projection_paint", None)
+    if (
+        entry is None
+        or int(entry.image_id) != int(image_id)
+        or settings is None
+        or int(settings.active_image_id) != int(image_id)
+    ):
+        return False
+    runtime.pending_frame = None
+    runtime.pending_frame_retry_count = 0
+    runtime.pending_frame_next_attempt_at = 0.0
+    runtime.pending_frame_error = ""
+    if not any(item.pending_frame is not None for item in _RUNTIMES.values()):
+        lifecycle_registry().unregister_timer(_frame_source_debounce_tick)
+    return True
 
 
 def _restore_camera_data(data: Any, expected: CameraDataManifest) -> bool:
@@ -867,6 +1020,14 @@ def _restore_camera_object(runtime: CameraRuntime, owned_uuid: str) -> bool:
 
     entry = runtime.entries_by_camera_uuid.get(owned_uuid)
     if entry is None:
+        return False
+    if runtime.manifest.resource_owner == RESOURCE_OWNER_SHARED_DATASET:
+        obj = runtime.objects.get(owned_uuid)
+        data = runtime.camera_data.get(shared_camera_data_uuid(entry.image_id))
+        if not _pointer(obj) or not _pointer(data) or getattr(obj, "data", None) is not data:
+            runtime.error = (
+                f"공용 Dataset Camera가 변경되었습니다: IMAGE_ID {entry.image_id}"
+            )
         return False
     expected_data = runtime.data_by_camera_id.get(entry.camera_id)
     if expected_data is None:
@@ -997,7 +1158,7 @@ def activate_managed_frame(
     *,
     refresh_source: bool = True,
 ) -> CameraManifestEntry:
-    """관리 Frame의 Marker·Camera·Viewport를 동기 적용하고 Pending 요청을 소비합니다."""
+    """관리 Frame의 Marker·Camera·Viewport를 동기 적용하고 Source 성공 여부를 전파합니다."""
 
     runtime = runtime_for_scene(scene)
     if runtime is None:
@@ -1010,8 +1171,6 @@ def activate_managed_frame(
         raise CameraSceneError(f"Frame {int(frame)}에 관리 Camera가 없습니다.")
     if int(scene.frame_current) != int(frame):
         scene.frame_set(int(frame))
-    if runtime.pending_frame == int(frame):
-        runtime.pending_frame = None
     _restore_camera_object(runtime, entry.camera_uuid)
     camera = runtime.objects.get(entry.camera_uuid)
     if camera is None or not _pointer(camera):
@@ -1030,8 +1189,213 @@ def activate_managed_frame(
     if refresh_source:
         from .paint_runtime import refresh_frame_source
 
-        refresh_frame_source(scene)
+        if not refresh_frame_source(
+            scene,
+            expected_frame=int(frame),
+            expected_image_id=int(entry.image_id),
+        ):
+            raise CameraSceneError(
+                f"Frame {int(frame)} Source Image를 연결하지 못했습니다."
+            )
     return entry
+
+
+def _pending_frame_request_is_current(
+    runtime: CameraRuntime,
+    frame: int,
+    serial: int,
+) -> bool:
+    """Pending Snapshot이 현재 Frame·Serial·Epoch과 모두 일치하는지 확인합니다."""
+
+    return bool(
+        runtime.pending_frame == int(frame)
+        and runtime.pending_frame_serial == int(serial)
+        and int(runtime.scene.frame_current) == int(frame)
+        and lifecycle_registry().token_is_current(
+            runtime.token,
+            runtime.scene,
+            dataset_revision=runtime.manifest.dataset_revision,
+        )
+    )
+
+
+def _validate_committed_frame_source(
+    runtime: CameraRuntime,
+    entry: CameraManifestEntry,
+) -> None:
+    """최종 Camera·Marker·IMAGE_ID·Source Pointer가 같은 Manifest 항목인지 검증합니다."""
+
+    scene = runtime.scene
+    settings = getattr(scene, "projection_paint", None)
+    camera = runtime.objects.get(entry.camera_uuid)
+    marker = runtime.markers.get(entry.image_id)
+    texture = getattr(settings, "stencil_texture", None) if settings is not None else None
+    source = (
+        getattr(settings, "stencil_source_image", None)
+        if settings is not None
+        else None
+    )
+    if camera is None or not _pointer(camera) or scene.camera is not camera:
+        raise CameraSceneError("Frame Commit Camera Pointer가 Manifest와 다릅니다.")
+    if _marker_session_is_active(scene) and (
+        not _pointer(marker)
+        or int(marker.frame) != int(entry.frame)
+        or marker.camera is not camera
+    ):
+        raise CameraSceneError("Frame Commit Marker가 Manifest와 다릅니다.")
+    if settings is None or int(settings.active_image_id) != int(entry.image_id):
+        raise CameraSceneError("Frame Commit IMAGE_ID가 Manifest와 다릅니다.")
+    if source is None or not _pointer(source):
+        raise CameraSceneError("Frame Commit Source Image Pointer가 없습니다.")
+    if texture is None or not _pointer(texture) or texture.image is not source:
+        raise CameraSceneError("Frame Commit Texture와 Source Image Pointer가 다릅니다.")
+    if str(settings.current_image_id or "") != str(entry.image_id):
+        raise CameraSceneError("Frame Commit IMAGE_ID metadata가 Manifest와 다릅니다.")
+    if str(settings.current_image_name or "") != str(entry.image_name):
+        raise CameraSceneError("Frame Commit Image 이름 metadata가 Manifest와 다릅니다.")
+
+
+def _commit_pending_frame_source(
+    runtime: CameraRuntime,
+    frame: int,
+    serial: int,
+) -> CameraManifestEntry:
+    """최신 Pending Snapshot의 Camera와 Source를 연결하고 최종 일치를 검증합니다."""
+
+    if not _pending_frame_request_is_current(runtime, frame, serial):
+        raise CameraSceneError("최신 Frame Source 요청이 변경되었습니다.")
+    entry = activate_managed_frame(
+        runtime.scene,
+        frame,
+        refresh_source=False,
+    )
+    from .paint_runtime import refresh_frame_source
+
+    if not refresh_frame_source(
+        runtime.scene,
+        expected_frame=frame,
+        expected_image_id=entry.image_id,
+        request_is_current=lambda: _pending_frame_request_is_current(
+            runtime,
+            frame,
+            serial,
+        ),
+        commit_validator=lambda: _validate_committed_frame_source(runtime, entry),
+    ):
+        settings = getattr(runtime.scene, "projection_paint", None)
+        detail = str(getattr(settings, "status", "") or "")
+        raise CameraSceneError(detail or "Frame Source Commit에 실패했습니다.")
+    if not _pending_frame_request_is_current(runtime, frame, serial):
+        raise CameraSceneError("Source Commit 후 최신 Frame 요청이 변경되었습니다.")
+    return entry
+
+
+def _record_frame_source_failure(
+    runtime: CameraRuntime,
+    frame: int,
+    serial: int,
+    exc: Exception,
+    now: float,
+) -> float | None:
+    """최신 Source 실패만 제한 횟수로 재시도하고 기존 Source를 유지합니다."""
+
+    if not _pending_frame_request_is_current(runtime, frame, serial):
+        return 0.0 if runtime.pending_frame is not None else None
+    runtime.pending_frame_error = str(exc) or type(exc).__name__
+    settings = getattr(runtime.scene, "projection_paint", None)
+    if runtime.pending_frame_retry_count < MAX_FRAME_SOURCE_RETRIES:
+        runtime.pending_frame_retry_count += 1
+        runtime.pending_frame_next_attempt_at = now + FRAME_SOURCE_RETRY_INTERVAL
+        if settings is not None:
+            settings.status = (
+                f"Frame {frame} Source 연결 재시도 "
+                f"{runtime.pending_frame_retry_count}/{MAX_FRAME_SOURCE_RETRIES}: "
+                f"{runtime.pending_frame_error}"
+            )
+            settings.status_kind = "WARNING"
+        return FRAME_SOURCE_RETRY_INTERVAL
+    runtime.pending_frame_next_attempt_at = 0.0
+    if settings is not None:
+        settings.status = (
+            f"Frame {frame} Source 연결 실패: {runtime.pending_frame_error}"
+        )
+        settings.status_kind = "ERROR"
+    return None
+
+
+def _frame_source_debounce_tick(now: float | None = None) -> float | None:
+    """마지막 Frame 입력 후 0.30초가 지난 최신 요청만 정확히 한 번 Commit합니다."""
+
+    current_time = monotonic() if now is None else float(now)
+    delays: list[float] = []
+    for runtime in tuple(_RUNTIMES.values()):
+        if not lifecycle_registry().token_is_current(
+            runtime.token,
+            runtime.scene,
+            dataset_revision=runtime.manifest.dataset_revision,
+        ):
+            continue
+        if runtime.pending_frame is None:
+            continue
+        current_frame = int(runtime.scene.frame_current)
+        if current_frame != int(runtime.pending_frame):
+            queue_frame_change(runtime.scene, changed_at=current_time)
+            delays.append(FRAME_SOURCE_DEBOUNCE_SECONDS)
+            continue
+        if (
+            runtime.pending_frame_error
+            and runtime.pending_frame_retry_count >= MAX_FRAME_SOURCE_RETRIES
+            and runtime.pending_frame_next_attempt_at <= 0.0
+        ):
+            continue
+        due_at = (
+            runtime.pending_frame_next_attempt_at
+            if runtime.pending_frame_next_attempt_at > 0.0
+            else runtime.pending_frame_changed_at + FRAME_SOURCE_DEBOUNCE_SECONDS
+        )
+        remaining = due_at - current_time
+        if remaining > 0.0:
+            delays.append(remaining)
+            continue
+        frame = int(runtime.pending_frame)
+        serial = int(runtime.pending_frame_serial)
+        runtime.pending_frame_next_attempt_at = 0.0
+        try:
+            entry = _commit_pending_frame_source(runtime, frame, serial)
+        except Exception as exc:
+            delay = _record_frame_source_failure(
+                runtime,
+                frame,
+                serial,
+                exc,
+                current_time,
+            )
+            if delay is not None:
+                delays.append(delay)
+            continue
+        if _pending_frame_request_is_current(runtime, frame, serial):
+            runtime.pending_frame = None
+            runtime.pending_frame_retry_count = 0
+            runtime.pending_frame_next_attempt_at = 0.0
+            runtime.pending_frame_error = ""
+            settings = getattr(runtime.scene, "projection_paint", None)
+            if settings is not None:
+                settings.status = (
+                    f"Camera Image 연결 완료: IMAGE_ID {entry.image_id}"
+                )
+                settings.status_kind = "SUCCESS"
+    return max(0.0, min(delays)) if delays else None
+
+
+def _ensure_frame_source_debounce_timer() -> None:
+    """Pending Frame이 있을 때만 단일 trailing-edge Timer를 등록합니다."""
+
+    lifecycle_registry().register_timer(
+        _frame_source_debounce_tick,
+        component="camera_frame_source_debounce",
+        first_interval=0.0,
+        persistent_timer=False,
+    )
 
 
 def _repair_runtime(runtime: CameraRuntime, deadline: float) -> None:
@@ -1042,14 +1406,6 @@ def _repair_runtime(runtime: CameraRuntime, deadline: float) -> None:
     runtime.repair_depth += 1
     wrote = False
     try:
-        if runtime.pending_frame is not None:
-            frame = runtime.pending_frame
-            entry = runtime.entries_by_frame.get(frame)
-            if entry is not None:
-                activate_managed_frame(runtime.scene, frame)
-                wrote = True
-            else:
-                runtime.pending_frame = None
         while runtime.dirty_objects and perf_counter() < deadline:
             owned_uuid = runtime.dirty_objects.popleft()
             runtime.queued.discard(("OBJECT", owned_uuid))

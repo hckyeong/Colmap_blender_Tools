@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import bpy
 from bpy.app.handlers import persistent
 
@@ -35,22 +33,7 @@ from .undo_domain_coordinator import (
 
 _PENDING_RESTORE_SCHEDULED = False
 _LOAD_RESTORE_GENERATION = 0
-_LOAD_RESTORE_SCHEDULED = False
 _VISIBILITY_SYNC_SCHEDULED = False
-
-
-@dataclass(frozen=True)
-class _PendingLoadRestore:
-    """연속 파일 로드에서 최신 Scene만 복원하기 위한 저장 token입니다."""
-
-    generation: int
-    filepath: str
-    scene_pointer: int
-    dataset_uuid: str
-    model_directory: str
-
-
-_PENDING_LOAD_RESTORE: _PendingLoadRestore | None = None
 
 
 def _synchronize_visibility_after_state_change() -> None:
@@ -162,8 +145,11 @@ def invalidate_transient_state(
 
 @persistent
 def reconcile_after_undo_redo(*_args) -> None:
-    """Undo가 복원한 Scene을 다음 Tick에서 새 Runtime으로 재생성합니다."""
+    """활성 Modifier Workspace에서만 Undo 결과를 즉시 재생성합니다."""
 
+    window = getattr(bpy.context, "window", None)
+    if SESSION.phase != SESSION_ACTIVE or not is_session_active_for_window(window):
+        return
     snapshot = current_undo_protection_snapshot()
     schedule_undo_domain_reconcile(snapshot)
     _schedule_visibility_synchronization()
@@ -180,148 +166,23 @@ def invalidate_loaded_state(*_args) -> None:
     _PENDING_RESTORE_SCHEDULED = False
     invalidate_transient_state(schedule_pending_restore=False)
     _schedule_visibility_synchronization()
-    _schedule_load_restore()
-
-
-def _load_restore_jobs_running() -> bool:
-    """로드 복원이 다른 장기 작업의 Blender 상태와 겹치는지 확인합니다."""
-
-    from .export_progress_session import active_export_progress_session
-    from .import_progress_session import active_import_progress_session
-
-    return bool(
-        active_import_progress_session() is not None
-        or active_export_progress_session() is not None
-    )
-
-
-def _pending_load_restore_is_current(
-    pending: _PendingLoadRestore,
-    scene,
-    settings,
-) -> bool:
-    """Timer가 예약된 파일과 현재 활성 Scene을 다시 검증합니다."""
-
-    try:
-        return bool(
-            pending.generation == _LOAD_RESTORE_GENERATION
-            and str(bpy.data.filepath or "") == pending.filepath
-            and scene.as_pointer() == pending.scene_pointer
-            and settings.dataset_uuid == pending.dataset_uuid
-            and settings.active_model_directory == pending.model_directory
-        )
-    except (AttributeError, ReferenceError, RuntimeError):
-        return False
 
 
 def process_pending_load_restore():
-    """로드 다음 Tick에서 저장 Camera Review와 Timeline Runtime을 재결합합니다."""
+    """구버전 호출 호환을 유지하되 파일 로드 Runtime 복원은 수행하지 않습니다."""
 
-    global _LOAD_RESTORE_SCHEDULED
-    global _PENDING_LOAD_RESTORE
-
-    pending = _PENDING_LOAD_RESTORE
-    if pending is None:
-        _LOAD_RESTORE_SCHEDULED = False
-        return None
-    context = bpy.context
-    scene = getattr(context, "scene", None)
-    settings = getattr(scene, "colmap_import", None)
-    if (
-        scene is None
-        or settings is None
-        or not _pending_load_restore_is_current(pending, scene, settings)
-    ):
-        if pending is _PENDING_LOAD_RESTORE:
-            _PENDING_LOAD_RESTORE = None
-            _LOAD_RESTORE_SCHEDULED = False
-        return None
-    if _load_restore_jobs_running():
-        return 0.1
-
-    _PENDING_LOAD_RESTORE = None
-    _LOAD_RESTORE_SCHEDULED = False
-    if not settings.dataset_uuid or not settings.active_model_directory:
-        return None
-
-    try:
-        from .camera_review_session import (
-            ensure_review_session,
-            update_review_background_from_settings,
-        )
-        from .camera_review_timeline import (
-            attach_review_timeline_markers,
-            detach_review_timeline_markers,
-            modifier_marker_session_owned,
-        )
-        from .runtime_state import ensure_runtime
-
-        state = ensure_runtime(scene)
-        session = ensure_review_session(context, state=state)
-        restore_pending_filters(context, state=state, session=session)
-        if settings.review_pending_filter_status == PENDING_STATUS_STALE:
-            return None
-
-        marker_session_active = bool(
-            SESSION.phase == SESSION_ACTIVE
-            and is_session_active_for_window(getattr(context, "window", None))
-            and modifier_marker_session_owned(scene)
-        )
-        marker_count = (
-            attach_review_timeline_markers(session)
-            if marker_session_active
-            else 0
-        )
-        if not marker_session_active:
-            detach_review_timeline_markers(session)
-
-        update_review_background_from_settings(settings, context)
-        if marker_count:
-            settings.review_status = (
-                f"저장된 Camera Review Timeline {marker_count}개를 "
-                f"복원했습니다. 현재 IMAGE_ID {session.current_image_id}."
-            )
-        else:
-            settings.review_status = (
-                "저장된 Camera Review를 복원했습니다. "
-                "비활성 Modifier의 Timeline Marker는 분리된 상태입니다."
-            )
-    except Exception as exc:
-        settings.review_status = (
-            "저장된 COLMAP Camera Review를 복원하지 못했습니다: "
-            f"{exc}. source와 Timeline을 확인한 뒤 "
-            "Build / Refresh Timeline을 실행하십시오."
-        )
     return None
 
 
 def _schedule_load_restore() -> None:
-    """현재 로드 generation의 복원 Timer를 정확히 하나 예약합니다."""
+    """구버전 호출 호환을 위해 generation만 폐기하고 복원 Timer는 만들지 않습니다."""
 
     global _LOAD_RESTORE_GENERATION
-    global _LOAD_RESTORE_SCHEDULED
-    global _PENDING_LOAD_RESTORE
 
     _LOAD_RESTORE_GENERATION += 1
-    scene = getattr(bpy.context, "scene", None)
-    settings = getattr(scene, "colmap_import", None)
-    if scene is None or settings is None:
-        _PENDING_LOAD_RESTORE = None
-        _LOAD_RESTORE_SCHEDULED = False
-        return
-    _PENDING_LOAD_RESTORE = _PendingLoadRestore(
-        generation=_LOAD_RESTORE_GENERATION,
-        filepath=str(bpy.data.filepath or ""),
-        scene_pointer=scene.as_pointer(),
-        dataset_uuid=str(settings.dataset_uuid or ""),
-        model_directory=str(settings.active_model_directory or ""),
-    )
-    _LOAD_RESTORE_SCHEDULED = True
     if not bpy.app.timers.is_registered(process_pending_load_restore):
-        bpy.app.timers.register(
-            process_pending_load_restore,
-            first_interval=0.0,
-        )
+        return
+    bpy.app.timers.unregister(process_pending_load_restore)
 
 
 def register_state_handlers() -> None:
@@ -349,8 +210,6 @@ def unregister_state_handlers() -> None:
 
     global _PENDING_RESTORE_SCHEDULED
     global _LOAD_RESTORE_GENERATION
-    global _LOAD_RESTORE_SCHEDULED
-    global _PENDING_LOAD_RESTORE
     global _VISIBILITY_SYNC_SCHEDULED
     if invalidate_loaded_state in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(invalidate_loaded_state)
@@ -374,7 +233,5 @@ def unregister_state_handlers() -> None:
         bpy.app.timers.unregister(_synchronize_visibility_after_state_change)
     _PENDING_RESTORE_SCHEDULED = False
     _LOAD_RESTORE_GENERATION += 1
-    _LOAD_RESTORE_SCHEDULED = False
-    _PENDING_LOAD_RESTORE = None
     _VISIBILITY_SYNC_SCHEDULED = False
     clear_undo_domain_state()

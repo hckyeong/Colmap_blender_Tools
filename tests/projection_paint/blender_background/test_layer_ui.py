@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import bpy
 
@@ -23,9 +23,14 @@ from tools.projection_paint.blender.composite_layer import (  # noqa: E402
     composite_source_partition,
 )
 from tools.projection_paint.blender.layers import (  # noqa: E402
+    PP_OT_composite_layer_release,
+    PP_OT_block_multiselect_paint_stroke,
     PP_OT_layer_adjustment_remove_hovered,
     PP_OT_layer_select,
+    PP_OT_layer_preview_toggle,
+    PP_OT_mask_preview_toggle,
     _finalize_pending_layer_ui_selection_clear,
+    _layer_ui_double_click_candidates,
     _layer_ui_pointer_events,
     _layer_ui_pointer_releases,
     _layer_ui_tracked_windows,
@@ -33,11 +38,13 @@ from tools.projection_paint.blender.layers import (  # noqa: E402
     _record_layer_ui_pointer_event,
     _restore_layer_ui_pointer_selection,
     active_layer_tree_item,
+    active_layer_tree_item_key,
     adjustment_mask_row_selected,
     adjustment_row_selected,
     layer_mask_row_selected,
     layer_preview_active,
     layer_row_selected,
+    layer_tree_selection_count,
     mask_preview_active,
 )
 from tools.projection_paint.blender.layer_shader import (  # noqa: E402
@@ -45,16 +52,18 @@ from tools.projection_paint.blender.layer_shader import (  # noqa: E402
 )
 from tools.projection_paint.blender.panels import (  # noqa: E402
     PP_PT_layers,
+    PP_PT_status,
     _draw_composite_source_rows,
+    _draw_paint_setup,
     _layer_panel_adjustment_mask_indent,
     _layer_panel_child_indent,
     _layer_panel_display_layers,
-    _layer_button_text,
     _panel_warning_lines,
     _preview_check_icon,
     _layer_panel_source_insertions,
     _layer_panel_source_rows,
     _source_child_status_icon,
+    _stencil_status_text,
 )
 from tools.projection_paint.blender.ui_messages import (  # noqa: E402
     CONFIRM_DIALOG_WIDTH,
@@ -82,10 +91,10 @@ class LayerUITests(unittest.TestCase):
     def setUp(self) -> None:
         """각 테스트를 빈 Factory Scene과 빈 Layer 목록으로 시작합니다."""
         bpy.ops.wm.read_factory_settings(use_empty=True)
-        layers_module._layer_ui_click_history.clear()
         _layer_ui_pointer_events.clear()
         _layer_ui_pointer_releases.clear()
         _layer_ui_tracked_windows.clear()
+        _layer_ui_double_click_candidates.clear()
 
     def test_add_creates_named_layers_with_unique_uuids(self) -> None:
         """더하기 버튼이 연속 이름과 고유 UUID를 가진 Layer를 추가합니다."""
@@ -171,6 +180,14 @@ class LayerUITests(unittest.TestCase):
         self.assertEqual(operator._wrapped_confirm_lines, lines)
         self.assertEqual(operator._wrapped_confirm_icon, "ERROR")
 
+    def test_release_confirmation_describes_direct_edit_and_normal_layer_preservation(self) -> None:
+        """해제 확인창은 Composite 결과 삭제와 독립 일반 Layer 보존·재합성 소비를 구분합니다."""
+        source = inspect.getsource(PP_OT_composite_layer_release.invoke)
+        self.assertIn("Paint·Clone·Mask·Adjustment", source)
+        self.assertIn("별도로 추가한 일반 Layer는 유지", source)
+        self.assertIn("재합성 Source로 선택하면", source)
+        self.assertNotIn("의존 형제 Layer 삭제", source)
+
     def test_alpha_warning_wraps_into_scrollable_panel_rows(self) -> None:
         """긴 Alpha 경고는 말줄임표 대신 패널 세로 스크롤에 포함될 여러 행이 됩니다."""
         message = "Alpha를 제외하면 빈 영역이 불투명한 색상으로 합쳐질 수 있습니다."
@@ -181,6 +198,29 @@ class LayerUITests(unittest.TestCase):
         self.assertTrue(all(ui_text_columns(line) <= 37 for line in lines))
         draw_source = inspect.getsource(PP_PT_layers.draw)
         self.assertIn("_draw_panel_warning(composite_options, alpha_warning)", draw_source)
+
+    def test_stencil_status_uses_one_top_status_row_without_setup_duplicate(self) -> None:
+        """Stencil 상태는 최상단 Status 한 행에만 압축하고 Paint Setup에서 반복하지 않습니다."""
+
+        connection = SimpleNamespace(
+            state="BRUSH_CHANGED",
+            reason=(
+                "다른 Brush가 활성 상태입니다. 연결한 Draw Brush로 돌아가면 "
+                "Stencil이 유지됩니다."
+            ),
+        )
+        status_text = _stencil_status_text(connection)
+
+        self.assertEqual(
+            status_text,
+            "Stencil: BRUSH_CHANGED · 다른 Brush 활성",
+        )
+        self.assertNotIn("\n", status_text)
+        status_source = inspect.getsource(PP_PT_status.draw)
+        setup_source = inspect.getsource(_draw_paint_setup)
+        self.assertIn("_stencil_status_text(connection)", status_source)
+        self.assertNotIn("resolve_stencil_connection", setup_source)
+        self.assertNotIn('text=f"Stencil:', setup_source)
 
     def test_confirmation_warning_icons_use_blender_52_enum(self) -> None:
         """공용 확인창은 Blender 5.2에서 유효한 상태 경고 아이콘만 사용합니다."""
@@ -295,7 +335,7 @@ class LayerUITests(unittest.TestCase):
         self.assertEqual(settings.layers[0].name, "Renamed Layer")
 
     def test_parent_and_child_selection_are_mutually_exclusive(self) -> None:
-        """활성 Paint Layer 변경은 Composite 후보 선택과 독립임을 검증합니다."""
+        """일반 클릭이 부모와 자식 중 한 행만 선택하고 즉시 활성화하는지 검증합니다."""
         settings = bpy.context.scene.projection_paint
         bpy.ops.projection_paint.layer_add()
         layer = settings.layers[0]
@@ -308,9 +348,192 @@ class LayerUITests(unittest.TestCase):
             ),
             {"FINISHED"},
         )
-        self.assertFalse(layer_row_selected(settings, 0))
+        self.assertTrue(layer_row_selected(settings, 0))
         self.assertFalse(layer_mask_row_selected(settings, 0))
         self.assertEqual(layer.active_adjustment_index, -1)
+
+    def test_all_tree_rows_support_single_ctrl_and_shift_selection(self) -> None:
+        """Layer·Mask·Adjustment 전체가 일반 단일 선택과 Ctrl·Shift 복수 선택을 공유합니다."""
+        settings = bpy.context.scene.projection_paint
+        self.assertEqual(bpy.ops.projection_paint.layer_add(), {"FINISHED"})
+        layer = settings.layers[0]
+        self.assertEqual(
+            bpy.ops.projection_paint.layer_mask_add(layer_uuid=layer.layer_uuid),
+            {"FINISHED"},
+        )
+        self.assertEqual(
+            bpy.ops.projection_paint.layer_adjustment_add(
+                layer_uuid=layer.layer_uuid,
+                adjustment_type="BRIGHTNESS",
+            ),
+            {"FINISHED"},
+        )
+        adjustment = layer.adjustments[0]
+        self.assertEqual(
+            bpy.ops.projection_paint.adjustment_mask_add(
+                layer_uuid=layer.layer_uuid,
+                adjustment_uuid=adjustment.adjustment_uuid,
+            ),
+            {"FINISHED"},
+        )
+
+        def invoke(operator_type, **properties):
+            """지정 트리 Operator의 실제 modifier 선택 경로를 호출합니다."""
+            ctrl = bool(properties.pop("ctrl", False))
+            shift = bool(properties.pop("shift", False))
+            operator = SimpleNamespace(
+                **properties,
+                report=lambda _types, _message: None,
+            )
+            return operator_type.invoke(
+                operator,
+                bpy.context,
+                SimpleNamespace(value="CLICK", ctrl=ctrl, shift=shift),
+            )
+
+        self.assertEqual(
+            invoke(
+                PP_OT_layer_select,
+                layer_uuid=str(layer.layer_uuid),
+            ),
+            {"FINISHED"},
+        )
+        self.assertEqual(layer_tree_selection_count(settings), 1)
+        self.assertTrue(layer_row_selected(settings, 0))
+
+        self.assertEqual(
+            invoke(
+                layers_module.PP_OT_layer_mask_select,
+                layer_uuid=str(layer.layer_uuid),
+                mask_uuid=str(layer.mask.mask_uuid),
+                ctrl=True,
+            ),
+            {"FINISHED"},
+        )
+        self.assertEqual(layer_tree_selection_count(settings), 2)
+        self.assertTrue(layer_row_selected(settings, 0))
+        self.assertTrue(layer_mask_row_selected(settings, 0))
+
+        self.assertEqual(
+            invoke(
+                layers_module.PP_OT_layer_adjustment_select,
+                layer_uuid=str(layer.layer_uuid),
+                adjustment_uuid=str(adjustment.adjustment_uuid),
+                ctrl=True,
+            ),
+            {"FINISHED"},
+        )
+        self.assertEqual(layer_tree_selection_count(settings), 3)
+        self.assertTrue(adjustment_row_selected(settings, 0, 0))
+        self.assertEqual(active_layer_tree_item(settings)[0], "ADJUSTMENT_MASK")
+
+        self.assertEqual(
+            invoke(
+                layers_module.PP_OT_layer_mask_select,
+                layer_uuid=str(layer.layer_uuid),
+                mask_uuid=str(layer.mask.mask_uuid),
+            ),
+            {"FINISHED"},
+        )
+        self.assertEqual(
+            invoke(
+                layers_module.PP_OT_adjustment_mask_select,
+                layer_uuid=str(layer.layer_uuid),
+                adjustment_uuid=str(adjustment.adjustment_uuid),
+                mask_uuid=str(adjustment.mask.mask_uuid),
+                shift=True,
+            ),
+            {"FINISHED"},
+        )
+        self.assertEqual(layer_tree_selection_count(settings), 3)
+        self.assertFalse(layer_row_selected(settings, 0))
+        self.assertTrue(layer_mask_row_selected(settings, 0))
+        self.assertTrue(adjustment_row_selected(settings, 0, 0))
+        self.assertTrue(adjustment_mask_row_selected(settings, 0, 0))
+        self.assertEqual(active_layer_tree_item(settings)[0], "ADJUSTMENT_MASK")
+
+        self.assertEqual(
+            invoke(
+                layers_module.PP_OT_layer_adjustment_select,
+                layer_uuid=str(layer.layer_uuid),
+                adjustment_uuid=str(adjustment.adjustment_uuid),
+            ),
+            {"FINISHED"},
+        )
+        self.assertEqual(layer_tree_selection_count(settings), 1)
+        self.assertTrue(adjustment_row_selected(settings, 0, 0))
+        self.assertFalse(layer_mask_row_selected(settings, 0))
+        self.assertFalse(adjustment_mask_row_selected(settings, 0, 0))
+
+    def test_multiselect_stroke_blocker_only_consumes_active_paint_input(self) -> None:
+        """복수 선택의 활성 Paint Viewport 입력만 소비하고 명확한 경고를 남깁니다."""
+        workspace = object()
+        target = SimpleNamespace(mode="TEXTURE_PAINT")
+        settings = SimpleNamespace(
+            paint_enabled=True,
+            paint_workspace=workspace,
+            paint_target=target,
+            status="",
+            status_kind="INFO",
+        )
+        context = SimpleNamespace(
+            scene=SimpleNamespace(projection_paint=settings),
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="WINDOW"),
+            window=SimpleNamespace(workspace=workspace),
+            view_layer=SimpleNamespace(objects=SimpleNamespace(active=target)),
+        )
+        with patch.object(layers_module, "layer_tree_selection_count", return_value=2):
+            self.assertTrue(PP_OT_block_multiselect_paint_stroke.poll(context))
+            reports = []
+            operator = SimpleNamespace(report=lambda kinds, message: reports.append((kinds, message)))
+            self.assertEqual(
+                PP_OT_block_multiselect_paint_stroke.execute(operator, context),
+                {"FINISHED"},
+            )
+            invoke_execute = Mock(return_value={"FINISHED"})
+            blocker = SimpleNamespace(execute=invoke_execute)
+            clone_source = SimpleNamespace(
+                type="LEFTMOUSE", ctrl=True, shift=False, alt=False
+            )
+            paint_stroke = SimpleNamespace(
+                type="LEFTMOUSE", ctrl=False, shift=False, alt=False
+            )
+            industry_orbit = SimpleNamespace(
+                type="LEFTMOUSE", ctrl=False, shift=False, alt=True
+            )
+            with patch(
+                "tools.projection_paint.blender.paint_tool_bridge.active_tool_id",
+                return_value="builtin_brush.clone",
+            ):
+                self.assertEqual(
+                    PP_OT_block_multiselect_paint_stroke.invoke(
+                        blocker, context, clone_source
+                    ),
+                    {"PASS_THROUGH"},
+                )
+            with patch(
+                "tools.projection_paint.blender.paint_tool_bridge.active_tool_id",
+                return_value="builtin.brush",
+            ):
+                self.assertEqual(
+                    PP_OT_block_multiselect_paint_stroke.invoke(
+                        blocker, context, industry_orbit
+                    ),
+                    {"PASS_THROUGH"},
+                )
+                self.assertEqual(
+                    PP_OT_block_multiselect_paint_stroke.invoke(
+                        blocker, context, paint_stroke
+                    ),
+                    {"FINISHED"},
+                )
+                invoke_execute.assert_called_once_with(context)
+            settings.paint_enabled = False
+            self.assertFalse(PP_OT_block_multiselect_paint_stroke.poll(context))
+        self.assertEqual(settings.status_kind, "WARNING")
+        self.assertIn("복수 레이어 선택", settings.status)
+        self.assertEqual(len(reports), 1)
 
     def test_click_selection_matrix_and_composite_snapshot(self) -> None:
         """일반·Ctrl·Shift 선택 행렬과 Composite Snapshot이 ui_selected만 읽는지 검증합니다."""
@@ -602,11 +825,6 @@ class LayerUITests(unittest.TestCase):
         settings.layers[0].ui_selected = True
         settings.layers[2].ui_selected = True
         settings.layer_selection_anchor_uuid = str(settings.layers[2].layer_uuid)
-        history_key = layers_module._layer_ui_click_history_key(bpy.context.scene)
-        layers_module._layer_ui_click_history[history_key] = (
-            str(settings.layers[2].layer_uuid),
-            1.0,
-        )
 
         _record_layer_ui_pointer_event(
             bpy.context.window,
@@ -629,7 +847,6 @@ class LayerUITests(unittest.TestCase):
             settings.layer_selection_anchor_uuid,
             str(settings.layers[2].layer_uuid),
         )
-        self.assertIn(history_key, layers_module._layer_ui_click_history)
         event.value = "RELEASE"
         event.mouse_x += 4
         event.mouse_y -= 4
@@ -645,7 +862,6 @@ class LayerUITests(unittest.TestCase):
             (False, False, False),
         )
         self.assertEqual(settings.layer_selection_anchor_uuid, "")
-        self.assertNotIn(history_key, layers_module._layer_ui_click_history)
 
     def test_unconfirmed_pointer_timeout_discards_input_without_deselecting(self) -> None:
         """좌표가 크게 달라 RELEASE가 미확정이면 만료 후에도 후보를 유지합니다."""
@@ -659,9 +875,6 @@ class LayerUITests(unittest.TestCase):
         settings.layers[0].ui_selected = True
         settings.layers[2].ui_selected = True
         settings.layer_selection_anchor_uuid = selected_uuids[-1]
-        history_key = layers_module._layer_ui_click_history_key(bpy.context.scene)
-        expected_click_history = (selected_uuids[-1], 1.0)
-        layers_module._layer_ui_click_history[history_key] = expected_click_history
 
         event = SimpleNamespace(
             type="LEFTMOUSE",
@@ -699,10 +912,6 @@ class LayerUITests(unittest.TestCase):
             selected_uuids,
         )
         self.assertEqual(settings.layer_selection_anchor_uuid, selected_uuids[-1])
-        self.assertEqual(
-            layers_module._layer_ui_click_history.get(history_key),
-            expected_click_history,
-        )
         self.assertFalse(_layer_ui_pointer_events)
 
     def test_layer_related_button_can_restore_pointer_candidate_snapshot(self) -> None:
@@ -717,9 +926,6 @@ class LayerUITests(unittest.TestCase):
         settings.layers[0].ui_selected = True
         settings.layers[2].ui_selected = True
         settings.layer_selection_anchor_uuid = selected_uuids[-1]
-        history_key = layers_module._layer_ui_click_history_key(bpy.context.scene)
-        expected_click_history = (selected_uuids[-1], 1.0)
-        layers_module._layer_ui_click_history[history_key] = expected_click_history
         event = SimpleNamespace(
             type="LEFTMOUSE",
             value="PRESS",
@@ -745,14 +951,10 @@ class LayerUITests(unittest.TestCase):
             selected_uuids,
         )
         self.assertEqual(settings.layer_selection_anchor_uuid, selected_uuids[-1])
-        self.assertEqual(
-            layers_module._layer_ui_click_history.get(history_key),
-            expected_click_history,
-        )
         self.assertFalse(_layer_ui_pointer_events)
 
-    def test_double_click_activates_paint_image_without_reselecting_candidate(self) -> None:
-        """더블클릭은 활성 Image만 바꾸고 첫 일반 클릭의 후보 선택을 유지하는지 검증합니다."""
+    def test_single_click_selects_and_second_click_activates_layer(self) -> None:
+        """첫 클릭은 선택만 하고 허용 시간 안의 같은 두 번째 클릭만 활성화합니다."""
         from tools.projection_paint.blender.layer_shader import (
             add_layer_transaction,
         )
@@ -812,9 +1014,12 @@ class LayerUITests(unittest.TestCase):
                 SimpleNamespace(value=value, ctrl=False, shift=False),
             )
 
+        first_index = int(settings.active_layer_index)
+        first_image = settings.active_paint_image
         self.assertEqual(invoke_layer_click("RELEASE"), {"FINISHED"})
         self.assertTrue(target_layer.ui_selected)
-        self.assertIs(settings.active_paint_image, first_layer.image)
+        self.assertEqual(settings.active_layer_index, first_index)
+        self.assertIs(settings.active_paint_image, first_image)
         self.assertEqual(invoke_layer_click("RELEASE"), {"FINISHED"})
         self.assertIs(settings.active_paint_image, target_layer.image)
         self.assertEqual(settings.active_layer_index, 0)
@@ -828,9 +1033,94 @@ class LayerUITests(unittest.TestCase):
         settings.active_paint_image = first_layer.image
         settings.overlay_image = first_layer.image
         target_layer.ui_selected = False
+        _layer_ui_double_click_candidates.clear()
+        self.assertEqual(invoke_layer_click("DOUBLE_CLICK"), {"FINISHED"})
+        self.assertIs(settings.active_paint_image, first_layer.image)
+        self.assertTrue(target_layer.ui_selected)
         self.assertEqual(invoke_layer_click("DOUBLE_CLICK"), {"FINISHED"})
         self.assertIs(settings.active_paint_image, target_layer.image)
-        self.assertFalse(target_layer.ui_selected)
+
+    def test_all_four_tree_item_kinds_require_same_unmodified_second_click(self) -> None:
+        """Layer·두 Mask·Adjustment가 모두 첫 선택과 두 번째 활성화를 분리합니다."""
+
+        settings = bpy.context.scene.projection_paint
+        bpy.ops.projection_paint.layer_add()
+        layer = settings.layers[0]
+        bpy.ops.projection_paint.layer_mask_add(layer_uuid=layer.layer_uuid)
+        bpy.ops.projection_paint.layer_adjustment_add(
+            layer_uuid=layer.layer_uuid,
+            adjustment_type="BRIGHTNESS",
+        )
+        adjustment = layer.adjustments[0]
+        bpy.ops.projection_paint.adjustment_mask_add(
+            layer_uuid=layer.layer_uuid,
+            adjustment_uuid=adjustment.adjustment_uuid,
+        )
+
+        cases = (
+            (
+                PP_OT_layer_select,
+                {"layer_uuid": str(layer.layer_uuid)},
+                str(layer.layer_uuid),
+            ),
+            (
+                layers_module.PP_OT_layer_mask_select,
+                {
+                    "layer_uuid": str(layer.layer_uuid),
+                    "mask_uuid": str(layer.mask.mask_uuid),
+                },
+                f"LAYER_MASK:{layer.mask.mask_uuid}",
+            ),
+            (
+                layers_module.PP_OT_layer_adjustment_select,
+                {
+                    "layer_uuid": str(layer.layer_uuid),
+                    "adjustment_uuid": str(adjustment.adjustment_uuid),
+                },
+                f"ADJUSTMENT:{adjustment.adjustment_uuid}",
+            ),
+            (
+                layers_module.PP_OT_adjustment_mask_select,
+                {
+                    "layer_uuid": str(layer.layer_uuid),
+                    "adjustment_uuid": str(adjustment.adjustment_uuid),
+                    "mask_uuid": str(adjustment.mask.mask_uuid),
+                },
+                f"ADJUSTMENT_MASK:{adjustment.mask.mask_uuid}",
+            ),
+        )
+
+        for operator_type, properties, expected_key in cases:
+            bpy.ops.projection_paint.layer_select(layer_uuid=layer.layer_uuid)
+            baseline_key = active_layer_tree_item_key(settings)
+            _layer_ui_double_click_candidates.clear()
+            operator = SimpleNamespace(
+                **properties,
+                report=lambda _types, _message: None,
+            )
+            event = SimpleNamespace(value="RELEASE", ctrl=False, shift=False)
+            self.assertEqual(
+                operator_type.invoke(operator, bpy.context, event),
+                {"FINISHED"},
+            )
+            self.assertEqual(active_layer_tree_item_key(settings), baseline_key)
+            self.assertEqual(
+                operator_type.invoke(operator, bpy.context, event),
+                {"FINISHED"},
+            )
+            self.assertEqual(active_layer_tree_item_key(settings), expected_key)
+
+        bpy.ops.projection_paint.layer_select(layer_uuid=layer.layer_uuid)
+        baseline_key = active_layer_tree_item_key(settings)
+        _layer_ui_double_click_candidates.clear()
+        operator = SimpleNamespace(
+            layer_uuid=str(layer.layer_uuid),
+            report=lambda _types, _message: None,
+        )
+        ctrl_event = SimpleNamespace(value="RELEASE", ctrl=True, shift=False)
+        self.assertEqual(PP_OT_layer_select.invoke(operator, bpy.context, ctrl_event), {"FINISHED"})
+        self.assertEqual(PP_OT_layer_select.invoke(operator, bpy.context, ctrl_event), {"FINISHED"})
+        self.assertEqual(active_layer_tree_item_key(settings), baseline_key)
 
     def test_mask_preview_highlight_is_exclusive(self) -> None:
         """저장된 단일 UUID와 일치하는 Mask만 미리보기 활성 상태가 됩니다."""
@@ -871,25 +1161,15 @@ class LayerUITests(unittest.TestCase):
         self.assertFalse(first.composite_source_expanded)
         self.assertTrue(second.composite_source_expanded)
 
-    def test_composite_ui_keeps_dependent_siblings_at_top_level(self) -> None:
-        """부분 Source만 숨기고 구형 파생 항목도 최상위 형제로 표시합니다."""
+    def test_composite_ui_keeps_independent_normal_layers_editable_at_top_level(self) -> None:
+        """활성 Composite의 독립 NORMAL은 최상위 편집 가능하고 원본 Source만 잠급니다."""
         composite = SimpleNamespace(
             name="Composite Layer",
             layer_role="COMPOSITE",
             composite_session_uuid="session-a",
         )
-        derived = SimpleNamespace(
-            name="Layer 4",
-            layer_role="COMPOSITE_DERIVED",
-            composite_session_uuid="session-a",
-        )
-        unrelated_derived = SimpleNamespace(
-            name="Unrelated Derived",
-            layer_role="COMPOSITE_DERIVED",
-            composite_session_uuid="session-b",
-        )
         external = SimpleNamespace(
-            name="Layer 5",
+            name="Layer 4",
             layer_role="NORMAL",
             composite_session_uuid="",
             composite_source_session_uuid="",
@@ -904,7 +1184,7 @@ class LayerUITests(unittest.TestCase):
             composite_state="ACTIVE",
             active_composite_session_uuid="session-a",
             composite_source_schema_version=1,
-            layers=(derived, external, source, composite, unrelated_derived),
+            layers=(external, source, composite),
         )
 
         display_layers = _layer_panel_display_layers(settings)
@@ -913,33 +1193,29 @@ class LayerUITests(unittest.TestCase):
             [(layer.name, composite_child) for _index, layer, composite_child in display_layers],
             [
                 ("Layer 4", False),
-                ("Layer 5", False),
                 ("Composite Layer", False),
-                ("Unrelated Derived", False),
             ],
         )
-        self.assertFalse(composite_layer_is_editable(settings, derived))
         self.assertFalse(composite_layer_is_editable(settings, source))
         self.assertTrue(composite_layer_is_editable(settings, external))
+        self.assertTrue(composite_layer_is_editable(settings, composite))
         self.assertEqual(
             [
                 (display_index, item.name)
                 for display_index, item in _layer_panel_source_insertions(display_layers)
             ],
-            [(2, "Composite Layer")],
+            [(1, "Composite Layer")],
         )
 
     def test_composite_children_share_source_depth_and_adjustment_mask_nests(self) -> None:
         """Composite의 Mask·Adjustment는 Source와 같은 깊이이며 Mask는 한 단계 더 들어갑니다."""
         composite = SimpleNamespace(layer_role="COMPOSITE")
-        derived = SimpleNamespace(layer_role="COMPOSITE_DERIVED")
         normal = SimpleNamespace(layer_role="NORMAL")
 
         self.assertEqual(_layer_panel_child_indent(composite), 0.12)
-        self.assertEqual(_layer_panel_child_indent(derived), 0.22)
         self.assertEqual(_layer_panel_child_indent(normal), 0.22)
         self.assertEqual(_layer_panel_adjustment_mask_indent(composite), 0.22)
-        self.assertEqual(_layer_panel_adjustment_mask_indent(derived), 0.34)
+        self.assertEqual(_layer_panel_adjustment_mask_indent(normal), 0.34)
 
     def test_composite_source_rows_are_always_last_and_nested(self) -> None:
         """Source 가상 행은 부분 Source를 순서대로 최하단 깊이에 표시합니다."""
@@ -1012,13 +1288,31 @@ class LayerUITests(unittest.TestCase):
         self.assertEqual(_preview_check_icon(True), "CHECKMARK")
         self.assertEqual(_preview_check_icon(False), "BLANK1")
 
-    def test_active_layer_check_uses_button_text_without_separate_icon_column(self) -> None:
-        """활성 Layer 체크는 이름 버튼 안에만 표시하고 별도 열을 만들지 않는지 검증합니다."""
-        self.assertEqual(_layer_button_text("Layer 1", True), "Layer 1  ✓")
-        self.assertEqual(_layer_button_text("Layer 1", False), "Layer 1")
+    def test_preview_tooltips_distinguish_layer_and_mask_solo_outputs(self) -> None:
+        """Layer 개인 보기와 Mask 흑백 보기의 Tooltip 의미를 구분합니다."""
+        self.assertIn("선택 Layer만 Mask·보정", PP_OT_layer_preview_toggle.bl_description)
+        self.assertIn("선택 Mask를 흑백", PP_OT_mask_preview_toggle.bl_description)
+
+    def test_layer_button_uses_plain_name_and_separate_active_radio_marker(self) -> None:
+        """이름은 그대로 두고 실제 활성 항목만 고정폭 라디오 기호로 표시합니다."""
         draw_source = inspect.getsource(PP_PT_layers.draw)
-        self.assertIn("text=_layer_button_text(", draw_source)
+        self.assertIn("text=str(layer.name)", draw_source)
+        self.assertNotIn("_layer_button_text", draw_source)
+        self.assertNotIn("✓", draw_source)
         self.assertNotIn('parent.label(text="", icon="CHECKMARK")', draw_source)
+        marker_source = inspect.getsource(
+            layers_module.active_layer_tree_item_key
+        ) + inspect.getsource(layers_module.active_layer_tree_item)
+        panel_source = inspect.getsource(
+            __import__(
+                "tools.projection_paint.blender.panels",
+                fromlist=["_draw_active_tree_marker"],
+            )._draw_active_tree_marker
+        )
+        self.assertIn("RADIOBUT_ON", panel_source)
+        self.assertIn("BLANK1", panel_source)
+        self.assertIn("ui_units_x = 1.0", panel_source)
+        self.assertIn("active_layer_tree_item(settings)", marker_source)
 
     def test_last_layer_reset_warning_names_new_resolution(self) -> None:
         """마지막 Layer 경고가 전체 작업 삭제와 새 해상도를 명시합니다."""
@@ -1028,7 +1322,7 @@ class LayerUITests(unittest.TestCase):
         self.assertIn("Blender Undo 기록", message)
 
     def test_remove_updates_active_index_and_reuses_available_name(self) -> None:
-        """빼기 버튼이 선택 Layer를 지우고 활성 Index와 기본 이름을 보정합니다."""
+        """빼기 버튼이 비활성 선택 Layer를 지우고 실제 활성 Layer를 보존합니다."""
         settings = bpy.context.scene.projection_paint
         for _index in range(3):
             bpy.ops.projection_paint.layer_add()
@@ -1039,13 +1333,13 @@ class LayerUITests(unittest.TestCase):
         )
         self.assertEqual(
             [layer.name for layer in settings.layers],
-            ["Layer 3", "Layer 1"],
+            ["Layer 2", "Layer 1"],
         )
-        self.assertEqual(settings.active_layer_index, 1)
+        self.assertEqual(settings.active_layer_index, 0)
         bpy.ops.projection_paint.layer_add()
         self.assertEqual(
             [layer.name for layer in settings.layers],
-            ["Layer 2", "Layer 3", "Layer 1"],
+            ["Layer 3", "Layer 2", "Layer 1"],
         )
         self.assertEqual(settings.active_layer_index, 0)
 
@@ -1087,6 +1381,118 @@ class LayerUITests(unittest.TestCase):
         self.assertEqual(len(settings.layers), 1)
         self.assertEqual(len(layer.adjustments), 1)
         self.assertFalse(str(adjustment.mask.mask_uuid or ""))
+
+    def test_multiselect_delete_normalizes_parent_children_and_preserves_active(self) -> None:
+        """복수 삭제는 부모 자식을 중복 제거하지 않고 비삭제 활성 Layer를 보존합니다."""
+
+        settings = bpy.context.scene.projection_paint
+        for _index in range(3):
+            bpy.ops.projection_paint.layer_add()
+        parent_layer, adjustment_layer, active_layer = tuple(settings.layers)
+        parent_uuid = str(parent_layer.layer_uuid)
+        adjustment_layer_uuid = str(adjustment_layer.layer_uuid)
+        bpy.ops.projection_paint.layer_mask_add(layer_uuid=parent_layer.layer_uuid)
+        bpy.ops.projection_paint.layer_adjustment_add(
+            layer_uuid=parent_layer.layer_uuid,
+            adjustment_type="BRIGHTNESS",
+        )
+        parent_adjustment = parent_layer.adjustments[0]
+        bpy.ops.projection_paint.adjustment_mask_add(
+            layer_uuid=parent_layer.layer_uuid,
+            adjustment_uuid=parent_adjustment.adjustment_uuid,
+        )
+        bpy.ops.projection_paint.layer_adjustment_add(
+            layer_uuid=adjustment_layer.layer_uuid,
+            adjustment_type="EXPOSURE",
+        )
+        child_adjustment = adjustment_layer.adjustments[0]
+        bpy.ops.projection_paint.adjustment_mask_add(
+            layer_uuid=adjustment_layer.layer_uuid,
+            adjustment_uuid=child_adjustment.adjustment_uuid,
+        )
+        bpy.ops.projection_paint.layer_select(layer_uuid=active_layer.layer_uuid)
+        active_uuid = str(active_layer.layer_uuid)
+        layers_module._clear_layer_tree_selection(settings)
+        parent_layer.ui_selected = True
+        parent_layer.mask.ui_selected = True
+        parent_adjustment.ui_selected = True
+        parent_adjustment.mask.ui_selected = True
+        child_adjustment.ui_selected = True
+        child_adjustment.mask.ui_selected = True
+
+        with patch.object(layers_module, "_reconcile_if_ready") as reconcile:
+            self.assertEqual(bpy.ops.projection_paint.layer_remove(), {"FINISHED"})
+        reconcile.assert_called_once_with(bpy.context)
+        self.assertIsNone(layers_module._find_layer(settings, parent_uuid))
+        remaining_adjustment_layer = layers_module._find_layer(
+            settings,
+            adjustment_layer_uuid,
+        )
+        self.assertIsNotNone(remaining_adjustment_layer)
+        self.assertEqual(len(remaining_adjustment_layer.adjustments), 0)
+        self.assertEqual(
+            str(settings.layers[settings.active_layer_index].layer_uuid),
+            active_uuid,
+        )
+        self.assertEqual(layer_tree_selection_count(settings), 0)
+        self.assertEqual(settings.layer_selection_anchor_uuid, "")
+
+    def test_multiselect_delete_with_composite_aborts_before_any_change(self) -> None:
+        """삭제 불가 Composite가 섞이면 선택·활성·목록을 바꾸지 않고 전체 중단합니다."""
+
+        settings = bpy.context.scene.projection_paint
+        for _index in range(3):
+            bpy.ops.projection_paint.layer_add()
+        layers_module._clear_layer_tree_selection(settings)
+        settings.layers[0].ui_selected = True
+        settings.layers[1].ui_selected = True
+        settings.layers[1].layer_role = "COMPOSITE"
+        settings.active_layer_index = 2
+        before_uuids = tuple(str(layer.layer_uuid) for layer in settings.layers)
+        before_selection = tuple(bool(layer.ui_selected) for layer in settings.layers)
+
+        self.assertEqual(bpy.ops.projection_paint.layer_remove(), {"CANCELLED"})
+        self.assertEqual(
+            tuple(str(layer.layer_uuid) for layer in settings.layers),
+            before_uuids,
+        )
+        self.assertEqual(
+            tuple(bool(layer.ui_selected) for layer in settings.layers),
+            before_selection,
+        )
+        self.assertEqual(settings.active_layer_index, 2)
+
+    def test_deleted_active_items_follow_owner_and_next_layer_fallbacks(self) -> None:
+        """활성 자식은 소유자로, 활성 Layer는 삭제 위치의 다음 Layer로 이동합니다."""
+
+        settings = bpy.context.scene.projection_paint
+        for _index in range(3):
+            bpy.ops.projection_paint.layer_add()
+        first_layer, middle_layer, last_layer = tuple(settings.layers)
+        bpy.ops.projection_paint.layer_adjustment_add(
+            layer_uuid=middle_layer.layer_uuid,
+            adjustment_type="BRIGHTNESS",
+        )
+        adjustment = middle_layer.adjustments[0]
+        bpy.ops.projection_paint.adjustment_mask_add(
+            layer_uuid=middle_layer.layer_uuid,
+            adjustment_uuid=adjustment.adjustment_uuid,
+        )
+        adjustment.mask.ui_selected = True
+        self.assertEqual(active_layer_tree_item(settings)[0], "ADJUSTMENT_MASK")
+        self.assertEqual(bpy.ops.projection_paint.layer_remove(), {"FINISHED"})
+        self.assertEqual(active_layer_tree_item(settings)[0], "ADJUSTMENT")
+
+        bpy.ops.projection_paint.layer_select(layer_uuid=middle_layer.layer_uuid)
+        layers_module._clear_layer_tree_selection(settings)
+        middle_layer.ui_selected = True
+        next_uuid = str(last_layer.layer_uuid)
+        self.assertEqual(bpy.ops.projection_paint.layer_remove(), {"FINISHED"})
+        self.assertEqual(
+            str(settings.layers[settings.active_layer_index].layer_uuid),
+            next_uuid,
+        )
+        self.assertEqual(str(settings.layers[0].layer_uuid), str(first_layer.layer_uuid))
 
     def test_move_reorders_collection_and_preserves_layer_identity(self) -> None:
         """위·아래 버튼이 UUID를 유지하며 실제 Collection 순서를 변경합니다."""
@@ -1237,8 +1643,8 @@ class LayerUITests(unittest.TestCase):
         )
         self.assertEqual(layer.active_adjustment_index, -1)
 
-    def test_hovered_delete_is_scoped_to_layer_item_icon(self) -> None:
-        """Delete 연산이 Layer 보조 아이콘 Context에서만 항목을 제거합니다."""
+    def test_delete_key_is_scoped_to_projection_paint_layer_tree_selection(self) -> None:
+        """Delete는 Projection Paint 레이어 트리 UI 선택 문맥에서만 동작합니다."""
         settings = bpy.context.scene.projection_paint
         bpy.ops.projection_paint.layer_add()
         layer = settings.layers[0]
@@ -1246,34 +1652,46 @@ class LayerUITests(unittest.TestCase):
             layer_uuid=layer.layer_uuid,
             adjustment_type="BRIGHTNESS",
         )
-        button_operator = SimpleNamespace(
-            bl_rna=SimpleNamespace(
-                identifier="PROJECTION_PAINT_OT_layer_adjustment_select",
-            ),
-            layer_uuid=str(layer.layer_uuid),
-            adjustment_uuid=str(layer.adjustments[0].adjustment_uuid),
-        )
+        workspace = bpy.context.window.workspace
+        settings.paint_workspace = workspace
         context = SimpleNamespace(
             scene=bpy.context.scene,
-            button_operator=button_operator,
+            window=SimpleNamespace(workspace=workspace),
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="UI"),
+            projection_paint_layer_tree=settings,
         )
         self.assertTrue(PP_OT_layer_adjustment_remove_hovered.poll(context))
-        self.assertEqual(
-            PP_OT_layer_adjustment_remove_hovered.execute(
-                SimpleNamespace(),
-                context,
-            ),
-            {"FINISHED"},
-        )
-        self.assertEqual(len(layer.adjustments), 0)
-        unrelated_context = SimpleNamespace(
+        viewport_context = SimpleNamespace(
             scene=bpy.context.scene,
-            button_operator=SimpleNamespace(
-                bl_rna=SimpleNamespace(identifier="OBJECT_OT_delete"),
-            ),
+            window=context.window,
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="WINDOW"),
+            projection_paint_layer_tree=settings,
         )
-        self.assertFalse(
-            PP_OT_layer_adjustment_remove_hovered.poll(unrelated_context)
+        other_panel_context = SimpleNamespace(
+            scene=bpy.context.scene,
+            window=context.window,
+            area=SimpleNamespace(type="VIEW_3D"),
+            region=SimpleNamespace(type="UI"),
+        )
+        outliner_context = SimpleNamespace(
+            scene=bpy.context.scene,
+            window=context.window,
+            area=SimpleNamespace(type="OUTLINER"),
+            region=SimpleNamespace(type="WINDOW"),
+            projection_paint_layer_tree=settings,
+        )
+        self.assertFalse(PP_OT_layer_adjustment_remove_hovered.poll(viewport_context))
+        self.assertFalse(PP_OT_layer_adjustment_remove_hovered.poll(other_panel_context))
+        self.assertFalse(PP_OT_layer_adjustment_remove_hovered.poll(outliner_context))
+        self.assertEqual(
+            PP_OT_layer_adjustment_remove_hovered.invoke(
+                SimpleNamespace(poll=lambda _context: False),
+                viewport_context,
+                SimpleNamespace(),
+            ),
+            {"PASS_THROUGH"},
         )
 
 

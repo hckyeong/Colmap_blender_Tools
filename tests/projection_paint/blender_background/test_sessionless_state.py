@@ -10,8 +10,8 @@ import unittest
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[3] / "tools" / "projection_paint"
-sys.path.insert(0, str(ROOT.parent))
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
 
 from tools import projection_paint as addon  # noqa: E402
 from tools.projection_paint.blender.material_setup import (  # noqa: E402
@@ -29,14 +29,36 @@ from tools.projection_paint.blender.state_handlers import (  # noqa: E402
     undo_pre_handler,
 )
 from tools.projection_paint.blender.stencil_session import (  # noqa: E402
+    bind_active_draw_brush,
     reconnect_stencil_texture,
     stage_stencil_source,
     start_stencil_session,
 )
 
 
+def _activate_and_bind_test_brush(scene, brush):
+    """Background 테스트용 Draw에서 생성된 프로젝트 전용 Stencil Brush를 반환합니다."""
+
+    window = bpy.context.window
+    area = next(item for item in window.screen.areas if item.type == "VIEW_3D")
+    region = next(item for item in area.regions if item.type == "WINDOW")
+    brush.asset_mark()
+    try:
+        with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
+            result = bpy.ops.brush.asset_activate(
+                asset_library_type="LOCAL",
+                relative_asset_identifier=f"Brush/{brush.name}",
+            )
+        if result != {"FINISHED"}:
+            raise AssertionError(f"Local Brush 활성화 실패: {result}")
+    finally:
+        if brush.asset_data is not None:
+            brush.asset_clear()
+    return bind_active_draw_brush(bpy.context, scene)
+
+
 def _new_target(name: str = "SessionlessTarget"):
-    """UV와 한 면을 가진 Paint Target을 생성합니다."""
+    """UV Target과 Sessionless Stencil 권위 Camera를 생성합니다."""
     mesh = bpy.data.meshes.new(f"{name}Mesh")
     mesh.from_pydata(
         ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
@@ -49,6 +71,10 @@ def _new_target(name: str = "SessionlessTarget"):
     material = bpy.data.materials.new(f"{name}Material")
     material.use_nodes = True
     target.data.materials.append(material)
+    camera_data = bpy.data.cameras.new(f"{name}CameraData")
+    camera = bpy.data.objects.new(f"{name}Camera", camera_data)
+    bpy.context.scene.collection.objects.link(camera)
+    bpy.context.scene.camera = camera
     return target
 
 
@@ -89,8 +115,12 @@ class SessionlessStateTests(unittest.TestCase):
         stencil = start_stencil_session(
             bpy.context,
             dataset_uuid="dataset",
-            brush_override=brush,
         )
+        bpy.context.view_layer.objects.active = target
+        target.select_set(True)
+        bpy.ops.object.mode_set(mode="TEXTURE_PAINT")
+        settings = bpy.context.scene.projection_paint
+        bound = _activate_and_bind_test_brush(bpy.context.scene, brush)
         source = bpy.data.images.new("UndoPointerSource", 64, 32, alpha=True)
         stage_stencil_source(
             stencil,
@@ -99,14 +129,12 @@ class SessionlessStateTests(unittest.TestCase):
             frame_corners=((0.0, 0.0), (64.0, 0.0), (64.0, 32.0), (0.0, 32.0)),
         )
         reconnect_stencil_texture(bpy.context)
-        settings = bpy.context.scene.projection_paint
         texture = settings.stencil_texture
         undo_pre_handler()
-        self.assertTrue(settings.paint_enabled)
         self.assertIs(settings.stencil_texture, texture)
         self.assertIs(settings.stencil_source_image, source)
-        self.assertIs(settings.stencil_brush, brush)
-        self.assertIs(brush.texture, texture)
+        self.assertIs(settings.stencil_brush, bound)
+        self.assertIs(bound.texture, texture)
         self.assertEqual(reconnect_stencil_texture(bpy.context), 7)
 
     def test_overlay_uuid_repair_preserves_authoritative_image(self):
@@ -140,7 +168,6 @@ class SessionlessStateTests(unittest.TestCase):
         settings = bpy.context.scene.projection_paint
         self.assertEqual(settings.overlay_image.name, overlay_name)
         self.assertEqual(settings.paint_material.name, material_name)
-
 
 if __name__ == "__main__":
     unittest.main(argv=[__file__], verbosity=2)

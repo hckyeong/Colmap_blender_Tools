@@ -36,6 +36,8 @@ class RepositoryStructureTests(unittest.TestCase):
             ROOT / "shell" / "menu.py",
             ROOT / "shared" / "contracts" / "__init__.py",
             ROOT / "shared" / "blender_runtime" / "__init__.py",
+            ROOT / "shared" / "colmap_dataset" / "contracts.py",
+            ROOT / "shared" / "colmap_dataset" / "blender" / "registry.py",
             *(ROOT / "tools" / name / "__init__.py" for name in TOOL_NAMES),
         )
         missing = [str(path.relative_to(ROOT)) for path in required_paths if not path.is_file()]
@@ -71,6 +73,24 @@ class RepositoryStructureTests(unittest.TestCase):
                             violations.append(
                                 f"{path.relative_to(ROOT)}:{node.lineno} -> {imported_name}"
                             )
+        self.assertEqual([], violations)
+
+    def test_shared_colmap_dataset_does_not_import_tool_packages(self) -> None:
+        """공용 Dataset 계층은 Modifier나 Projection Painting Runtime에 의존하지 않습니다."""
+
+        violations: list[str] = []
+        for path in _python_files(ROOT / "shared" / "colmap_dataset"):
+            for node in ast.walk(_syntax_tree(path)):
+                imported_names: tuple[str, ...] = ()
+                if isinstance(node, ast.Import):
+                    imported_names = tuple(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported_names = (node.module,)
+                for imported_name in imported_names:
+                    if imported_name == "tools" or imported_name.startswith("tools."):
+                        violations.append(
+                            f"{path.relative_to(ROOT)}:{node.lineno} -> {imported_name}"
+                        )
         self.assertEqual([], violations)
 
     def test_core_packages_do_not_import_bpy(self) -> None:

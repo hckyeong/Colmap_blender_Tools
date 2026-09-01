@@ -12,9 +12,17 @@ from bpy.props import StringProperty
 
 from ..core.discovery import discover_dataset
 from ..core.fingerprint import SourceFingerprintJob, source_fingerprint
-from ..core.import_types import ImportPlan
+from ..core.import_types import (
+    CAMERA_FRUSTUM_SIZE_MAX,
+    CAMERA_FRUSTUM_SIZE_MIN,
+    ImportPlan,
+)
 from ..core.layout import resolve_layout
 from .camera_edit_session import force_end_camera_mode
+from .dataset_adapter import (
+    matching_import_identity,
+    prepare_modifier_import_commit,
+)
 from .camera_review_session import (
     begin_import_review_transition,
     complete_import_review_transition,
@@ -151,7 +159,7 @@ def _resolved_optional_path(value: str) -> Path | None:
     return Path(bpy.path.abspath(value)).expanduser().resolve()
 
 
-def _snapshot_import_plan(settings) -> ImportPlan:
+def _snapshot_import_plan(settings, scene=None) -> ImportPlan:
     """현재 RNA 입력을 절대경로 기반의 불변 ImportPlan으로 고정합니다."""
 
     dataset_root = _resolved_optional_path(settings.dataset_root)
@@ -170,15 +178,21 @@ def _snapshot_import_plan(settings) -> ImportPlan:
             os.path.commonpath((str(sparse_directory), str(images_directory)))
         ).resolve()
 
-    matching_model = _resolved_optional_path(settings.active_model_directory)
-    matching_uuid = settings.dataset_uuid or None
+    if scene is None:
+        matching_model = _resolved_optional_path(settings.active_model_directory)
+        matching_uuid = settings.dataset_uuid or None
+    else:
+        matching_uuid, matching_model = matching_import_identity(scene, settings)
     return ImportPlan(
         dataset_root=dataset_root,
         sparse_directory=sparse_directory,
         images_directory=images_directory,
         input_format=settings.input_format,
         point_size=settings.point_size,
-        camera_frustum_size=settings.camera_frustum_size,
+        camera_frustum_size=min(
+            CAMERA_FRUSTUM_SIZE_MAX,
+            max(CAMERA_FRUSTUM_SIZE_MIN, float(settings.camera_frustum_size)),
+        ),
         axis_forward=settings.axis_forward,
         axis_up=settings.axis_up,
         matching_dataset_uuid=matching_uuid,
@@ -194,7 +208,7 @@ def _prepare_import_session(context):
 
     require_export_mutation_allowed(context, "Import")
     require_no_pending_filters(context, "Import")
-    plan = _snapshot_import_plan(settings)
+    plan = _snapshot_import_plan(settings, context.scene)
 
     force_end_point_mode(context)
     force_end_camera_mode(context)
@@ -455,11 +469,21 @@ def _commit_import(context, session) -> None:
     camera_count = str(len(runtime_state.current_reconstruction.cameras))
     image_count = str(len(runtime_state.current_reconstruction.images))
     point3d_count = str(len(runtime_state.current_reconstruction.points3d))
+    shared_commit = prepare_modifier_import_commit(
+        context.scene,
+        loaded,
+        runtime_state,
+        settings,
+    )
 
     review_transition = begin_import_review_transition(context)
     try:
+        if shared_commit is not None:
+            shared_commit.apply()
         cleanup_warnings = commit_staging(context.scene, staged)
     except Exception:
+        if shared_commit is not None:
+            shared_commit.rollback()
         rollback_import_review_transition(context, review_transition)
         raise
 
@@ -484,6 +508,8 @@ def _commit_import(context, session) -> None:
     settings.camera_count = camera_count
     settings.image_count = image_count
     settings.point3d_count = point3d_count
+    if shared_commit is not None:
+        shared_commit.complete()
     settings.warning_summary = "\n".join((*loaded.warnings, *cleanup_warnings))
     write_history_settings(settings, runtime_state)
     install_state(runtime_state)

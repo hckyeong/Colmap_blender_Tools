@@ -1,7 +1,7 @@
 """설치된 Extension의 실제 Layer 버튼을 event_simulate로 검증합니다.
 
-실행 전 별도 GUI Blender에서 Extension 0.1.63을 활성화하고 다음 두 환경 변수를
-해당 창의 실제 PP_PT_layers 팝업 좌표로 지정합니다. Blender Python RNA는
+실행 전 별도 GUI Blender에서 Extension 0.3.23을 활성화하고 다음 두 환경 변수를
+해당 창의 실제 Layers 패널 팝업 좌표로 지정합니다. Blender Python RNA는
 UILayout.operator 버튼의 사각형을 공개하지 않으므로 좌표를 추측하지 않습니다.
 
 PP_LAYER_SELECTION_PANEL_OPEN_AT='[x, y]'
@@ -24,7 +24,7 @@ import bpy
 
 
 ROOT = Path(__file__).resolve().parents[2] / "tools" / "projection_paint"
-EXPECTED_VERSION = "0.1.63"
+EXPECTED_VERSION = "0.3.23"
 _STATE: dict[str, object] = {
     "actions": [],
     "checks": [],
@@ -108,11 +108,11 @@ def _load_coordinates(window) -> tuple[tuple[int, int], dict[str, tuple[int, int
 
 
 def _installed_panel_module():
-    """작업 트리 아닌 설치본 0.1.63의 실제 Layers 패널 모듈만 반환합니다."""
+    """작업 트리 아닌 설치본 0.3.23의 실제 Layers 패널 모듈만 반환합니다."""
     panel_type = getattr(bpy.types, "PP_PT_layers", None)
     if panel_type is None:
         raise _PreconditionError(
-            "INSTALLED_EXTENSION_NOT_ENABLED: 별도 GUI Blender에서 설치된 Extension 0.1.63을 활성화해야 합니다."
+            "INSTALLED_EXTENSION_NOT_ENABLED: 별도 GUI Blender에서 설치된 Extension 0.3.23을 활성화해야 합니다."
         )
     module = importlib.import_module(panel_type.__module__)
     module_path = Path(inspect.getfile(module)).resolve()
@@ -194,21 +194,28 @@ def _make_test_scene(panel_module):
 
 
 def _assert_panel_contract() -> None:
-    """활성 체크 문자열과 별도 CHECKMARK 열 제거를 설치된 패널 소스로 확인합니다."""
+    """선택 배경과 별개인 고정폭 실제 활성 기호 열을 확인합니다."""
     panel_module = _STATE["panel_module"]
     assert panel_module is not None
-    if panel_module._layer_button_text("GUI Layer", True) != "GUI Layer  ✓":
-        raise AssertionError("활성 Layer 버튼 문자열의 체크 표시가 올바르지 않습니다.")
     source = inspect.getsource(panel_module.PP_PT_layers.draw)
+    if "_layer_button_text" in source or "✓" in source:
+        raise AssertionError("Layer 이름 버튼에 활성 체크 문자열이 남아 있습니다.")
+    if "text=str(layer.name)" not in source:
+        raise AssertionError("Layer 이름 버튼이 저장된 이름을 그대로 표시하지 않습니다.")
     if 'parent.label(text="", icon="CHECKMARK")' in source:
         raise AssertionError("별도 CHECKMARK UI 열이 남아 있습니다.")
     if '"projection_paint.layer_select"' not in source:
         raise AssertionError("실제 PP_PT_layers에 layer_select UILayout.operator가 없습니다.")
-    _record_check("활성 체크 문자열과 별도 CHECKMARK 열 제거")
+    marker_source = inspect.getsource(panel_module._draw_active_tree_marker)
+    if '"RADIOBUT_ON"' not in marker_source or '"BLANK1"' not in marker_source:
+        raise AssertionError("실제 활성·비활성 행의 고정폭 기호가 없습니다.")
+    if "ui_units_x = 1.0" not in marker_source:
+        raise AssertionError("실제 활성 기호 열의 고정폭이 보장되지 않습니다.")
+    _record_check("선택과 별개인 고정폭 실제 활성 기호")
 
 
 def _selection() -> tuple[int, ...]:
-    """현재 후보 선택된 Layer index만 불변 순서로 반환합니다."""
+    """현재 선택된 Layer index만 불변 순서로 반환합니다."""
     layers = _STATE["layers"]
     assert isinstance(layers, tuple)
     return tuple(index for index, layer in enumerate(layers) if bool(layer.ui_selected))
@@ -322,12 +329,13 @@ def _open_real_panel() -> None:
 
 
 def _prepare_actions() -> None:
-    """일반·Ctrl·Shift·더블클릭의 실제 UI 검증 순서를 구성합니다."""
+    """첫 클릭 선택·수정키 선택·두 번째 클릭 활성화의 실제 검증 순서를 구성합니다."""
     _queue_click(0)
-    _queue(lambda: _assert_selection((0,), "일반 클릭은 단일 후보 선택"))
-    _queue(lambda: _assert_active(3, "일반 클릭은 활성 Paint를 유지"))
+    _queue(lambda: _assert_selection((0,), "일반 클릭은 단일 선택"))
+    _queue(lambda: _assert_active(3, "첫 일반 클릭은 기존 활성 Paint 유지"))
     _queue_click(1)
     _queue(lambda: _assert_selection((1,), "다른 Layer 일반 클릭은 기존 선택 해제"))
+    _queue(lambda: _assert_active(3, "다른 Layer 첫 클릭도 기존 활성 Paint 유지"))
     _queue_click(0, ctrl=True)
     _queue(lambda: _assert_selection((0, 1), "Ctrl 클릭은 후보 추가"))
     _queue_click(0, ctrl=True)
@@ -339,10 +347,13 @@ def _prepare_actions() -> None:
     _queue_click(3, ctrl=True)
     _queue_click(1, ctrl=True, shift=True)
     _queue(lambda: _assert_selection((0, 1, 2, 3), "Ctrl+Shift 클릭은 앵커 범위 추가"))
+    _queue(lambda: _assert_active(3, "수정키 연속 클릭은 활성화하지 않음"))
     _queue_click(1, double_click_part="FIRST")
+    _queue(lambda: _assert_selection((1,), "더블클릭 첫 입력은 즉시 단일 선택"))
+    _queue(lambda: _assert_active(3, "더블클릭 첫 입력은 활성 Paint 유지"))
     _queue_click(1, double_click_part="SECOND")
-    _queue(lambda: _assert_selection((1,), "더블클릭은 첫 클릭의 단일 후보 선택 유지"))
-    _queue(lambda: _assert_active(1, "더블클릭은 활성 Layer와 Paint Image 변경"))
+    _queue(lambda: _assert_selection((1,), "두 번째 클릭도 단일 선택 유지"))
+    _queue(lambda: _assert_active(1, "허용 시간 안의 같은 두 번째 클릭은 활성화"))
 
 
 def _advance() -> float | None:

@@ -13,9 +13,9 @@ from uuid import uuid4
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[3] / "tools" / "projection_paint"
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from tools import projection_paint as addon  # noqa: E402
 from tools.projection_paint.blender import composite_layer as composite_module  # noqa: E402
@@ -27,6 +27,7 @@ from tools.projection_paint.blender import state_handlers as state_handlers_modu
 from tools.projection_paint.blender.composite_layer import (  # noqa: E402
     COMPOSITE_IMAGE_SESSION_KEY,
     CompositeLayerError,
+    CompositeSession,
     create_composite_layer,
     release_composite_layer,
     validate_composite_session,
@@ -35,6 +36,7 @@ from tools.projection_paint.blender.layer_shader import (  # noqa: E402
     LAYER_MIX_NODE_ROLE,
     LAYER_UUID_KEY,
     ORIGINAL_GATE_NODE_ROLE,
+    ORIGINAL_LAYER_SCHEMA_VERSION,
     TARGET_UUID_KEY,
     _graph_layers,
     reconcile_layer_graph,
@@ -424,8 +426,8 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         """각 Composite 테스트를 빈 Blender Factory Scene으로 시작합니다."""
         bpy.ops.wm.read_factory_settings(use_empty=True)
 
-    def test_native_progress_explains_blender_image_conversion_after_status_100(self):
-        """Native 진행창은 게이지 없이 Process 점 애니메이션과 변환 정보를 표시합니다."""
+    def test_native_progress_uses_common_activity_details_without_percent(self):
+        """Native 진행창은 백분율 없이 Process와 장치·Image·Bake 정보를 표시합니다."""
         session = composite_progress_module.CompositeProgressSession(
             session_id="native-progress-test",
             started_at=0.0,
@@ -455,10 +457,11 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
             progress_overlay_module.ACTIVITY_OVERLAY_HEIGHT,
             progress_overlay_module.OVERLAY_HEIGHT,
         )
-        self.assertIn("Cycles", view.detail_lines[0])
+        self.assertIn("Cycles", view.detail_lines[1])
         self.assertNotIn("1/1", view.detail_lines[0])
-        self.assertIn("100%", view.detail_lines[2])
-        self.assertIn("이미지 변환", view.detail_lines[2])
+        self.assertNotIn("100%", " ".join(view.detail_lines))
+        self.assertIn("Image:", view.detail_lines[2])
+        self.assertIn("Bake: EMIT", view.detail_lines[2])
         self.assertIn("Samples 32", view.detail_lines[2])
 
     def test_composite_process_label_repeats_one_to_four_dots(self):
@@ -556,6 +559,19 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(partition.source_layer_uuids, ("4", "3", "2"))
         self.assertEqual(partition.bake_included_layer_uuids, ("4",))
         self.assertEqual(partition.source_insert_index, 0)
+
+    def test_composite_session_contains_only_current_internal_values(self):
+        """CompositeSession은 세션 UUID·Composite·Source 세 값만 보관합니다."""
+        _target, setup = _prepare_backend("CompositeCompatibilityShimTarget")
+        settings = bpy.context.scene.projection_paint
+        session = CompositeSession("session", settings.layers[0], (settings.layers[0],))
+        self.assertEqual(session.session_uuid, "session")
+        self.assertEqual(session.composite.as_pointer(), settings.layers[0].as_pointer())
+        self.assertEqual(
+            tuple(source.as_pointer() for source in session.sources),
+            (settings.layers[0].as_pointer(),),
+        )
+        self.assertEqual(tuple(session.__slots__), ("session_uuid", "composite", "sources"))
         with self.assertRaisesRegex(CompositeLayerError, "눈이 켜진"):
             composite_module.composite_source_partition(
                 tuple(
@@ -889,7 +905,9 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         source_uuid = str(source.layer_uuid)
         source_image = source.image
         self.assertEqual(bpy.ops.projection_paint.layer_add(), {"FINISHED"})
-        settings.layers[0].ui_selected = True
+        for candidate in settings.layers:
+            if str(candidate.layer_role) == "NORMAL":
+                candidate.ui_selected = True
         source_uuids = tuple(
             str(layer.layer_uuid)
             for layer in settings.layers
@@ -1022,82 +1040,61 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
 
         settings.composite_state = "ACTIVE"
 
-    def test_dependent_sibling_uses_composite_clone_source_and_release_restores_sources(self):
-        """의존 일반 형제가 Composite를 Clone 소스로 쓰고 해제 시 함께 삭제되는지 검증합니다."""
+    def test_direct_release_preserves_independent_normal_layer_and_clone_settings(self):
+        """직접 해제는 독립 일반 Layer의 UUID·Image·Pixel과 외부 Clone 설정을 보존합니다."""
         _target, setup = _prepare_backend("CompositeReleaseTarget")
         settings = bpy.context.scene.projection_paint
+        initial_source_uuids = tuple(str(layer.layer_uuid) for layer in settings.layers)
         source_uuid = str(settings.layers[0].layer_uuid)
         source_image = settings.layers[0].image
+        image_paint = bpy.context.scene.tool_settings.image_paint
+        external_clone = bpy.data.images.new("ExternalClone", width=2, height=2)
+        image_paint.clone_image = external_clone
+        image_paint.use_clone_layer = True
+        clone_slot_before = int(setup.material.paint_clone_slot)
         create_composite_layer(bpy.context)
         composite_image = settings.layers[0].image
         composite_image_name = str(composite_image.name)
 
         self.assertEqual(bpy.ops.projection_paint.layer_add(), {"FINISHED"})
-        dependent = settings.layers[0]
-        dependent_image_name = str(dependent.image.name)
-        self.assertEqual(dependent.layer_role, "NORMAL")
-        self.assertEqual(
-            dependent.composite_dependency_session_uuid,
-            settings.active_composite_session_uuid,
-        )
-        image_paint = bpy.context.scene.tool_settings.image_paint
-        self.assertEqual(
-            image_paint.clone_image.as_pointer(),
-            composite_image.as_pointer(),
-        )
-        self.assertTrue(image_paint.use_clone_layer)
+        independent = settings.layers[0]
+        independent_uuid = str(independent.layer_uuid)
+        independent_image = independent.image
+        _fill_image(independent_image, (0.125, 0.25, 0.5, 1.0))
+        independent_pixels = tuple(independent_image.pixels[:])
+        self.assertEqual(independent.layer_role, "NORMAL")
         self.assertEqual(
             bpy.ops.projection_paint.layer_mask_add(
-                layer_uuid=str(dependent.layer_uuid)
+                layer_uuid=independent_uuid
             ),
             {"FINISHED"},
         )
-        dependent_mask_name = str(dependent.mask.image.name)
+        independent_mask = independent.mask.image
 
         release_composite_layer(bpy.context)
 
         self.assertEqual(settings.composite_state, "NONE")
-        self.assertEqual(len(settings.layers), 2)
+        self.assertEqual(len(settings.layers), len(initial_source_uuids) + 1)
+        self.assertTrue(
+            set(initial_source_uuids).issubset(
+                {str(layer.layer_uuid) for layer in settings.layers}
+            )
+        )
         source_after_release = _layer_for_uuid(settings, source_uuid)
         self.assertIs(source_after_release.image, source_image)
         self.assertEqual(source_after_release.layer_role, "NORMAL")
         self.assertTrue(source_after_release.visible)
         self.assertIsNone(bpy.data.images.get(composite_image_name))
-        self.assertIsNone(bpy.data.images.get(dependent_image_name))
-        self.assertIsNone(bpy.data.images.get(dependent_mask_name))
+        independent_after = _layer_for_uuid(settings, independent_uuid)
+        self.assertIs(independent_after.image, independent_image)
+        self.assertIs(independent_after.mask.image, independent_mask)
+        self.assertEqual(tuple(independent_after.image.pixels[:]), independent_pixels)
+        self.assertIs(image_paint.clone_image, external_clone)
+        self.assertTrue(image_paint.use_clone_layer)
+        self.assertEqual(int(setup.material.paint_clone_slot), clone_slot_before)
         validate_layer_graph(
             setup.material,
             tuple(str(layer.layer_uuid) for layer in settings.layers),
-        )
-
-    def test_legacy_derived_layer_migrates_to_dependent_normal_sibling(self):
-        """구형 COMPOSITE_DERIVED 항목은 Pixel 손실 없이 의존 일반 형제로 이전됩니다."""
-        _target, setup = _prepare_backend("CompositeLegacyDerivedTarget")
-        settings = bpy.context.scene.projection_paint
-        create_composite_layer(bpy.context)
-        self.assertEqual(bpy.ops.projection_paint.layer_add(), {"FINISHED"})
-        legacy = settings.layers[0]
-        image = legacy.image
-        session_uuid = str(settings.active_composite_session_uuid)
-        legacy.layer_role = "COMPOSITE_DERIVED"
-        legacy.composite_session_uuid = session_uuid
-        legacy.composite_dependency_session_uuid = ""
-
-        reconcile_layer_graph(bpy.context.scene)
-
-        self.assertEqual(legacy.layer_role, "NORMAL")
-        self.assertEqual(legacy.composite_session_uuid, "")
-        self.assertEqual(legacy.composite_dependency_session_uuid, session_uuid)
-        self.assertIs(legacy.image, image)
-        validate_composite_session(bpy.context.scene)
-        self.assertEqual(
-            tuple(str(layer.layer_uuid) for layer in _graph_layers(settings, tuple(settings.layers))),
-            tuple(
-                str(layer.layer_uuid)
-                for layer in settings.layers
-                if str(getattr(layer, "composite_source_session_uuid", "") or "")
-                != session_uuid
-            ),
         )
 
     def test_release_refuses_mismatched_composite_image_session(self):
@@ -1116,13 +1113,14 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
 
     def test_failed_create_restores_existing_clone_settings(self):
         """베이크 실패가 Composite 전 Clone 설정과 원본 가시성을 정확히 되돌리는지 검증합니다."""
-        _target, _setup = _prepare_backend("CompositeRollbackTarget")
+        _target, setup = _prepare_backend("CompositeRollbackTarget")
         settings = bpy.context.scene.projection_paint
         source = settings.layers[0]
         original_clone = bpy.data.images.new("ExistingClone", width=1, height=1)
         image_paint = bpy.context.scene.tool_settings.image_paint
         image_paint.clone_image = original_clone
         image_paint.use_clone_layer = True
+        original_clone_slot = int(setup.material.paint_clone_slot)
 
         with patch.object(
             composite_module,
@@ -1137,6 +1135,7 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertTrue(source.visible)
         self.assertEqual(image_paint.clone_image.as_pointer(), original_clone.as_pointer())
         self.assertTrue(image_paint.use_clone_layer)
+        self.assertEqual(int(setup.material.paint_clone_slot), original_clone_slot)
 
     def test_sync_bake_uses_exec_default_without_progress_overlay(self):
         """동기 GPU Bake 호출 전에는 Composite 진행 Overlay와 Timer를 만들지 않는지 검증합니다."""
@@ -1562,7 +1561,7 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
 
     def test_extension_unregistration_waits_for_native_modal_rollback(self):
         """Extension 해제 요청은 Native Job을 유지하고 Modal 해제 뒤 한 번만 실제 해제합니다."""
-        _target, setup = _prepare_backend("CompositeNativeExtensionUnregisterTarget")
+        target, setup = _prepare_backend("CompositeNativeExtensionUnregisterTarget")
         window_manager = _FakeCompositeWindowManager()
         context = SimpleNamespace(
             scene=bpy.context.scene,
@@ -1847,8 +1846,13 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
             "active_image": settings.active_paint_image.as_pointer(),
             "mask_mode": bool(settings.paint_mask_mode),
             "mask_uuid": str(settings.active_mask_uuid),
-            "clone": image_paint.clone_image.as_pointer(),
+            "clone": (
+                image_paint.clone_image.as_pointer()
+                if image_paint.clone_image is not None
+                else 0
+            ),
             "clone_layer": bool(image_paint.use_clone_layer),
+            "clone_slot": int(material.paint_clone_slot),
             "active_node": tree.nodes.active.as_pointer(),
             "node_selection": tuple(
                 (node.as_pointer(), bool(node.select)) for node in tree.nodes
@@ -1889,14 +1893,46 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(settings.active_paint_image.as_pointer(), snapshot["active_image"])
         self.assertEqual(bool(settings.paint_mask_mode), snapshot["mask_mode"])
         self.assertEqual(str(settings.active_mask_uuid), snapshot["mask_uuid"])
-        self.assertEqual(image_paint.clone_image.as_pointer(), snapshot["clone"])
+        self.assertEqual(
+            image_paint.clone_image.as_pointer() if image_paint.clone_image is not None else 0,
+            snapshot["clone"],
+        )
         self.assertEqual(bool(image_paint.use_clone_layer), snapshot["clone_layer"])
+        self.assertEqual(int(material.paint_clone_slot), snapshot["clone_slot"])
         self.assertEqual(tree.nodes.active.as_pointer(), snapshot["active_node"])
         self.assertEqual(
             tuple((node.as_pointer(), bool(node.select)) for node in tree.nodes),
             snapshot["node_selection"],
         )
         self.assertEqual(int(material.paint_active_slot), snapshot["paint_slot"])
+
+    def test_release_cleanup_failure_keeps_committed_normal_graph_with_warning(self):
+        """논리 Commit 뒤 고아 정리 실패는 정상 일반 Graph와 명확한 경고를 유지합니다."""
+        _target, setup = _prepare_backend("CompositeReleaseCleanupWarningTarget")
+        settings = bpy.context.scene.projection_paint
+        source_uuid = str(settings.layers[0].layer_uuid)
+        create_composite_layer(bpy.context)
+        composite_uuid = str(settings.composite_layer_uuid)
+
+        with patch.object(
+            composite_module,
+            "remove_owned_layer_bundles",
+            side_effect=RuntimeError("강제 고아 정리 실패"),
+        ):
+            release_composite_layer(bpy.context)
+
+        self.assertEqual(settings.composite_state, "NONE")
+        self.assertNotIn(
+            composite_uuid,
+            {str(layer.layer_uuid) for layer in settings.layers},
+        )
+        self.assertIsNotNone(_layer_for_uuid(settings, source_uuid))
+        self.assertEqual(settings.status_kind, "WARNING")
+        self.assertIn("고아 자원 정리 경고", settings.status)
+        validate_layer_graph(
+            setup.material,
+            tuple(str(layer.layer_uuid) for layer in settings.layers),
+        )
 
     def test_stale_composite_blocks_layer_operations_without_data_changes(self):
         """STALE 세션이 자동 재구성과 Layer·Mask·선택·이동·삭제를 모두 차단하는지 검증합니다."""
@@ -1911,6 +1947,8 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
             {"FINISHED"},
         )
         adjustment_uuid = str(source_before_composite.adjustments[0].adjustment_uuid)
+        source_before_composite.adjustments[0].ui_selected = False
+        source_before_composite.ui_selected = True
         create_composite_layer(bpy.context)
         composite = settings.layers[0]
         source = settings.layers[1]
@@ -2097,7 +2135,10 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(str(settings.active_composite_session_uuid), session_uuid)
         self.assertEqual(composite.image.as_pointer(), composite_image.as_pointer())
         self.assertEqual(tuple(composite_image.pixels[:]), composite_pixels)
-        self.assertEqual(int(settings.original_layer_schema_version), 1)
+        self.assertEqual(
+            int(settings.original_layer_schema_version),
+            ORIGINAL_LAYER_SCHEMA_VERSION,
+        )
         self.assertTrue(migrated.is_original_layer)
         self.assertFalse(
             any(
@@ -2252,6 +2293,7 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(bpy.ops.projection_paint.layer_add(), {"FINISHED"})
         dependent = settings.layers[0]
         dependent_uuid = str(dependent.layer_uuid)
+        dependent_image_name = str(dependent.image.name)
         old_composite = _layer_for_uuid(settings, old_composite_uuid)
         for layer in settings.layers:
             layer.ui_selected = False
@@ -2265,11 +2307,8 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(len([layer for layer in settings.layers if layer.layer_role == "COMPOSITE"]), 1)
         new_composite = _layer_for_uuid(settings, str(settings.composite_layer_uuid))
         self.assertIs(new_composite.image, new_image)
-        self.assertIs(
-            bpy.context.scene.tool_settings.image_paint.clone_image,
-            new_composite.image,
-        )
-        self.assertTrue(bpy.context.scene.tool_settings.image_paint.use_clone_layer)
+        self.assertIsNone(bpy.context.scene.tool_settings.image_paint.clone_image)
+        self.assertFalse(bpy.context.scene.tool_settings.image_paint.use_clone_layer)
         self.assertEqual(new_composite.composite_generation, 2)
         self.assertFalse(new_composite.expanded)
         self.assertFalse(
@@ -2281,14 +2320,18 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(flat.composite_generation, 1)
         self.assertEqual(flat.composite_source_session_uuid, settings.active_composite_session_uuid)
         self.assertEqual(flat.composite_session_uuid, "")
-        self.assertFalse(str(flat.composite_dependency_session_uuid))
         self.assertFalse(
             flat.image.get(composite_module.RECOMPOSITE_TRANSACTION_KEY)
         )
         self.assertEqual(
             set(str(layer.layer_uuid) for layer in settings.layers),
-            {str(new_composite.layer_uuid), old_composite_uuid, dependent_uuid},
+            {str(new_composite.layer_uuid), old_composite_uuid},
         )
+        self.assertNotIn(
+            dependent_uuid,
+            {str(layer.layer_uuid) for layer in settings.layers},
+        )
+        self.assertIsNone(bpy.data.images.get(dependent_image_name))
         self.assertTrue(
             all(
                 layer_uuid not in {str(layer.layer_uuid) for layer in settings.layers}
@@ -2304,7 +2347,7 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertEqual(settings.composite_state, "NONE")
         self.assertEqual(
             tuple(str(layer.layer_uuid) for layer in settings.layers),
-            (dependent_uuid, old_composite_uuid),
+            (old_composite_uuid,),
         )
         self.assertTrue(
             all(
@@ -2819,14 +2862,14 @@ class CompositeLayerBackgroundTests(unittest.TestCase):
         self.assertTrue(initial_source_uuids.isdisjoint(remaining_uuids))
         self.assertNotIn(created_source_uuids[0], remaining_uuids)
         self.assertNotIn(created_source_uuids[1], remaining_uuids)
-        self.assertIn(created_source_uuids[2], remaining_uuids)
+        self.assertNotIn(created_source_uuids[2], remaining_uuids)
 
         release_composite_layer(bpy.context)
 
         self.assertEqual(settings.composite_state, "NONE")
         self.assertEqual(
             {str(layer.layer_uuid) for layer in settings.layers},
-            {final_flattened_uuid, created_source_uuids[2]},
+            {final_flattened_uuid},
         )
         self.assertNotIn(final_composite_uuid, {str(layer.layer_uuid) for layer in settings.layers})
         validate_layer_graph(

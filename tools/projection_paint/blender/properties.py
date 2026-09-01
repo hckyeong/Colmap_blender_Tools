@@ -14,7 +14,6 @@ from bpy.props import (
     StringProperty,
 )
 
-
 AXIS_ITEMS = (
     ("X", "+X", "양의 X축"),
     ("-X", "-X", "음의 X축"),
@@ -38,23 +37,41 @@ def _mesh_object_poll(_settings, obj):
 
 
 def _update_point_size(settings, context):
-    """UI Point Scale 변경을 현재 관리 Point Mesh 표시로 전달합니다."""
+    """PP Snapshot의 Point Scale만 독립적으로 갱신합니다."""
 
-    del context
-    scene = getattr(settings, "id_data", None)
-    if not isinstance(scene, bpy.types.Scene):
-        return
     from .point_scene import update_dataset_point_scale
 
-    update_dataset_point_scale(scene, settings.point_size)
+    scene = getattr(settings, "id_data", None) or getattr(context, "scene", None)
+    if scene is not None:
+        update_dataset_point_scale(scene, float(settings.point_size))
 
 
 def _update_camera_frustum_size(settings, context):
-    """Camera Frustum Size 변경을 관리 Camera Data에 즉시 반영합니다."""
+    """PP Snapshot의 Camera Frustum만 독립적으로 갱신합니다."""
 
     from .camera_display import update_camera_frustum_size_from_settings
 
     update_camera_frustum_size_from_settings(settings, context)
+
+
+def _update_camera_axes(settings, context):
+    """PP Snapshot의 Camera·Point Axis Root만 독립적으로 갱신합니다."""
+
+    from .axis_roots import axis_matrix
+    from .ownership import is_owned
+
+    scene = getattr(settings, "id_data", None) or getattr(context, "scene", None)
+    dataset_uuid = str(getattr(settings, "dataset_uuid", "") or "")
+    if scene is None or not dataset_uuid:
+        return
+    matrix = axis_matrix(
+        str(settings.camera_axis_preset),
+        custom_forward=str(settings.camera_forward),
+        custom_up=str(settings.camera_up),
+    )
+    for obj in tuple(scene.objects):
+        if is_owned(obj, kind="CAMERA_AXIS_ROOT", dataset_uuid=dataset_uuid):
+            obj.matrix_world = matrix
 
 
 def _update_review_background(settings, context):
@@ -117,6 +134,7 @@ class PP_PG_mask(bpy.types.PropertyGroup):
     """Layer 또는 Adjustment에 하나만 속하는 Paint Mask 상태를 저장합니다."""
 
     mask_uuid: StringProperty(options={"HIDDEN"})
+    ui_selected: BoolProperty(default=False, options={"HIDDEN"})
     image: PointerProperty(
         name="Mask Image",
         type=bpy.types.Image,
@@ -148,6 +166,7 @@ class PP_PG_layer_adjustment(bpy.types.PropertyGroup):
         ),
     )
     adjustment_uuid: StringProperty(options={"HIDDEN"})
+    ui_selected: BoolProperty(default=False, options={"HIDDEN"})
     image: PointerProperty(
         name="Legacy Mask Image",
         type=bpy.types.Image,
@@ -217,20 +236,11 @@ class PP_PG_layer(bpy.types.PropertyGroup):
         items=(
             ("NORMAL", "Normal", "Composite 생성 전부터 존재한 일반 Layer입니다"),
             ("COMPOSITE", "Composite", "현재 합성 결과를 가진 작업 기준 Layer입니다"),
-            (
-                "COMPOSITE_DERIVED",
-                "Composite Derived",
-                "Composite를 기준으로 만든 파생 작업 Layer입니다",
-            ),
         ),
         default="NORMAL",
         options={"HIDDEN"},
     )
     composite_session_uuid: StringProperty(default="", options={"HIDDEN"})
-    composite_dependency_session_uuid: StringProperty(
-        default="",
-        options={"HIDDEN"},
-    )
     composite_generation: IntProperty(default=0, min=0, options={"HIDDEN"})
     composite_source_session_uuid: StringProperty(default="", options={"HIDDEN"})
     composite_bake_included: BoolProperty(default=False, options={"HIDDEN"})
@@ -291,9 +301,9 @@ class PP_PG_settings(bpy.types.PropertyGroup):
     )
     camera_frustum_size: FloatProperty(
         name="Camera Frustum Size",
-        description="Import한 COLMAP 카메라 프러스텀 크기이며 0은 표시를 숨깁니다",
+        description="PP Snapshot 카메라 프러스텀 표시 크기입니다",
         default=1.0,
-        min=0.0,
+        min=0.01,
         max=1000.0,
         soft_max=10.0,
         precision=3,
@@ -305,18 +315,21 @@ class PP_PG_settings(bpy.types.PropertyGroup):
         description="원본 애플리케이션의 표시축 프리셋입니다",
         items=AXIS_PRESET_ITEMS,
         default="REALITY_CAPTURE",
+        update=_update_camera_axes,
     )
     camera_forward: EnumProperty(
         name="Forward Axis",
         description="COLMAP 원본에서 전방으로 간주할 표시 전용 축입니다",
         items=AXIS_ITEMS,
         default="-Z",
+        update=_update_camera_axes,
     )
     camera_up: EnumProperty(
         name="Up Axis",
         description="COLMAP 원본에서 위쪽으로 간주할 표시 전용 축입니다",
         items=AXIS_ITEMS,
         default="Y",
+        update=_update_camera_axes,
     )
     frame_start: IntProperty(name="Frame Start", default=1, min=-1_048_574, max=1_048_574)
     review_background_alpha: FloatProperty(
@@ -388,12 +401,6 @@ class PP_PG_settings(bpy.types.PropertyGroup):
     composite_source_schema_version: IntProperty(default=0, min=0, options={"HIDDEN"})
     composite_layer_uuid: StringProperty(default="", options={"HIDDEN"})
     composite_saved_active_layer_uuid: StringProperty(default="", options={"HIDDEN"})
-    composite_saved_clone_image: PointerProperty(
-        name="Composite Saved Clone Image",
-        type=bpy.types.Image,
-        options={"HIDDEN"},
-    )
-    composite_saved_use_clone_layer: BoolProperty(default=False, options={"HIDDEN"})
     original_layer_name: StringProperty(
         default="Original Layer",
         options={"HIDDEN"},
@@ -448,11 +455,6 @@ class PP_PG_settings(bpy.types.PropertyGroup):
         type=bpy.types.Image,
         options={"HIDDEN"},
     )
-    original_brush_texture: PointerProperty(
-        name="Original Brush Texture",
-        type=bpy.types.Texture,
-        options={"HIDDEN"},
-    )
     original_canvas: PointerProperty(
         name="Original Paint Canvas",
         type=bpy.types.Image,
@@ -468,32 +470,26 @@ class PP_PG_settings(bpy.types.PropertyGroup):
         type=bpy.types.WorkSpace,
         options={"HIDDEN"},
     )
+    dataset_view_layer_name: StringProperty(default="", options={"HIDDEN"})
+    source_view_layer_name: StringProperty(default="", options={"HIDDEN"})
     paint_enabled: BoolProperty(default=False, options={"HIDDEN"})
     manual_stencil_disabled: BoolProperty(default=False, options={"HIDDEN"})
     stencil_outside_camera_view: BoolProperty(default=False, options={"HIDDEN"})
-    stencil_original_state_valid: BoolProperty(default=False, options={"HIDDEN"})
-    stencil_original_use_unified_color: BoolProperty(default=False, options={"HIDDEN"})
-    stencil_owns_brush: BoolProperty(default=False, options={"HIDDEN"})
-    stencil_follow_active_brush: BoolProperty(default=True, options={"HIDDEN"})
-    original_brush_map_mode: StringProperty(default="", options={"HIDDEN"})
-    original_brush_color: FloatVectorProperty(
-        size=3,
-        default=(1.0, 1.0, 1.0),
-        options={"HIDDEN"},
+    stencil_state: EnumProperty(
+        name="Stencil State",
+        items=(
+            ("DISCONNECTED", "Disconnected", "연결된 Draw Brush가 없습니다"),
+            ("CONNECTED", "Connected", "현재 Draw Brush에 Camera Stencil이 연결됐습니다"),
+            ("CAMERA_SUSPENDED", "Camera Suspended", "Camera View 밖에서 연결을 일시 중단했습니다"),
+            ("MASK_SUSPENDED", "Mask Suspended", "Projection Paint Mask 편집 중입니다"),
+            ("BRUSH_CHANGED", "Brush Changed", "활성 Brush가 연결 Brush와 다릅니다"),
+            ("MANUAL_DISABLED", "Manual Disabled", "사용자가 Stencil 연결을 해제했습니다"),
+            ("ERROR", "Error", "Stencil 연결 계약이 손상됐습니다"),
+        ),
+        default="DISCONNECTED",
+        options={"HIDDEN", "SKIP_SAVE"},
     )
-    original_stencil_pos: FloatVectorProperty(
-        size=2,
-        default=(0.0, 0.0),
-        options={"HIDDEN"},
-    )
-    original_stencil_dimension: FloatVectorProperty(
-        size=2,
-        default=(256.0, 256.0),
-        options={"HIDDEN"},
-    )
-    original_brush_asset_library_type: StringProperty(default="", options={"HIDDEN"})
-    original_brush_asset_library_identifier: StringProperty(default="", options={"HIDDEN"})
-    original_brush_asset_relative_identifier: StringProperty(default="", options={"HIDDEN"})
+    stencil_reason: StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})
     stencil_frame_corners_json: StringProperty(default="", options={"HIDDEN"})
     paint_snapshot_json: StringProperty(default="{}", options={"HIDDEN"})
     paint_mesh_uuid: StringProperty(default="", options={"HIDDEN"})
@@ -567,7 +563,31 @@ class PP_PG_settings(bpy.types.PropertyGroup):
     current_image_name: StringProperty(name="Image", options={"HIDDEN", "SKIP_SAVE"})
     dataset_uuid: StringProperty(options={"HIDDEN"})
     dataset_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
+    display_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
     source_fingerprint: StringProperty(options={"HIDDEN"})
+    snapshot_uuid: StringProperty(options={"HIDDEN"})
+    snapshot_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
+    source_modifier_dataset_uuid: StringProperty(options={"HIDDEN"})
+    source_modifier_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
+    source_modifier_fingerprint: StringProperty(options={"HIDDEN"})
+    source_content_fingerprint: StringProperty(options={"HIDDEN"})
+    snapshot_camera_count: IntProperty(default=0, min=0, options={"HIDDEN"})
+    snapshot_image_count: IntProperty(default=0, min=0, options={"HIDDEN"})
+    snapshot_point_count: IntProperty(default=0, min=0, options={"HIDDEN"})
+    snapshot_created_at: StringProperty(options={"HIDDEN"})
+    snapshot_state: EnumProperty(
+        name="Snapshot State",
+        items=(
+            ("NONE", "None", ""),
+            ("UPDATING", "Updating", ""),
+            ("READY", "Ready", ""),
+            ("STALE", "Stale", ""),
+            ("ERROR", "Error", ""),
+        ),
+        default="NONE",
+        options={"HIDDEN"},
+    )
+    snapshot_schema_version: IntProperty(default=0, min=0, options={"HIDDEN"})
     dataset_manifest_json: StringProperty(default="{}", options={"HIDDEN"})
     image_path_manifest_json: StringProperty(default="{}", options={"HIDDEN"})
     marker_manifest_json: StringProperty(default="[]", options={"HIDDEN"})

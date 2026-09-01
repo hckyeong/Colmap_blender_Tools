@@ -15,6 +15,11 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 from tools import modifier as blender_colmap
+from shared.colmap_dataset import (
+    register as register_shared_dataset,
+    unregister as unregister_shared_dataset,
+)
+from shared.colmap_dataset.blender.registry import snapshot as dataset_snapshot
 from tools.modifier.blender.ownership import (
     DATASET_UUID_KEY,
     OWNER_KEY,
@@ -67,6 +72,7 @@ def _remove_first_point(settings) -> None:
     )
 
 
+register_shared_dataset()
 blender_colmap.register()
 try:
     with tempfile.TemporaryDirectory() as directory:
@@ -82,6 +88,11 @@ try:
             bpy.ops.colmap.import_model() == {"FINISHED"},
             settings.status,
         )
+        shared_after_import = dataset_snapshot(bpy.context.scene)
+        assert_true(
+            shared_after_import.dataset_revision == 1,
+            "Import가 공용 Dataset Revision을 초기화하지 않았습니다.",
+        )
         assert_true(
             settings.export_backup_enabled,
             "Backup 기본값은 활성화여야 합니다.",
@@ -89,6 +100,11 @@ try:
         settings.export_backup_enabled = False
 
         _remove_first_point(settings)
+        shared_before_export = dataset_snapshot(bpy.context.scene)
+        assert_true(
+            shared_before_export.dataset_revision == 2,
+            "Point 편집이 공용 Dataset Revision을 증가시키지 않았습니다.",
+        )
         state_before_export = ensure_runtime(bpy.context.scene)
         assert_true(
             state_before_export.edit_revision == 1
@@ -151,6 +167,14 @@ try:
         assert_true(
             bpy.ops.colmap.export() == {"FINISHED"},
             settings.export_status,
+        )
+        shared_after_export = dataset_snapshot(bpy.context.scene)
+        assert_true(
+            shared_after_export.dataset_revision
+            == shared_before_export.dataset_revision
+            and shared_after_export.source_fingerprint
+            == settings.source_fingerprint,
+            "Export가 공용 Dataset Revision 또는 원본 지문을 잘못 갱신했습니다.",
         )
         exported_model = read_model_text(model_directory, modern=False)
         assert_true(
@@ -275,5 +299,6 @@ try:
         )
 finally:
     blender_colmap.unregister()
+    unregister_shared_dataset()
 
 print("Blender COLMAP Export background test passed.")

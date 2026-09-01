@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from array import array
 from itertools import combinations
-import inspect
 from pathlib import Path
 import sys
 import tempfile
@@ -15,8 +14,8 @@ from unittest import mock
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[3] / "tools" / "projection_paint"
-sys.path.insert(0, str(ROOT.parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools import projection_paint as addon  # noqa: E402
 from tools.projection_paint.blender.layer_shader import (  # noqa: E402
@@ -29,6 +28,7 @@ from tools.projection_paint.blender.layer_shader import (  # noqa: E402
     LAYER_IMAGE_NODE_ROLE,
     LAYER_MIX_NODE_ROLE,
     LAYER_PREVIEW_UUID_KEY,
+    LAYER_SOLO_PREVIEW_MIX_NODE_ROLE,
     LAYER_UUID_KEY,
     LayerShaderError,
     MASK_BW_NODE_ROLE,
@@ -69,9 +69,31 @@ from tools.projection_paint.blender.paint_state import (  # noqa: E402
     validate_paint_contract,
 )
 from tools.projection_paint.blender.stencil_session import (  # noqa: E402
+    bind_active_draw_brush,
     stage_stencil_source,
     start_stencil_session,
 )
+
+
+def _activate_and_bind_test_brush(scene, brush) -> None:
+    """Background 테스트용 Local Brush를 활성화하고 직접 Stencil 대상으로 연결합니다."""
+
+    window = bpy.context.window
+    area = next(item for item in window.screen.areas if item.type == "VIEW_3D")
+    region = next(item for item in area.regions if item.type == "WINDOW")
+    brush.asset_mark()
+    try:
+        with bpy.context.temp_override(window=window, screen=window.screen, area=area, region=region):
+            result = bpy.ops.brush.asset_activate(
+                asset_library_type="LOCAL",
+                relative_asset_identifier=f"Brush/{brush.name}",
+            )
+        if result != {"FINISHED"}:
+            raise AssertionError(f"Local Brush 활성화 실패: {result}")
+    finally:
+        if brush.asset_data is not None:
+            brush.asset_clear()
+    bind_active_draw_brush(bpy.context, scene)
 
 
 def _new_target(name: str = "LayerTarget"):
@@ -172,7 +194,7 @@ def _fill_image(image, color: tuple[float, float, float, float]) -> None:
 
 
 def _render_center_color(target, material) -> tuple[float, float, float, float]:
-    """Layer Stack 출력을 Emission으로 렌더링해 중앙 Pixel을 반환합니다."""
+    """Layer 출력을 임시 Emission으로 렌더링하고 원래 Material 연결을 복구합니다."""
     scene = bpy.context.scene
     camera_data = bpy.data.cameras.new("LayerRenderCameraData")
     camera = bpy.data.objects.new("LayerRenderCamera", camera_data)
@@ -194,6 +216,7 @@ def _render_center_color(target, material) -> tuple[float, float, float, float]:
         for node in tree.nodes
         if node.type == "OUTPUT_MATERIAL" and bool(node.is_active_output)
     )
+    surface_source = output.inputs["Surface"].links[0].from_socket
     emission = tree.nodes.new("ShaderNodeEmission")
     tree.links.new(final_color, emission.inputs["Color"])
     tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
@@ -201,24 +224,34 @@ def _render_center_color(target, material) -> tuple[float, float, float, float]:
     scene.render.image_settings.file_format = "OPEN_EXR"
     scene.render.image_settings.color_mode = "RGBA"
     scene.render.image_settings.color_depth = "32"
-    with tempfile.TemporaryDirectory() as directory:
-        path = str(Path(directory) / "layer_result.exr")
-        scene.render.filepath = path
-        bpy.ops.render.render(write_still=True)
-        result = bpy.data.images.load(path, check_existing=False)
-        try:
-            values = array("f", [0.0]) * len(result.pixels)
-            result.pixels.foreach_get(values)
-            center = (8 * 16 + 8) * 4
-            return tuple(float(value) for value in values[center : center + 4])
-        finally:
-            bpy.data.images.remove(result)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "layer_result.exr")
+            scene.render.filepath = path
+            bpy.ops.render.render(write_still=True)
+            result = bpy.data.images.load(path, check_existing=False)
+            try:
+                values = array("f", [0.0]) * len(result.pixels)
+                result.pixels.foreach_get(values)
+                center = (8 * 16 + 8) * 4
+                return tuple(float(value) for value in values[center : center + 4])
+            finally:
+                bpy.data.images.remove(result)
+    finally:
+        tree.links.new(surface_source, output.inputs["Surface"])
+        tree.nodes.remove(emission)
+        bpy.data.objects.remove(camera, do_unlink=True)
+        bpy.data.cameras.remove(camera_data)
 
 
 def _prepare_layer_stencil_resume():
     """Camera View 복구 조건을 흉내 낼 Layer·Mask·Stencil 상태를 준비합니다."""
     target, setup = _prepare_backend("LayerStencilResumeTarget")
     scene = bpy.context.scene
+    camera_data = bpy.data.cameras.new("LayerStencilResumeCameraData")
+    camera = bpy.data.objects.new("LayerStencilResumeCamera", camera_data)
+    scene.collection.objects.link(camera)
+    scene.camera = camera
     settings = scene.projection_paint
     layer = settings.layers[0]
     bpy.ops.projection_paint.layer_mask_add(layer_uuid=layer.layer_uuid)
@@ -234,8 +267,8 @@ def _prepare_layer_stencil_resume():
     stencil = start_stencil_session(
         bpy.context,
         dataset_uuid="layer-stencil-resume",
-        brush_override=brush,
     )
+    _activate_and_bind_test_brush(scene, brush)
     source = bpy.data.images.new("LayerStencilResumeSource", 64, 32, alpha=True)
     image_id = 701
     stage_stencil_source(
@@ -256,20 +289,12 @@ def _prepare_layer_stencil_resume():
         },
         viewport_token=None,
     )
+    settings.paint_state = "ACTIVE"
     return target, setup, layer, stencil, runtime
 
 
 class LayerShaderTests(unittest.TestCase):
     """Layer Image, Shader Chain, Mask 선택과 Node 배치를 검증합니다."""
-
-    def test_original_duplicate_resamples_before_single_final_pack(self) -> None:
-        """Original 복제는 목표 해상도 리샘플 뒤 최종 Pack을 한 번만 수행합니다."""
-        source = inspect.getsource(layer_shader._duplicate_file_backed_original)
-        self.assertEqual(source.count("image.pack()"), 1)
-        self.assertNotIn("working.pack(", source)
-        self.assertNotIn("working.save(", source)
-        self.assertLess(source.index("working.scale("), source.index("image.pack()"))
-        self.assertLess(source.index("temporary.scale("), source.index("image.pack()"))
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -872,7 +897,7 @@ class LayerShaderTests(unittest.TestCase):
         _validate_active_graph(setup.material)
 
     def test_layer_and_mask_preview_are_globally_exclusive(self) -> None:
-        """Layer와 Mask 체크가 하나만 활성화되고 해제 시 전체 합성을 복구합니다."""
+        """Layer 개인 보기와 두 종류 Mask 보기가 배타적이며 전체 합성을 복구합니다."""
         _target, setup = _prepare_backend("GlobalPreviewTarget")
         settings = bpy.context.scene.projection_paint
         bottom_layer_uuid = str(settings.layers[0].layer_uuid)
@@ -883,10 +908,18 @@ class LayerShaderTests(unittest.TestCase):
             {"FINISHED"},
         )
         bottom_mask_uuid = str(settings.layers[0].mask.mask_uuid)
+        bottom_mix = _layer_mix(setup.material, bottom_layer_uuid)
         self.assertEqual(bpy.ops.projection_paint.layer_add(), {"FINISHED"})
         top_layer_uuid = str(settings.layers[0].layer_uuid)
+        self.assertEqual(
+            bpy.ops.projection_paint.layer_mask_add(
+                layer_uuid=top_layer_uuid,
+            ),
+            {"FINISHED"},
+        )
+        top_mask_uuid = str(settings.layers[0].mask.mask_uuid)
         top_mix = _layer_mix(setup.material, top_layer_uuid)
-        top_preview_source = top_mix.inputs[2].links[0].from_socket
+        solo_mix = None
         principled = next(
             node
             for node in setup.material.node_tree.nodes
@@ -906,9 +939,32 @@ class LayerShaderTests(unittest.TestCase):
             top_layer_uuid,
         )
         self.assertNotIn(MASK_PREVIEW_UUID_KEY, setup.material)
+        solo_mix = _owned_nodes(setup.material, LAYER_SOLO_PREVIEW_MIX_NODE_ROLE)[0]
         self.assertEqual(
-            principled.inputs["Base Color"].links[0].from_socket.as_pointer(),
-            top_preview_source.as_pointer(),
+            principled.inputs["Base Color"].links[0].from_node.as_pointer(),
+            solo_mix.as_pointer(),
+        )
+        self.assertEqual(solo_mix.get(LAYER_UUID_KEY), top_layer_uuid)
+        self.assertEqual(tuple(solo_mix.inputs[1].default_value), (0.0, 0.0, 0.0, 1.0))
+        self.assertEqual(
+            solo_mix.inputs[2].links[0].from_socket.as_pointer(),
+            top_mix.inputs[2].links[0].from_socket.as_pointer(),
+        )
+        self.assertEqual(
+            solo_mix.inputs[0].links[0].from_socket.as_pointer(),
+            top_mix.inputs[0].links[0].from_socket.as_pointer(),
+        )
+        self.assertEqual(
+            top_mix.inputs[0].links[0].from_node.get(MASK_UUID_KEY),
+            top_mask_uuid,
+        )
+        self.assertEqual(
+            top_mix.inputs[1].links[0].from_node.as_pointer(),
+            bottom_mix.as_pointer(),
+        )
+        self.assertEqual(
+            bottom_mix.inputs[0].links[0].from_node.get(MASK_UUID_KEY),
+            bottom_mask_uuid,
         )
         _validate_active_graph(setup.material)
 
@@ -1026,6 +1082,63 @@ class LayerShaderTests(unittest.TestCase):
         self.assertNotIn(MASK_PREVIEW_UUID_KEY, setup.material)
         _validate_active_graph(setup.material)
 
+    def test_layer_layer_mask_and_adjustment_mask_solo_switch_exclusively(self) -> None:
+        """Layer·Layer Mask·Adjustment Mask 단독 보기가 차례로 대체되고 해제됩니다."""
+        _target, setup = _prepare_backend("AllSoloTransitionsTarget")
+        settings = bpy.context.scene.projection_paint
+        layer = settings.layers[0]
+        bpy.ops.projection_paint.layer_mask_add(layer_uuid=layer.layer_uuid)
+        layer_mask_uuid = str(layer.mask.mask_uuid)
+        bpy.ops.projection_paint.layer_adjustment_add(
+            layer_uuid=layer.layer_uuid,
+            adjustment_type="BRIGHTNESS",
+        )
+        adjustment = layer.adjustments[0]
+        bpy.ops.projection_paint.adjustment_mask_add(
+            layer_uuid=layer.layer_uuid,
+            adjustment_uuid=adjustment.adjustment_uuid,
+        )
+        adjustment_mask_uuid = str(adjustment.mask.mask_uuid)
+        top_mix = _layer_mix(setup.material, settings.layers[0].layer_uuid)
+        principled = next(
+            node for node in setup.material.node_tree.nodes
+            if node.type == "BSDF_PRINCIPLED"
+        )
+
+        bpy.ops.projection_paint.layer_preview_toggle(layer_uuid=layer.layer_uuid)
+        self.assertEqual(settings.layer_preview_uuid, layer.layer_uuid)
+        self.assertEqual(settings.mask_preview_adjustment_uuid, "")
+        bpy.ops.projection_paint.mask_preview_toggle(
+            layer_uuid=layer.layer_uuid,
+            mask_uuid=layer_mask_uuid,
+        )
+        self.assertEqual(settings.layer_preview_uuid, "")
+        self.assertEqual(settings.mask_preview_adjustment_uuid, layer_mask_uuid)
+        bpy.ops.projection_paint.mask_preview_toggle(
+            layer_uuid=layer.layer_uuid,
+            mask_uuid=adjustment_mask_uuid,
+        )
+        self.assertEqual(settings.layer_preview_uuid, "")
+        self.assertEqual(settings.mask_preview_adjustment_uuid, adjustment_mask_uuid)
+        adjustment_bw = next(
+            node for node in _owned_nodes(setup.material, ADJUSTMENT_MASK_BW_NODE_ROLE)
+            if node.get(MASK_UUID_KEY) == adjustment_mask_uuid
+        )
+        self.assertEqual(
+            principled.inputs["Base Color"].links[0].from_node.as_pointer(),
+            adjustment_bw.as_pointer(),
+        )
+        bpy.ops.projection_paint.mask_preview_toggle(
+            layer_uuid=layer.layer_uuid,
+            mask_uuid=adjustment_mask_uuid,
+        )
+        self.assertEqual(settings.mask_preview_adjustment_uuid, "")
+        self.assertEqual(
+            principled.inputs["Base Color"].links[0].from_node.as_pointer(),
+            top_mix.as_pointer(),
+        )
+        _validate_active_graph(setup.material)
+
     def test_ui_top_layer_is_last_mix_before_principled(self) -> None:
         """UI 첫 Layer가 아래 Layer 결과를 받아 Principled 직전에 합성됩니다."""
         _target, setup = _prepare_backend()
@@ -1087,13 +1200,12 @@ class LayerShaderTests(unittest.TestCase):
         _validate_active_graph(setup.material)
 
     def test_layer_add_preserves_existing_preview_and_full_chain(self) -> None:
-        """미리보기 중 Layer 추가가 기존 Preview와 전체 합성 Chain을 보존합니다."""
+        """개인 보기 중 Layer 추가가 전용 Preview와 전체 합성 Chain을 보존합니다."""
         _target, setup = _prepare_backend("LayerAddPreviewTarget")
         settings = bpy.context.scene.projection_paint
         previewed = settings.layers[0]
         previewed_uuid = str(previewed.layer_uuid)
         previewed_mix = _layer_mix(setup.material, previewed_uuid)
-        preview_source = previewed_mix.inputs[2].links[0].from_socket
         principled = next(
             node
             for node in setup.material.node_tree.nodes
@@ -1107,8 +1219,11 @@ class LayerShaderTests(unittest.TestCase):
         added_mix = _layer_mix(setup.material, added.layer_uuid)
         self.assertEqual(settings.layer_preview_uuid, previewed_uuid)
         self.assertEqual(
-            principled.inputs["Base Color"].links[0].from_socket.as_pointer(),
-            preview_source.as_pointer(),
+            principled.inputs["Base Color"].links[0].from_node.as_pointer(),
+            _owned_nodes(
+                setup.material,
+                LAYER_SOLO_PREVIEW_MIX_NODE_ROLE,
+            )[0].as_pointer(),
         )
         self.assertEqual(
             added_mix.inputs[1].links[0].from_node.as_pointer(),
@@ -1270,8 +1385,8 @@ class LayerShaderTests(unittest.TestCase):
         self.assertFalse(settings.paint_mask_mode)
         self.assertIs(settings.active_paint_image, layer.image)
 
-    def test_layer_and_mask_selection_outside_runtime_do_not_update_stencil(self) -> None:
-        """실제 Projection Runtime 밖의 Layer·Mask 선택은 Stencil을 변경하지 않습니다."""
+    def test_mask_selection_outside_runtime_disconnects_stale_stencil(self) -> None:
+        """Runtime 밖에서도 Layer는 재연결하지 않고 Mask는 남은 Stencil을 해제합니다."""
         _target, _setup = _prepare_backend("LayerViewPreserveTarget")
         scene = bpy.context.scene
         settings = scene.projection_paint
@@ -1297,10 +1412,10 @@ class LayerShaderTests(unittest.TestCase):
             )
 
         reconnect.assert_not_called()
-        disconnect.assert_not_called()
+        disconnect.assert_called_once_with(scene)
 
-    def test_layer_selection_in_camera_view_restores_projection_stencil(self) -> None:
-        """Camera View의 Layer 선택은 검은 Brush를 흰 STENCIL 상태로 되돌립니다."""
+    def test_layer_selection_in_camera_view_keeps_manual_stencil_state(self) -> None:
+        """Camera View의 Layer 선택도 사용자가 해제한 Stencil을 자동 복구하지 않습니다."""
         _target, setup, layer, stencil, runtime = _prepare_layer_stencil_resume()
         scene = bpy.context.scene
         settings = scene.projection_paint
@@ -1340,17 +1455,14 @@ class LayerShaderTests(unittest.TestCase):
             setup.material.texture_paint_images[setup.material.paint_active_slot],
             layer.image,
         )
-        self.assertIs(brush.texture, stencil.managed_texture)
-        self.assertEqual(brush.texture_slot.map_mode, "STENCIL")
-        self.assertEqual(tuple(brush.color), (1.0, 1.0, 1.0))
-        self.assertFalse(settings.manual_stencil_disabled)
-        self.assertFalse(settings.stencil_outside_camera_view)
+        self.assertIsNone(brush.texture)
+        self.assertEqual(brush.texture_slot.map_mode, "VIEW_PLANE")
+        self.assertEqual(tuple(brush.color), (0.0, 0.0, 0.0))
         self.assertEqual(settings.paint_state, "ACTIVE")
-        self.assertEqual(runtime.viewport_token, (True, "camera-view"))
         start_tracking.assert_called_once_with(scene)
 
     def test_layer_selection_outside_camera_view_keeps_stencil_unchanged(self) -> None:
-        """Camera View가 아니면 Layer 선택이 Stencil을 강제로 복구하지 않습니다."""
+        """Camera View 밖의 Layer 선택은 연결 없이 Camera 감시만 재개합니다."""
         _target, setup, layer, stencil, runtime = _prepare_layer_stencil_resume()
         brush = stencil.brush
         brush.color = (0.0, 0.0, 0.0)
@@ -1376,6 +1488,10 @@ class LayerShaderTests(unittest.TestCase):
                 "tools.projection_paint.blender.paint_runtime."
                 "reconnect_stencil_texture",
             ) as reconnect,
+            mock.patch(
+                "tools.projection_paint.blender.paint_runtime."
+                "start_viewport_tracking",
+            ) as start_tracking,
         ):
             self.assertIs(
                 activate_layer_paint_image(bpy.context, str(layer.layer_uuid)),
@@ -1390,6 +1506,7 @@ class LayerShaderTests(unittest.TestCase):
         self.assertIsNone(brush.texture)
         self.assertEqual(brush.texture_slot.map_mode, "VIEW_PLANE")
         reconnect.assert_not_called()
+        start_tracking.assert_called_once_with(bpy.context.scene)
 
     def test_layer_selection_without_source_keeps_selection_successful(self) -> None:
         """Frame Source가 없으면 Layer 선택은 성공하고 Stencil 복구만 생략합니다."""
@@ -1416,6 +1533,10 @@ class LayerShaderTests(unittest.TestCase):
                 "tools.projection_paint.blender.paint_runtime."
                 "reconnect_stencil_texture",
             ) as reconnect,
+            mock.patch(
+                "tools.projection_paint.blender.paint_runtime."
+                "start_viewport_tracking",
+            ) as start_tracking,
         ):
             self.assertIs(
                 activate_layer_paint_image(bpy.context, str(layer.layer_uuid)),
@@ -1432,9 +1553,10 @@ class LayerShaderTests(unittest.TestCase):
         self.assertIsNone(brush.texture)
         self.assertEqual(brush.texture_slot.map_mode, "VIEW_PLANE")
         reconnect.assert_not_called()
+        start_tracking.assert_called_once_with(bpy.context.scene)
 
-    def test_layer_selection_keeps_target_when_stencil_restore_fails(self) -> None:
-        """Stencil 복구 예외가 발생해도 확정된 Layer 선택과 Paint Slot을 유지합니다."""
+    def test_layer_selection_does_not_call_stencil_refresh(self) -> None:
+        """Layer 선택은 Stencil 자동 복구 함수를 호출하지 않고 Paint Target만 확정합니다."""
         _target, setup, layer, stencil, runtime = _prepare_layer_stencil_resume()
         brush = stencil.brush
         brush.color = (0.0, 0.0, 0.0)
@@ -1458,9 +1580,13 @@ class LayerShaderTests(unittest.TestCase):
             ),
             mock.patch(
                 "tools.projection_paint.blender.paint_runtime."
-                "reconnect_stencil_texture",
+                "refresh_stencil",
                 side_effect=RuntimeError("재연결 실패"),
-            ) as reconnect,
+            ) as refresh,
+            mock.patch(
+                "tools.projection_paint.blender.paint_runtime."
+                "start_viewport_tracking",
+            ) as start_tracking,
         ):
             self.assertIs(
                 activate_layer_paint_image(bpy.context, str(layer.layer_uuid)),
@@ -1475,7 +1601,8 @@ class LayerShaderTests(unittest.TestCase):
         self.assertEqual(tuple(brush.color), (0.0, 0.0, 0.0))
         self.assertIsNone(brush.texture)
         self.assertEqual(brush.texture_slot.map_mode, "VIEW_PLANE")
-        reconnect.assert_called_once()
+        refresh.assert_not_called()
+        start_tracking.assert_called_once_with(bpy.context.scene)
 
     def test_paint_image_selection_100_times_changes_only_active_node(self) -> None:
         """Texture Paint에서 Layer와 두 Mask를 100회 선택해도 자원이 유지됩니다."""
@@ -2147,7 +2274,7 @@ class LayerShaderTests(unittest.TestCase):
         _validate_active_graph(setup.material)
 
     def test_two_layer_alpha_chain_renders_expected_linear_color(self) -> None:
-        """불투명 파랑 위 50% 빨강 Layer가 선형 보라색으로 렌더링됩니다."""
+        """전체는 보라색이고 위 Layer 개인 보기는 검정 위 50% 빨강으로 렌더링됩니다."""
         target, setup = _prepare_backend("LayerRenderTarget")
         settings = bpy.context.scene.projection_paint
         bpy.ops.projection_paint.layer_add()
@@ -2159,6 +2286,13 @@ class LayerShaderTests(unittest.TestCase):
         self.assertAlmostEqual(color[1], 0.0, delta=0.02)
         self.assertAlmostEqual(color[2], 0.5, delta=0.02)
         self.assertAlmostEqual(color[3], 1.0, delta=0.02)
+        bpy.ops.projection_paint.layer_preview_toggle(layer_uuid=top.layer_uuid)
+        solo_color = _render_center_color(target, setup.material)
+        self.assertAlmostEqual(solo_color[0], 0.5, delta=0.02)
+        self.assertAlmostEqual(solo_color[1], 0.0, delta=0.02)
+        self.assertAlmostEqual(solo_color[2], 0.0, delta=0.02)
+        self.assertAlmostEqual(solo_color[3], 1.0, delta=0.02)
+        bpy.ops.projection_paint.layer_preview_toggle(layer_uuid=top.layer_uuid)
         top.visible = False
         hidden_color = _render_center_color(target, setup.material)
         self.assertAlmostEqual(hidden_color[0], 0.0, delta=0.02)
@@ -2166,6 +2300,46 @@ class LayerShaderTests(unittest.TestCase):
         self.assertAlmostEqual(hidden_color[2], 1.0, delta=0.02)
         self.assertAlmostEqual(hidden_color[3], 1.0, delta=0.02)
 
+    def test_layer_solo_includes_adjustment_and_layer_mask_but_excludes_lower_layer(self) -> None:
+        """Layer 개인 보기는 보정·보정 Mask·Layer Mask를 적용하고 아래 파랑을 제외합니다."""
+        target, setup = _prepare_backend("LayerSoloProcessedTarget")
+        settings = bpy.context.scene.projection_paint
+        bpy.ops.projection_paint.layer_add()
+        top, bottom = _normal_layers(settings)
+        _fill_image(bottom.image, (0.0, 0.0, 1.0, 1.0))
+        _fill_image(top.image, (0.25, 0.0, 0.0, 1.0))
+        bpy.ops.projection_paint.layer_adjustment_add(
+            layer_uuid=top.layer_uuid,
+            adjustment_type="EXPOSURE",
+        )
+        adjustment = top.adjustments[0]
+        adjustment.exposure = 1.0
+        bpy.ops.projection_paint.adjustment_mask_add(
+            layer_uuid=top.layer_uuid,
+            adjustment_uuid=adjustment.adjustment_uuid,
+        )
+        _fill_image(adjustment.mask.image, (1.0, 1.0, 1.0, 1.0))
+        bpy.ops.projection_paint.layer_mask_add(layer_uuid=top.layer_uuid)
+        _fill_image(top.mask.image, (0.5, 0.5, 0.5, 1.0))
+
+        bpy.ops.projection_paint.layer_preview_toggle(layer_uuid=top.layer_uuid)
+        color = _render_center_color(target, setup.material)
+
+        self.assertAlmostEqual(color[0], 0.25, delta=0.03)
+        self.assertAlmostEqual(color[1], 0.0, delta=0.02)
+        self.assertAlmostEqual(color[2], 0.0, delta=0.02)
+        self.assertAlmostEqual(color[3], 1.0, delta=0.02)
+        top.mask.enabled = False
+        unmasked = _render_center_color(target, setup.material)
+        self.assertAlmostEqual(unmasked[0], 0.5, delta=0.03)
+        self.assertAlmostEqual(unmasked[2], 0.0, delta=0.02)
+        top.mask.enabled = True
+        top.visible = False
+        hidden = _render_center_color(target, setup.material)
+        self.assertAlmostEqual(hidden[0], 0.0, delta=0.02)
+        self.assertAlmostEqual(hidden[2], 0.0, delta=0.02)
+        top.visible = True
+        _validate_active_graph(setup.material)
 
 if __name__ == "__main__":
     unittest.main(argv=[__file__], verbosity=2)

@@ -8,8 +8,6 @@ from ..core.edit_replay import history_hash, replay_history
 from ..core.edits import (
     ImageObservationRemovalPlan,
     PointRemovalPlan,
-    apply_image_observation_removal,
-    apply_point_removal,
     image_operation_from_report,
     plan_image_observation_removal,
     plan_point_removal,
@@ -17,11 +15,16 @@ from ..core.edits import (
     serialize_history,
 )
 from ..core.indexes import build_relationship_indexes
+from ..core.removal import (
+    apply_image_observation_removal_indexed,
+    apply_point_removal_indexed,
+)
 from .camera_edit_session import (
     current_camera_edit_session,
     force_end_camera_mode,
     start_camera_edit_mode,
 )
+from .dataset_adapter import prepare_modifier_edit_commit
 from .edit_coordinator import synchronize_scene
 from .point_edit_session import (
     current_edit_session,
@@ -155,6 +158,7 @@ def commit_edit(
         "camera_edit_mode_active": settings.camera_edit_mode_active,
         "remove_target": settings.remove_target,
     }
+    shared_commit = prepare_modifier_edit_commit(context.scene, new_state)
     try:
         write_history_settings(settings, new_state)
         write_source_settings(settings, new_state)
@@ -162,8 +166,12 @@ def commit_edit(
         settings.camera_count = str(len(new_state.current_reconstruction.cameras))
         settings.point3d_count = str(len(new_state.current_reconstruction.points3d))
         settings.point_selection_status = status
+        if shared_commit is not None:
+            shared_commit.apply()
         warnings = synchronize_scene(context, new_state, settings)
     except Exception:
+        if shared_commit is not None:
+            shared_commit.rollback()
         for name, value in old_values.items():
             setattr(settings, name, value)
         raise
@@ -195,6 +203,8 @@ def commit_edit(
                     old_values,
                     review_snapshot,
                 )
+                if shared_commit is not None:
+                    shared_commit.rollback()
             except Exception as rollback_exc:
                 raise RuntimeError(
                     "Camera Filter 후처리 실패 후 복구에도 실패했습니다. "
@@ -216,6 +226,8 @@ def commit_edit(
         )
         settings.review_status = message
         post_warnings.append(message)
+    if shared_commit is not None:
+        shared_commit.complete()
     return (*warnings, *post_warnings)
 
 
@@ -466,10 +478,11 @@ def apply_pending_remove(
 ) -> tuple[str, ...]:
     """검증된 제거 계획을 Core에 적용하고 Scene까지 커밋합니다."""
     if pending.target_kind == "POINTS":
-        result, result_indexes, report = apply_point_removal(
+        result, result_indexes, report = apply_point_removal_indexed(
             state.current_reconstruction,
             pending.plan,
             current_revision=state.edit_revision,
+            indexes=state.indexes,
         )
         operation = point_operation_from_report(
             report,
@@ -482,10 +495,11 @@ def apply_pending_remove(
             f"관측 참조 {report.cleared_observation_count}개를 정리했습니다."
         )
     else:
-        result, result_indexes, report = apply_image_observation_removal(
+        result, result_indexes, report = apply_image_observation_removal_indexed(
             state.current_reconstruction,
             pending.plan,
             current_revision=state.edit_revision,
+            indexes=state.indexes,
         )
         operation = image_operation_from_report(
             report,

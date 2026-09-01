@@ -6,7 +6,13 @@ from collections.abc import Iterable, Iterator
 
 import bpy
 
-from .ownership import DATASET_UUID_KEY, OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
+from .ownership import (
+    DATASET_UUID_KEY,
+    OWNER_KEY,
+    OWNER_TOKEN,
+    RECORD_KIND_KEY,
+    is_dataset_owned,
+)
 
 
 def is_managed(
@@ -16,16 +22,24 @@ def is_managed(
     dataset_uuid: str | None = None,
 ) -> bool:
     """데이터블록이 요청한 애드온 소유권 조건을 만족하는지 반환합니다."""
-    if data_block.get(OWNER_KEY) != OWNER_TOKEN:
+    try:
+        legacy_owned = data_block.get(OWNER_KEY) == OWNER_TOKEN
+        if legacy_owned:
+            if kind is not None and data_block.get(RECORD_KIND_KEY) != kind:
+                return False
+            if (
+                dataset_uuid is not None
+                and data_block.get(DATASET_UUID_KEY) != dataset_uuid
+            ):
+                return False
+            return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
         return False
-    if kind is not None and data_block.get(RECORD_KIND_KEY) != kind:
-        return False
-    if (
-        dataset_uuid is not None
-        and data_block.get(DATASET_UUID_KEY) != dataset_uuid
-    ):
-        return False
-    return True
+    return is_dataset_owned(
+        data_block,
+        dataset_uuid=dataset_uuid,
+        role=kind,
+    )
 
 
 def iter_managed_objects(

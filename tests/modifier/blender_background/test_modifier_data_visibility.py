@@ -22,6 +22,9 @@ from tools.modifier.blender.ownership import (  # noqa: E402
     OWNER_TOKEN,
     RECORD_KIND_KEY,
 )
+from shared.colmap_dataset.blender.ownership import (  # noqa: E402
+    mark_dataset_owned,
+)
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -54,6 +57,24 @@ def main() -> None:
     managed_root.objects.link(managed_object)
     scene.collection.children.link(managed_root)
 
+    shared_root = bpy.data.collections.new("COLMAP Shared Dataset Root")
+    mark_dataset_owned(
+        shared_root,
+        dataset_uuid="shared-dataset",
+        role="ROOT",
+        source_fingerprint="f" * 64,
+    )
+    shared_object = bpy.data.objects.new("COLMAP Shared Dataset Camera", None)
+    mark_dataset_owned(
+        shared_object,
+        dataset_uuid="shared-dataset",
+        role="CAMERA",
+        record_id=1,
+        source_fingerprint="f" * 64,
+    )
+    shared_root.objects.link(shared_object)
+    scene.collection.children.link(shared_root)
+
     modifier_view_layer = synchronize_modifier_data_visibility(
         scene,
         create_view_layer=True,
@@ -71,6 +92,14 @@ def main() -> None:
         ordinary_view_layer.layer_collection,
         managed_root,
     )
+    modifier_shared_layer_collection = _layer_collection_for_collection(
+        modifier_view_layer.layer_collection,
+        shared_root,
+    )
+    ordinary_shared_layer_collection = _layer_collection_for_collection(
+        ordinary_view_layer.layer_collection,
+        shared_root,
+    )
     modifier_user_layer_collection = _layer_collection_for_collection(
         modifier_view_layer.layer_collection,
         user_collection,
@@ -83,6 +112,15 @@ def main() -> None:
     assert_true(
         not modifier_layer_collection.exclude and ordinary_layer_collection.exclude,
         "관리 Root의 View Layer별 제외 상태가 올바르지 않습니다.",
+    )
+    assert_true(
+        modifier_shared_layer_collection is not None
+        and ordinary_shared_layer_collection is not None
+        and not modifier_shared_layer_collection.exclude
+        and ordinary_shared_layer_collection.exclude
+        and shared_object.visible_get(view_layer=modifier_view_layer)
+        and not shared_object.visible_get(view_layer=ordinary_view_layer),
+        "중립 공용 Dataset Root가 Modifier 전용 Layer에만 표시되지 않았습니다.",
     )
     assert_true(
         modifier_user_layer_collection is not None
@@ -115,7 +153,12 @@ def main() -> None:
             additional_view_layer.layer_collection,
             managed_root,
         ).exclude
+        and _layer_collection_for_collection(
+            additional_view_layer.layer_collection,
+            shared_root,
+        ).exclude
         and not managed_object.visible_get(view_layer=additional_view_layer)
+        and not shared_object.visible_get(view_layer=additional_view_layer)
         and user_object.visible_get(view_layer=additional_view_layer)
         and direct_user_object.visible_get(view_layer=additional_view_layer),
         "새 사용자 View Layer에서 Modifier 데이터만 제외되지 않았습니다.",

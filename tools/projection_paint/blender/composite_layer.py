@@ -25,9 +25,11 @@ from .layer_shader import (
     LAYER_IMAGE_NODE_ROLE,
     LAYER_MIX_NODE_ROLE,
     LAYER_UUID_KEY,
+    MASK_IMAGE_ROLE,
     NORMAL_LAYER_ROLE,
     LayerShaderError,
     activate_layer_paint_image,
+    active_base_color_graph_layers,
     composite_chain_layers,
     composite_session_is_active,
     composite_source_layers,
@@ -35,12 +37,11 @@ from .layer_shader import (
     detach_shared_owned_image,
     find_layer,
     _remove_image,
-    migrate_legacy_composite_derived,
+    original_layer_is_read_only,
     reconcile_layer_graph,
     remove_owned_layer_bundles,
     remove_adjustment_resources,
     remove_mask_resources,
-    restore_legacy_composite_migration,
     validate_active_layer_graph,
     validate_layer_graph,
 )
@@ -200,17 +201,11 @@ def composite_recompose_summary(settings: Any) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CompositeSession:
-    """검증된 Composite와 의존 형제·원본 Layer 묶음을 한 Transaction에 전달합니다."""
+    """검증된 Composite 세션 식별자와 Composite·Source만 전달합니다."""
 
     session_uuid: str
     composite: Any
-    dependents: tuple[Any, ...]
     sources: tuple[Any, ...]
-
-    @property
-    def derived(self) -> tuple[Any, ...]:
-        """구형 호출 호환을 위해 의존 형제를 이전 파생 이름으로 반환합니다."""
-        return self.dependents
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,8 +321,6 @@ class CompositeCreateJob:
     source_visibility: tuple[tuple[str, bool, bool, str, bool], ...]
     composite_uuid: str
     session_uuid: str
-    clone_restore_image: Any
-    clone_restore_use_clone_layer: bool
     include_alpha: bool
     kind: str = "CREATE"
     recomposite_snapshot: tuple[
@@ -424,7 +417,7 @@ def _update_job_progress(
 
 @dataclass(slots=True)
 class CompositeReleaseSnapshot:
-    """Composite 해제의 그래프 복구 검증 실패 때 되돌릴 Scene·Clone·Node 활성 상태를 보관합니다."""
+    """Composite 해제의 논리 Commit 전 실패 때 되돌릴 Scene·Node 활성 상태를 보관합니다."""
 
     composite_state: str
     active_layer_index: int
@@ -432,8 +425,6 @@ class CompositeReleaseSnapshot:
     active_paint_image: Any
     paint_mask_mode: bool
     active_mask_uuid: str
-    clone_image: Any
-    use_clone_layer: bool
     source_visibility: tuple[tuple[Any, bool], ...]
     active_node: Any
     node_selection: tuple[tuple[Any, bool], ...]
@@ -463,7 +454,7 @@ def _job_bake_layers(job: CompositeCreateJob) -> tuple[Any, ...]:
 
 
 def _composite_session(settings: Any, *, require_active: bool) -> CompositeSession:
-    """역할·세션 UUID·Image 소유권이 일치하는 Composite 세션 묶음을 검증합니다."""
+    """역할·세션 UUID·Image 소유권이 일치하는 Composite와 Source를 검증합니다."""
     state = str(getattr(settings, "composite_state", "NONE"))
     session_uuid = str(getattr(settings, "active_composite_session_uuid", "") or "")
     if require_active and state != "ACTIVE":
@@ -488,19 +479,6 @@ def _composite_session(settings: Any, *, require_active: bool) -> CompositeSessi
         raise CompositeLayerError("Composite Image의 소유권이 유효하지 않습니다.")
     if str(composite.image.get(COMPOSITE_IMAGE_SESSION_KEY, "") or "") != session_uuid:
         raise CompositeLayerError("Composite Image 세션 UUID가 일치하지 않습니다.")
-    dependents = tuple(
-        layer
-        for layer in settings.layers
-        if str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
-        == NORMAL_LAYER_ROLE
-        and str(
-            getattr(layer, "composite_dependency_session_uuid", "") or ""
-        )
-        == session_uuid
-    )
-    for layer in dependents:
-        if not _owned_layer_image(layer.image, str(layer.layer_uuid)):
-            raise CompositeLayerError("Composite 의존 형제 Layer Image의 소유권이 유효하지 않습니다.")
     sources = composite_source_layers(settings)
     if not sources:
         raise CompositeLayerError("Composite 복구에 필요한 원본 Layer가 없습니다.")
@@ -512,7 +490,7 @@ def _composite_session(settings: Any, *, require_active: bool) -> CompositeSessi
             for layer in sources
         ):
             raise CompositeLayerError("Composite Source 세션 UUID가 서로 다릅니다.")
-    return CompositeSession(session_uuid, composite, dependents, sources)
+    return CompositeSession(session_uuid, composite, sources)
 
 
 def validate_composite_session(scene: Any) -> CompositeSession:
@@ -520,13 +498,10 @@ def validate_composite_session(scene: Any) -> CompositeSession:
     settings = _settings(scene)
     if settings is None or not _pointer(getattr(settings, "paint_material", None)):
         raise CompositeLayerError("Composite 검증에 필요한 관리 Material이 없습니다.")
-    legacy_snapshot = migrate_legacy_composite_derived(settings)
     try:
         session = _composite_session(settings, require_active=True)
         validate_active_layer_graph(scene, settings.paint_material)
     except Exception as exc:
-        if legacy_snapshot:
-            restore_legacy_composite_migration(legacy_snapshot)
         settings.composite_state = "STALE"
         if isinstance(exc, CompositeLayerError):
             raise
@@ -537,46 +512,9 @@ def validate_composite_session(scene: Any) -> CompositeSession:
 
 
 def composite_release_summary(settings: Any) -> tuple[str, tuple[str, ...]]:
-    """확인 대화상자에 표시할 Composite와 의존 형제 삭제 대상을 반환합니다."""
+    """확인 대화상자에 표시할 Composite와 빈 호환 삭제 목록을 반환합니다."""
     session = _composite_session(settings, require_active=True)
-    names = tuple(str(layer.name) for layer in session.dependents)
-    return str(session.composite.name), names
-
-
-def _capture_clone_settings(scene: Any, settings: Any) -> None:
-    """Composite가 바꿀 Blender Clone 설정만 Scene Property에 저장합니다."""
-    image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
-    if image_paint is None:
-        raise CompositeLayerError("Blender Image Paint 설정을 찾을 수 없습니다.")
-    settings.composite_saved_clone_image = image_paint.clone_image
-    settings.composite_saved_use_clone_layer = bool(image_paint.use_clone_layer)
-
-
-def _restore_clone_settings(scene: Any, settings: Any) -> None:
-    """Composite 활성 전 저장한 Blender Clone 설정을 유효한 Pointer만 복구합니다."""
-    _apply_clone_settings(
-        scene,
-        settings.composite_saved_clone_image,
-        bool(settings.composite_saved_use_clone_layer),
-    )
-    settings.composite_saved_clone_image = None
-    settings.composite_saved_use_clone_layer = False
-
-
-def _apply_clone_settings(scene: Any, image: Any, use_clone_layer: bool) -> None:
-    """저장한 Clone Image와 Clone Layer 사용 여부를 Blender 도구 설정에 적용합니다."""
-    image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
-    if image_paint is None:
-        return
-    image_paint.clone_image = image
-    image_paint.use_clone_layer = bool(use_clone_layer)
-
-
-def _activate_composite_clone_source(scene: Any, image: Any) -> None:
-    """활성 Composite 교체 뒤 Clone Image가 새 결과를 참조하도록 이전합니다."""
-    if not _pointer(image):
-        raise CompositeLayerError("새 Composite Clone Image가 유효하지 않습니다.")
-    _apply_clone_settings(scene, image, True)
+    return str(session.composite.name), ()
 
 
 def _capture_selection(context: Any) -> tuple[Any, tuple[tuple[Any, bool], ...], str]:
@@ -1242,7 +1180,7 @@ def _prepare_source_rgba_bake(
 def _prepare_source_emit_bake(
     context: Any,
     image: Any,
-    job: CompositeCreateJob,
+    job: Any,
     *,
     channel: str,
     source_image_overrides: dict[str, Any] | None = None,
@@ -1513,6 +1451,78 @@ def _restore_bake_ui_state(context: Any, preparation: CompositeBakePreparation) 
     )
 
 
+def prepare_emit_bake(
+    context: Any,
+    image: Any,
+    settings: Any,
+    bake_included_layer_uuids: tuple[str, ...],
+    *,
+    channel: str,
+    source_image_overrides: dict[str, Any] | None = None,
+) -> CompositeBakePreparation:
+    """Job 종류와 무관하게 선택 Layer의 Native·동기 EMIT Bake 상태를 준비합니다."""
+    preparation = _prepare_source_emit_bake(
+        context,
+        image,
+        SimpleNamespace(
+            settings=settings,
+            bake_included_layer_uuids=tuple(
+                str(layer_uuid) for layer_uuid in bake_included_layer_uuids
+            ),
+        ),
+        channel=str(channel),
+        source_image_overrides=source_image_overrides,
+    )
+    try:
+        _set_composite_bake_samples(preparation.scene)
+    except Exception:
+        _restore_bake_persistent_state(preparation)
+        _restore_bake_ui_state(context, preparation)
+        raise
+    return preparation
+
+
+def invoke_prepared_emit_bake(
+    preparation: CompositeBakePreparation,
+    *,
+    execution_mode: str,
+) -> set[str]:
+    """준비된 EMIT Bake를 지정한 Blender 실행 모드로 호출하고 반환 계약을 검증합니다."""
+    mode = str(execution_mode)
+    if mode not in {"EXEC_DEFAULT", "INVOKE_DEFAULT"}:
+        raise CompositeLayerError("지원하지 않는 EMIT Bake 실행 모드입니다.")
+    result = bpy.ops.object.bake(
+        mode,
+        type="EMIT",
+        target="IMAGE_TEXTURES",
+        use_clear=True,
+        margin=preparation.bake_margin,
+    )
+    expected = "FINISHED" if mode == "EXEC_DEFAULT" else "RUNNING_MODAL"
+    if expected not in result:
+        raise CompositeLayerError(
+            "Cycles EMIT Bake를 완료하지 못했습니다."
+            if mode == "EXEC_DEFAULT"
+            else "Cycles Native EMIT Bake Job을 시작하지 못했습니다."
+        )
+    return set(result)
+
+
+def restore_emit_bake_persistent_state(
+    preparation: CompositeBakePreparation,
+) -> None:
+    """Job 종류와 무관하게 EMIT Bake의 Node·렌더·장치 상태를 멱등 복구합니다."""
+    _restore_bake_persistent_state(preparation)
+
+
+def restore_emit_bake_ui_state(
+    context: Any,
+    preparation: CompositeBakePreparation,
+) -> None:
+    """Job 종류와 무관하게 EMIT Bake 전 선택·Mode 상태를 현재 Context에서 복구합니다."""
+    _restore_bake_ui_state(context, preparation)
+
+
 def _bake_final_base_color(
     context: Any,
     image: Any,
@@ -1613,59 +1623,130 @@ def _bake_source_rgba(context: Any, image: Any, *, job: CompositeCreateJob) -> N
     job.phase = "BAKED"
 
 
-def create_final_texture_export_image(context: Any) -> Any:
-    """현재 보이는 Base Color Chain을 같은 백엔드의 임시 RGBA Image에 Bake합니다."""
+def _bake_texture_export_channel(
+    context: Any,
+    image: Any,
+    job: Any,
+    *,
+    channel: str,
+) -> None:
+    """Texture Export의 premultiplied Color 또는 coverage Alpha를 동기 EMIT Bake합니다."""
+    preparation = prepare_emit_bake(
+        context,
+        image,
+        job.settings,
+        tuple(job.bake_included_layer_uuids),
+        channel=channel,
+    )
+    try:
+        invoke_prepared_emit_bake(preparation, execution_mode="EXEC_DEFAULT")
+        image.update()
+    finally:
+        restore_emit_bake_persistent_state(preparation)
+        restore_emit_bake_ui_state(context, preparation)
+
+
+def _validated_texture_export_layers(
+    context: Any,
+    visible_layers: tuple[Any, ...] | None,
+) -> tuple[Any, tuple[Any, ...]]:
+    """Texture Export용 가시 Layer가 현재 Base Color Graph의 순서와 일치하는지 검증합니다."""
     scene = context.scene
     settings = _settings(scene)
     if settings is None:
         raise CompositeLayerError("최종 Texture Export에 필요한 설정이 없습니다.")
-    session = validate_composite_session(scene)
-    visible_layers = tuple(
-        layer
-        for layer in composite_chain_layers(settings)
-        if bool(getattr(layer, "visible", False))
-        and str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
-        in {NORMAL_LAYER_ROLE, COMPOSITE_LAYER_ROLE}
+    try:
+        validate_active_layer_graph(scene, settings.paint_material)
+        graph_layers = active_base_color_graph_layers(settings)
+    except LayerShaderError as exc:
+        raise CompositeLayerError(f"최종 Texture Export Layer Graph가 유효하지 않습니다: {exc}") from exc
+    selected_layers = (
+        tuple(visible_layers)
+        if visible_layers is not None
+        else tuple(layer for layer in graph_layers if bool(getattr(layer, "visible", False)))
     )
-    if session.composite not in visible_layers:
-        raise CompositeLayerError("활성 Composite가 최종 Shader Chain에 표시되지 않습니다.")
-    export_uuid = new_uuid()
-    image = create_composite_layer_image(scene, export_uuid)
-    preparation = None
+    graph_pointers = {_pointer(layer) for layer in graph_layers}
+    selected_pointers = tuple(_pointer(layer) for layer in selected_layers)
+    if not selected_layers:
+        raise CompositeLayerError("내보낼 Layer가 없습니다. 하나 이상의 Layer 눈을 켜십시오.")
+    if len(set(selected_pointers)) != len(selected_layers):
+        raise CompositeLayerError("최종 Texture Export Layer가 중복되었습니다.")
+    if any(
+        pointer not in graph_pointers or not bool(getattr(layer, "visible", False))
+        for pointer, layer in zip(selected_pointers, selected_layers)
+    ):
+        raise CompositeLayerError("최종 Texture Export Layer가 현재 가시 Graph와 다릅니다.")
+    selected_pointer_set = set(selected_pointers)
+    expected_order = tuple(
+        _pointer(layer) for layer in graph_layers if _pointer(layer) in selected_pointer_set
+    )
+    if selected_pointers != expected_order:
+        raise CompositeLayerError("최종 Texture Export Layer 순서가 현재 Graph와 다릅니다.")
+    return settings, selected_layers
+
+
+def create_texture_export_bake_images(
+    context: Any,
+    visible_layers: tuple[Any, ...] | None = None,
+) -> tuple[Any, Any, tuple[str, ...]]:
+    """GUI·동기 Export가 공유할 Color·Alpha 임시 Image와 고정 Layer UUID를 생성합니다."""
+    settings, selected_layers = _validated_texture_export_layers(context, visible_layers)
+    image = create_composite_layer_image(context.scene, new_uuid())
+    alpha_image = None
+    try:
+        alpha_image = create_composite_layer_image(context.scene, new_uuid())
+        alpha_image[COMBINED_RGBA_IMAGE_KEY] = False
+        alpha_image.colorspace_settings.name = "Non-Color"
+        return (
+            image,
+            alpha_image,
+            tuple(str(layer.layer_uuid) for layer in selected_layers),
+        )
+    except Exception:
+        if alpha_image is not None and _pointer(alpha_image):
+            _remove_image(alpha_image)
+        _remove_image(image)
+        raise
+
+
+def create_final_texture_export_image(
+    context: Any,
+    visible_layers: tuple[Any, ...] | None = None,
+) -> Any:
+    """명시된 가시 Base Color Graph를 같은 백엔드의 임시 RGBA Image에 Bake합니다."""
+    settings, selected_layers = _validated_texture_export_layers(context, visible_layers)
+    image, alpha_image, layer_uuids = create_texture_export_bake_images(
+        context,
+        selected_layers,
+    )
     succeeded = False
     try:
         temporary_job = SimpleNamespace(
             settings=settings,
-            bake_included_layer_uuids=tuple(
-                str(layer.layer_uuid) for layer in visible_layers
-            ),
+            bake_included_layer_uuids=layer_uuids,
         )
-        preparation = _prepare_source_rgba_bake(
+        _bake_texture_export_channel(
             context,
             image,
             temporary_job,
+            channel="COLOR",
         )
-        _set_composite_bake_samples(scene)
-        result = bpy.ops.object.bake(
-            "EXEC_DEFAULT",
-            type="COMBINED",
-            target="IMAGE_TEXTURES",
-            use_clear=True,
-            margin=preparation.bake_margin,
+        _bake_texture_export_channel(
+            context,
+            alpha_image,
+            temporary_job,
+            channel="ALPHA",
         )
-        if "FINISHED" not in result:
-            raise CompositeLayerError("최종 Texture Export RGBA Bake가 완료되지 않았습니다.")
-        image.update()
+        combine_color_alpha_numpy(image, alpha_image)
+        _remove_image(alpha_image)
+        alpha_image = None
         succeeded = True
         return image
     finally:
-        try:
-            if preparation is not None:
-                _restore_bake_persistent_state(preparation)
-                _restore_bake_ui_state(context, preparation)
-        finally:
-            if not succeeded:
-                _remove_image(image)
+        if alpha_image is not None and _pointer(alpha_image):
+            _remove_image(alpha_image)
+        if not succeeded:
+            _remove_image(image)
 
 
 def remove_final_texture_export_image(image: Any) -> None:
@@ -1673,12 +1754,17 @@ def remove_final_texture_export_image(image: Any) -> None:
     _remove_image(image)
 
 
-def _native_bake_is_running() -> bool:
-    """현재 Blender가 Composite에 쓰는 Native OBJECT_BAKE Job을 실행 중인지 반환합니다."""
+def native_object_bake_running() -> bool:
+    """현재 Blender가 공통 Native OBJECT_BAKE Job을 실행 중인지 반환합니다."""
     try:
         return bool(bpy.app.is_job_running("OBJECT_BAKE"))
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return False
+
+
+def _native_bake_is_running() -> bool:
+    """기존 Composite 내부 API에서 공통 OBJECT_BAKE 실행 여부를 반환합니다."""
+    return native_object_bake_running()
 
 
 def _native_bake_image(job: CompositeCreateJob, stage: str) -> Any:
@@ -1769,24 +1855,25 @@ def prepare_native_bake(
             settings=job.settings,
             bake_included_layer_uuids=(str(job.old_composite_uuid),),
         )
-        preparation = _prepare_source_emit_bake(
+        preparation = prepare_emit_bake(
             context,
             image,
-            temporary_job,
+            temporary_job.settings,
+            tuple(temporary_job.bake_included_layer_uuids),
             channel="COLOR" if stage.endswith("COLOR") else "ALPHA",
         )
     elif stage in {"COLOR", "ALPHA"}:
-        preparation = _prepare_source_emit_bake(
+        preparation = prepare_emit_bake(
             context,
             image,
-            job,
+            job.settings,
+            tuple(job.bake_included_layer_uuids),
             channel=stage,
             source_image_overrides=_recomposite_flatten_source_overrides(job),
         )
     else:
         raise CompositeLayerError("Composite Native Bake 단계가 유효하지 않습니다.")
     try:
-        _set_composite_bake_samples(preparation.scene)
         job.bake_preparation = preparation
         if job.ui_bake_preparation is None:
             job.ui_bake_preparation = preparation
@@ -1808,7 +1895,7 @@ def prepare_native_bake(
                 sample_count=COMPOSITE_BAKE_SAMPLES,
             )
     except Exception:
-        _restore_bake_persistent_state(preparation)
+        restore_emit_bake_persistent_state(preparation)
         raise
 
 
@@ -1819,18 +1906,7 @@ def invoke_native_bake(context: Any, job: CompositeCreateJob) -> None:
     preparation = job.bake_preparation
     if preparation is None:
         raise CompositeLayerError("Composite Native Bake Margin을 계산할 준비 상태가 없습니다.")
-    try:
-        result = bpy.ops.object.bake(
-            "INVOKE_DEFAULT",
-            type="EMIT",
-            target="IMAGE_TEXTURES",
-            use_clear=True,
-            margin=preparation.bake_margin,
-        )
-    except Exception:
-        raise
-    if "RUNNING_MODAL" not in result:
-        raise CompositeLayerError("Cycles Native Bake Job을 시작하지 못했습니다.")
+    invoke_prepared_emit_bake(preparation, execution_mode="INVOKE_DEFAULT")
     job.native_bake_started = True
 
 
@@ -1882,7 +1958,7 @@ def finalize_native_bake(context: Any, job: CompositeCreateJob) -> str:
     preparation = job.bake_preparation
     if preparation is None:
         raise CompositeLayerError("Composite Native Bake 복구 상태가 없습니다.")
-    _restore_bake_persistent_state(preparation)
+    restore_emit_bake_persistent_state(preparation)
     image.update()
     job.bake_preparation = None
     job.native_bake_stage = ""
@@ -2084,14 +2160,13 @@ def _recomposite_partition(
 
 def _capture_recomposite_snapshot(
     settings: Any,
-) -> tuple[tuple[Any, str, str, str, str, int, bool, bool, bool, Any], ...]:
+) -> tuple[tuple[Any, str, str, str, int, bool, bool, bool, Any], ...]:
     """재합성 실패 시 기존 Composite를 완전히 되돌릴 Layer 영구 상태를 보관합니다."""
     return tuple(
         (
             layer,
             str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE)),
             str(getattr(layer, "composite_session_uuid", "") or ""),
-            str(getattr(layer, "composite_dependency_session_uuid", "") or ""),
             str(getattr(layer, "composite_source_session_uuid", "") or ""),
             int(getattr(layer, "composite_generation", 0)),
             bool(layer.visible),
@@ -2109,7 +2184,6 @@ def _restore_recomposite_snapshot(job: CompositeCreateJob) -> None:
         layer,
         role,
         composite_session_uuid,
-        dependency_session_uuid,
         source_session_uuid,
         generation,
         visible,
@@ -2120,7 +2194,6 @@ def _restore_recomposite_snapshot(job: CompositeCreateJob) -> None:
         if _pointer(layer):
             layer.layer_role = role
             layer.composite_session_uuid = composite_session_uuid
-            layer.composite_dependency_session_uuid = dependency_session_uuid
             layer.composite_source_session_uuid = source_session_uuid
             layer.composite_generation = generation
             layer.visible = visible
@@ -2230,8 +2303,6 @@ def _start_recomposite_layer_creation(context: Any) -> CompositeCreateJob:
         int(settings.composite_source_schema_version),
         str(settings.composite_layer_uuid),
         str(settings.composite_saved_active_layer_uuid),
-        settings.composite_saved_clone_image,
-        bool(settings.composite_saved_use_clone_layer),
         int(settings.active_layer_index),
         settings.overlay_image,
         settings.active_paint_image,
@@ -2252,10 +2323,6 @@ def _start_recomposite_layer_creation(context: Any) -> CompositeCreateJob:
         source_visibility=(),
         composite_uuid=new_uuid(),
         session_uuid=new_uuid(),
-        clone_restore_image=getattr(scene.tool_settings.image_paint, "clone_image", None),
-        clone_restore_use_clone_layer=bool(
-            getattr(scene.tool_settings.image_paint, "use_clone_layer", False)
-        ),
         include_alpha=bool(settings.composite_include_alpha),
         kind="RECOMPOSITE",
         recomposite_snapshot=_capture_recomposite_snapshot(settings),
@@ -2397,8 +2464,6 @@ def _rollback_composite_creation(
             "composite_source_schema_version",
             "composite_layer_uuid",
             "composite_saved_active_layer_uuid",
-            "composite_saved_clone_image",
-            "composite_saved_use_clone_layer",
             "active_layer_index",
             "overlay_image",
             "active_paint_image",
@@ -2411,14 +2476,6 @@ def _rollback_composite_creation(
             f"Scene 상태 {attribute}",
             lambda attribute=attribute, value=value: setattr(settings, attribute, value),
         )
-    rollback_step(
-        "Clone 설정",
-        lambda: _apply_clone_settings(
-            job.scene,
-            job.clone_restore_image,
-            job.clone_restore_use_clone_layer,
-        ),
-    )
     if job.kind == "RECOMPOSITE":
         rollback_step(
             "Graph 복구 전 재합성 임시 Image 보호",
@@ -2493,8 +2550,6 @@ def start_composite_layer_creation(context: Any) -> CompositeCreateJob:
         int(settings.composite_source_schema_version),
         str(settings.composite_layer_uuid),
         str(settings.composite_saved_active_layer_uuid),
-        settings.composite_saved_clone_image,
-        bool(settings.composite_saved_use_clone_layer),
         int(settings.active_layer_index),
         settings.overlay_image,
         settings.active_paint_image,
@@ -2524,8 +2579,6 @@ def start_composite_layer_creation(context: Any) -> CompositeCreateJob:
         source_visibility=source_visibility,
         composite_uuid=new_uuid(),
         session_uuid=new_uuid(),
-        clone_restore_image=previous_state[5],
-        clone_restore_use_clone_layer=bool(previous_state[6]),
         include_alpha=bool(settings.composite_include_alpha),
     )
     try:
@@ -2537,9 +2590,6 @@ def start_composite_layer_creation(context: Any) -> CompositeCreateJob:
             if 0 <= int(settings.active_layer_index) < len(settings.layers)
             else partition.normal_layer_uuids[0]
         )
-        _capture_clone_settings(scene, settings)
-        job.clone_restore_image = settings.composite_saved_clone_image
-        job.clone_restore_use_clone_layer = bool(settings.composite_saved_use_clone_layer)
         for layer in _job_source_layers(job):
             layer.composite_saved_visible = bool(layer.visible)
             layer.composite_source_session_uuid = job.session_uuid
@@ -2690,11 +2740,10 @@ def start_composite_post_bake_progress(
 
 
 def _set_recomposite_source_metadata(job: CompositeCreateJob, new_layer: Any) -> None:
-    """새 Composite 검증 전에 선택 Source와 외부 의존 형제의 세션 관계를 전환합니다."""
+    """새 Composite 검증 전에 명시 선택 Source의 세션 관계만 전환합니다."""
     if job.old_session is None or not _pointer(job.flatten_image):
         raise CompositeLayerError("재합성에 필요한 기존 Composite 평면 Source가 없습니다.")
     settings = job.settings
-    old_session = job.old_session
     old_composite = find_layer(settings, job.old_composite_uuid)
     if old_composite is None:
         raise CompositeLayerError("재합성할 기존 Composite Layer UUID를 찾을 수 없습니다.")
@@ -2713,20 +2762,10 @@ def _set_recomposite_source_metadata(job: CompositeCreateJob, new_layer: Any) ->
             layer.composite_saved_visible = bool(layer.visible)
             layer.composite_source_session_uuid = job.session_uuid
             layer.composite_bake_included = layer_uuid in new_bake_uuids
-            layer.composite_dependency_session_uuid = ""
             layer.visible = False
             continue
-        if (
-            str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE)) == NORMAL_LAYER_ROLE
-            and str(
-                getattr(layer, "composite_dependency_session_uuid", "") or ""
-            )
-            == old_session.session_uuid
-        ):
-            layer.composite_dependency_session_uuid = job.session_uuid
     old_composite.layer_role = NORMAL_LAYER_ROLE
     old_composite.composite_session_uuid = ""
-    old_composite.composite_dependency_session_uuid = ""
     old_composite.composite_generation = old_generation
     if _pointer(job.old_composite_image) and not job.reuse_old_composite_image:
         job.old_composite_image["pp_recomposite_pending_delete"] = True
@@ -2738,14 +2777,25 @@ def _set_recomposite_source_metadata(job: CompositeCreateJob, new_layer: Any) ->
 
 
 def _remove_recomposited_composite_children(job: CompositeCreateJob) -> None:
-    """검증된 재합성 뒤 삭제 대상의 Source와 Composite 자체 보조 자원을 실제로 제거합니다."""
+    """검증된 재합성 뒤 과거 Source와 명시 선택 일반 Source를 Bake 후 소비합니다."""
     if job.old_session is None:
         raise CompositeLayerError("삭제할 기존 Composite 세션이 없습니다.")
     settings = job.settings
     old_composite = find_layer(settings, job.old_composite_uuid)
     if old_composite is None:
         raise CompositeLayerError("삭제할 기존 Composite Layer UUID를 찾을 수 없습니다.")
-    source_uuids = tuple(job.old_source_layer_uuids)
+    source_uuids = tuple(
+        dict.fromkeys(
+            (
+                *job.old_source_layer_uuids,
+                *(
+                    layer_uuid
+                    for layer_uuid in job.source_layer_uuids
+                    if layer_uuid != job.old_composite_uuid
+                ),
+            )
+        )
+    )
     source_layers = tuple(
         find_layer(settings, layer_uuid) for layer_uuid in source_uuids
     )
@@ -2801,7 +2851,6 @@ def _commit_recomposite_creation(job: CompositeCreateJob) -> Any:
     new_layer.layer_uuid = job.composite_uuid
     new_layer.layer_role = COMPOSITE_LAYER_ROLE
     new_layer.composite_session_uuid = job.session_uuid
-    new_layer.composite_dependency_session_uuid = ""
     new_layer.composite_has_baked_alpha = bool(job.include_alpha)
     new_layer.image = job.composite_image
     new_layer.visible = True
@@ -2828,7 +2877,6 @@ def _commit_recomposite_creation(job: CompositeCreateJob) -> Any:
     settings.paint_mask_mode = False
     settings.overlay_image = job.composite_image
     settings.active_paint_image = job.composite_image
-    _activate_composite_clone_source(job.scene, job.composite_image)
     reconcile_layer_graph(job.scene)
     validate_composite_session(job.scene)
     _update_job_progress(job, 5, "Shader Switched", "새 Composite Shader Chain을 검증했습니다")
@@ -2872,7 +2920,6 @@ def _commit_composite_creation(job: CompositeCreateJob) -> Any:
     layer.layer_uuid = job.composite_uuid
     layer.layer_role = COMPOSITE_LAYER_ROLE
     layer.composite_session_uuid = job.session_uuid
-    layer.composite_dependency_session_uuid = ""
     layer.composite_generation = generation
     layer.composite_has_baked_alpha = bool(job.include_alpha)
     layer.image = composite_image
@@ -2911,7 +2958,7 @@ def _commit_composite_creation(job: CompositeCreateJob) -> Any:
         job,
         6,
         "Paint Target Ready",
-        "Composite Paint Target과 Clone 소유권을 확정했습니다",
+        "Composite Image를 직접 Paint Target으로 확정했습니다",
     )
     _set_status(settings, "Composite Layer 생성 완료", "SUCCESS")
     job.committed = True
@@ -3033,7 +3080,12 @@ def _layer_bundle_images(layers: tuple[Any, ...]) -> tuple[Any, ...]:
         )
         for image in candidates:
             pointer = _pointer(image)
-            if pointer and pointer not in seen:
+            owned = bool(
+                pointer
+                and image.get(OWNER_KEY) == OWNER_TOKEN
+                and image.get(RECORD_KIND_KEY) in {LAYER_IMAGE_ROLE, MASK_IMAGE_ROLE}
+            )
+            if owned and pointer not in seen:
                 seen.add(pointer)
                 images.append(image)
     return tuple(images)
@@ -3063,10 +3115,10 @@ def _capture_release_snapshot(
     settings: Any,
     session: CompositeSession,
 ) -> CompositeReleaseSnapshot:
-    """원본 그래프 복구 전 변경될 Composite 활성 Scene·Clone·Node 상태를 캡처합니다."""
+    """원본 그래프 복구 전 변경될 Composite 활성 Scene·Node 상태를 캡처합니다."""
+    del scene
     material = settings.paint_material
     tree = material.node_tree
-    image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
     return CompositeReleaseSnapshot(
         composite_state=str(settings.composite_state),
         active_layer_index=int(settings.active_layer_index),
@@ -3074,8 +3126,6 @@ def _capture_release_snapshot(
         active_paint_image=settings.active_paint_image,
         paint_mask_mode=bool(settings.paint_mask_mode),
         active_mask_uuid=str(settings.active_mask_uuid or ""),
-        clone_image=getattr(image_paint, "clone_image", None),
-        use_clone_layer=bool(getattr(image_paint, "use_clone_layer", False)),
         source_visibility=tuple(
             (layer, bool(layer.visible)) for layer in session.sources
         ),
@@ -3090,7 +3140,7 @@ def _restore_release_snapshot(
     settings: Any,
     snapshot: CompositeReleaseSnapshot,
 ) -> None:
-    """복구 검증 실패 뒤 Composite 활성 상태의 가시성·선택·Clone·Node 상태를 완전히 되돌립니다."""
+    """복구 검증 실패 뒤 Composite 활성 상태의 가시성·선택·Node 상태를 되돌립니다."""
     settings.composite_state = snapshot.composite_state
     for layer, visible in snapshot.source_visibility:
         if _pointer(layer):
@@ -3100,11 +3150,6 @@ def _restore_release_snapshot(
     settings.active_paint_image = snapshot.active_paint_image
     settings.paint_mask_mode = snapshot.paint_mask_mode
     settings.active_mask_uuid = snapshot.active_mask_uuid
-    _apply_clone_settings(
-        scene,
-        snapshot.clone_image,
-        snapshot.use_clone_layer,
-    )
     reconcile_layer_graph(scene)
     material = settings.paint_material
     for node, selected in snapshot.node_selection:
@@ -3121,7 +3166,7 @@ def _restore_release_snapshot(
 
 
 def release_composite_layer(context: Any) -> None:
-    """Composite와 같은 세션 의존 형제를 삭제하고 Source Layer Stack을 복구합니다."""
+    """Composite만 논리 해제하고 독립 일반 Layer를 보존한 뒤 고아 자원을 정리합니다."""
     scene = context.scene
     settings = _settings(scene)
     if settings is None:
@@ -3135,8 +3180,10 @@ def release_composite_layer(context: Any) -> None:
         settings.composite_state = "STALE"
         raise
     for source_layer in session.sources:
+        if original_layer_is_read_only(settings, source_layer):
+            continue
         repair_managed_overlay_if_needed(context, overlay=source_layer.image)
-    deletion_layers = (session.composite, *session.dependents)
+    deletion_layers = (session.composite,)
     deletion_uuids = tuple(str(layer.layer_uuid) for layer in deletion_layers)
     source_uuids = tuple(str(layer.layer_uuid) for layer in session.sources)
     deletion_images = _layer_bundle_images(deletion_layers)
@@ -3171,14 +3218,8 @@ def release_composite_layer(context: Any) -> None:
             tuple(
                 str(layer.layer_uuid)
                 for layer in settings.layers
-                if (
-                    str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
-                    == NORMAL_LAYER_ROLE
-                    and str(
-                        getattr(layer, "composite_dependency_session_uuid", "") or ""
-                    )
-                    != session.session_uuid
-                )
+                if str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
+                == NORMAL_LAYER_ROLE
             ),
             expected_original_base=False,
         )
@@ -3191,32 +3232,44 @@ def release_composite_layer(context: Any) -> None:
                 f"원본 Layer Shader Chain 복구와 Composite 상태 롤백에 실패했습니다: {rollback_exc}"
             ) from exc
         raise CompositeLayerError(f"원본 Layer Shader Chain 복구에 실패했습니다: {exc}") from exc
+    composite_index = next(
+        index
+        for index, layer in enumerate(settings.layers)
+        if str(layer.layer_uuid) == deletion_uuids[0]
+    )
+    settings.layers.remove(composite_index)
+    _clear_source_metadata(settings, source_uuids)
+    _clear_composite_settings(settings)
+    active_source_index = next(
+        index
+        for index, layer in enumerate(settings.layers)
+        if str(layer.layer_uuid) == active_source_uuid
+    )
+    settings.active_layer_index = active_source_index
+    settings.overlay_image = active_source.image
+    settings.active_paint_image = (
+        None if original_layer_is_read_only(settings, active_source) else active_source.image
+    )
+    settings.active_mask_uuid = ""
+    settings.paint_mask_mode = False
+    cleanup_error = None
     try:
-        _restore_clone_settings(scene, settings)
-        for index in sorted(
-            (
-                index
-                for index, layer in enumerate(settings.layers)
-                if str(layer.layer_uuid) in set(deletion_uuids)
-            ),
-            reverse=True,
-        ):
-            settings.layers.remove(index)
         remove_owned_layer_bundles(
             settings.paint_material,
             deletion_uuids,
             deletion_images,
             detach_shared=True,
         )
-        _clear_source_metadata(settings, source_uuids)
-        _clear_composite_settings(settings)
-        reconcile_layer_graph(scene)
-        activate_layer_paint_image(context, active_source_uuid)
-        _set_status(settings, "Composite Layer 해제 및 의존 형제 Layer 삭제 완료", "SUCCESS")
     except Exception as exc:
-        settings.composite_state = "STALE"
-        _set_status(settings, f"Composite 정리 실패: {exc}", "ERROR")
-        raise CompositeLayerError(f"원본 Layer는 복구됐지만 Composite 정리에 실패했습니다: {exc}") from exc
+        cleanup_error = exc
+    if cleanup_error is None:
+        _set_status(settings, "Composite Layer 해제 완료 · 독립 일반 Layer 보존", "SUCCESS")
+        return
+    _set_status(
+        settings,
+        f"Composite Layer 해제 완료 · 고아 자원 정리 경고: {cleanup_error}",
+        "WARNING",
+    )
 
 
 def recover_interrupted_recomposite(scene: Any) -> None:
@@ -3287,13 +3340,17 @@ __all__ = [
     "composite_memory_label",
     "composite_recompose_summary",
     "composite_release_summary",
+    "combine_color_alpha_numpy",
     "create_final_texture_export_image",
+    "create_texture_export_bake_images",
     "create_composite_layer",
     "finalize_native_bake",
     "invoke_native_bake",
+    "invoke_prepared_emit_bake",
     "mark_native_bake_job_stopped",
     "mark_native_bake_outcome",
     "prepare_native_bake",
+    "prepare_emit_bake",
     "prepare_composite_image",
     "prepare_recomposite_flatten_image",
     "prepare_recomposite_native_source",
@@ -3302,6 +3359,9 @@ __all__ = [
     "release_composite_create_job",
     "release_composite_layer",
     "rollback_native_bake",
+    "restore_emit_bake_persistent_state",
+    "restore_emit_bake_ui_state",
+    "native_object_bake_running",
     "start_composite_native_progress",
     "start_composite_post_bake_progress",
     "start_composite_layer_creation",

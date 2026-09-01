@@ -241,7 +241,7 @@ Modifier의 가시성은 Workspace 타입 필터로 숨기지 않는다. 특정 
 | Layout | 왼쪽 상단 `VIEW_3D`, 왼쪽 하단 `TIMELINE`, 오른쪽 상단 `OUTLINER`, 오른쪽 하단 `PROPERTIES` |
 | Scene Object 표시 | 지원되는 모든 `show_object_viewport_* = True` |
 | 설정 모드 | Workspace Open 시 `OBJECT` |
-| Paint 모드 | Paint 진입 뒤 `TEXTURE_PAINT`, Material Shading, Combined Pass |
+| Paint 모드 | Paint 진입 뒤 `TEXTURE_PAINT`, Material Shading, Diffuse Color Pass, Combined 배경색 승계 |
 | Point 표시 | Paint Session의 기존 숨김·복구 계약으로 제어 |
 | Sidebar | `Projection Paint` 탭 활성화 |
 | Properties | Object Context |

@@ -10,9 +10,9 @@ import traceback
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[2] / "tools" / "projection_paint"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESULT_PATH = Path(r"C:\tmp\projection_paint_base_color_view.json")
-sys.path.insert(0, str(ROOT.parent))
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools import projection_paint as addon  # noqa: E402
 from tools.projection_paint.blender.material_setup import (  # noqa: E402
@@ -31,7 +31,7 @@ from tools.projection_paint.blender.paint_workspace import (  # noqa: E402
 
 
 STATE = {"step": 0, "setup": None, "target": None}
-LAYOUT_BACKGROUND_COLOR = (0.18, 0.24, 0.31)
+COMBINED_BACKGROUND_COLOR = (0.18, 0.18, 0.18)
 
 
 def _write_result(payload: dict) -> None:
@@ -67,7 +67,7 @@ def _same_color(left, right) -> bool:
 
 
 def _run() -> float | None:
-    """전용 Paint View의 최종 합성 표시와 배경 비활성화를 검증합니다."""
+    """Paint View의 Diffuse Color 표시와 Combined 회색 배경 승계를 검증합니다."""
     try:
         if STATE["step"] == 0:
             addon.register()
@@ -91,7 +91,7 @@ def _run() -> float | None:
             )
             layout_shading = layout_area.spaces.active.shading
             layout_shading.background_type = "VIEWPORT"
-            layout_shading.background_color = LAYOUT_BACKGROUND_COLOR
+            layout_shading.background_color = COMBINED_BACKGROUND_COLOR
             with bpy.context.temp_override(
                 window=window,
                 screen=window.screen,
@@ -130,12 +130,15 @@ def _run() -> float | None:
         }
         if paint_state["shading"] != "MATERIAL":
             raise RuntimeError("Paint View가 Material Preview가 아닙니다.")
-        if paint_state["render_pass"] != "COMBINED":
-            raise RuntimeError("Paint View가 최종 합성 Combined Pass가 아닙니다.")
+        if paint_state["render_pass"] != "DIFFUSE_COLOR":
+            raise RuntimeError("Paint View가 Diffuse Color Pass가 아닙니다.")
         if paint_state["background_type"] != "VIEWPORT":
             raise RuntimeError("Paint View 배경 유형이 Layout Viewport와 다릅니다.")
-        if not _same_color(paint_state["background_color"], LAYOUT_BACKGROUND_COLOR):
-            raise RuntimeError("Paint View 배경색이 Layout Viewport와 다릅니다.")
+        if not _same_color(
+            paint_state["background_color"],
+            COMBINED_BACKGROUND_COLOR,
+        ):
+            raise RuntimeError("Paint View 배경색이 Combined 회색 배경과 다릅니다.")
         if paint_state["background_enabled"]:
             raise RuntimeError("Paint View에서 Show Background Image가 활성화되었습니다.")
         _restore_snapshot(bpy.context, STATE["setup"].overlay)

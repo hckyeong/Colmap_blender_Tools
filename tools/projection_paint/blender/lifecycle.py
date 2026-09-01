@@ -644,8 +644,13 @@ def _rebuild_projection_marker_session(scene: Any, _reason: str, _epoch: int) ->
         None,
     )
     if active_window is not None:
+        from .snapshot_update import snapshot_is_ready
+        from .dataset_view_layer import activate_projection_dataset_view_layer
+
+        activate_projection_dataset_view_layer(scene, active_window)
         acquire_scene_marker_session(scene, "projection_paint", window=active_window)
-        attach_projection_markers(scene)
+        if snapshot_is_ready(scene):
+            attach_projection_markers(scene)
         return
     detach_projection_markers(scene)
     if scene_marker_session_owned_by(scene, "projection_paint"):
@@ -793,8 +798,9 @@ def register() -> None:
 
         class_modules = (
             ".properties",
-            ".camera_import",
+            ".snapshot_update",
             ".camera_review",
+            ".viewport_navigation",
             ".paint_session",
             ".frame_source",
             ".stencil_session",
@@ -830,37 +836,53 @@ def register() -> None:
         )
         LIFECYCLE.register_keymap_item(
             "3D View",
-            "view3d.zoom",
-            "RIGHTMOUSE",
+            "projection_paint.reconnect_stencil",
+            "F6",
             space_type="VIEW_3D",
             region_type="WINDOW",
-            alt=True,
-        )
-        LIFECYCLE.register_keymap_item(
-            "Image Paint",
-            "view3d.zoom",
-            "RIGHTMOUSE",
-            region_type="WINDOW",
-            alt=True,
             head=True,
         )
-        from .camera_import import set_import_request_factory
-        from .core_adapter import create_camera_import_request_job
-
-        set_import_request_factory(create_camera_import_request_job)
+        industry_navigation = (
+            ("projection_paint.industry_orbit", "LEFTMOUSE"),
+            ("projection_paint.industry_pan", "MIDDLEMOUSE"),
+            ("projection_paint.industry_zoom", "RIGHTMOUSE"),
+        )
+        for keymap_name in ("3D View", "Image Paint"):
+            for operator_idname, event_type in industry_navigation:
+                LIFECYCLE.register_keymap_item(
+                    keymap_name,
+                    operator_idname,
+                    event_type,
+                    space_type="VIEW_3D" if keymap_name == "3D View" else "EMPTY",
+                    region_type="WINDOW",
+                    alt=True,
+                    head=True,
+                )
+        for stroke_event in ("LEFTMOUSE", "PEN", "ERASER"):
+            LIFECYCLE.register_keymap_item(
+                "Image Paint",
+                "projection_paint.block_multiselect_paint_stroke",
+                stroke_event,
+                region_type="WINDOW",
+                head=True,
+            )
         from .state_handlers import register_state_handlers
-        from .layers import enable_layer_ui_event_tracking
+        from .layers import (
+            clear_layer_ui_runtime_state,
+            enable_layer_ui_event_tracking,
+        )
         from .paint_workspace import (
             pause_paint_workspace_cleanup,
             rebuild_paint_workspace_cleanup,
         )
         from .texture_export import clear_texture_export_jobs
 
-        LIFECYCLE.add_rebuild_hook(_rebuild_projection_marker_session)
         register_state_handlers()
+        LIFECYCLE.add_rebuild_hook(_rebuild_projection_marker_session)
         LIFECYCLE.add_barrier_hook(clear_texture_export_jobs)
         LIFECYCLE.add_barrier_hook(pause_paint_workspace_cleanup)
         enable_layer_ui_event_tracking()
+        LIFECYCLE.add_barrier_hook(clear_layer_ui_runtime_state)
         LIFECYCLE.add_rebuild_hook(_rebuild_layer_ui_event_tracker)
         LIFECYCLE.add_rebuild_hook(rebuild_paint_workspace_cleanup)
         LIFECYCLE.rebuild(getattr(bpy.context, "scene", None), "register")
@@ -881,11 +903,9 @@ def _unregister_now() -> None:
         marker_cleanup_error = exc
     try:
         _unregister_paint_handoff_adapter()
-        from .camera_import import set_import_request_factory
         from .layers import disable_layer_ui_event_tracking
         from .state_handlers import unregister_state_handlers
 
-        set_import_request_factory(None)
         disable_layer_ui_event_tracking()
         unregister_state_handlers()
     finally:

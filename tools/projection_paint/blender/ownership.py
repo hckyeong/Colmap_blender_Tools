@@ -19,6 +19,15 @@ MANIFEST_KEY = "pp_camera_manifest"
 DATASET_REVISION_KEY = "pp_dataset_revision"
 MODEL_AXIS_REVISION_KEY = "pp_model_axis_revision"
 MODEL_AXIS_SIGNATURE_KEY = "pp_model_axis_signature"
+SNAPSHOT_OWNER_KEY = "pp_snapshot_owner"
+SNAPSHOT_OWNER_TOKEN = "projection_paint_snapshot"
+SNAPSHOT_UUID_KEY = "pp_snapshot_uuid"
+SNAPSHOT_SCHEMA_KEY = "pp_snapshot_schema"
+SNAPSHOT_ROLE_KEY = "pp_snapshot_role"
+SNAPSHOT_RECORD_ID_KEY = "pp_snapshot_record_id"
+SNAPSHOT_SOURCE_UUID_KEY = "pp_snapshot_source_uuid"
+SNAPSHOT_SOURCE_REVISION_KEY = "pp_snapshot_source_revision"
+PROJECT_STENCIL_DRAW_BRUSH_ROLE = "PROJECT_STENCIL_DRAW_BRUSH"
 
 CURRENT_SCHEMA = 1
 
@@ -134,6 +143,27 @@ def owned_identity(id_block: Any) -> tuple[str, str, str]:
 
     if not is_owned(id_block):
         return "", "", ""
+
+
+def tag_snapshot_resource(
+    id_block: Any,
+    *,
+    snapshot_uuid: str,
+    source_dataset_uuid: str,
+    source_revision: int,
+    schema_version: int,
+) -> None:
+    """PP COLMAP ID에 독립 Snapshot 출처와 역할 Metadata를 추가합니다."""
+
+    if not is_owned(id_block, dataset_uuid=snapshot_uuid):
+        raise ValueError("Projection Painting 소유 ID가 아닙니다.")
+    id_block[SNAPSHOT_OWNER_KEY] = SNAPSHOT_OWNER_TOKEN
+    id_block[SNAPSHOT_UUID_KEY] = str(snapshot_uuid)
+    id_block[SNAPSHOT_SCHEMA_KEY] = int(schema_version)
+    id_block[SNAPSHOT_ROLE_KEY] = str(id_block.get(RECORD_KIND_KEY, "") or "")
+    id_block[SNAPSHOT_RECORD_ID_KEY] = str(id_block.get(RECORD_ID_KEY, "") or "")
+    id_block[SNAPSHOT_SOURCE_UUID_KEY] = str(source_dataset_uuid)
+    id_block[SNAPSHOT_SOURCE_REVISION_KEY] = int(source_revision)
     try:
         return (
             str(id_block.get(DATASET_UUID_KEY, "") or ""),

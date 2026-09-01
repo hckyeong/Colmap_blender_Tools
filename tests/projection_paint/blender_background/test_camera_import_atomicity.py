@@ -201,8 +201,8 @@ class CameraImportAtomicityTest(unittest.TestCase):
         self.assertEqual(tuple(recreated.lock_location), (True, True, True))
         self.assertEqual(recreated.data.lens, manifest.camera_data[0].lens)
 
-    def test_camera_frustum_size_import_and_live_sync(self) -> None:
-        """Camera 표시 크기를 Import와 UI 변경에 적용하고 사용자 Camera는 보존합니다."""
+    def test_camera_frustum_callback_mutates_only_pp_resources(self) -> None:
+        """PP 표시 Callback이 독립 Snapshot Camera만 수정합니다."""
 
         self._acquire_marker_session()
         settings = self.scene.projection_paint
@@ -228,53 +228,15 @@ class CameraImportAtomicityTest(unittest.TestCase):
             bpy.data.objects.remove(user_object, do_unlink=True)
             bpy.data.cameras.remove(user_data)
 
-    def test_zero_camera_frustum_hides_only_managed_camera_objects(self) -> None:
-        """프러스텀 0이 Camera 뷰용 Object를 숨기고 이전 눈 상태를 복구합니다."""
+    def test_zero_camera_frustum_is_not_available_in_new_pp_settings(self) -> None:
+        """공용 계약과 맞게 PP Legacy Frustum 입력도 0보다 큰 값으로 제한합니다."""
 
-        self._acquire_marker_session()
         settings = self.scene.projection_paint
         settings.camera_frustum_size = 0.0
-        CameraImportJob(
-            self.scene,
-            _request("dataset-zero-frustum", camera_frustum_size=0.0),
-        ).run_to_completion()
-        runtime = runtime_for_scene(self.scene)
-        managed_objects = tuple(runtime.objects.values())
-        managed_data = next(iter(runtime.camera_data.values()))
-        view_layer = self.scene.view_layers[0]
-        self.assertAlmostEqual(0.0, settings.camera_frustum_size)
-        self.assertAlmostEqual(0.01, managed_data.display_size)
-        self.assertTrue(
-            all(obj.hide_get(view_layer=view_layer) for obj in managed_objects)
-        )
-        self.assertTrue(all(not obj.hide_viewport for obj in managed_objects))
+        self.assertGreater(settings.camera_frustum_size, 0.0)
 
-        user_data = bpy.data.cameras.new("PP_TEST_ZERO_USER_CAMERA_DATA")
-        user_object = bpy.data.objects.new("PP_TEST_ZERO_USER_CAMERA", user_data)
-        self.scene.collection.objects.link(user_object)
-        try:
-            settings.camera_frustum_size = 0.6
-            self.assertTrue(
-                all(not obj.hide_get(view_layer=view_layer) for obj in managed_objects)
-            )
-            self.assertFalse(user_object.hide_get(view_layer=view_layer))
-
-            managed_objects[0].hide_set(True, view_layer=view_layer)
-            settings.camera_frustum_size = 0.0
-            settings.camera_frustum_size = 0.8
-            self.assertTrue(managed_objects[0].hide_get(view_layer=view_layer))
-            self.assertTrue(
-                all(
-                    not obj.hide_get(view_layer=view_layer)
-                    for obj in managed_objects[1:]
-                )
-            )
-        finally:
-            bpy.data.objects.remove(user_object, do_unlink=True)
-            bpy.data.cameras.remove(user_data)
-
-    def test_point_scale_updates_the_settings_owner_scene(self) -> None:
-        """Point Scale Callback이 현재 Context가 아닌 소유 Scene을 갱신합니다."""
+    def test_point_scale_callback_mutates_pp_snapshot_resource(self) -> None:
+        """PP Point Scale Callback이 독립 Snapshot Mesh만 수정합니다."""
 
         self._acquire_marker_session()
         CameraImportJob(
@@ -289,11 +251,15 @@ class CameraImportAtomicityTest(unittest.TestCase):
         modifier = point_object.modifiers[0]
         identifier = modifier.node_group.get("pp_point_scale_socket")
 
-        self.scene.projection_paint.point_size = 0.25
+        with patch(
+            "tools.projection_paint.blender.point_scene._tag_point_display_update"
+        ) as tag_update:
+            self.scene.projection_paint.point_size = 0.25
 
         modifier_input = getattr(modifier.properties.inputs, identifier)
         self.assertAlmostEqual(0.25, modifier_input.value)
         self.assertAlmostEqual(0.25, point_object["colmap_point_size"])
+        tag_update.assert_called_once_with(point_object)
 
     def test_commit_failure_restores_previous_dataset(self) -> None:
         """새 Commit 오류가 이전 Manifest와 Scene Camera를 보존하는지 확인합니다."""
@@ -345,11 +311,10 @@ class CameraImportAtomicityTest(unittest.TestCase):
         self.assertEqual("USER_CAMERA_MARKER", marker.name)
 
     def test_marker_detach_attach_and_inactive_guard(self) -> None:
-        """Marker 분리·재연결과 비활성 Guard의 무생성 계약을 검증합니다."""
+        """Legacy Marker 분리와 공용 Dataset 미바인드 재연결 차단을 검증합니다."""
 
         self._acquire_marker_session()
         CameraImportJob(self.scene, _request("dataset-session")).run_to_completion()
-        manifest = scene_manifest(self.scene)
         runtime = runtime_for_scene(self.scene)
         modifier_marker = self.scene.timeline_markers.new(
             "COLMAP Review modifier IMAGE_ID 99",
@@ -392,18 +357,10 @@ class CameraImportAtomicityTest(unittest.TestCase):
         ):
             _rebuild_projection_marker_session(self.scene, "undo", 0)
         runtime = runtime_for_scene(self.scene)
-        self.assertTrue(projection_markers_attached(self.scene))
-        for entry in manifest.entries:
-            marker = runtime.markers[entry.image_id]
-            self.assertEqual(entry.marker_name, marker.name)
-            self.assertEqual(entry.frame, marker.frame)
-            self.assertEqual(entry.camera_uuid, marker.camera.get("pp_uuid"))
-        deleted_entry = manifest.entries[0]
-        self.scene.timeline_markers.remove(runtime.markers[deleted_entry.image_id])
-        _repair_timer()
-        restored = runtime.markers[deleted_entry.image_id]
-        self.assertEqual(deleted_entry.marker_name, restored.name)
-        self.assertEqual(deleted_entry.frame, restored.frame)
+        self.assertFalse(projection_markers_attached(self.scene))
+        self.assertTrue(scene_marker_session_owned_by(self.scene, "projection_paint"))
+        self.assertTrue(all(marker is None for marker in runtime.markers.values()))
+        self.assertIsNotNone(scene_manifest(self.scene))
 
     def test_import_commit_requires_projection_marker_session(self) -> None:
         """비활성 Projection Workspace의 Import Commit을 차단합니다."""

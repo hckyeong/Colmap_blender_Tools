@@ -17,6 +17,11 @@ from tools import modifier as blender_colmap
 from tools.modifier.blender import camera_review_timeline, edit_workflows
 from tools.modifier.blender import point_edit_session
 from tools.modifier.blender.camera_review_session import ensure_review_session
+from tools.modifier.blender.camera_review_timeline import (
+    acquire_modifier_marker_session,
+    detach_review_timeline_markers,
+    release_modifier_marker_session,
+)
 from tools.modifier.blender.delete_guard import _KEYMAP_ITEMS
 from tools.modifier.blender.operators_point_edit_mode import (
     _SESSIONS as POINT_EDIT_SESSIONS,
@@ -364,6 +369,7 @@ try:
             settings.status,
         )
         review_session = ensure_review_session(bpy.context)
+        acquire_modifier_marker_session(scene)
         assert_true(
             bpy.ops.colmap.review_build_timeline() == {"FINISHED"},
             settings.review_status,
@@ -787,6 +793,8 @@ try:
         point_identity.hide_select = False
         point_identity.select_set(True)
         bpy.context.view_layer.objects.active = point_identity
+        detach_review_timeline_markers(ensure_review_session(bpy.context))
+        release_modifier_marker_session(scene)
         blend_path = root / "feature2_redesign.blend"
         assert_true(
             bpy.ops.wm.save_as_mainfile(filepath=str(blend_path)) == {"FINISHED"},

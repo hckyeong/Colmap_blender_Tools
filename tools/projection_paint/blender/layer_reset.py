@@ -10,22 +10,27 @@ import bpy
 from .layer_shader import (
     LAYER_IMAGE_NODE_ROLE,
     LAYER_IMAGE_ROLE,
+    MASK_IMAGE_ROLE,
     NORMAL_LAYER_ROLE,
     ORIGINAL_LAYER_IMAGE_KEY,
     LayerShaderError,
     _activate_paint_image_node,
     _create_original_image,
+    _external_original_image,
     _image_size,
     _image_tile_numbers,
     _new_image,
     _node_for,
+    _owned_image,
     _pointer,
     _remove_image,
     _validate_target_image_contract,
     _target_tile_numbers,
+    original_layer_is_read_only,
     reconcile_layer_graph,
     validate_active_layer_graph,
 )
+from .ownership import new_uuid
 from .udim_setup import UDIM_KIND_KEY
 
 
@@ -36,6 +41,7 @@ def _snapshot_mask(mask: Any) -> dict[str, Any]:
     """Mask PropertyGroup을 RNA 참조 없이 복원 가능한 값으로 복사합니다."""
     return {
         "mask_uuid": str(mask.mask_uuid or ""),
+        "ui_selected": bool(mask.ui_selected),
         "image": mask.image,
         "enabled": bool(mask.enabled),
     }
@@ -46,6 +52,7 @@ def _snapshot_adjustment(adjustment: Any) -> dict[str, Any]:
     return {
         "adjustment_type": str(adjustment.adjustment_type),
         "adjustment_uuid": str(adjustment.adjustment_uuid or ""),
+        "ui_selected": bool(adjustment.ui_selected),
         "image": adjustment.image,
         "mask": _snapshot_mask(adjustment.mask),
         "expanded": bool(adjustment.expanded),
@@ -64,9 +71,6 @@ def _snapshot_layer(layer: Any) -> dict[str, Any]:
         "layer_uuid": str(layer.layer_uuid),
         "layer_role": str(layer.layer_role),
         "composite_session_uuid": str(layer.composite_session_uuid or ""),
-        "composite_dependency_session_uuid": str(
-            layer.composite_dependency_session_uuid or ""
-        ),
         "composite_generation": int(layer.composite_generation),
         "composite_source_session_uuid": str(
             layer.composite_source_session_uuid or ""
@@ -90,6 +94,7 @@ def _snapshot_layer(layer: Any) -> dict[str, Any]:
 def _assign_mask(mask: Any, snapshot: dict[str, Any]) -> None:
     """Mask Snapshot을 Update Callback 없이 PropertyGroup에 복원합니다."""
     mask.mask_uuid = snapshot["mask_uuid"]
+    mask.ui_selected = bool(snapshot.get("ui_selected", False))
     mask.image = snapshot["image"]
     mask["enabled"] = snapshot["enabled"]
 
@@ -98,6 +103,7 @@ def _assign_adjustment(adjustment: Any, snapshot: dict[str, Any]) -> None:
     """Adjustment Snapshot과 자체 Mask를 PropertyGroup에 복원합니다."""
     adjustment.adjustment_type = snapshot["adjustment_type"]
     adjustment.adjustment_uuid = snapshot["adjustment_uuid"]
+    adjustment.ui_selected = bool(snapshot.get("ui_selected", False))
     adjustment.image = snapshot["image"]
     adjustment["expanded"] = snapshot["expanded"]
     adjustment["enabled"] = snapshot["enabled"]
@@ -115,7 +121,6 @@ def _assign_layer(layer: Any, snapshot: dict[str, Any]) -> None:
         "layer_uuid",
         "layer_role",
         "composite_session_uuid",
-        "composite_dependency_session_uuid",
         "composite_generation",
         "composite_source_session_uuid",
         "composite_bake_included",
@@ -186,7 +191,7 @@ def _snapshot_images(layer_snapshots: tuple[dict[str, Any], ...]) -> tuple[Any, 
 def _set_reset_protection(images: tuple[Any, ...], enabled: bool) -> None:
     """Graph 재구성 중 기존 관리 Image가 고아 정리되지 않게 보호합니다."""
     for image in images:
-        if not _pointer(image):
+        if not _owned_image(image, {LAYER_IMAGE_ROLE, MASK_IMAGE_ROLE}):
             continue
         if enabled:
             image[RESET_PENDING_DELETE_KEY] = True
@@ -250,7 +255,7 @@ def _prepare_initial_image(
     source: Any | None,
     source_socket: Any | None,
 ) -> tuple[Any, bool]:
-    """검증된 provenance로 목표 해상도의 Original 또는 투명 Image를 준비합니다."""
+    """검증된 provenance로 외부 Original 참조 또는 관리 Paint Image를 준비합니다."""
     if source is None and source_socket is None:
         image = _new_image(
             target,
@@ -274,7 +279,8 @@ def _prepare_initial_image(
         material=settings.paint_material,
         source_socket=source_socket,
     )
-    image[ORIGINAL_LAYER_IMAGE_KEY] = True
+    if _owned_image(image, {LAYER_IMAGE_ROLE}):
+        image[ORIGINAL_LAYER_IMAGE_KEY] = True
     return image, True
 
 
@@ -289,7 +295,6 @@ def _initial_layer_snapshot(
         "name": "Original Layer · Texture" if is_original else "Layer 1",
         "layer_role": NORMAL_LAYER_ROLE,
         "composite_session_uuid": "",
-        "composite_dependency_session_uuid": "",
         "composite_generation": 0,
         "composite_source_session_uuid": "",
         "composite_bake_included": False,
@@ -300,7 +305,12 @@ def _initial_layer_snapshot(
         "image": image,
         "visible": True,
         "expanded": True,
-        "mask": {"mask_uuid": "", "image": None, "enabled": True},
+        "mask": {
+            "mask_uuid": "",
+            "ui_selected": False,
+            "image": None,
+            "enabled": True,
+        },
         "adjustments": (),
         "active_adjustment_index": -1,
     }
@@ -313,7 +323,7 @@ def replace_with_fresh_layer(
     *,
     use_base_resolution: bool = True,
 ) -> Any:
-    """해상도 변경 시 Original Texture 또는 투명 Layer 한 개로 원자적으로 초기화합니다."""
+    """해상도 변경 시 쓰기 Layer와 필요하면 읽기 전용 Original을 원자 초기화합니다."""
     scene = context.scene
     settings = scene.projection_paint
     if str(getattr(settings, "composite_state", "NONE")) != "NONE":
@@ -334,7 +344,11 @@ def replace_with_fresh_layer(
             layer.mask.image,
             *(adjustment.mask.image for adjustment in layer.adjustments),
         ):
-            if _pointer(image):
+            if not _pointer(image):
+                continue
+            if image is layer.image and original_layer_is_read_only(settings, layer):
+                _external_original_image(image, require_files=True)
+            else:
                 _validate_target_image_contract(
                     target,
                     image,
@@ -352,7 +366,7 @@ def replace_with_fresh_layer(
         if source_image is not None and _pointer(source_image):
             size = _image_size(source_image)
 
-    new_image, is_original = _prepare_initial_image(
+    prepared_image, is_original = _prepare_initial_image(
         settings,
         target,
         layer_uuid,
@@ -361,6 +375,23 @@ def replace_with_fresh_layer(
         source,
         source_socket,
     )
+    direct_original = bool(
+        is_original
+        and source is not None
+        and _external_original_image(source, require_files=True) is prepared_image
+    )
+    if direct_original:
+        new_image = _new_image(
+            target,
+            f"{target.name}_Layer 1_Paint",
+            size,
+            role=LAYER_IMAGE_ROLE,
+            layer_uuid=layer_uuid,
+            color=(0.0, 0.0, 0.0, 0.0),
+            reference=first_snapshot["image"],
+        )
+    else:
+        new_image = prepared_image
     try:
         _validate_target_image_contract(target, new_image, size, first_snapshot["image"])
     except Exception:
@@ -370,10 +401,24 @@ def replace_with_fresh_layer(
     layer_snapshots = tuple(_snapshot_layer(layer) for layer in settings.layers)
     scene_snapshot = _settings_snapshot(settings)
     old_images = _snapshot_images(layer_snapshots)
-    initial_snapshot = _initial_layer_snapshot(first_snapshot, new_image, is_original)
+    initial_snapshot = _initial_layer_snapshot(
+        first_snapshot,
+        new_image,
+        is_original and not direct_original,
+    )
+    initial_snapshots = (initial_snapshot,)
+    if direct_original:
+        original_seed = {**first_snapshot, "layer_uuid": new_uuid()}
+        original_snapshot = _initial_layer_snapshot(
+            original_seed,
+            prepared_image,
+            True,
+        )
+        original_snapshot["ui_selected"] = False
+        initial_snapshots = (initial_snapshot, original_snapshot)
     _set_reset_protection(old_images, True)
     try:
-        _replace_layer_collection(settings, (initial_snapshot,))
+        _replace_layer_collection(settings, initial_snapshots)
         settings.active_layer_index = 0
         settings.active_mask_uuid = ""
         settings.paint_mask_mode = False
@@ -382,7 +427,11 @@ def replace_with_fresh_layer(
         settings.layer_selection_anchor_uuid = layer_uuid
         settings.overlay_image = new_image
         settings.active_paint_image = new_image
-        settings.original_layer_name = str(initial_snapshot["name"])
+        settings.original_layer_name = (
+            str(initial_snapshots[-1]["name"])
+            if direct_original
+            else str(initial_snapshot["name"])
+        )
         settings.durability_state = "EMPTY"
         reconcile_layer_graph(scene)
         _activate_paint_image_node(material, LAYER_IMAGE_NODE_ROLE, new_image)
@@ -408,7 +457,11 @@ def replace_with_fresh_layer(
 
     _set_reset_protection(old_images, False)
     for image in old_images:
-        if _pointer(image) and image is not new_image and int(image.users) == 0:
+        if (
+            _owned_image(image, {LAYER_IMAGE_ROLE, MASK_IMAGE_ROLE})
+            and image is not new_image
+            and int(image.users) == 0
+        ):
             _remove_image(image)
     return new_image
 

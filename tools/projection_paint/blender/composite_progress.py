@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 from .progress_overlay import (
     ProgressOverlayView,
+    activity_process_label,
     add_progress_overlay_draw_handler,
+    native_bake_progress_view,
     remove_progress_overlay_draw_handler,
     request_progress_overlay_redraw,
 )
@@ -44,8 +45,6 @@ class CompositeProgressSession:
 
 
 _SESSIONS: dict[str, CompositeProgressSession] = {}
-_PROCESS_DOT_INTERVAL_SECONDS = 0.4
-_PROCESS_DOT_FRAME_COUNT = 4
 
 
 def _memory_label(memory_bytes: int) -> str:
@@ -55,14 +54,8 @@ def _memory_label(memory_bytes: int) -> str:
 
 
 def composite_process_label(elapsed_seconds: float) -> str:
-    """경과 시간에 따라 점 한 개부터 네 개까지 반복되는 Process 문구를 반환합니다."""
-    elapsed = float(elapsed_seconds)
-    if not isfinite(elapsed) or elapsed < 0.0:
-        elapsed = 0.0
-    frame = int(
-        elapsed / _PROCESS_DOT_INTERVAL_SECONDS + 1.0e-9
-    ) % _PROCESS_DOT_FRAME_COUNT
-    return f"Process{'.' * (frame + 1)}"
+    """기존 Composite 공개 API에서 공통 Process 활동 문구를 반환합니다."""
+    return activity_process_label(elapsed_seconds)
 
 
 def composite_progress_view(session: CompositeProgressSession) -> ProgressOverlayView:
@@ -70,17 +63,21 @@ def composite_progress_view(session: CompositeProgressSession) -> ProgressOverla
     width, height = session.image_size
     elapsed_seconds = session.elapsed_seconds
     if session.indeterminate:
-        detail_lines = (
-            str(session.detail),
-            f"{session.bake_device_detail} · EMIT · {width}×{height} · 버퍼 {session.tile_count}개",
-            f"하단 100% 뒤에도 이미지 변환 중 · Samples {session.sample_count} · 경과 {elapsed_seconds:.1f}초",
+        return native_bake_progress_view(
+            title="Composite Layer",
+            phase=str(session.phase),
+            elapsed_seconds=elapsed_seconds,
+            detail=str(session.detail),
+            device_detail=str(session.bake_device_detail),
+            image_size=(width, height),
+            tile_count=int(session.tile_count),
+            sample_count=int(session.sample_count),
         )
-    else:
-        detail_lines = (
-            str(session.detail),
-            _memory_label(session.memory_bytes),
-            f"경과 시간 {elapsed_seconds:.1f}초",
-        )
+    detail_lines = (
+        str(session.detail),
+        _memory_label(session.memory_bytes),
+        f"경과 시간 {elapsed_seconds:.1f}초",
+    )
     return ProgressOverlayView(
         title="Composite Layer",
         phase=str(session.phase),

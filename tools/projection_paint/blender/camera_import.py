@@ -124,6 +124,13 @@ class CameraImportRequest:
     point_size: float = 0.05
     camera_frustum_size: float = DEFAULT_CAMERA_FRUSTUM_SIZE
     core_validated: bool = False
+    snapshot_schema_version: int = 0
+    source_dataset_uuid: str = ""
+    source_revision: int = 0
+    source_modifier_fingerprint: str = ""
+    content_fingerprint: str = ""
+    snapshot_created_at: str = ""
+    preferred_image_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,11 +588,19 @@ class CameraImportJob:
             self.scene[DATASET_REVISION_KEY] = manifest.dataset_revision
             self.scene.frame_start = manifest.frame_start
             self.scene.frame_end = manifest.frame_end
-            self.scene.frame_current = manifest.frame_start
+            preferred_entry = next(
+                (
+                    entry
+                    for entry in manifest.entries
+                    if entry.image_id == int(self.request.preferred_image_id)
+                ),
+                manifest.entries[0],
+            )
+            self.scene.frame_current = preferred_entry.frame
             first_camera = next(
                 obj
                 for obj in self.collection.objects
-                if owned_uuid_of(obj) == manifest.entries[0].camera_uuid
+                if owned_uuid_of(obj) == preferred_entry.camera_uuid
             )
             self.scene.camera = first_camera
             settings = getattr(self.scene, "projection_paint", None)
@@ -599,6 +614,23 @@ class CameraImportJob:
                     "images_directory",
                     "image_path_manifest_json",
                     "marker_manifest_json",
+                    "snapshot_uuid",
+                    "snapshot_revision",
+                    "source_modifier_dataset_uuid",
+                    "source_modifier_revision",
+                    "source_modifier_fingerprint",
+                    "source_content_fingerprint",
+                    "snapshot_camera_count",
+                    "snapshot_image_count",
+                    "snapshot_point_count",
+                    "snapshot_created_at",
+                    "snapshot_state",
+                    "snapshot_schema_version",
+                    "point_size",
+                    "camera_frustum_size",
+                    "camera_axis_preset",
+                    "camera_forward",
+                    "camera_up",
                 ):
                     journal.record_attribute(settings, attribute)
                 settings.dataset_uuid = manifest.dataset_uuid
@@ -616,6 +648,59 @@ class CameraImportJob:
                     separators=(",", ":"),
                 )
                 settings.marker_manifest_json = json_marker_manifest(manifest)
+                if int(self.request.snapshot_schema_version) > 0:
+                    settings.snapshot_uuid = manifest.dataset_uuid
+                    settings.snapshot_revision = manifest.dataset_revision
+                    settings.source_modifier_dataset_uuid = str(
+                        self.request.source_dataset_uuid
+                    )
+                    settings.source_modifier_revision = int(self.request.source_revision)
+                    settings.source_modifier_fingerprint = str(
+                        self.request.source_modifier_fingerprint
+                    )
+                    settings.source_content_fingerprint = str(
+                        self.request.content_fingerprint
+                    )
+                    settings.snapshot_camera_count = len(manifest.camera_data)
+                    settings.snapshot_image_count = len(manifest.entries)
+                    settings.snapshot_point_count = len(self.points)
+                    settings.snapshot_created_at = str(self.request.snapshot_created_at)
+                    settings.snapshot_state = "READY"
+                    settings.snapshot_schema_version = int(
+                        self.request.snapshot_schema_version
+                    )
+                    settings.point_size = float(self.request.point_size)
+                    settings.camera_frustum_size = float(
+                        self.request.camera_frustum_size
+                    )
+                    settings.camera_axis_preset = str(self.request.axis_preset)
+                    settings.camera_forward = str(self.request.custom_forward)
+                    settings.camera_up = str(self.request.custom_up)
+                    from .ownership import tag_snapshot_resource
+
+                    resources = [self.collection, *tuple(self.collection.all_objects)]
+                    resources.extend(
+                        data
+                        for obj in tuple(self.collection.all_objects)
+                        for data in (getattr(obj, "data", None),)
+                        if data is not None
+                    )
+                    if self.point_resources is not None:
+                        resources.extend(
+                            (
+                                self.point_resources.mesh,
+                                self.point_resources.material,
+                                self.point_resources.node_group,
+                            )
+                        )
+                    for resource in resources:
+                        tag_snapshot_resource(
+                            resource,
+                            snapshot_uuid=manifest.dataset_uuid,
+                            source_dataset_uuid=self.request.source_dataset_uuid,
+                            source_revision=self.request.source_revision,
+                            schema_version=self.request.snapshot_schema_version,
+                        )
             self._fault("before_runtime")
             install_camera_runtime(self.scene, manifest)
             self._fault("committed")

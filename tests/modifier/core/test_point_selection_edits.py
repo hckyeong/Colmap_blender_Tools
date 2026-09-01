@@ -20,6 +20,7 @@ from tools.modifier.core.edits import (
     serialize_history,
 )
 from tools.modifier.core.indexes import build_relationship_indexes
+from tools.modifier.core.legacy_removal import apply_removal_indexed
 from tools.modifier.core.integrity import validate_reconstruction
 from tools.modifier.core.model import (
     CameraRecord,
@@ -32,6 +33,10 @@ from tools.modifier.core.model import (
     RigRecord,
     SensorRecord,
     TrackElement,
+)
+from tools.modifier.core.removal import (
+    apply_image_observation_removal_indexed,
+    apply_point_removal_indexed,
 )
 
 
@@ -713,6 +718,60 @@ class RedesignedRemovalTests(unittest.TestCase):
         self.assertEqual(result_index_builder.call_count, 1)
         self.assertIs(result.images[40], model.images[40])
         self.assertIs(result.images[40].points2d, model.images[40].points2d)
+
+    def test_indexed_removal_matches_full_rebuild_for_all_schemas(self):
+        """지연 Runtime용 영향 범위 갱신이 전체 인덱스 재생성과 같은 결과를 만드는지 확인합니다."""
+
+        model = _legacy_model()
+        baseline_indexes = build_relationship_indexes(model)
+        point_plan = plan_point_removal(
+            model,
+            baseline_indexes,
+            [2**63 + 7],
+            source_revision=0,
+        )
+        full_point = apply_point_removal(model, point_plan, current_revision=0)
+        fast_point = apply_point_removal_indexed(
+            model,
+            point_plan,
+            current_revision=0,
+            indexes=baseline_indexes,
+        )
+        self.assertEqual(fast_point, full_point)
+
+        image_plan = plan_image_observation_removal(
+            model,
+            baseline_indexes,
+            [10],
+            source_revision=0,
+        )
+        full_image = apply_image_observation_removal(
+            model,
+            image_plan,
+            current_revision=0,
+        )
+        fast_image = apply_image_observation_removal_indexed(
+            model,
+            image_plan,
+            current_revision=0,
+            indexes=baseline_indexes,
+        )
+        self.assertEqual(fast_image, full_image)
+
+        legacy_plan = plan_removal(
+            model,
+            baseline_indexes,
+            [2**63 + 7],
+            source_revision=0,
+        )
+        full_legacy = apply_removal(model, legacy_plan, current_revision=0)
+        fast_legacy = apply_removal_indexed(
+            model,
+            legacy_plan,
+            current_revision=0,
+            indexes=baseline_indexes,
+        )
+        self.assertEqual(fast_legacy, full_legacy)
 
     def test_schema_two_and_mixed_schema_replay(self):
         model = _legacy_model()

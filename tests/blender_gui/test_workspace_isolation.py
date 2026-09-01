@@ -134,6 +134,9 @@ class WorkspaceHandoffProbe:
         self.paint_workspace = import_module(
             f"{PACKAGE_NAME}.tools.projection_paint.blender.paint_workspace"
         )
+        self.paint_lifecycle = import_module(
+            f"{PACKAGE_NAME}.tools.projection_paint.blender.lifecycle"
+        )
         self.factory = import_module(
             f"{PACKAGE_NAME}.shared.blender_runtime.workspace_factory"
         )
@@ -238,13 +241,25 @@ class WorkspaceHandoffProbe:
 
         if time.monotonic() - self.started_at > TIMEOUT_SECONDS:
             active_name = str(getattr(getattr(bpy.context, "window", None), "workspace", None))
+            paint_settings = bpy.context.scene.projection_paint
+            paint_workspace = getattr(paint_settings, "paint_workspace", None)
+            paint_failures = tuple(
+                (item.component, item.exception_type, item.message)
+                for item in self.paint_lifecycle.lifecycle_registry().failures
+            )
             raise TimeoutError(
                 "Workspace 자동 전환 GUI 검증 시간 초과: "
                 f"{self.stage}, active={active_name}, "
                 f"align={self.align_state.RUNTIME.session.phase}, "
                 f"modifier={self.modifier_session.SESSION.phase}, "
                 f"modifier_status={self.modifier_session.SESSION.status_message!r}, "
-                f"align_error={self.align_state.RUNTIME.workspace_setup_error!r}"
+                f"align_error={self.align_state.RUNTIME.workspace_setup_error!r}, "
+                f"paint_state={paint_settings.paint_state!r}, "
+                f"paint_status={paint_settings.status!r}, "
+                f"paint_status_kind={paint_settings.status_kind!r}, "
+                f"view_layer={getattr(bpy.context.window.view_layer, 'name', '')!r}, "
+                f"layout_stage={getattr(paint_workspace, 'get', lambda *_: '')(self.paint_workspace.LAYOUT_STAGE_KEY, '')!r}, "
+                f"paint_failures={paint_failures!r}"
             )
         window = bpy.context.window
         if window is None:

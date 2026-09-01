@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from math import pow
+from pathlib import Path
 from typing import Any
 
 import bpy
@@ -15,8 +16,6 @@ from .ownership import (
     UUID_KEY,
     new_uuid,
 )
-
-
 LAYER_UUID_KEY = "pp_layer_uuid"
 ADJUSTMENT_UUID_KEY = "pp_adjustment_uuid"
 MASK_UUID_KEY = "pp_mask_uuid"
@@ -29,6 +28,7 @@ MASK_IMAGE_ROLE = "MASK_PERSISTENT"
 LAYER_FRAME_ROLE = "LAYER_FRAME"
 LAYER_IMAGE_NODE_ROLE = "OVERLAY_IMAGE_NODE"
 LAYER_MIX_NODE_ROLE = "OVERLAY_MIX_NODE"
+LAYER_SOLO_PREVIEW_MIX_NODE_ROLE = "LAYER_SOLO_PREVIEW_MIX_NODE"
 COMPOSITE_UNPREMULTIPLY_SEPARATE_NODE_ROLE = "COMPOSITE_UNPREMULTIPLY_SEPARATE_NODE"
 COMPOSITE_UNPREMULTIPLY_ALPHA_NODE_ROLE = "COMPOSITE_UNPREMULTIPLY_ALPHA_NODE"
 COMPOSITE_UNPREMULTIPLY_COMBINE_NODE_ROLE = "COMPOSITE_UNPREMULTIPLY_COMBINE_NODE"
@@ -44,17 +44,18 @@ ADJUSTMENT_MASK_IMAGE_NODE_ROLE = "ADJUSTMENT_MASK_IMAGE_NODE"
 ADJUSTMENT_MASK_BW_NODE_ROLE = "ADJUSTMENT_MASK_BW_NODE"
 ORIGINAL_GATE_NODE_ROLE = "ORIGINAL_BASE_GATE"
 COMPOSITE_LAYER_ROLE = "COMPOSITE"
-COMPOSITE_DERIVED_LAYER_ROLE = "COMPOSITE_DERIVED"
 NORMAL_LAYER_ROLE = "NORMAL"
-ORIGINAL_LAYER_SCHEMA_VERSION = 1
+ORIGINAL_LAYER_SCHEMA_VERSION = 2
 ORIGINAL_SOURCE_NODE_UUID_KEY = "pp_original_source_node_uuid"
 ORIGINAL_LAYER_IMAGE_KEY = "pp_is_original_layer"
+ORIGINAL_REFERENCE_PENDING_DELETE_KEY = "pp_original_reference_pending_delete"
 COMBINED_RGBA_IMAGE_KEY = "pp_combined_rgba_premultiplied"
 
 _MANAGED_NODE_ROLES = {
     LAYER_FRAME_ROLE,
     LAYER_IMAGE_NODE_ROLE,
     LAYER_MIX_NODE_ROLE,
+    LAYER_SOLO_PREVIEW_MIX_NODE_ROLE,
     COMPOSITE_UNPREMULTIPLY_SEPARATE_NODE_ROLE,
     COMPOSITE_UNPREMULTIPLY_ALPHA_NODE_ROLE,
     COMPOSITE_UNPREMULTIPLY_COMBINE_NODE_ROLE,
@@ -185,6 +186,95 @@ def _image_size(image: Any) -> tuple[int, int]:
     return size
 
 
+def _external_image_paths(image: Any) -> tuple[Path, ...]:
+    """외부 FILE·TILED Image가 참조하는 실제 파일 경로를 반환합니다."""
+    if image is None or _pointer(image) == 0:
+        return ()
+    source = str(getattr(image, "source", "") or "")
+    if source not in {"FILE", "TILED"}:
+        return ()
+    raw_path = str(
+        getattr(image, "filepath_raw", "")
+        or getattr(image, "filepath", "")
+        or ""
+    )
+    if not raw_path:
+        return ()
+    absolute = str(bpy.path.abspath(raw_path))
+    if source == "FILE":
+        return (Path(absolute).resolve(),)
+    paths = []
+    for tile in tuple(getattr(image, "tiles", ())):
+        number = int(tile.number)
+        u = (number - 1001) % 10 + 1
+        v = (number - 1001) // 10 + 1
+        resolved = absolute.replace("<UDIM>", str(number)).replace(
+            "<UVTILE>",
+            f"u{u}_v{v}",
+        )
+        paths.append(Path(resolved).resolve())
+    return tuple(paths)
+
+
+def _external_original_image(image: Any, *, require_files: bool = True) -> Any | None:
+    """복제 없이 사용할 외부 Original Image를 검증하고 필요하면 다시 로드합니다."""
+    paths = _external_image_paths(image)
+    if not paths:
+        return None
+    missing = tuple(path for path in paths if not path.is_file())
+    if missing and require_files:
+        preview = ", ".join(str(path) for path in missing[:3])
+        raise LayerShaderError(f"Original Source Texture 파일을 찾을 수 없습니다: {preview}")
+    if missing:
+        return None
+    if bool(getattr(image, "is_dirty", False)):
+        raise LayerShaderError(
+            "Original Source Texture에 저장되지 않은 변경이 있습니다. "
+            "원본 파일을 먼저 저장하거나 다시 불러오십시오."
+        )
+    if not bool(getattr(image, "has_data", False)):
+        try:
+            image.reload()
+        except RuntimeError as exc:
+            raise LayerShaderError(
+                f"Original Source Texture를 다시 불러오지 못했습니다: {exc}"
+            ) from exc
+    return image
+
+
+def original_layer_is_read_only(settings: Any, layer: Any) -> bool:
+    """Layer가 외부 원본 파일을 직접 참조하는 읽기 전용 Original인지 반환합니다."""
+    if not bool(getattr(layer, "is_original_layer", False)):
+        return False
+    source = getattr(settings, "original_source_image", None)
+    return bool(
+        _pointer(source)
+        and _pointer(getattr(layer, "image", None)) == _pointer(source)
+        and _external_image_paths(source)
+    )
+
+
+def _managed_layer_reference(
+    settings: Any,
+    *,
+    exclude_layer_uuid: str = "",
+) -> Any | None:
+    """해상도·Mask·Bake 기준으로 사용할 애드온 소유 Layer Image를 반환합니다."""
+    reference = next(
+        (
+            layer.image
+            for layer in settings.layers
+            if str(layer.layer_uuid) != str(exclude_layer_uuid)
+            and _owned_image(layer.image, {LAYER_IMAGE_ROLE})
+        ),
+        None,
+    )
+    if reference is not None:
+        return reference
+    overlay = getattr(settings, "overlay_image", None)
+    return overlay if _owned_image(overlay, {LAYER_IMAGE_ROLE}) else None
+
+
 def _new_image(
     target: Any,
     name: str,
@@ -290,18 +380,6 @@ def _validate_target_image_contract(
         raise LayerShaderError(f"관리 Paint Image 계약이 다릅니다: {exc}") from exc
 
 
-def _clear_external_image_path(image: Any) -> None:
-    """SINGLE·UDIM 관리 Staging을 검증해 사용자 외부 경로가 승계되지 않게 합니다."""
-    from .image_backend import managed_staging_paths
-
-    try:
-        managed_staging_paths(image)
-    except Exception as exc:
-        raise LayerShaderError(
-            f"관리 Original Image의 Staging 경로가 유효하지 않습니다: {exc}"
-        ) from exc
-
-
 def _replace_image_identity(image: Any) -> None:
     """복제 Image의 기존 소유 태그와 UUID를 제거해 새 관리 자원으로 준비합니다."""
     for key in (
@@ -326,112 +404,6 @@ def _match_original_image_contract(image: Any, reference: Any) -> None:
     image.alpha_mode = str(reference.alpha_mode)
 
 
-def _duplicate_file_backed_original(
-    source: Any,
-    target: Any,
-    layer_uuid: str,
-    name: str,
-    size: tuple[int, int],
-    reference: Any,
-) -> Any:
-    """파일 기반 원본을 Pack한 독립 관리 Image로 복제하고 Stack 계약을 검증합니다."""
-    has_external_path = bool(
-        str(getattr(source, "filepath", "") or getattr(source, "filepath_raw", ""))
-    )
-    has_packed_data = bool(
-        getattr(source, "packed_file", None) is not None
-        or len(tuple(getattr(source, "packed_files", ()))) > 0
-    )
-    is_generated = str(getattr(source, "source", "")) == "GENERATED"
-    if not has_external_path and not is_generated and not has_packed_data:
-        raise LayerShaderError("파일 기반 Original Image에 원본 파일 경로가 없습니다.")
-    if bool(getattr(source, "is_dirty", False)):
-        if has_external_path and not _owned_image(source, {LAYER_IMAGE_ROLE}):
-            raise LayerShaderError(
-                "저장되지 않은 외부 Original Image는 원본을 변경하지 않고 안전하게 복제할 수 없습니다."
-            )
-        if not is_generated and not has_external_path and not has_packed_data:
-            raise LayerShaderError("저장되지 않은 관리 Original 백업은 복원할 수 없습니다.")
-    working = source.copy()
-    image = None
-    try:
-        if _image_tile_numbers(working) != _target_tile_numbers(target):
-            raise LayerShaderError("Original Image의 UDIM 타일이 현재 Layer Stack과 다릅니다.")
-        image = _new_image(
-            target,
-            name,
-            size,
-            role=LAYER_IMAGE_ROLE,
-            layer_uuid=layer_uuid,
-            color=(0.0, 0.0, 0.0, 0.0),
-            reference=reference,
-        )
-        _match_original_image_contract(image, reference)
-        if len(working.tiles) == 1:
-            if _image_size(working) != size:
-                working.scale(int(size[0]), int(size[1]))
-            image.pixels.foreach_set(working.pixels[:])
-        else:
-            source_active = int(working.tiles.active_index)
-            target_active = int(image.tiles.active_index)
-            try:
-                for tile_index, tile in enumerate(working.tiles):
-                    working.tiles.active_index = tile_index
-                    image.tiles.active_index = tile_index
-                    temporary = bpy.data.images.new(
-                        f"{name}_Tile_{int(tile.number)}",
-                        int(tile.size[0]),
-                        int(tile.size[1]),
-                        alpha=True,
-                    )
-                    try:
-                        temporary.pixels.foreach_set(working.pixels[:])
-                        if _image_size(temporary) != size:
-                            temporary.scale(int(size[0]), int(size[1]))
-                        image.pixels.foreach_set(temporary.pixels[:])
-                    finally:
-                        bpy.data.images.remove(temporary)
-            finally:
-                working.tiles.active_index = source_active
-                image.tiles.active_index = target_active
-        image.save()
-        image.pack()
-        _clear_external_image_path(image)
-        _validate_target_image_contract(target, image, size, reference)
-        if reference is not None and _pointer(reference):
-            if (
-                str(image.colorspace_settings.name)
-                != str(reference.colorspace_settings.name)
-                or str(image.alpha_mode) != str(reference.alpha_mode)
-            ):
-                raise LayerShaderError("관리 Original Image의 색 공간 또는 Alpha 계약이 다릅니다.")
-        _clear_external_image_path(image)
-        if (
-            getattr(image, "packed_file", None) is None
-            and len(tuple(getattr(image, "packed_files", ()))) == 0
-        ):
-            raise LayerShaderError("관리 Original Image를 최종 Pack하지 못했습니다.")
-        image.name = str(name)
-        _replace_image_identity(image)
-        _tag_image(
-            image,
-            LAYER_IMAGE_ROLE,
-            _target_uuid(target),
-            layer_uuid,
-        )
-        from .overlay_durability import register_overlay
-
-        register_overlay(image)
-        return image
-    except Exception:
-        if image is not None and _pointer(image) and int(image.users) == 0:
-            bpy.data.images.remove(image)
-        raise
-    finally:
-        if _pointer(working) and int(working.users) == 0:
-            bpy.data.images.remove(working)
-
-
 def _create_original_image(
     target: Any,
     layer_uuid: str,
@@ -445,8 +417,21 @@ def _create_original_image(
     material: Any | None = None,
     source_socket: Any | None = None,
 ) -> Any:
-    """외부 또는 생성 원본을 현재 Stack 계약의 독립 관리 Original Image로 만듭니다."""
-    if source_image is not None and str(getattr(source_image, "source", "")) == "GENERATED":
+    """외부 원본은 직접 반환하고 생성·Packed·Material 원본만 관리 Image로 만듭니다."""
+    external = _external_original_image(source_image, require_files=True)
+    if external is not None:
+        return external
+    has_packed_data = bool(
+        source_image is not None
+        and (
+            getattr(source_image, "packed_file", None) is not None
+            or len(tuple(getattr(source_image, "packed_files", ()))) > 0
+        )
+    )
+    if source_image is not None and (
+        str(getattr(source_image, "source", "")) == "GENERATED"
+        or has_packed_data
+    ):
         image = _new_image(
             target,
             name,
@@ -472,19 +457,6 @@ def _create_original_image(
         finally:
             if _pointer(temporary) and int(temporary.users) == 0:
                 _remove_image(temporary)
-    if source_image is not None and (
-        str(getattr(source_image, "filepath", "") or getattr(source_image, "filepath_raw", ""))
-        or getattr(source_image, "packed_file", None) is not None
-        or len(tuple(getattr(source_image, "packed_files", ()))) > 0
-    ):
-        return _duplicate_file_backed_original(
-            source_image,
-            target,
-            layer_uuid,
-            name,
-            size,
-            reference,
-        )
     image = _new_image(
         target,
         name,
@@ -637,6 +609,15 @@ def find_mask(settings: Any, mask_uuid: str):
 
 def _sync_paint_image_selection(scene: Any, settings: Any) -> None:
     """Blender Paint Image와 Mask UUID를 같은 트리 선택 상태로 동기화합니다."""
+    active_layer = _active_layer(settings)
+    if (
+        active_layer is not None
+        and original_layer_is_read_only(settings, active_layer)
+        and not bool(settings.paint_mask_mode)
+    ):
+        settings.active_mask_uuid = ""
+        settings.active_paint_image = None
+        return
     active_image = settings.active_paint_image
     if not bool(settings.paint_mask_mode) and _pointer(active_image):
         layer_matches = tuple(
@@ -679,7 +660,11 @@ def _sync_paint_image_selection(scene: Any, settings: Any) -> None:
     if active is not None and _pointer(active.image):
         settings.active_mask_uuid = ""
         settings.paint_mask_mode = False
-        settings.active_paint_image = active.image
+        settings.active_paint_image = (
+            None
+            if original_layer_is_read_only(settings, active)
+            else active.image
+        )
         return
     active_mask_uuid = str(settings.active_mask_uuid or "")
     if active_mask_uuid:
@@ -910,11 +895,15 @@ def _ensure_layer_data(
     )
     if len({_pointer(image) for image in logical_images}) != len(logical_images):
         raise LayerShaderError("여러 Layer가 같은 Paint Image를 참조합니다.")
-    reference = logical_images[0] if logical_images else overlay
+    reference = _managed_layer_reference(settings) or overlay
+    if not _owned_image(reference, {LAYER_IMAGE_ROLE}):
+        raise LayerShaderError("관리 Paint Layer 해상도의 기준 Image가 없습니다.")
     size = _image_size(reference)
     _validate_target_image_contract(target, reference, size, reference)
     for layer in settings.layers:
-        if _pointer(layer.image):
+        if _pointer(layer.image) and original_layer_is_read_only(settings, layer):
+            _external_original_image(layer.image, require_files=True)
+        elif _pointer(layer.image):
             _validate_target_image_contract(target, layer.image, size, reference)
         for mask in (
             layer.mask,
@@ -962,13 +951,14 @@ def _ensure_layer_data(
                     reference=reference,
                 )
         else:
-            if not _owned_image(layer.image, {LAYER_IMAGE_ROLE}):
-                raise LayerShaderError("Layer Image의 관리 소유권이 유효하지 않습니다.")
-            _validate_target_image_contract(target, layer.image, size, reference)
-            actual_target = str(layer.image.get(TARGET_UUID_KEY, "") or "")
-            actual_layer = str(layer.image.get(LAYER_UUID_KEY, "") or "")
-            if actual_target != target_uuid or actual_layer != layer_uuid:
-                raise LayerShaderError("Layer Image의 논리 소유 UUID가 일치하지 않습니다.")
+            if not original_layer_is_read_only(settings, layer):
+                if not _owned_image(layer.image, {LAYER_IMAGE_ROLE}):
+                    raise LayerShaderError("Layer Image의 관리 소유권이 유효하지 않습니다.")
+                _validate_target_image_contract(target, layer.image, size, reference)
+                actual_target = str(layer.image.get(TARGET_UUID_KEY, "") or "")
+                actual_layer = str(layer.image.get(LAYER_UUID_KEY, "") or "")
+                if actual_target != target_uuid or actual_layer != layer_uuid:
+                    raise LayerShaderError("Layer Image의 논리 소유 UUID가 일치하지 않습니다.")
         _ensure_mask_image(
             target,
             target_uuid,
@@ -1027,62 +1017,6 @@ def composite_chain_layers(settings: Any) -> tuple[Any, ...]:
         == COMPOSITE_LAYER_ROLE
         and str(getattr(layer, "composite_session_uuid", "") or "") == session_uuid
     )
-
-
-def migrate_legacy_composite_derived(settings: Any) -> tuple[tuple[Any, str, str, str, int], ...]:
-    """구형 파생 Layer를 의존성 UUID를 가진 일반 형제로 한 번만 이전합니다."""
-    if not composite_session_is_active(settings):
-        return ()
-    session_uuid = str(getattr(settings, "active_composite_session_uuid", "") or "")
-    composites = composite_chain_layers(settings)
-    if len(composites) != 1:
-        raise LayerShaderError("구형 Composite 파생 Layer 이전의 기준 Composite가 유효하지 않습니다.")
-    composite = composites[0]
-    snapshot: list[tuple[Any, str, str, str, int]] = []
-    if int(getattr(composite, "composite_generation", 0)) <= 0:
-        snapshot.append(
-            (
-                composite,
-                str(composite.layer_role),
-                str(getattr(composite, "composite_session_uuid", "") or ""),
-                str(getattr(composite, "composite_dependency_session_uuid", "") or ""),
-                int(getattr(composite, "composite_generation", 0)),
-            )
-        )
-        composite.composite_generation = 1
-    for layer in settings.layers:
-        if (
-            str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
-            != COMPOSITE_DERIVED_LAYER_ROLE
-            or str(getattr(layer, "composite_session_uuid", "") or "") != session_uuid
-        ):
-            continue
-        snapshot.append(
-            (
-                layer,
-                str(layer.layer_role),
-                str(getattr(layer, "composite_session_uuid", "") or ""),
-                str(getattr(layer, "composite_dependency_session_uuid", "") or ""),
-                int(getattr(layer, "composite_generation", 0)),
-            )
-        )
-        layer.layer_role = NORMAL_LAYER_ROLE
-        layer.composite_session_uuid = ""
-        layer.composite_dependency_session_uuid = session_uuid
-        layer.composite_generation = 0
-    return tuple(snapshot)
-
-
-def restore_legacy_composite_migration(
-    snapshot: tuple[tuple[Any, str, str, str, int], ...],
-) -> None:
-    """검증 실패 시 구형 파생 Layer 이전 전의 역할 Metadata를 되돌립니다."""
-    for layer, role, session_uuid, dependency_uuid, generation in snapshot:
-        if _pointer(layer):
-            layer.layer_role = role
-            layer.composite_session_uuid = session_uuid
-            layer.composite_dependency_session_uuid = dependency_uuid
-            layer.composite_generation = generation
 
 
 def composite_source_layers(settings: Any) -> tuple[Any, ...]:
@@ -1178,23 +1112,23 @@ def _graph_layers(settings: Any, layers: tuple[Any, ...]) -> tuple[Any, ...]:
             raise LayerShaderError("활성 Composite 출력 Layer가 없습니다.")
         return graph_layers
     if state == "RELEASING":
-        session_uuid = str(getattr(settings, "active_composite_session_uuid", "") or "")
         chain = tuple(
             layer
             for layer in layers
-            if (
-                str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
-                == NORMAL_LAYER_ROLE
-                and str(
-                    getattr(layer, "composite_dependency_session_uuid", "") or ""
-                )
-                != session_uuid
-            )
+            if str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE))
+            == NORMAL_LAYER_ROLE
         )
         if not chain:
             raise LayerShaderError("복구할 원본 Paint Layer가 없습니다.")
         return chain
     return layers
+
+
+def active_base_color_graph_layers(settings: Any) -> tuple[Any, ...]:
+    """현재 Material Base Color 출력에 참여하는 Layer를 UI 순서로 읽어 반환합니다."""
+    if settings is None:
+        raise LayerShaderError("활성 Layer Graph를 읽을 Projection Paint 설정이 없습니다.")
+    return _graph_layers(settings, tuple(settings.layers))
 
 
 def _nodes_with_role(tree: Any, role: str) -> tuple[Any, ...]:
@@ -1745,6 +1679,81 @@ def original_layer(settings: Any) -> Any | None:
     return matches[0] if matches else None
 
 
+def _prepare_original_reference_migration(settings: Any) -> dict[str, Any] | None:
+    """기존 복제 Original을 외부 Source Image 직접 참조로 원자 이관 준비합니다."""
+    current = original_layer(settings)
+    schema = int(getattr(settings, "original_layer_schema_version", 0))
+    if current is None or schema < 1:
+        return None
+    source = getattr(settings, "original_source_image", None)
+    external = _external_original_image(source, require_files=True)
+    if external is None:
+        if schema < ORIGINAL_LAYER_SCHEMA_VERSION:
+            settings.original_layer_schema_version = ORIGINAL_LAYER_SCHEMA_VERSION
+            return {
+                "layer": current,
+                "previous_image": current.image,
+                "previous_schema": schema,
+                "protected_image": None,
+            }
+        return None
+    if (
+        schema >= ORIGINAL_LAYER_SCHEMA_VERSION
+        and _pointer(current.image) == _pointer(external)
+    ):
+        return None
+    previous = current.image
+    protected = (
+        previous
+        if _owned_image(previous, {LAYER_IMAGE_ROLE})
+        and _pointer(previous) != _pointer(external)
+        else None
+    )
+    if protected is not None:
+        protected[ORIGINAL_REFERENCE_PENDING_DELETE_KEY] = True
+    current.image = external
+    settings.original_layer_schema_version = ORIGINAL_LAYER_SCHEMA_VERSION
+    return {
+        "layer": current,
+        "previous_image": previous,
+        "previous_schema": schema,
+        "protected_image": protected,
+    }
+
+
+def _finish_original_reference_migration(snapshot: dict[str, Any] | None) -> None:
+    """직접 참조 이관이 끝난 뒤 과거 관리 복제본만 안전하게 정리합니다."""
+    if snapshot is None:
+        return
+    protected = snapshot.get("protected_image")
+    if _pointer(protected) and ORIGINAL_REFERENCE_PENDING_DELETE_KEY in protected:
+        del protected[ORIGINAL_REFERENCE_PENDING_DELETE_KEY]
+    if _pointer(protected) and int(getattr(protected, "users", 0)) == 0:
+        _remove_image(protected)
+
+
+def _rollback_original_reference_migration(
+    settings: Any,
+    snapshot: dict[str, Any] | None,
+) -> None:
+    """직접 참조 이관 실패 시 기존 Image Pointer와 Schema를 복구합니다."""
+    if snapshot is None:
+        return
+    layer_uuid = str(getattr(snapshot.get("layer"), "layer_uuid", "") or "")
+    current = find_layer(settings, layer_uuid)
+    if current is not None:
+        current.image = snapshot.get("previous_image")
+    material = getattr(settings, "paint_material", None)
+    if material is not None and material.node_tree is not None and layer_uuid:
+        node = _node_for(material.node_tree, LAYER_IMAGE_NODE_ROLE, layer_uuid)
+        if node is not None:
+            node.image = snapshot.get("previous_image")
+    settings.original_layer_schema_version = int(snapshot.get("previous_schema", 0))
+    protected = snapshot.get("protected_image")
+    if _pointer(protected) and ORIGINAL_REFERENCE_PENDING_DELETE_KEY in protected:
+        del protected[ORIGINAL_REFERENCE_PENDING_DELETE_KEY]
+
+
 def _original_source_from_input(
     source: Any | None,
     default: tuple[float, float, float, float],
@@ -1852,7 +1861,8 @@ def migrate_original_layer(
                 reference,
             )
         layer.image = image
-        image[ORIGINAL_LAYER_IMAGE_KEY] = True
+        if _owned_image(image, {LAYER_IMAGE_ROLE}):
+            image[ORIGINAL_LAYER_IMAGE_KEY] = True
         return (
             layer,
             source_image,
@@ -1863,7 +1873,7 @@ def migrate_original_layer(
         index = len(settings.layers) - 1
         if 0 <= index < len(settings.layers) and _pointer(settings.layers[index]) == _pointer(layer):
             settings.layers.remove(index)
-        if _pointer(image) and int(image.users) == 0:
+        if _owned_image(image, {LAYER_IMAGE_ROLE}) and int(image.users) == 0:
             _remove_image(image)
         raise
 
@@ -1924,7 +1934,8 @@ def restore_original_layer(context: Any) -> Any:
             source_socket=source_socket,
         )
         layer.image = image
-        image[ORIGINAL_LAYER_IMAGE_KEY] = True
+        if _owned_image(image, {LAYER_IMAGE_ROLE}):
+            image[ORIGINAL_LAYER_IMAGE_KEY] = True
         reconcile_layer_graph(scene)
         settings.original_layer_name = str(layer.name)
         return layer
@@ -1941,7 +1952,7 @@ def restore_original_layer(context: Any) -> Any:
         )
         if index >= 0:
             settings.layers.remove(index)
-        if _pointer(image) and int(image.users) == 0:
+        if _owned_image(image, {LAYER_IMAGE_ROLE}) and int(image.users) == 0:
             _remove_image(image)
         try:
             reconcile_layer_graph(scene)
@@ -1989,7 +2000,7 @@ def _rollback_uncommitted_original_migration(
     ):
         tree.nodes.remove(node)
     settings.layers.remove(index)
-    if _pointer(image) and int(image.users) == 0:
+    if _owned_image(image, {LAYER_IMAGE_ROLE}) and int(image.users) == 0:
         _remove_image(image)
     if settings_snapshot is not None:
         for key, value in settings_snapshot.items():
@@ -2219,6 +2230,7 @@ def _reconcile_stale_resources(tree: Any, settings: Any, target: Any) -> None:
         and _pointer(image) not in logical_pointers
         and not bool(image.get("pp_recomposite_pending_delete", False))
         and not bool(image.get("pp_layer_reset_pending_delete", False))
+        and not bool(image.get(ORIGINAL_REFERENCE_PENDING_DELETE_KEY, False))
     )
     for image in stale_images:
         managed_node_users = sum(
@@ -2338,27 +2350,90 @@ def _mask_preview_source(material: Any) -> Any | None:
     return matches[0].outputs["Val"]
 
 
+def _ensure_layer_solo_preview_mix(tree: Any) -> Any:
+    """레이어 개인 단독 보기에 사용하는 애드온 소유 Mix Node 하나를 준비합니다."""
+    matches = _nodes_with_role(tree, LAYER_SOLO_PREVIEW_MIX_NODE_ROLE)
+    if len(matches) > 1:
+        raise LayerShaderError("Layer 개인 단독 보기 Mix Node가 둘 이상 존재합니다.")
+    preview = matches[0] if matches else _new_node(
+        tree,
+        "ShaderNodeMixRGB",
+        LAYER_SOLO_PREVIEW_MIX_NODE_ROLE,
+        "",
+    )
+    preview.name = "PP Layer Solo Preview Mix"
+    preview.label = "Layer Solo Preview"
+    preview.blend_type = "MIX"
+    preview.width = 180.0
+    preview.inputs[1].default_value = (0.0, 0.0, 0.0, 1.0)
+    return preview
+
+
+def _copy_input_socket(tree: Any, source: Any, target: Any) -> None:
+    """원본 입력 Socket의 단일 링크 또는 기본값을 대상 입력에 그대로 복제합니다."""
+    if len(source.links) > 1:
+        raise LayerShaderError("복제할 Layer 입력 연결이 하나를 초과합니다.")
+    if source.links:
+        _connect(tree, source.links[0].from_socket, target)
+        return
+    _clear_input(tree, target)
+    target.default_value = source.default_value
+
+
+def _sync_layer_solo_preview_mix(material: Any, layer_uuid: str) -> Any:
+    """선택 Layer의 처리 색과 Factor를 검정 Base 전용 Preview Mix에 동기화합니다."""
+    tree = material.node_tree
+    layer_mix = _node_for(tree, LAYER_MIX_NODE_ROLE, layer_uuid)
+    if layer_mix is None:
+        raise LayerShaderError("Layer 개인 단독 보기의 원본 Mix Node를 찾을 수 없습니다.")
+    preview = _ensure_layer_solo_preview_mix(tree)
+    _tag_node(preview, LAYER_SOLO_PREVIEW_MIX_NODE_ROLE, layer_uuid)
+    _clear_input(tree, preview.inputs[1])
+    preview.inputs[1].default_value = (0.0, 0.0, 0.0, 1.0)
+    _copy_input_socket(tree, layer_mix.inputs[2], preview.inputs[2])
+    _copy_input_socket(tree, layer_mix.inputs[0], preview.inputs[0])
+    return preview
+
+
+def _same_input_socket(source: Any, target: Any) -> bool:
+    """두 입력 Socket이 같은 링크 또는 같은 기본값을 사용하는지 확인합니다."""
+    if len(source.links) != len(target.links) or len(source.links) > 1:
+        return False
+    if source.links:
+        return _pointer(source.links[0].from_socket) == _pointer(
+            target.links[0].from_socket
+        )
+    try:
+        return tuple(source.default_value) == tuple(target.default_value)
+    except TypeError:
+        return float(source.default_value) == float(target.default_value)
+
+
 def _layer_preview_source(material: Any) -> Any | None:
-    """Material 태그와 일치하는 유효한 Layer 색상 출력 Socket을 반환합니다."""
+    """Material 태그와 일치하는 검증된 Layer 개인 단독 보기 출력을 반환합니다."""
     layer_uuid = str(material.get(LAYER_PREVIEW_UUID_KEY, "") or "")
     if not layer_uuid:
         return None
-    mix = _node_for(material.node_tree, LAYER_MIX_NODE_ROLE, layer_uuid)
-    if mix is None or len(mix.inputs[2].links) != 1:
-        raise LayerShaderError("Layer 미리보기 색상 입력을 하나로 찾을 수 없습니다.")
-    link = mix.inputs[2].links[0]
+    tree = material.node_tree
+    layer_mix = _node_for(tree, LAYER_MIX_NODE_ROLE, layer_uuid)
+    matches = _nodes_with_role(tree, LAYER_SOLO_PREVIEW_MIX_NODE_ROLE)
+    if layer_mix is None or len(matches) != 1:
+        raise LayerShaderError("Layer 개인 단독 보기 Mix를 하나로 찾을 수 없습니다.")
+    preview = matches[0]
+    if preview.type != "MIX_RGB" or str(preview.blend_type) != "MIX":
+        raise LayerShaderError("Layer 개인 단독 보기 Node 타입이 유효하지 않습니다.")
+    if str(preview.get(LAYER_UUID_KEY, "") or "") != layer_uuid:
+        raise LayerShaderError("Layer 개인 단독 보기 UUID가 Material 태그와 다릅니다.")
     if (
-        not _owned_node(link.from_node)
-        or str(link.from_node.get(LAYER_UUID_KEY, "")) != layer_uuid
-        or str(link.from_node.get(RECORD_KIND_KEY, ""))
-        not in {
-            LAYER_IMAGE_NODE_ROLE,
-            ADJUSTMENT_NODE_ROLE,
-            ADJUSTMENT_APPLY_MIX_NODE_ROLE,
-        }
+        len(preview.inputs[1].links) != 0
+        or tuple(preview.inputs[1].default_value) != (0.0, 0.0, 0.0, 1.0)
     ):
-        raise LayerShaderError("Layer 미리보기 색상 Node 소유권이 유효하지 않습니다.")
-    return link.from_socket
+        raise LayerShaderError("Layer 개인 단독 보기 Base가 검정이 아닙니다.")
+    if not _same_input_socket(layer_mix.inputs[2], preview.inputs[2]):
+        raise LayerShaderError("Layer 개인 단독 보기 처리 색 연결이 원본 Layer와 다릅니다.")
+    if not _same_input_socket(layer_mix.inputs[0], preview.inputs[0]):
+        raise LayerShaderError("Layer 개인 단독 보기 Factor 연결이 원본 Layer와 다릅니다.")
+    return preview.outputs["Color"]
 
 
 def _original_preview_source(material: Any) -> Any | None:
@@ -2531,7 +2606,21 @@ def validate_active_layer_graph(
     active_material = material or getattr(settings, "paint_material", None)
     if active_material is None or active_material.node_tree is None:
         raise LayerShaderError("활성 Layer Graph를 검증할 관리 Material이 없습니다.")
-    graph_layers = _graph_layers(settings, tuple(settings.layers))
+    scene_preview = (
+        str(settings.layer_preview_uuid or ""),
+        str(settings.mask_preview_adjustment_uuid or ""),
+        bool(settings.original_layer_preview),
+    )
+    material_preview = (
+        str(active_material.get(LAYER_PREVIEW_UUID_KEY, "") or ""),
+        str(active_material.get(MASK_PREVIEW_UUID_KEY, "") or ""),
+        bool(active_material.get(ORIGINAL_PREVIEW_KEY, False)),
+    )
+    if scene_preview != material_preview:
+        raise LayerShaderError("Scene 선택과 Material 단독 보기 태그가 다릅니다.")
+    if sum((bool(scene_preview[0]), bool(scene_preview[1]), scene_preview[2])) > 1:
+        raise LayerShaderError("Scene 단독 보기 상태는 동시에 하나만 활성화할 수 있습니다.")
+    graph_layers = active_base_color_graph_layers(settings)
     if not graph_layers:
         raise LayerShaderError("활성 출력 Layer Chain이 비어 있습니다.")
     validate_layer_graph(
@@ -2575,15 +2664,12 @@ def connect_new_layer_nodes(scene: Any, layer: Any) -> Any:
     target = getattr(settings, "paint_target", None)
     if material is None or material.node_tree is None or target is None:
         raise LayerShaderError("새 Layer를 연결할 관리 Material이 없습니다.")
-    reference = next(
-        (
-            candidate.image
-            for candidate in settings.layers
-            if str(candidate.layer_uuid) != str(layer.layer_uuid)
-            and _pointer(candidate.image)
-        ),
-        settings.overlay_image,
+    reference = _managed_layer_reference(
+        settings,
+        exclude_layer_uuid=str(layer.layer_uuid),
     )
+    if reference is None:
+        raise LayerShaderError("새 Layer 해상도의 기준 관리 Image가 없습니다.")
     size = _image_size(reference)
     _validate_target_image_contract(target, reference, size, reference)
     new_image = _new_image(
@@ -2664,11 +2750,6 @@ def add_layer_transaction(
         layer.layer_uuid = str(layer_uuid)
         layer.layer_role = NORMAL_LAYER_ROLE
         layer.composite_session_uuid = ""
-        layer.composite_dependency_session_uuid = (
-            str(settings.active_composite_session_uuid)
-            if composite_session_is_active(settings)
-            else ""
-        )
         layer.composite_generation = 0
         new_index = len(settings.layers) - 1
         target_index = insertion_index()
@@ -2701,11 +2782,6 @@ def add_layer_transaction(
     layer.layer_uuid = str(layer_uuid)
     layer.layer_role = NORMAL_LAYER_ROLE
     layer.composite_session_uuid = ""
-    layer.composite_dependency_session_uuid = (
-        str(settings.active_composite_session_uuid)
-        if composite_session_is_active(settings)
-        else ""
-    )
     layer.composite_generation = 0
     new_index = len(settings.layers) - 1
     target_index = insertion_index()
@@ -2801,7 +2877,7 @@ def _apply_preview(
     allowed_mask_uuids: set[str] | None = None,
     top_layer_uuid: str = "",
 ) -> bool:
-    """저장된 단일 Layer 또는 Mask 미리보기를 Base Color에 적용합니다."""
+    """선택 Layer 개인 출력 또는 Mask 원본을 Base Color 대체 출력으로 적용합니다."""
     settings = _settings(scene)
     active_material = material or getattr(settings, "paint_material", None)
     if settings is None or active_material is None or active_material.node_tree is None:
@@ -2855,18 +2931,14 @@ def _apply_preview(
             _clear_preview_state(settings, active_material)
             return False
         layer = find_layer(settings, layer_uuid)
-        mix = _node_for(
-            active_material.node_tree,
-            LAYER_MIX_NODE_ROLE,
-            layer_uuid,
-        )
-        if layer is None or mix is None or len(mix.inputs[2].links) != 1:
+        if layer is None:
             _clear_preview_state(settings, active_material)
             return False
+        preview_mix = _sync_layer_solo_preview_mix(active_material, layer_uuid)
         active_material[LAYER_PREVIEW_UUID_KEY] = layer_uuid
         _connect(
             active_material.node_tree,
-            mix.inputs[2].links[0].from_socket,
+            preview_mix.outputs["Color"],
             principled.inputs["Base Color"],
         )
         return True
@@ -2908,7 +2980,7 @@ def _apply_preview(
 
 
 def toggle_layer_preview(scene: Any, layer_uuid: str) -> bool:
-    """지정 Layer 단독 보기를 토글하고 Mask 체크와 이전 연결을 함께 관리합니다."""
+    """지정 Layer 개인 출력을 토글하고 Mask 단독 보기와 전체 합성을 함께 관리합니다."""
     settings = _settings(scene)
     if settings is None or settings.paint_material is None:
         raise LayerShaderError("Layer 미리보기를 적용할 관리 Material이 없습니다.")
@@ -3017,11 +3089,11 @@ def reconcile_layer_graph(
         raise LayerShaderError(
             "Composite 처리 중에는 Original Layer를 자동 이관하지 않습니다."
         )
+    reference_migration = _prepare_original_reference_migration(settings)
     legacy_source = None
     legacy_default = (0.0, 0.0, 0.0, 1.0)
     snapshot = None
     created_source_tag_node = None
-    legacy_composite_snapshot = ()
     if (
         schema_version < ORIGINAL_LAYER_SCHEMA_VERSION
         and original_before is None
@@ -3035,16 +3107,15 @@ def reconcile_layer_graph(
         snapshot = _original_migration_settings_snapshot(settings)
         created_source_tag_node = _new_original_source_tag_node(legacy_source)
     try:
-        if state == "ACTIVE":
-            legacy_composite_snapshot = migrate_legacy_composite_derived(settings)
-        return _reconcile_layer_graph_impl(
+        result = _reconcile_layer_graph_impl(
             scene,
             material=material,
             overlay=overlay,
         )
+        _finish_original_reference_migration(reference_migration)
+        return result
     except Exception:
-        if legacy_composite_snapshot:
-            restore_legacy_composite_migration(legacy_composite_snapshot)
+        _rollback_original_reference_migration(settings, reference_migration)
         partial_original = original_layer(settings)
         if (
             snapshot is not None
@@ -3094,10 +3165,7 @@ def _reconcile_layer_graph_impl(
         _nodes_with_role(active_material.node_tree, LAYER_MIX_NODE_ROLE),
     )
     layers = _ensure_layer_data(scene, target, active_overlay)
-    reference = next(
-        (layer.image for layer in layers if _pointer(layer.image)),
-        active_overlay,
-    )
+    reference = _managed_layer_reference(settings) or active_overlay
     (
         migrated_original,
         migrated_source,
@@ -3147,8 +3215,17 @@ def _reconcile_layer_graph_impl(
     active = _active_layer(settings)
     if active is None:
         raise LayerShaderError("활성 Paint Layer가 없습니다.")
-    settings.overlay_image = active.image
-    if not _pointer(settings.active_paint_image):
+    writable_reference = (
+        active.image
+        if _owned_image(active.image, {LAYER_IMAGE_ROLE})
+        else _managed_layer_reference(settings)
+    )
+    if writable_reference is None:
+        raise LayerShaderError("페인팅할 관리 Layer Image가 없습니다.")
+    settings.overlay_image = writable_reference
+    if original_layer_is_read_only(settings, active):
+        settings.active_paint_image = None
+    elif not _pointer(settings.active_paint_image):
         settings.active_paint_image = active.image
     tree = active_material.node_tree
     legacy_image, legacy_mix = _legacy_nodes(tree)
@@ -3275,7 +3352,7 @@ def _reconcile_layer_graph_impl(
                 ),
                 mask.image,
             )
-        else:
+        elif not original_layer_is_read_only(settings, active):
             _activate_paint_image_node(
                 active_material,
                 LAYER_IMAGE_NODE_ROLE,
@@ -3442,6 +3519,8 @@ def update_mask(scene: Any, mask_uuid: str) -> None:
         mix_node,
         {mask_uuid: (image, bw, multiply)},
     )
+    if str(settings.layer_preview_uuid or "") == str(layer.layer_uuid):
+        _apply_preview(scene, material)
 
 
 def update_layer_visibility(scene: Any, layer_uuid: str) -> None:
@@ -3500,6 +3579,27 @@ def update_layer_visibility(scene: Any, layer_uuid: str) -> None:
         mix_node,
         mask_nodes,
     )
+    if str(settings.layer_preview_uuid or "") == str(layer.layer_uuid):
+        _apply_preview(scene, material)
+
+
+def _paint_image_slot_index(
+    material: Any,
+    image: Any,
+    *,
+    require_unique: bool = True,
+) -> int:
+    """지정 Image가 연결된 Material Texture Paint Slot을 검증해 반환합니다."""
+    paint_images = tuple(material.texture_paint_images)
+    image_pointer = _pointer(image)
+    indices = tuple(
+        index
+        for index, candidate in enumerate(paint_images)
+        if _pointer(candidate) == image_pointer
+    )
+    if not indices or (require_unique and len(indices) != 1):
+        raise LayerShaderError("Paint Image가 Material Texture Paint Slot에 하나로 존재하지 않습니다.")
+    return int(indices[0])
 
 
 def _activate_paint_image_node(material: Any, role: str, image: Any) -> Any:
@@ -3538,16 +3638,8 @@ def _activate_paint_image_node(material: Any, role: str, image: Any) -> Any:
     )
     if not actual_target:
         return matches[0]
-    paint_images = tuple(material.texture_paint_images)
     image_pointer = _pointer(image)
-    indices = tuple(
-        index
-        for index, candidate in enumerate(paint_images)
-        if _pointer(candidate) == image_pointer
-    )
-    if len(indices) != 1:
-        raise LayerShaderError("Paint Image가 Material Texture Paint Slot에 하나로 존재하지 않습니다.")
-    material.paint_active_slot = int(indices[0])
+    material.paint_active_slot = _paint_image_slot_index(material, image)
     refreshed = tuple(material.texture_paint_images)
     active_index = int(material.paint_active_slot)
     if (
@@ -3559,44 +3651,17 @@ def _activate_paint_image_node(material: Any, role: str, image: Any) -> Any:
     return matches[0]
 
 
-def configure_composite_clone_source(scene: Any, layer: Any) -> None:
-    """Composite 의존 일반 형제 Layer 선택 시 Clone Image를 기준 Composite로 연결합니다."""
-    settings = _settings(scene)
-    if not composite_session_is_active(settings):
-        return
-    if (
-        str(getattr(layer, "layer_role", NORMAL_LAYER_ROLE)) != NORMAL_LAYER_ROLE
-        or str(
-            getattr(layer, "composite_dependency_session_uuid", "") or ""
-        )
-        != str(getattr(settings, "active_composite_session_uuid", "") or "")
-    ):
-        return
-    session_uuid = str(getattr(settings, "active_composite_session_uuid", "") or "")
-    composite = next(
-        (
-            candidate
-            for candidate in composite_chain_layers(settings)
-            if str(getattr(candidate, "layer_role", NORMAL_LAYER_ROLE))
-            == COMPOSITE_LAYER_ROLE
-            and str(getattr(candidate, "composite_session_uuid", "") or "")
-            == session_uuid
-        ),
-        None,
-    )
-    image_paint = getattr(getattr(scene, "tool_settings", None), "image_paint", None)
-    if composite is None or not _pointer(getattr(composite, "image", None)) or image_paint is None:
-        raise LayerShaderError("Composite Clone 소스를 설정할 수 없습니다.")
-    image_paint.clone_image = composite.image
-    image_paint.use_clone_layer = True
-
-
 def activate_layer_paint_image(context: Any, layer_uuid: str) -> Any:
-    """선택 Layer의 Image Texture 노드와 Scene Pointer를 활성화합니다."""
+    """일반 Layer는 Paint로, 외부 Original은 읽기 전용 선택으로 활성화합니다."""
     scene = context.scene
     settings = scene.projection_paint
     layer = find_layer(settings, layer_uuid)
-    if layer is not None and _pointer(layer.image):
+    read_only_original = bool(
+        layer is not None
+        and _pointer(layer.image)
+        and original_layer_is_read_only(settings, layer)
+    )
+    if layer is not None and _pointer(layer.image) and not read_only_original:
         try:
             from .overlay_migration import repair_managed_overlay_if_needed
 
@@ -3629,16 +3694,21 @@ def activate_layer_paint_image(context: Any, layer_uuid: str) -> Any:
         settings.active_layer_index = next_index
         layer.active_adjustment_index = -1
         settings.active_mask_uuid = ""
-        settings.overlay_image = layer.image
-        settings.active_paint_image = layer.image
+        settings.overlay_image = (
+            _managed_layer_reference(settings)
+            if read_only_original
+            else layer.image
+        )
+        if settings.overlay_image is None:
+            raise LayerShaderError("페인팅할 관리 Layer Image가 없습니다.")
+        settings.active_paint_image = None if read_only_original else layer.image
         settings.paint_mask_mode = False
-        if settings.paint_material is not None:
+        if settings.paint_material is not None and not read_only_original:
             _activate_paint_image_node(
                 settings.paint_material,
                 LAYER_IMAGE_NODE_ROLE,
                 layer.image,
             )
-        configure_composite_clone_source(scene, layer)
     except Exception:
         (
             settings.active_layer_index,
@@ -3669,7 +3739,8 @@ def activate_mask_paint_image(
     layer = find_layer(settings, layer_uuid)
     if layer is None:
         raise LayerShaderError("Mask가 속한 Layer를 찾을 수 없습니다.")
-    if _pointer(layer.image):
+    read_only_original = original_layer_is_read_only(settings, layer)
+    if _pointer(layer.image) and not read_only_original:
         try:
             from .overlay_migration import repair_managed_overlay_if_needed
 
@@ -3701,7 +3772,13 @@ def activate_mask_paint_image(
         else -1
     )
     settings.active_mask_uuid = str(mask.mask_uuid)
-    settings.overlay_image = layer.image
+    settings.overlay_image = (
+        _managed_layer_reference(settings)
+        if read_only_original
+        else layer.image
+    )
+    if settings.overlay_image is None:
+        raise LayerShaderError("Mask 페인팅에 필요한 관리 Layer Image가 없습니다.")
     settings.active_paint_image = mask.image
     settings.paint_mask_mode = True
     if settings.paint_material is not None:
@@ -3714,6 +3791,9 @@ def activate_mask_paint_image(
             ),
             mask.image,
         )
+    from .stencil_session import disconnect_stencil
+
+    disconnect_stencil(scene)
     return mask.image
 
 
@@ -3743,14 +3823,7 @@ def create_composite_layer_image(scene: Any, layer_uuid: str) -> Any:
     target = getattr(settings, "paint_target", None)
     if settings is None or target is None or _pointer(target) == 0:
         raise LayerShaderError("Composite Image를 만들 Paint Target이 없습니다.")
-    reference = next(
-        (
-            layer.image
-            for layer in settings.layers
-            if _pointer(getattr(layer, "image", None))
-        ),
-        None,
-    )
+    reference = _managed_layer_reference(settings)
     if not _pointer(reference):
         raise LayerShaderError("Composite Image 해상도의 기준 Layer가 없습니다.")
     image = _new_image(
@@ -3872,9 +3945,14 @@ def remove_mask_resources(
     image = mask.image
     if str(settings.active_mask_uuid or "") == mask_uuid:
         settings.active_mask_uuid = ""
-        settings.active_paint_image = layer.image
+        read_only_original = original_layer_is_read_only(settings, layer)
+        settings.active_paint_image = None if read_only_original else layer.image
         settings.paint_mask_mode = False
-        if material is not None and material.node_tree is not None:
+        if (
+            material is not None
+            and material.node_tree is not None
+            and not read_only_original
+        ):
             _activate_paint_image_node(material, LAYER_IMAGE_NODE_ROLE, layer.image)
     if material is not None and material.node_tree is not None:
         tree = material.node_tree
@@ -3909,7 +3987,9 @@ def _delete_owned_layer_resources(
     for node in nodes:
         tree.nodes.remove(node)
     for image in images:
-        if _pointer(image) and int(image.users) == 0:
+        if not _owned_image(image, {LAYER_IMAGE_ROLE, MASK_IMAGE_ROLE}):
+            continue
+        if int(image.users) == 0:
             _remove_image(image)
         else:
             detach_shared_owned_image(image)
@@ -4018,12 +4098,12 @@ __all__ = [
     "ADJUSTMENT_MASK_IMAGE_NODE_ROLE",
     "ADJUSTMENT_NODE_ROLE",
     "ADJUSTMENT_UUID_KEY",
-    "COMPOSITE_DERIVED_LAYER_ROLE",
     "COMPOSITE_LAYER_ROLE",
     "LAYER_FRAME_ROLE",
     "LAYER_IMAGE_NODE_ROLE",
     "LAYER_IMAGE_ROLE",
     "LAYER_MIX_NODE_ROLE",
+    "LAYER_SOLO_PREVIEW_MIX_NODE_ROLE",
     "LAYER_PREVIEW_UUID_KEY",
     "LAYER_UUID_KEY",
     "LayerShaderError",
@@ -4034,19 +4114,18 @@ __all__ = [
     "MASK_UUID_KEY",
     "ORIGINAL_GATE_NODE_ROLE",
     "ORIGINAL_PREVIEW_KEY",
+    "active_base_color_graph_layers",
     "add_layer_transaction",
     "composite_chain_layers",
     "composite_layer_is_editable",
     "composite_session_is_active",
     "composite_state_locks_layer_edits",
     "composite_source_layers",
-    "configure_composite_clone_source",
     "create_composite_layer_image",
     "detach_shared_owned_image",
     "remove_layer_resources",
     "remove_owned_layer_bundles",
     "restore_original_layer",
-    "restore_legacy_composite_migration",
     "connect_new_layer_nodes",
     "find_adjustment",
     "find_mask",
@@ -4054,8 +4133,8 @@ __all__ = [
     "has_layer_backend",
     "layout_layer_nodes",
     "managed_node_rectangles",
-    "migrate_legacy_composite_derived",
     "original_layer",
+    "original_layer_is_read_only",
     "reconcile_layer_graph",
     "remove_adjustment_resources",
     "remove_mask_resources",

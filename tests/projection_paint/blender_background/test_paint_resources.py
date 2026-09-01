@@ -11,8 +11,8 @@ from unittest import mock
 import bpy
 
 
-ROOT = Path(__file__).resolve().parents[3] / "tools" / "projection_paint"
-sys.path.insert(0, str(ROOT.parent))
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
 
 from tools.projection_paint.blender.material_setup import (  # noqa: E402
     MANAGED_OVERLAY_LEGACY_VALID,
@@ -976,7 +976,7 @@ class PaintResourceTests(unittest.TestCase):
                 len(tuple(source.packed_files)), bool(source.is_dirty), path.read_bytes(),
             )
 
-            with self.assertRaisesRegex(LayerShaderError, "저장되지 않은 외부"):
+            with self.assertRaisesRegex(LayerShaderError, "저장되지 않은 변경"):
                 replace_with_fresh_layer(bpy.context, 16, 16, use_base_resolution=False)
 
             self.assertEqual(

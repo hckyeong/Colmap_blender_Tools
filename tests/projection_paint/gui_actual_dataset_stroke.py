@@ -610,8 +610,8 @@ def _phase_verify_camera_exit() -> float:
         raise RuntimeError("Camera View 이탈 중 현재 Source Image가 유실되었습니다.")
     if not stencil.outside_camera_view or stencil.manual_disabled:
         raise RuntimeError("Camera View 이탈 상태가 수동 해제로 잘못 기록되었습니다.")
-    if bpy.context.scene.projection_paint.paint_state != "FROZEN":
-        raise RuntimeError("Camera View 이탈 상태가 FROZEN으로 표시되지 않았습니다.")
+    if bpy.context.scene.projection_paint.paint_state != "ACTIVE":
+        raise RuntimeError("Camera View 이탈 뒤에도 Layer Paint 상태가 ACTIVE가 아닙니다.")
     STATE["result"]["camera_exit_disconnected"] = True
     _window, _area, _region, _space, rv3d = _view_parts()
     rv3d.view_perspective = "CAMERA"

@@ -17,8 +17,6 @@ from .ownership import (
 
 
 REVIEW_IMAGE_KIND = "CAMERA_REVIEW_IMAGE"
-REVIEW_SLOT_INDEX_KEY = "pp_review_background_slot_index"
-REVIEW_SLOT_DATASET_KEY = "pp_review_background_dataset_uuid"
 _TRACKED_SLOTS: dict[str, tuple[int, int]] = {}
 
 
@@ -165,8 +163,7 @@ def _camera_view_active(context: Any) -> bool:
 def _apply_camera_frame(scene: Any, camera: Any) -> None:
     """COLMAP Camera 해상도를 Scene Camera와 Render Frame에 적용합니다."""
 
-    width = int(camera.data.get("pp_camera_width", 0))
-    height = int(camera.data.get("pp_camera_height", 0))
+    width, height = camera_dimensions(camera.data)
     if width <= 0 or height <= 0:
         raise CameraReviewError("현재 Camera의 COLMAP 해상도 Metadata가 없습니다.")
     scene.camera = camera
@@ -207,7 +204,6 @@ def _persistent_slot(settings: Any, camera_data: Any) -> Any | None:
     index = int(settings.review_background_slot_index)
     if (
         index < 0
-        or int(camera_data.get(REVIEW_SLOT_INDEX_KEY, -1)) != index
         or index >= len(camera_data.background_images)
     ):
         return None
@@ -241,16 +237,10 @@ def _managed_slot(scene: Any) -> tuple[Any | None, Any | None]:
 
 
 def _forget_slot(scene: Any, camera_data: Any) -> None:
-    """Scene Runtime 추적과 Camera Data의 Review 슬롯 Metadata를 제거합니다."""
+    """Scene Runtime의 Review 슬롯 추적만 제거합니다."""
 
     _TRACKED_SLOTS.pop(ensure_scene_uuid(scene), None)
-    if camera_data is None or not _pointer(camera_data):
-        return
-    for key in (REVIEW_SLOT_INDEX_KEY, REVIEW_SLOT_DATASET_KEY):
-        try:
-            camera_data.pop(key, None)
-        except (AttributeError, ReferenceError, RuntimeError):
-            pass
+    del camera_data
 
 
 def _remove_managed_slot(scene: Any) -> None:
@@ -293,8 +283,6 @@ def _ensure_managed_slot(scene: Any, camera_data: Any) -> Any:
     )
     if index < 0:
         raise CameraReviewError("Camera Review 배경 슬롯을 확인할 수 없습니다.")
-    camera_data[REVIEW_SLOT_INDEX_KEY] = index
-    camera_data[REVIEW_SLOT_DATASET_KEY] = str(settings.dataset_uuid)
     settings.review_background_camera_data = camera_data
     settings.review_background_slot_index = index
     _TRACKED_SLOTS[ensure_scene_uuid(scene)] = (
@@ -351,10 +339,7 @@ def _load_review_image(scene: Any, entry: CameraManifestEntry, path: Path) -> An
 def _validate_image_size(camera: Any, image: Any) -> None:
     """Review Image 해상도가 COLMAP Camera 해상도와 일치하는지 검증합니다."""
 
-    expected = (
-        int(camera.data.get("pp_camera_width", 0)),
-        int(camera.data.get("pp_camera_height", 0)),
-    )
+    expected = camera_dimensions(camera.data)
     actual = tuple(int(value) for value in image.size)
     if min(actual, default=0) <= 0 or actual != expected:
         raise CameraReviewError(
@@ -495,6 +480,43 @@ def clear_camera_review_runtime() -> None:
     _TRACKED_SLOTS.clear()
 
 
+def camera_dimensions(camera_data: Any) -> tuple[int, int]:
+    """공용 또는 Legacy Camera Data에서 검증 가능한 COLMAP 해상도를 반환합니다."""
+
+    try:
+        width = int(
+            camera_data.get(
+                "colmap_width",
+                camera_data.get("pp_camera_width", 0),
+            )
+        )
+        height = int(
+            camera_data.get(
+                "colmap_height",
+                camera_data.get("pp_camera_height", 0),
+            )
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return 0, 0
+    return width, height
+
+
+def release_camera_review_links(scene: Any) -> None:
+    """Dataset 교체 전에 PP 배경 슬롯과 현재 Image 연결만 안전하게 해제합니다."""
+
+    settings = _settings(scene)
+    if settings is None:
+        return
+    image = settings.review_background_image
+    _remove_managed_slot(scene)
+    settings.review_background_image = None
+    settings.review_background_image_id = 0
+    settings.current_image_id = ""
+    settings.current_image_name = ""
+    if image is not settings.stencil_source_image:
+        _release_review_image(image)
+
+
 class PP_OT_review_look_through(bpy.types.Operator):
     """현재 Frame의 COLMAP Camera를 현재 3D Viewport에서 표시합니다."""
 
@@ -507,9 +529,12 @@ class PP_OT_review_look_through(bpy.types.Operator):
     def poll(cls, context: Any) -> bool:
         """현재 Frame에 관리 Camera가 있고 3D Viewport일 때만 버튼을 활성화합니다."""
 
+        from .snapshot_update import snapshot_is_ready
+
         scene = getattr(context, "scene", None)
         return bool(
             scene is not None
+            and snapshot_is_ready(scene)
             and _current_entry(scene) is not None
             and _viewport_available(context)
         )
@@ -540,7 +565,14 @@ class PP_OT_review_background_toggle(bpy.types.Operator):
     def poll(cls, context: Any) -> bool:
         """Projection Paint Workspace의 Camera View에서만 단축키를 허용합니다."""
 
-        return _camera_view_active(context)
+        from .snapshot_update import snapshot_is_ready
+
+        scene = getattr(context, "scene", None)
+        return bool(
+            scene is not None
+            and snapshot_is_ready(scene)
+            and _camera_view_active(context)
+        )
 
     def execute(self, context: Any) -> set[str]:
         """설정값 반전으로 기존 Camera Review 갱신 경로를 실행합니다."""
@@ -563,10 +595,12 @@ __all__ = [
     "PP_OT_review_look_through",
     "PP_OT_review_background_toggle",
     "REVIEW_IMAGE_KIND",
+    "camera_dimensions",
     "clear_camera_review_runtime",
     "initialize_camera_review",
     "look_through_current_camera",
     "refresh_camera_review",
+    "release_camera_review_links",
     "sync_camera_review",
     "update_camera_review_from_settings",
     "update_camera_review_style",

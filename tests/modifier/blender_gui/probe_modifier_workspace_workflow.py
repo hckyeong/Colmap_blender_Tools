@@ -23,7 +23,16 @@ PACKAGE_NAME = (
     if USE_INSTALLED
     else "tools.modifier"
 )
+SHARED_PACKAGE_NAME = (
+    "bl_ext.user_default.colmap_tools.shared.colmap_dataset"
+    if USE_INSTALLED
+    else "shared.colmap_dataset"
+)
 blender_colmap = importlib.import_module(PACKAGE_NAME)
+shared_dataset = importlib.import_module(SHARED_PACKAGE_NAME)
+dataset_registry = importlib.import_module(
+    f"{SHARED_PACKAGE_NAME}.blender.registry"
+)
 ownership = importlib.import_module(f"{PACKAGE_NAME}.blender.ownership")
 runtime_state = importlib.import_module(f"{PACKAGE_NAME}.blender.runtime_state")
 undo_domain_coordinator = importlib.import_module(
@@ -231,6 +240,10 @@ def _workflow_tick():
                     == ("1", "1", "1"),
                     "전용 Workspace Import 결과 Count가 잘못되었습니다.",
                 )
+                _assert(
+                    dataset_registry.snapshot(bpy.context.scene).dataset_revision == 1,
+                    "전용 Workspace Import가 공용 Dataset Revision을 만들지 못했습니다.",
+                )
                 managed_objects = _managed_scene_objects(settings)
                 _assert(
                     len(managed_objects) == 2
@@ -319,7 +332,14 @@ def _workflow_tick():
                     "전용 Workspace Undo Last Filter 복원이 실패했습니다.",
                 )
                 _remove_point(settings)
-                _assert(settings.edit_revision == 1, "Point Remove revision이 증가하지 않았습니다.")
+                _assert(
+                    settings.edit_revision == 1
+                    and dataset_registry.snapshot(
+                        bpy.context.scene
+                    ).dataset_revision
+                    == 2,
+                    "Point Remove가 Modifier와 공용 Dataset Revision을 증가시키지 않았습니다.",
+                )
                 bpy.ops.ed.undo_push(message="COLMAP Modifier Point Remove")
             _STAGE = "GLOBAL_UNDO"
             return 0.1
@@ -342,6 +362,13 @@ def _workflow_tick():
                 if settings.edit_revision != 0 or len(state.current_reconstruction.points3d) != 1:
                     return 0.1
                 _assert(
+                    dataset_registry.snapshot(
+                        bpy.context.scene
+                    ).dataset_revision
+                    == 1,
+                    "Global Undo가 공용 Dataset Revision을 복원하지 못했습니다.",
+                )
+                _assert(
                     SESSION.phase == SESSION_ACTIVE,
                     "Global Undo 뒤 Modifier Workspace Session이 비활성화되었습니다.",
                 )
@@ -351,6 +378,13 @@ def _workflow_tick():
                 _assert(
                     bpy.ops.colmap.export("EXEC_DEFAULT") == {"FINISHED"},
                     settings.export_status,
+                )
+                _assert(
+                    dataset_registry.snapshot(
+                        bpy.context.scene
+                    ).dataset_revision
+                    == 2,
+                    "Export가 편집된 공용 Dataset Revision을 변경했습니다.",
                 )
                 exported = binary_io.read_model_binary(_MODEL_DIRECTORY, modern=False)
                 _assert(
@@ -457,6 +491,7 @@ def _workflow_tick():
             print("COLMAP_MODIFIER_WORKSPACE_WORKFLOW_GUI_OK")
             _TEMP_DIRECTORY.cleanup()
             blender_colmap.unregister()
+            shared_dataset.unregister()
             bpy.ops.wm.quit_blender()
             return None
     except Exception as error:
@@ -465,7 +500,10 @@ def _workflow_tick():
         try:
             blender_colmap.unregister()
         finally:
-            bpy.ops.wm.quit_blender()
+            try:
+                shared_dataset.unregister()
+            finally:
+                bpy.ops.wm.quit_blender()
         raise
     return 0.05
 
@@ -476,6 +514,7 @@ def main() -> None:
     global _DEFAULT_OBJECT_HIDE_STATES
     global _SOURCE_WORKSPACE_POINTER
     _SOURCE_WORKSPACE_POINTER = bpy.context.window.workspace.as_pointer()
+    shared_dataset.register()
     blender_colmap.register()
     _DEFAULT_OBJECT_HIDE_STATES = {
         object_name: bool(obj.hide_get(view_layer=bpy.context.view_layer))
