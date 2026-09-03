@@ -160,6 +160,28 @@ Factory GUI 검사는 세 Seed의 독립 Workspace·Screen Pointer, CREATING →
 
 Blender 5.2는 Append Workspace 공식 삭제 시 `ID user decrement error: SRLayout` 내부 진단을 출력하지만 삭제 결과와 Workspace·Screen ID 제거는 정상입니다. 사용자 수 조작 우회는 사용하지 않습니다.
 
+## Align 진입 Object Mode 자동 전환 회귀
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env `
+  --python ".\tests\align\blender\test_object_mode_entry.py"
+
+$process = Start-Process `
+  -FilePath "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" `
+  -ArgumentList @(
+    "--factory-startup",
+    "--python-use-system-env",
+    "--python",
+    ".\tests\align\blender\test_object_mode_workspace_gui.py"
+  ) `
+  -WindowStyle Hidden `
+  -PassThru
+$process.WaitForExit()
+```
+
+첫 검사는 Edit·Sculpt·Texture Paint에서 Blender 기본 Object Mode 전환이 완료되는지 확인합니다. 두 번째 검사는 Edit Mode 상태로 실제 Align 진입 Operator를 실행해 기존 모드 전환이 끝난 다음에만 Align 작업공간과 세션이 활성화되는지 확인합니다.
+
 ## Modifier 고정 COLMAP Fixture GUI 회귀
 
 ```powershell
@@ -169,7 +191,27 @@ Blender 5.2는 Append Workspace 공식 삭제 시 `ID user decrement error: SRLa
   --python ".\tests\modifier\blender_gui\probe_modifier_workspace_workflow.py"
 ```
 
-단일 Camera·Image·Point3D TXT Fixture를 실제 Import하고 Frame All, Camera Review, Point Edit, Global Undo, BIN Export와 Workspace 재진입을 검증합니다. Blender의 합성 입력 허용 옵션으로 Modifier Camera View에 실제 F7 PRESS·RELEASE 이벤트를 보내 관리 Background Image가 OFF → ON으로 전환되는지도 확인합니다. 종료 뒤에는 Modifier 관리 Object 데이터 블록이 삭제되지 않은 채 일반 View Layer에서 모두 제외되고, 재진입하면 Modifier 전용 View Layer가 활성화되어 관리 Collection이 다시 포함되는지 확인합니다. Pending Camera의 개별 숨김 상태와 Pending Undo도 그대로 유지되어야 합니다.
+단일 Camera·Image·Point3D TXT Fixture를 실제 Import하고 Frame All, Camera Review, Point Edit, Modifier 전용 `Ctrl+Z`·`Ctrl+Shift+Z`, BIN Export와 Workspace 재진입을 검증합니다. 이 입력이 Blender Global Undo를 호출하지 않고 독립 Runtime Journal만 변경하는지 확인합니다. Blender의 합성 입력 허용 옵션으로 Modifier Camera View에 실제 F7 PRESS·RELEASE 이벤트를 보내 관리 Background Image가 OFF → ON으로 전환되는지도 확인합니다. 종료 뒤에는 Modifier 관리 Object 데이터 블록이 삭제되지 않은 채 일반 View Layer에서 모두 제외되고, 재진입하면 Modifier 전용 View Layer가 활성화되어 관리 Collection이 다시 포함되는지 확인합니다. Pending Camera의 개별 숨김 상태와 Pending Undo도 그대로 유지되어야 합니다.
+
+## Modifier 독립 Runtime·전용 Undo/Redo 회귀
+
+```powershell
+python -m unittest discover -s ".\tests\modifier\core" -p "test_*.py"
+
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env `
+  --python ".\tests\modifier\blender_background\test_point_selection_background.py"
+
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env `
+  --python ".\tests\modifier\blender_background\test_undo_domain_reconcile_background.py"
+
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env `
+  --python ".\tests\modifier\blender_background\test_camera_review_load_rehydrate_background.py"
+```
+
+Core 검사는 변경 범위 Delta, Undo·Redo 분기, Reset 되돌리기, Domain 저장 Codec과 Active/Staging Text 원자 저장을 확인합니다. Blender 검사는 Global Undo 뒤 Runtime 객체와 Journal이 보존되는지, 저장·재실행 때 Source·Operation으로 Undo Command가 다시 구성되고 Redo가 비워지는지, Projection Painting Snapshot이 Domain 복합 Identity로만 수동 갱신되는지 확인합니다. `0.3.33` 이하에서 저장한 Modifier 데이터는 자동 이전하지 않으므로 새 버전에서 한 번 재Import한 뒤 `.blend`를 저장해야 합니다.
 
 Modifier 데이터 View Layer의 순수 포함·제외 계약은 Background에서도 별도로 검증합니다.
 
@@ -395,6 +437,36 @@ python -m unittest discover -s tests/coexistence -p "test_scene_marker_session.p
 ```
 
 공용 검사는 Scene별 단일 소유, 같은 Window 재획득, 다른 도구와 다른 Window 차단 및 정확한 소유자 반납을 확인합니다. Modifier와 Projection Paint 검사는 Manifest 기반 Marker Attach·Detach·Rollback, 사용자 Marker 보존, 비활성 Load·Undo·Guard의 Marker 무생성, Extension 해제와 데이터 보존을 확인합니다. `tests/blender_gui/test_workspace_isolation.py`는 도구를 자동 또는 수동으로 전환할 때 이전 Marker 사용권이 반납된 뒤 다음 도구가 획득하는 순서도 함께 검사합니다.
+
+## Modifier·Projection Painting Camera 세션 격리 회귀
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env `
+  --python ".\tests\projection_paint\blender_background\test_camera_review_background.py"
+
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env `
+  --python ".\tests\modifier\blender_background\test_camera_review_background.py"
+```
+
+실제 Window가 필요한 교대 검사는 사용자 화면을 가리지 않도록 숨김 창에서 실행합니다.
+
+```powershell
+$process = Start-Process `
+  -FilePath "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" `
+  -ArgumentList @(
+    "--factory-startup",
+    "--python-use-system-env",
+    "--python",
+    ".\tests\blender_gui\test_camera_marker_handoff.py"
+  ) `
+  -WindowStyle Hidden `
+  -PassThru
+$process.WaitForExit()
+```
+
+검사는 작업공간 열기 직후 Camera 세션이 아직 비활성인지, 화면 구성이 `READY`가 된 다음 UI Tick에서만 활성화되는지 확인합니다. 이어 Modifier → Projection Painting → Modifier → 일반 Workspace를 이동하며 비활성 도구의 Camera·Background·Frame Timer가 현재 도구를 덮어쓰지 않고 양쪽 Object와 사용자 Marker가 보존되는지 검증합니다.
 
 ## Extension 검증과 ZIP 빌드
 

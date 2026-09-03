@@ -98,6 +98,30 @@ class CameraManifest:
     resource_owner: str = RESOURCE_OWNER_PROJECTION_PAINT
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectionCameraSessionToken:
+    """Projection Camera 쓰기 권한의 세대와 Window·Workspace 범위를 식별합니다."""
+
+    generation: int
+    scene_pointer: int
+    window_pointer: int
+    workspace_pointer: int
+
+
+@dataclass(slots=True)
+class _ProjectionCameraSession:
+    """저장되지 않는 Camera 세션과 조건부 복원 Snapshot을 보관합니다."""
+
+    scene: Any
+    window: Any
+    workspace: Any
+    token: ProjectionCameraSessionToken
+    previous_scene_camera: Any
+    previous_render: tuple[int, int, int]
+    last_applied_scene_camera: Any = None
+    last_applied_render: tuple[int, int, int] | None = None
+
+
 @dataclass(slots=True)
 class CameraRuntime:
     """현재 Epoch에서만 유효한 Camera와 Marker 직접 참조를 보관합니다."""
@@ -122,12 +146,15 @@ class CameraRuntime:
     pending_frame_retry_count: int = 0
     pending_frame_next_attempt_at: float = 0.0
     pending_frame_error: str = ""
+    camera_session_token: ProjectionCameraSessionToken | None = None
     repair_depth: int = 0
     repair_attempts: int = 0
     error: str = ""
 
 
 _RUNTIMES: dict[int, CameraRuntime] = {}
+_CAMERA_SESSIONS: dict[int, _ProjectionCameraSession] = {}
+_CAMERA_SESSION_GENERATION = 0
 _MARKER_TOOL_ID = "projection_paint"
 
 
@@ -144,6 +171,282 @@ def _marker_session_is_active(scene: Any) -> bool:
         )
 
     return bool(scene_marker_session_owned_by(scene, _MARKER_TOOL_ID))
+
+
+def _window_for_projection_camera_session(
+    session: _ProjectionCameraSession,
+) -> Any | None:
+    """저장한 포인터와 일치하는 현재 Blender Window를 반환합니다."""
+
+    manager = getattr(bpy.context, "window_manager", None)
+    return next(
+        (
+            window
+            for window in tuple(getattr(manager, "windows", ()))
+            if _pointer(window) == session.token.window_pointer
+        ),
+        None,
+    )
+
+
+def projection_camera_session_is_active(
+    scene: Any,
+    *,
+    token: ProjectionCameraSessionToken | None = None,
+    window: Any = None,
+) -> bool:
+    """Workspace·Window·lease·세대가 모두 일치할 때만 Camera 쓰기를 허용합니다."""
+
+    session = _CAMERA_SESSIONS.get(_pointer(scene))
+    if session is None or session.scene is not scene:
+        return False
+    if token is not None and session.token != token:
+        return False
+    active_window = window or _window_for_projection_camera_session(session)
+    if (
+        active_window is None
+        or _pointer(active_window) != session.token.window_pointer
+        or getattr(active_window, "scene", None) is not scene
+        or getattr(active_window, "workspace", None) is not session.workspace
+        or _pointer(session.workspace) != session.token.workspace_pointer
+    ):
+        return False
+    settings = getattr(scene, "projection_paint", None)
+    if settings is None or getattr(settings, "paint_workspace", None) is not session.workspace:
+        return False
+    try:
+        from ....shared.blender_runtime.scene_marker_session import (
+            scene_marker_session_owned_by_window,
+        )
+    except ImportError:
+        from shared.blender_runtime.scene_marker_session import (
+            scene_marker_session_owned_by_window,
+        )
+    try:
+        from ....shared.blender_runtime.workspace_factory import workspace_matches_spec
+    except ImportError:
+        from shared.blender_runtime.workspace_factory import workspace_matches_spec
+    from .paint_workspace import PAINT_WORKSPACE_SPEC
+
+    return bool(
+        workspace_matches_spec(
+            session.workspace,
+            PAINT_WORKSPACE_SPEC,
+            require_ready=False,
+        )
+        and scene_marker_session_owned_by_window(
+            scene,
+            _MARKER_TOOL_ID,
+            active_window,
+        )
+    )
+
+
+def projection_camera_session_token(
+    scene: Any,
+) -> ProjectionCameraSessionToken | None:
+    """현재 활성 Projection Camera 세션의 불변 Token을 반환합니다."""
+
+    session = _CAMERA_SESSIONS.get(_pointer(scene))
+    if session is None or not projection_camera_session_is_active(scene, token=session.token):
+        return None
+    return session.token
+
+
+def activate_projection_camera_session(
+    scene: Any,
+    window: Any,
+) -> ProjectionCameraSessionToken:
+    """lease 획득 뒤 현재 Projection Workspace에 새 Camera 세대를 발급합니다."""
+
+    global _CAMERA_SESSION_GENERATION
+    workspace = getattr(window, "workspace", None)
+    settings = getattr(scene, "projection_paint", None)
+    if (
+        settings is None
+        or getattr(window, "scene", None) is not scene
+        or workspace is None
+        or getattr(settings, "paint_workspace", None) is not workspace
+    ):
+        raise CameraSceneError("Projection Paint Camera 세션 Workspace가 활성 상태가 아닙니다.")
+    try:
+        from ....shared.blender_runtime.scene_marker_session import (
+            scene_marker_session_owned_by_window,
+        )
+        from ....shared.blender_runtime.workspace_factory import workspace_matches_spec
+    except ImportError:
+        from shared.blender_runtime.scene_marker_session import (
+            scene_marker_session_owned_by_window,
+        )
+        from shared.blender_runtime.workspace_factory import workspace_matches_spec
+    from .paint_workspace import PAINT_WORKSPACE_SPEC
+
+    if not workspace_matches_spec(
+        workspace,
+        PAINT_WORKSPACE_SPEC,
+        require_ready=False,
+    ) or not scene_marker_session_owned_by_window(
+        scene,
+        _MARKER_TOOL_ID,
+        window,
+    ):
+        raise CameraSceneError("Projection Paint Camera 세션 소유권이 활성 상태가 아닙니다.")
+    existing = _CAMERA_SESSIONS.get(_pointer(scene))
+    if existing is not None and projection_camera_session_is_active(
+        scene,
+        token=existing.token,
+        window=window,
+    ):
+        return existing.token
+    _CAMERA_SESSION_GENERATION += 1
+    token = ProjectionCameraSessionToken(
+        generation=_CAMERA_SESSION_GENERATION,
+        scene_pointer=_pointer(scene),
+        window_pointer=_pointer(window),
+        workspace_pointer=_pointer(workspace),
+    )
+    session = _ProjectionCameraSession(
+        scene=scene,
+        window=window,
+        workspace=workspace,
+        token=token,
+        previous_scene_camera=getattr(scene, "camera", None),
+        previous_render=(
+            int(scene.render.resolution_x),
+            int(scene.render.resolution_y),
+            int(scene.render.resolution_percentage),
+        ),
+    )
+    _CAMERA_SESSIONS[_pointer(scene)] = session
+    runtime = runtime_for_scene(scene)
+    if runtime is not None:
+        runtime.camera_session_token = token
+    return token
+
+
+def _clear_pending_frame(runtime: CameraRuntime) -> None:
+    """Camera Runtime을 보존한 채 모든 pending·retry·error 요청만 폐기합니다."""
+
+    runtime.pending_frame = None
+    runtime.pending_frame_serial += 1
+    runtime.pending_frame_changed_at = 0.0
+    runtime.pending_frame_retry_count = 0
+    runtime.pending_frame_next_attempt_at = 0.0
+    runtime.pending_frame_error = ""
+
+
+def cancel_projection_frame_requests(scene: Any) -> None:
+    """Runtime과 Cache를 보존하면서 지정 Scene의 Frame 요청만 즉시 취소합니다."""
+
+    runtime = runtime_for_scene(scene)
+    if runtime is None:
+        return
+    _clear_pending_frame(runtime)
+    if not any(item.pending_frame is not None for item in _RUNTIMES.values()):
+        lifecycle_registry().unregister_timer(_frame_source_debounce_tick)
+
+
+def invalidate_projection_camera_session(
+    scene: Any,
+    window: Any = None,
+) -> _ProjectionCameraSession | None:
+    """종료 첫 단계에서 세대 권한과 새 Frame 요청을 무효화합니다."""
+
+    global _CAMERA_SESSION_GENERATION
+    scene_pointer = _pointer(scene)
+    session = _CAMERA_SESSIONS.get(scene_pointer)
+    if session is None:
+        runtime = runtime_for_scene(scene)
+        if runtime is not None:
+            runtime.camera_session_token = None
+            _clear_pending_frame(runtime)
+        return None
+    if window is not None and _pointer(window) != session.token.window_pointer:
+        return None
+    _CAMERA_SESSION_GENERATION += 1
+    _CAMERA_SESSIONS.pop(scene_pointer, None)
+    runtime = runtime_for_scene(scene)
+    if runtime is not None:
+        runtime.camera_session_token = None
+        _clear_pending_frame(runtime)
+    if not any(item.pending_frame is not None for item in _RUNTIMES.values()):
+        lifecycle_registry().unregister_timer(_frame_source_debounce_tick)
+    return session
+
+
+def finish_projection_camera_session_exit(
+    session: _ProjectionCameraSession | None,
+) -> tuple[bool, bool]:
+    """마지막 적용값이 그대로일 때만 진입 전 Camera와 Render 값을 복원합니다."""
+
+    if session is None or _pointer(session.scene) != session.token.scene_pointer:
+        return True, True
+    scene = session.scene
+    current_render = (
+        int(scene.render.resolution_x),
+        int(scene.render.resolution_y),
+        int(scene.render.resolution_percentage),
+    )
+    camera_unchanged = (
+        session.last_applied_scene_camera is not None
+        and getattr(scene, "camera", None) is session.last_applied_scene_camera
+    )
+    render_unchanged = (
+        session.last_applied_render is not None
+        and current_render == session.last_applied_render
+    )
+    if camera_unchanged:
+        scene.camera = session.previous_scene_camera
+    if render_unchanged:
+        (
+            scene.render.resolution_x,
+            scene.render.resolution_y,
+            scene.render.resolution_percentage,
+        ) = session.previous_render
+    return camera_unchanged, render_unchanged
+
+
+def projection_camera_session_settled(scene: Any) -> bool:
+    """Camera 권한·pending·debounce가 모두 종료됐는지 확인합니다."""
+
+    runtime = runtime_for_scene(scene)
+    return bool(
+        _pointer(scene) not in _CAMERA_SESSIONS
+        and (runtime is None or runtime.pending_frame is None)
+    )
+
+
+def apply_projection_camera_state(
+    scene: Any,
+    camera: Any,
+    *,
+    render_resolution: tuple[int, int, int] | None = None,
+    token: ProjectionCameraSessionToken | None = None,
+) -> None:
+    """검증된 활성 세션에서만 Scene Camera와 선택적 Render 값을 기록합니다."""
+
+    runtime = runtime_for_scene(scene)
+    expected_token = token or (
+        runtime.camera_session_token if runtime is not None else None
+    ) or projection_camera_session_token(scene)
+    if expected_token is None or not projection_camera_session_is_active(
+        scene,
+        token=expected_token,
+    ):
+        raise CameraSceneError("활성 Projection Paint Camera 세션이 아닙니다.")
+    scene.camera = camera
+    if render_resolution is not None:
+        width, height, percentage = (int(value) for value in render_resolution)
+        scene.render.resolution_x = width
+        scene.render.resolution_y = height
+        scene.render.resolution_percentage = percentage
+    session = _CAMERA_SESSIONS[_pointer(scene)]
+    session.last_applied_scene_camera = camera
+    session.last_applied_render = (
+        int(scene.render.resolution_x),
+        int(scene.render.resolution_y),
+        int(scene.render.resolution_percentage),
+    )
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -739,6 +1042,21 @@ def clear_camera_runtime(_reason: str = "", _epoch: int = 0) -> None:
     registry.unregister_timer(_repair_timer)
 
 
+def invalidate_projection_camera_sessions_for_lifecycle(
+    _reason: str = "",
+    _epoch: int = 0,
+) -> None:
+    """Load·Undo 경계에서 저장되지 않는 Camera 권한만 쓰기 없이 폐기합니다."""
+
+    global _CAMERA_SESSION_GENERATION
+    _CAMERA_SESSION_GENERATION += 1
+    _CAMERA_SESSIONS.clear()
+    for runtime in tuple(_RUNTIMES.values()):
+        runtime.camera_session_token = None
+        _clear_pending_frame(runtime)
+    lifecycle_registry().unregister_timer(_frame_source_debounce_tick)
+
+
 def _runtime_key(scene: Any) -> int:
     """현재 Epoch 안에서 Scene Runtime을 찾을 포인터 Key를 반환합니다."""
 
@@ -789,7 +1107,7 @@ def _resolve_runtime(scene: Any, manifest: CameraManifest) -> CameraRuntime:
         scene,
         dataset_revision=manifest.dataset_revision,
     )
-    return CameraRuntime(
+    runtime = CameraRuntime(
         scene=scene,
         manifest=manifest,
         token=token,
@@ -810,6 +1128,8 @@ def _resolve_runtime(scene: Any, manifest: CameraManifest) -> CameraRuntime:
         dirty_data=deque(),
         queued=set(),
     )
+    runtime.camera_session_token = projection_camera_session_token(scene)
+    return runtime
 
 
 def install_camera_runtime(scene: Any, manifest: CameraManifest) -> CameraRuntime:
@@ -838,11 +1158,11 @@ def rebuild_camera_runtime(scene: Any, _reason: str, _epoch: int) -> None:
         return
     try:
         install_camera_runtime(scene, manifest)
-        if _marker_session_is_active(scene):
+        if projection_camera_session_is_active(scene):
             attach_projection_markers(scene)
-        from .camera_review import refresh_camera_review
+            from .camera_review import refresh_camera_review
 
-        refresh_camera_review(scene)
+            refresh_camera_review(scene)
     except CameraSceneError as exc:
         settings = getattr(scene, "projection_paint", None)
         if settings is not None:
@@ -854,6 +1174,7 @@ def register_camera_runtime_hooks() -> None:
     """Lifecycle 중단과 재구축 Hook을 정확히 한 번 등록합니다."""
 
     registry = lifecycle_registry()
+    registry.add_barrier_hook(invalidate_projection_camera_sessions_for_lifecycle)
     registry.add_barrier_hook(clear_camera_runtime)
     registry.add_rebuild_hook(rebuild_camera_runtime)
 
@@ -862,7 +1183,9 @@ def unregister_camera_runtime_hooks() -> None:
     """Lifecycle Hook과 Camera Runtime 직접 참조를 제거합니다."""
 
     registry = lifecycle_registry()
+    registry.remove_barrier_hook(invalidate_projection_camera_sessions_for_lifecycle)
     registry.remove_barrier_hook(clear_camera_runtime)
+    invalidate_projection_camera_sessions_for_lifecycle()
     registry.remove_rebuild_hook(rebuild_camera_runtime)
     clear_camera_runtime()
 
@@ -907,6 +1230,12 @@ def queue_frame_change(scene: Any, *, changed_at: float | None = None) -> None:
     runtime = runtime_for_scene(scene)
     if runtime is None:
         return
+    if not projection_camera_session_is_active(
+        scene,
+        token=runtime.camera_session_token,
+    ):
+        _clear_pending_frame(runtime)
+        return
     runtime.pending_frame = int(scene.frame_current)
     runtime.pending_frame_serial += 1
     runtime.pending_frame_changed_at = (
@@ -932,7 +1261,14 @@ def consume_committed_frame_request(
     """명시적 즉시 Source Commit이 같은 Pending Frame을 완료했으면 소비합니다."""
 
     runtime = runtime_for_scene(scene)
-    if runtime is None or runtime.pending_frame != int(frame):
+    if (
+        runtime is None
+        or not projection_camera_session_is_active(
+            scene,
+            token=runtime.camera_session_token,
+        )
+        or runtime.pending_frame != int(frame)
+    ):
         return False
     entry = runtime.entries_by_frame.get(int(frame))
     settings = getattr(scene, "projection_paint", None)
@@ -1129,25 +1465,34 @@ def _restore_marker(runtime: CameraRuntime, entry: CameraManifestEntry) -> bool:
     return changed
 
 
-def _enter_camera_views(scene: Any, camera: Any) -> bool:
-    """현재 Scene을 표시하는 모든 3D View를 관리 Camera 시점으로 전환합니다."""
+def _enter_camera_views(
+    scene: Any,
+    camera: Any,
+    token: ProjectionCameraSessionToken,
+) -> bool:
+    """세션 소유 Window의 Projection 3D View만 Local Camera로 전환합니다."""
 
     changed = False
-    window_manager = getattr(bpy.context, "window_manager", None)
-    for window in tuple(getattr(window_manager, "windows", ())):
-        if getattr(window, "scene", None) is not scene:
+    session = _CAMERA_SESSIONS.get(_pointer(scene))
+    if session is None or not projection_camera_session_is_active(scene, token=token):
+        return False
+    window = _window_for_projection_camera_session(session)
+    if window is None:
+        return False
+    for area in tuple(window.screen.areas):
+        if area.type != "VIEW_3D":
             continue
-        for area in tuple(window.screen.areas):
-            if area.type != "VIEW_3D":
-                continue
-            space = area.spaces.active
-            if getattr(space, "camera", None) is not camera:
-                space.camera = camera
-                changed = True
-            rv3d = space.region_3d
-            if rv3d.view_perspective != "CAMERA":
-                rv3d.view_perspective = "CAMERA"
-                changed = True
+        space = area.spaces.active
+        if not bool(getattr(space, "use_local_camera", False)):
+            space.use_local_camera = True
+            changed = True
+        if getattr(space, "camera", None) is not camera:
+            space.camera = camera
+            changed = True
+        rv3d = space.region_3d
+        if rv3d.view_perspective != "CAMERA":
+            rv3d.view_perspective = "CAMERA"
+            changed = True
     return changed
 
 
@@ -1166,6 +1511,9 @@ def activate_managed_frame(
         if manifest is None:
             raise CameraSceneError("현재 Scene에 Camera Manifest가 없습니다.")
         runtime = install_camera_runtime(scene, manifest)
+    token = runtime.camera_session_token
+    if token is None or not projection_camera_session_is_active(scene, token=token):
+        raise CameraSceneError("활성 Projection Paint Camera 세션이 아닙니다.")
     entry = runtime.entries_by_frame.get(int(frame))
     if entry is None:
         raise CameraSceneError(f"Frame {int(frame)}에 관리 Camera가 없습니다.")
@@ -1176,13 +1524,13 @@ def activate_managed_frame(
     if camera is None or not _pointer(camera):
         raise CameraSceneError(f"IMAGE_ID {entry.image_id}의 Camera Object가 없습니다.")
     _restore_marker(runtime, entry)
-    scene.camera = camera
+    apply_projection_camera_state(scene, camera, token=token)
     if context is not None:
         from .camera_review import initialize_camera_review
 
         initialize_camera_review(context)
     else:
-        _enter_camera_views(scene, camera)
+        _enter_camera_views(scene, camera, token)
         from .camera_review import refresh_camera_review
 
         refresh_camera_review(scene)
@@ -1211,6 +1559,11 @@ def _pending_frame_request_is_current(
         runtime.pending_frame == int(frame)
         and runtime.pending_frame_serial == int(serial)
         and int(runtime.scene.frame_current) == int(frame)
+        and runtime.camera_session_token is not None
+        and projection_camera_session_is_active(
+            runtime.scene,
+            token=runtime.camera_session_token,
+        )
         and lifecycle_registry().token_is_current(
             runtime.token,
             runtime.scene,
@@ -1329,6 +1682,12 @@ def _frame_source_debounce_tick(now: float | None = None) -> float | None:
     current_time = monotonic() if now is None else float(now)
     delays: list[float] = []
     for runtime in tuple(_RUNTIMES.values()):
+        if not projection_camera_session_is_active(
+            runtime.scene,
+            token=runtime.camera_session_token,
+        ):
+            _clear_pending_frame(runtime)
+            continue
         if not lifecycle_registry().token_is_current(
             runtime.token,
             runtime.scene,
@@ -1445,10 +1804,16 @@ def _repair_timer() -> float | None:
     for runtime in tuple(_RUNTIMES.values()):
         if perf_counter() >= deadline:
             break
-        if lifecycle_registry().token_is_current(
-            runtime.token,
-            runtime.scene,
-            dataset_revision=runtime.manifest.dataset_revision,
+        if (
+            projection_camera_session_is_active(
+                runtime.scene,
+                token=runtime.camera_session_token,
+            )
+            and lifecycle_registry().token_is_current(
+                runtime.token,
+                runtime.scene,
+                dataset_revision=runtime.manifest.dataset_revision,
+            )
         ):
             _repair_runtime(runtime, deadline)
     return REPAIR_INTERVAL if _RUNTIMES else None

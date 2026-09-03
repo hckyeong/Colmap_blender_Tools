@@ -5,9 +5,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from .camera_review_authority import (
+    modifier_camera_session_is_active,
+    set_modifier_scene_camera,
+)
+
 
 @dataclass(frozen=True)
 class ViewportState:
+    """복원에 필요한 Viewport Camera·시점·Local Camera 상태를 보관합니다."""
+
     view_perspective: str
     view_location: object
     view_rotation: object
@@ -15,6 +22,7 @@ class ViewportState:
     view_camera_zoom: float
     view_camera_offset: object
     viewport_camera: object
+    use_local_camera: bool
 
 
 @dataclass
@@ -55,6 +63,8 @@ def _copy_value(value):
 
 
 def _viewport_state(space, rv3d) -> ViewportState:
+    """현재 3D View의 복원 가능한 Camera 탐색 상태를 캡처합니다."""
+
     return ViewportState(
         view_perspective=rv3d.view_perspective,
         view_location=_copy_value(rv3d.view_location),
@@ -63,6 +73,7 @@ def _viewport_state(space, rv3d) -> ViewportState:
         view_camera_zoom=float(rv3d.view_camera_zoom),
         view_camera_offset=_copy_value(rv3d.view_camera_offset),
         viewport_camera=space.camera,
+        use_local_camera=bool(getattr(space, "use_local_camera", False)),
     )
 
 
@@ -138,7 +149,9 @@ def _pixel_aspect_axes(camera_object) -> tuple[float, float]:
     return 1.0 / ratio, 1.0
 
 
-def _apply_render_for_entry(scene, camera_object, entry) -> None:
+def _apply_render_for_entry(scene, camera_object, entry, session) -> None:
+    """활성 Modifier Camera 세션의 Render와 Scene Camera를 함께 적용합니다."""
+
     pixel_aspect_x, pixel_aspect_y = _pixel_aspect_axes(camera_object)
     render = scene.render
     render.resolution_x = entry.width
@@ -146,10 +159,13 @@ def _apply_render_for_entry(scene, camera_object, entry) -> None:
     render.resolution_percentage = 100
     render.pixel_aspect_x = pixel_aspect_x
     render.pixel_aspect_y = pixel_aspect_y
-    scene.camera = camera_object
+    set_modifier_scene_camera(session, camera_object)
 
 
 def _apply_viewport_camera(snapshot: ViewportSnapshot, camera_object) -> None:
+    """전용 Viewport에 Local Camera를 적용하고 마지막 상태를 기록합니다."""
+
+    snapshot.space.use_local_camera = True
     snapshot.space.camera = camera_object
     snapshot.rv3d.view_perspective = "CAMERA"
     snapshot.last_applied = _viewport_state(snapshot.space, snapshot.rv3d)
@@ -159,6 +175,11 @@ def _apply_viewport_camera(snapshot: ViewportSnapshot, camera_object) -> None:
 def look_through_current(context, session) -> None:
     """호출된 현재 Viewport만 저장하고 Review Camera View로 전환합니다."""
     area, region, space, rv3d = _require_viewport(context)
+    if not modifier_camera_session_is_active(
+        session,
+        window=getattr(context, "window", None),
+    ):
+        raise ValueError("활성 Modifier Camera 세션이 아닙니다.")
     if session.current_image_id is None:
         raise ValueError("현재 Camera Review 항목이 없습니다.")
     camera_object = session.camera_objects[session.current_image_id]
@@ -183,7 +204,7 @@ def look_through_current(context, session) -> None:
     if session.render_snapshot is None:
         session.render_snapshot = _render_state(context.scene)
 
-    _apply_render_for_entry(context.scene, camera_object, entry)
+    _apply_render_for_entry(context.scene, camera_object, entry, session)
     session.render_last_applied = _render_state(context.scene)
     _apply_viewport_camera(snapshot, camera_object)
     settings = context.scene.colmap_import
@@ -193,7 +214,11 @@ def look_through_current(context, session) -> None:
 
 def update_review_view_for_current(context, session) -> None:
     """Look Through가 활성일 때만 Scene Camera, Render와 활성 Viewport를 갱신합니다."""
-    if not session.viewport_snapshots or session.current_image_id is None:
+    if (
+        not session.viewport_snapshots
+        or session.current_image_id is None
+        or not modifier_camera_session_is_active(session)
+    ):
         return
 
     invalid_keys: list[tuple[int, int, int]] = []
@@ -219,7 +244,7 @@ def update_review_view_for_current(context, session) -> None:
 
     entry = session.review_index.entries[session.current_index]
     camera_object = session.camera_objects[session.current_image_id]
-    _apply_render_for_entry(context.scene, camera_object, entry)
+    _apply_render_for_entry(context.scene, camera_object, entry, session)
     session.render_last_applied = _render_state(context.scene)
     for snapshot in session.viewport_snapshots.values():
         _apply_viewport_camera(snapshot, camera_object)
@@ -237,6 +262,7 @@ def _restore_viewport_snapshot(snapshot: ViewportSnapshot) -> bool:
         return False
     previous = snapshot.previous
     rv3d = snapshot.rv3d
+    snapshot.space.use_local_camera = previous.use_local_camera
     snapshot.space.camera = previous.viewport_camera
     rv3d.view_location = _copy_value(previous.view_location)
     rv3d.view_rotation = _copy_value(previous.view_rotation)

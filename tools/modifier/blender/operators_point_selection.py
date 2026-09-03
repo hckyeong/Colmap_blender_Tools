@@ -13,8 +13,11 @@ from .edit_workflows import (
     PendingRemove,
     apply_pending_remove,
     commit_edit as _commit_edit,
+    modifier_redo_available,
+    modifier_undo_available,
     prepare_remove,
     reset_edits,
+    redo_last_edit,
     resolve_remove_target as _resolve_remove_target,
     select_observing_cameras,
     undo_last_edit,
@@ -241,20 +244,24 @@ class COLMAP_OT_remove(bpy.types.Operator):
 class COLMAP_OT_undo_last_edit(bpy.types.Operator):
     bl_idname = "colmap.undo_last_edit"
     bl_label = "Undo Last Edit"
-    bl_description = "가장 최근 COLMAP 편집 작업 하나를 제거하고 현재 장면을 다시 구성합니다"
+    bl_description = "Modifier 전용 Journal의 가장 최근 편집 작업 하나를 되돌립니다"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
+        """현재 독립 Journal에 Undo Command가 있을 때만 활성화합니다."""
+
         settings = getattr(context.scene, "colmap_import", None)
         return bool(
             settings
             and settings.dataset_uuid
-            and settings.edit_revision > 0
+            and modifier_undo_available(context.scene)
             and export_mutation_allowed(context)
         )
 
     def execute(self, context):
+        """Blender Global Undo 대신 Modifier 전용 Undo를 실행합니다."""
+
         settings = context.scene.colmap_import
         state = None
         try:
@@ -271,6 +278,45 @@ class COLMAP_OT_undo_last_edit(bpy.types.Operator):
             return {"CANCELLED"}
 
 
+class COLMAP_OT_redo_last_edit(bpy.types.Operator):
+    """Modifier 전용 Journal의 마지막 Undo Command를 다시 적용합니다."""
+
+    bl_idname = "colmap.redo_last_edit"
+    bl_label = "Redo Last Edit"
+    bl_description = "Modifier 전용 Journal에서 마지막으로 되돌린 편집을 다시 적용합니다"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        """현재 독립 Journal에 Redo Command가 있을 때만 활성화합니다."""
+
+        settings = getattr(context.scene, "colmap_import", None)
+        return bool(
+            settings
+            and settings.dataset_uuid
+            and modifier_redo_available(context.scene)
+            and export_mutation_allowed(context)
+        )
+
+    def execute(self, context):
+        """Blender Global Redo 대신 Modifier 전용 Redo를 실행합니다."""
+
+        settings = context.scene.colmap_import
+        state = None
+        try:
+            require_export_mutation_allowed(context, "Redo Last Edit")
+            state = redo_last_edit(context)
+            self.report({"INFO"}, settings.point_selection_status)
+            return {"FINISHED"}
+        except Exception as exc:
+            if state is not None:
+                force_end_point_mode(context, state.dataset_uuid)
+                force_end_camera_mode(context, state.dataset_uuid)
+            settings.point_selection_status = f"마지막 편집 다시 적용 실패: {exc}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
 class COLMAP_OT_reset_edits(bpy.types.Operator):
     bl_idname = "colmap.reset_edits"
     bl_label = "Reset Edits"
@@ -279,6 +325,8 @@ class COLMAP_OT_reset_edits(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        """현재 편집 이력이 있을 때만 Reset을 활성화합니다."""
+
         settings = getattr(context.scene, "colmap_import", None)
         return bool(
             settings
@@ -288,14 +336,20 @@ class COLMAP_OT_reset_edits(bpy.types.Operator):
         )
 
     def invoke(self, context, event):
+        """전체 편집 Reset 전 사용자 확인창을 표시합니다."""
+
         return context.window_manager.invoke_confirm(self, event)
 
     def draw(self, context):
+        """Reset 범위와 원본 파일 불변 안내를 확인창에 표시합니다."""
+
         del context
         self.layout.label(text="저장된 COLMAP 편집 작업 전체를 초기화합니다.")
         self.layout.label(text="원본 sparse 파일은 변경되지 않습니다.", icon="INFO")
 
     def execute(self, context):
+        """현재 Session에서 Undo 가능한 Reset Command를 실행합니다."""
+
         settings = context.scene.colmap_import
         state = None
         try:
@@ -319,5 +373,6 @@ CLASSES = (
     COLMAP_OT_select_observing_cameras,
     COLMAP_OT_remove,
     COLMAP_OT_undo_last_edit,
+    COLMAP_OT_redo_last_edit,
     COLMAP_OT_reset_edits,
 )

@@ -683,7 +683,22 @@ def _restore_workspace_after_open_failure(
     window: Any,
     workspace: Any,
 ) -> None:
-    """작업공간 구성 실패 시 원래 Workspace로 복귀하고 소유본을 제거합니다."""
+    """작업공간 구성 실패 시 세션 권한을 정리하고 원래 Workspace로 복귀합니다."""
+
+    from .camera_scene import (
+        detach_projection_markers,
+        finish_projection_camera_session_exit,
+        invalidate_projection_camera_session,
+    )
+    from .dataset_view_layer import restore_projection_source_view_layer
+
+    camera_exit = invalidate_projection_camera_session(scene, window)
+    try:
+        detach_projection_markers(scene)
+        release_scene_marker_session(scene, _MARKER_TOOL_ID)
+    finally:
+        finish_projection_camera_session_exit(camera_exit)
+        restore_projection_source_view_layer(scene, window)
 
     try:
         mark_workspace_failed(workspace)
@@ -699,12 +714,50 @@ def _restore_workspace_after_open_failure(
     remove_paint_workspace(scene, window=window, workspace=workspace)
 
 
+def _activate_open_workspace_camera_session(
+    scene: Any,
+    window: Any,
+    workspace: Any,
+) -> None:
+    """READY 작업공간을 다시 확인한 뒤 Camera Runtime을 한 번만 연결합니다."""
+
+    settings = getattr(scene, "projection_paint", None)
+    if (
+        settings is None
+        or getattr(window, "scene", None) is not scene
+        or getattr(window, "workspace", None) is not workspace
+        or getattr(settings, "paint_workspace", None) is not workspace
+        or workspace.get(WORKSPACE_STATE_KEY) != STATE_READY
+    ):
+        raise PaintWorkspaceError("Projection Paint 작업공간 전환이 아직 완료되지 않았습니다.")
+    from .camera_scene import (
+        activate_managed_frame,
+        activate_projection_camera_session,
+        runtime_for_scene,
+    )
+    from .state_handlers import recover_lazy_runtime
+
+    camera_token = activate_projection_camera_session(scene, window)
+    recover_lazy_runtime(scene, "workspace_enter")
+    camera_runtime = runtime_for_scene(scene)
+    if (
+        camera_runtime is not None
+        and camera_runtime.camera_session_token == camera_token
+        and int(scene.frame_current) in camera_runtime.entries_by_frame
+    ):
+        activate_managed_frame(
+            scene,
+            int(scene.frame_current),
+            refresh_source=False,
+        )
+
+
 def _schedule_open_workspace_configuration(
     scene: Any,
     window: Any,
     workspace: Any,
 ) -> None:
-    """Event Tick마다 화면 배치를 구성하고 N패널을 활성화합니다."""
+    """Event Tick에서 화면 배치를 완료한 뒤 Camera 세션을 연결합니다."""
 
     scene_pointer = _pointer(scene)
     window_pointer = _pointer(window)
@@ -728,15 +781,30 @@ def _schedule_open_workspace_configuration(
         attempts["count"] += 1
         try:
             if getattr(current_window, "workspace", None) is not current_workspace:
-                settings.status = "Workspace 전환으로 Projection Paint 준비를 종료합니다."
+                _restore_workspace_after_open_failure(
+                    current_scene,
+                    current_window,
+                    current_workspace,
+                )
+                settings.status = "Workspace 전환으로 Projection Paint 준비를 종료했습니다."
                 settings.status_kind = "READY"
                 return None
-            if not configure_paint_workspace(bpy.context):
-                return 0.025
+            with bpy.context.temp_override(
+                window=current_window,
+                workspace=current_workspace,
+                screen=current_window.screen,
+            ):
+                if not configure_paint_workspace(bpy.context):
+                    return 0.025
             if not _show_projection_paint_sidebar(current_window):
                 if attempts["count"] < 200:
                     return 0.025
                 raise PaintWorkspaceError("Projection Paint N패널을 활성화하지 못했습니다.")
+            _activate_open_workspace_camera_session(
+                current_scene,
+                current_window,
+                current_workspace,
+            )
         except (PaintWorkspaceError, RuntimeError, ValueError) as exc:
             _restore_workspace_after_open_failure(
                 current_scene,
@@ -774,7 +842,7 @@ def _schedule_open_workspace_configuration(
 
 
 def open_paint_workspace(context: Any) -> Any:
-    """Paint 연산 없이 전용 작업공간을 열고 설정용 N패널을 준비합니다."""
+    """전용 작업공간 전환만 요청하고 Runtime 연결은 다음 UI Tick에 예약합니다."""
 
     window = getattr(context, "window", None)
     if window is None or _pointer(window) == 0:
@@ -782,7 +850,7 @@ def open_paint_workspace(context: Any) -> Any:
     settings = context.scene.projection_paint
     if str(settings.paint_state) in {"ENTERING", "EXITING"}:
         raise PaintWorkspaceError("Paint 진입 또는 종료가 끝난 뒤 작업공간을 여십시오.")
-    from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
+    from .snapshot_update import snapshot_is_ready
     from .dataset_view_layer import (
         activate_projection_dataset_view_layer,
         restore_projection_source_view_layer,
@@ -820,18 +888,10 @@ def open_paint_workspace(context: Any) -> Any:
             release_scene_marker_session(context.scene, _MARKER_TOOL_ID)
             restore_projection_source_view_layer(context.scene, window)
         raise
-    from .state_handlers import recover_lazy_runtime
-
-    recover_lazy_runtime(context.scene, "workspace_enter")
     if not bool(settings.paint_enabled):
         workspace.object_mode = "OBJECT"
-    if not (
-        modifier_snapshot_available(context)
-        and not snapshot_is_ready(context.scene)
-        and str(settings.status_kind) == "ERROR"
-    ):
-        settings.status = "Projection Paint 작업공간 준비 중"
-        settings.status_kind = "RUNNING"
+    settings.status = "Projection Paint 작업공간 전환 확인 중"
+    settings.status_kind = "RUNNING"
     _schedule_open_workspace_configuration(
         context.scene,
         window,
@@ -848,6 +908,13 @@ def request_paint_workspace_exit(context: Any) -> None:
     window = getattr(context, "window", None)
     if window is None or _pointer(window) == 0:
         raise PaintWorkspaceError("Projection Paint를 종료할 Window가 없습니다.")
+    from .camera_scene import (
+        detach_projection_markers,
+        finish_projection_camera_session_exit,
+        invalidate_projection_camera_session,
+    )
+
+    camera_exit = invalidate_projection_camera_session(scene, window)
     from .paint_progress_session import (
         active_paint_progress_session,
         release_paint_progress_session,
@@ -865,11 +932,12 @@ def request_paint_workspace_exit(context: Any) -> None:
     }:
         from .paint_session import finish_paint_session
 
-        finish_paint_session(context)
-    from .camera_scene import detach_projection_markers
-
-    detach_projection_markers(scene)
-    release_scene_marker_session(scene, _MARKER_TOOL_ID)
+        finish_paint_session(context, restore_resolution=False)
+    try:
+        detach_projection_markers(scene)
+        release_scene_marker_session(scene, _MARKER_TOOL_ID)
+    finally:
+        finish_projection_camera_session_exit(camera_exit)
 
     workspace = _stored_workspace(settings)
     if workspace is None:
@@ -928,7 +996,10 @@ def paint_workspace_exit_settled(scene: Any, window: Any) -> bool:
     """Paint 상태 복구와 Source 복귀가 끝나 Workspace를 재사용할 수 있는지 반환합니다."""
 
     _prune_pending_workspace_deletions()
-    from .camera_scene import projection_markers_detached
+    from .camera_scene import (
+        projection_camera_session_settled,
+        projection_markers_detached,
+    )
 
     settings = getattr(scene, "projection_paint", None)
     if settings is None:
@@ -937,6 +1008,7 @@ def paint_workspace_exit_settled(scene: Any, window: Any) -> bool:
             and not _DEFERRED_WORKSPACE_DELETIONS
             and not scene_marker_session_owned_by(scene, _MARKER_TOOL_ID)
             and projection_markers_detached(scene)
+            and projection_camera_session_settled(scene)
         )
     return bool(
         not bool(getattr(settings, "paint_enabled", False))
@@ -946,6 +1018,7 @@ def paint_workspace_exit_settled(scene: Any, window: Any) -> bool:
         and not _DEFERRED_WORKSPACE_DELETIONS
         and not scene_marker_session_owned_by(scene, _MARKER_TOOL_ID)
         and projection_markers_detached(scene)
+        and projection_camera_session_settled(scene)
         and not workspace_matches_spec(
             getattr(window, "workspace", None),
             PAINT_WORKSPACE_SPEC,

@@ -7,11 +7,13 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from types import MappingProxyType
 from typing import Mapping
+import uuid
 
 
-TRANSFER_SCHEMA_VERSION = 1
+TRANSFER_SCHEMA_VERSION = 2
 _CAMERA_MODELS = {"SIMPLE_PINHOLE", "PINHOLE"}
 
 
@@ -128,9 +130,12 @@ class ColmapTransferSnapshot:
     """Modifier 확정 상태를 한 시점에 고정한 값 전용 Snapshot입니다."""
 
     schema_version: int
+    source_domain_uuid: str
+    source_domain_generation: int
     source_dataset_uuid: str
     source_revision: int
     source_fingerprint: str
+    source_history_hash: str
     content_fingerprint: str
     model_directory: str
     images_directory: str
@@ -144,10 +149,24 @@ class ColmapTransferSnapshot:
 
         if self.schema_version != TRANSFER_SCHEMA_VERSION:
             raise ValueError("지원하지 않는 COLMAP 전송 Schema입니다.")
-        if not self.source_dataset_uuid or self.source_revision < 0:
-            raise ValueError("Modifier Dataset 식별자 또는 Revision이 올바르지 않습니다.")
-        if not self.source_fingerprint or not self.content_fingerprint:
-            raise ValueError("Snapshot fingerprint가 비어 있습니다.")
+        try:
+            domain_uuid = str(uuid.UUID(self.source_domain_uuid))
+            dataset_uuid = str(uuid.UUID(self.source_dataset_uuid))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("Modifier Domain 또는 Dataset UUID가 올바르지 않습니다.") from error
+        if domain_uuid != self.source_domain_uuid or dataset_uuid != self.source_dataset_uuid:
+            raise ValueError("Modifier Domain과 Dataset UUID는 표준 형식이어야 합니다.")
+        if type(self.source_domain_generation) is not int or self.source_domain_generation < 0:
+            raise ValueError("Modifier Domain generation이 올바르지 않습니다.")
+        if type(self.source_revision) is not int or self.source_revision < 0:
+            raise ValueError("Modifier Revision이 올바르지 않습니다.")
+        for label, value in (
+            ("source fingerprint", self.source_fingerprint),
+            ("history hash", self.source_history_hash),
+            ("content fingerprint", self.content_fingerprint),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(value)) is None:
+                raise ValueError(f"Snapshot {label}가 올바른 SHA-256 문자열이 아닙니다.")
         object.__setattr__(self, "model_directory", _absolute_path(self.model_directory, "Model"))
         object.__setattr__(self, "images_directory", _absolute_path(self.images_directory, "Images"))
         cameras = tuple(self.cameras)
@@ -181,9 +200,12 @@ class SnapshotContentFingerprintBuilder:
     def __init__(
         self,
         *,
+        source_domain_uuid: str,
+        source_domain_generation: int,
         source_dataset_uuid: str,
         source_revision: int,
         source_fingerprint: str,
+        source_history_hash: str,
     ) -> None:
         """기존 직렬화 형식과 동일한 JSON 머리말로 증분 지문을 시작합니다."""
 
@@ -191,12 +213,18 @@ class SnapshotContentFingerprintBuilder:
         self._phase = "CAMERAS"
         self._first_record = True
         prefix = (
-            '{"source_dataset_uuid":'
+            '{"source_domain_uuid":'
+            f"{self._json(source_domain_uuid)},"
+            '"source_domain_generation":'
+            f"{self._json(int(source_domain_generation))},"
+            '"source_dataset_uuid":'
             f"{self._json(source_dataset_uuid)},"
             '"source_revision":'
             f"{self._json(int(source_revision))},"
             '"source_fingerprint":'
             f"{self._json(source_fingerprint)},"
+            '"source_history_hash":'
+            f"{self._json(source_history_hash)},"
             '"cameras":['
         )
         self._write(prefix)
@@ -274,9 +302,12 @@ class SnapshotContentFingerprintBuilder:
 
 def snapshot_content_fingerprint(
     *,
+    source_domain_uuid: str,
+    source_domain_generation: int,
     source_dataset_uuid: str,
     source_revision: int,
     source_fingerprint: str,
+    source_history_hash: str,
     cameras: tuple[CameraValue, ...],
     images: tuple[ImageValue, ...],
     points3d: tuple[Point3DValue, ...],
@@ -284,9 +315,12 @@ def snapshot_content_fingerprint(
     """전송 값의 기존 JSON 형식을 증분 기록해 재현 가능한 SHA-256을 계산합니다."""
 
     builder = SnapshotContentFingerprintBuilder(
+        source_domain_uuid=source_domain_uuid,
+        source_domain_generation=source_domain_generation,
         source_dataset_uuid=source_dataset_uuid,
         source_revision=source_revision,
         source_fingerprint=source_fingerprint,
+        source_history_hash=source_history_hash,
     )
     for item in cameras:
         builder.add_camera(item)
@@ -312,9 +346,12 @@ def validate_snapshot(snapshot: ColmapTransferSnapshot) -> ColmapTransferSnapsho
             if hasattr(candidate, "as_pointer") or candidate.__class__.__module__.startswith("bpy"):
                 raise TypeError("COLMAP 전송 Snapshot에 Blender ID가 포함되었습니다.")
     expected = snapshot_content_fingerprint(
+        source_domain_uuid=snapshot.source_domain_uuid,
+        source_domain_generation=snapshot.source_domain_generation,
         source_dataset_uuid=snapshot.source_dataset_uuid,
         source_revision=snapshot.source_revision,
         source_fingerprint=snapshot.source_fingerprint,
+        source_history_hash=snapshot.source_history_hash,
         cameras=snapshot.cameras,
         images=snapshot.images,
         points3d=snapshot.points3d,

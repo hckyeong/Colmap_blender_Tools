@@ -733,12 +733,92 @@ def cancel_workspace_setup() -> None:
     RUNTIME.workspace_setup_task = None
 
 
+def ensure_object_mode_before_align(context: Any) -> bool:
+    """기존 도구 종료 뒤 현재 활성 Object를 Object Mode로 안전하게 전환합니다."""
+
+    current_mode = str(getattr(context, "mode", "OBJECT"))
+    if current_mode == "OBJECT":
+        return False
+    window = getattr(context, "window", None)
+    if window is None or pointer(window) == 0:
+        raise WorkspaceConfigurationError(
+            f"{current_mode}에서 Object Mode로 전환할 Blender Window가 없습니다."
+        )
+    screen = getattr(window, "screen", None)
+    scene = getattr(window, "scene", None)
+    view_layer = getattr(window, "view_layer", None)
+    if screen is None or scene is None or view_layer is None:
+        raise WorkspaceConfigurationError(
+            f"{current_mode}에서 Object Mode로 전환할 화면 컨텍스트가 없습니다."
+        )
+    active_object = getattr(getattr(view_layer, "objects", None), "active", None)
+    if active_object is None:
+        raise WorkspaceConfigurationError(
+            f"{current_mode}에서 Object Mode로 전환할 활성 오브젝트가 없습니다."
+        )
+
+    context_area = getattr(context, "area", None)
+    live_areas = tuple(getattr(screen, "areas", ()))
+    area = next(
+        (
+            candidate
+            for candidate in live_areas
+            if candidate.type == "VIEW_3D"
+            and (
+                context_area is None
+                or pointer(candidate) == pointer(context_area)
+            )
+        ),
+        None,
+    )
+    if area is None:
+        area = next(
+            (candidate for candidate in live_areas if candidate.type == "VIEW_3D"),
+            None,
+        )
+    override = {
+        "window": window,
+        "screen": screen,
+        "scene": scene,
+        "view_layer": view_layer,
+        "active_object": active_object,
+        "object": active_object,
+    }
+    if area is not None:
+        region = next(
+            (candidate for candidate in area.regions if candidate.type == "WINDOW"),
+            None,
+        )
+        override["area"] = area
+        if region is not None:
+            override["region"] = region
+    try:
+        with context.temp_override(**override):
+            if not bpy.ops.object.mode_set.poll():
+                raise WorkspaceConfigurationError(
+                    f"{current_mode}에서 Object Mode 전환을 실행할 수 없습니다."
+                )
+            result = bpy.ops.object.mode_set(mode="OBJECT")
+    except WorkspaceConfigurationError:
+        raise
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        raise WorkspaceConfigurationError(
+            f"{current_mode}에서 Object Mode로 전환하지 못했습니다: {error}"
+        ) from error
+    if "FINISHED" not in result or str(getattr(active_object, "mode", "")) != "OBJECT":
+        raise WorkspaceConfigurationError(
+            f"{current_mode}에서 Object Mode 전환이 완료되지 않았습니다."
+        )
+    return True
+
+
 def configure_workspace(context: Any, force_restore: bool = False) -> bool:
     """현재 창을 전용 듀얼 뷰 작업공간으로 전환하거나 멱등적으로 재사용합니다."""
     if context.window_manager is None:
         raise WorkspaceConfigurationError("Blender WindowManager가 없습니다.")
     if RUNTIME.workspace_setup_task is not None:
         return False
+    ensure_object_mode_before_align(context)
     is_active_session = RUNTIME.session.session_active
     if is_active_session and not RUNTIME.session.is_target_window(context.window):
         raise WorkspaceConfigurationError("다른 Blender Window에서 COLMAP Align 세션이 실행 중입니다.")

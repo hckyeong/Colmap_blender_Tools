@@ -31,6 +31,12 @@ from shared.colmap_transfer.registry import (
 )
 
 
+DOMAIN_UUID = "11111111-1111-4111-8111-111111111111"
+DATASET_UUID = "22222222-2222-4222-8222-222222222222"
+SOURCE_FINGERPRINT = "a" * 64
+HISTORY_HASH = "b" * 64
+
+
 def _snapshot(root: Path, revision: int = 0) -> ColmapTransferSnapshot:
     """테스트용 최소 PINHOLE Snapshot을 생성합니다."""
 
@@ -42,18 +48,24 @@ def _snapshot(root: Path, revision: int = 0) -> ColmapTransferSnapshot:
     )
     points = (Point3DValue(99, (1.0, 2.0, 3.0), (10, 20, 30), 0.25),)
     fingerprint = snapshot_content_fingerprint(
-        source_dataset_uuid="modifier-source",
+        source_domain_uuid=DOMAIN_UUID,
+        source_domain_generation=revision,
+        source_dataset_uuid=DATASET_UUID,
         source_revision=revision,
-        source_fingerprint="source-fingerprint",
+        source_fingerprint=SOURCE_FINGERPRINT,
+        source_history_hash=HISTORY_HASH,
         cameras=cameras,
         images=images,
         points3d=points,
     )
     return ColmapTransferSnapshot(
         schema_version=TRANSFER_SCHEMA_VERSION,
-        source_dataset_uuid="modifier-source",
+        source_domain_uuid=DOMAIN_UUID,
+        source_domain_generation=revision,
+        source_dataset_uuid=DATASET_UUID,
         source_revision=revision,
-        source_fingerprint="source-fingerprint",
+        source_fingerprint=SOURCE_FINGERPRINT,
+        source_history_hash=HISTORY_HASH,
         content_fingerprint=fingerprint,
         model_directory=str(root),
         images_directory=str(root),
@@ -128,25 +140,31 @@ class ColmapTransferContractTests(unittest.TestCase):
                 ImageValue(4, 19, "b.png", (1.0, 0.0, 0.0, 0.0), (3.0, 2.0, 1.0), str(root / "b.png")),
             )
             fingerprint = snapshot_content_fingerprint(
-                source_dataset_uuid="source",
+                source_domain_uuid=DOMAIN_UUID,
+                source_domain_generation=8,
+                source_dataset_uuid=DATASET_UUID,
                 source_revision=8,
-                source_fingerprint="disk",
+                source_fingerprint=SOURCE_FINGERPRINT,
+                source_history_hash=HISTORY_HASH,
                 cameras=cameras,
                 images=images,
                 points3d=(),
             )
             snapshot = ColmapTransferSnapshot(
-                TRANSFER_SCHEMA_VERSION,
-                "source",
-                8,
-                "disk",
-                fingerprint,
-                str(root),
-                str(root),
-                cameras,
-                images,
-                (),
-                TransferDisplayDefaults("BLENDER", "Y", "Z", 0.1, 2.0),
+                schema_version=TRANSFER_SCHEMA_VERSION,
+                source_domain_uuid=DOMAIN_UUID,
+                source_domain_generation=8,
+                source_dataset_uuid=DATASET_UUID,
+                source_revision=8,
+                source_fingerprint=SOURCE_FINGERPRINT,
+                source_history_hash=HISTORY_HASH,
+                content_fingerprint=fingerprint,
+                model_directory=str(root),
+                images_directory=str(root),
+                cameras=cameras,
+                images=images,
+                points3d=(),
+                display_defaults=TransferDisplayDefaults("BLENDER", "Y", "Z", 0.1, 2.0),
             )
         self.assertEqual(tuple(item.camera_id for item in snapshot.cameras), (2, 19))
         self.assertEqual(snapshot.images[0].camera_id, 19)
@@ -159,9 +177,12 @@ class ColmapTransferContractTests(unittest.TestCase):
             root = Path(directory).resolve()
             snapshot = _snapshot(root, 4)
         payload = {
+            "source_domain_uuid": snapshot.source_domain_uuid,
+            "source_domain_generation": snapshot.source_domain_generation,
             "source_dataset_uuid": snapshot.source_dataset_uuid,
             "source_revision": snapshot.source_revision,
             "source_fingerprint": snapshot.source_fingerprint,
+            "source_history_hash": snapshot.source_history_hash,
             "cameras": [
                 tuple(getattr(item, field.name) for field in fields(item))
                 for item in snapshot.cameras
@@ -181,9 +202,12 @@ class ColmapTransferContractTests(unittest.TestCase):
             )
         ).hexdigest()
         builder = SnapshotContentFingerprintBuilder(
+            source_domain_uuid=snapshot.source_domain_uuid,
+            source_domain_generation=snapshot.source_domain_generation,
             source_dataset_uuid=snapshot.source_dataset_uuid,
             source_revision=snapshot.source_revision,
             source_fingerprint=snapshot.source_fingerprint,
+            source_history_hash=snapshot.source_history_hash,
         )
         for item in snapshot.cameras:
             builder.add_camera(item)

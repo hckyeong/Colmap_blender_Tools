@@ -45,6 +45,7 @@ from .runtime_state import (
     request_runtime_restore,
     runtime_restore_token,
 )
+from .modifier_runtime_domain import domain_for_scene
 
 
 PROVIDER_NAME = "modifier"
@@ -77,6 +78,10 @@ def build_projection_snapshot(context: Any) -> ColmapTransferSnapshot:
     if settings is None or not str(settings.dataset_uuid or ""):
         raise ValueError("COLMAP Modifier에서 데이터를 먼저 불러오세요.")
     state = ensure_runtime(scene)
+    domain = domain_for_scene(scene, required=True)
+    if domain.dataset_state is not state:
+        raise ValueError("Modifier Domain과 Snapshot Runtime 상태가 일치하지 않습니다.")
+    identity = domain.identity
     reconstruction = state.current_reconstruction
     paths = _image_paths(state)
     cameras = tuple(
@@ -111,18 +116,24 @@ def build_projection_snapshot(context: Any) -> ColmapTransferSnapshot:
         for _point_id, record in sorted(reconstruction.points3d.items())
     )
     content_fingerprint = snapshot_content_fingerprint(
+        source_domain_uuid=identity.domain_uuid,
+        source_domain_generation=identity.domain_generation,
         source_dataset_uuid=str(state.dataset_uuid),
         source_revision=int(state.edit_revision),
         source_fingerprint=str(state.source.source_fingerprint),
+        source_history_hash=str(state.history_hash),
         cameras=cameras,
         images=images,
         points3d=points,
     )
     return ColmapTransferSnapshot(
         schema_version=TRANSFER_SCHEMA_VERSION,
+        source_domain_uuid=identity.domain_uuid,
+        source_domain_generation=identity.domain_generation,
         source_dataset_uuid=str(state.dataset_uuid),
         source_revision=int(state.edit_revision),
         source_fingerprint=str(state.source.source_fingerprint),
+        source_history_hash=str(state.history_hash),
         content_fingerprint=content_fingerprint,
         model_directory=str(state.source.model_directory),
         images_directory=str(state.source.images_directory),
@@ -148,6 +159,7 @@ class ProjectionSnapshotProviderHandle:
         self._context = context
         self._scene = _scene(context)
         self._token = runtime_restore_token(self._scene)
+        self._domain_identity = None
         self._runtime_job = None
         self._state = None
         self._phase = "RESTORE"
@@ -169,8 +181,15 @@ class ProjectionSnapshotProviderHandle:
             0.0,
             message="Modifier Runtime 복원을 준비하는 중",
         )
-        if cached_runtime_matches_scene(self._scene):
+        domain = domain_for_scene(self._scene)
+        if domain is not None:
+            domain.require_editable()
+            self._state = domain.dataset_state
+            self._domain_identity = domain.identity
+            self._begin_transfer()
+        elif cached_runtime_matches_scene(self._scene):
             self._state = cached_runtime(self._token.dataset_uuid)
+            self._domain_identity = domain_for_scene(self._scene, required=True).identity
             self._begin_transfer()
         else:
             self._runtime_job = request_runtime_restore(self._scene)
@@ -181,8 +200,11 @@ class ProjectionSnapshotProviderHandle:
         if self.done or self.failed:
             return self.progress
         try:
-            if runtime_restore_token(self._scene) != self._token:
-                raise ValueError("Snapshot 준비 중 Modifier source token이 변경되었습니다.")
+            if self._domain_identity is None:
+                if runtime_restore_token(self._scene) != self._token:
+                    raise ValueError("Snapshot 준비 중 Modifier source token이 변경되었습니다.")
+            elif domain_for_scene(self._scene, required=True).identity != self._domain_identity:
+                raise ValueError("Snapshot 준비 중 Modifier Domain 상태가 변경되었습니다.")
             if self._phase == "RESTORE":
                 self._advance_restore(work_budget_ms)
             elif self._phase in {"CAMERAS", "IMAGES", "POINTS"}:
@@ -247,6 +269,7 @@ class ProjectionSnapshotProviderHandle:
         self._state = self._runtime_job.result
         if self._state is None:
             raise RuntimeError("완료된 Modifier Runtime 복원 결과가 없습니다.")
+        self._domain_identity = domain_for_scene(self._scene, required=True).identity
         self._begin_transfer()
 
     def _begin_transfer(self) -> None:
@@ -260,9 +283,12 @@ class ProjectionSnapshotProviderHandle:
         self._image_ids = tuple(sorted(int(value) for value in reconstruction.images))
         self._point_ids = tuple(int(value) for value in self._state.point_id_order)
         self._fingerprint_builder = SnapshotContentFingerprintBuilder(
+            source_domain_uuid=self._domain_identity.domain_uuid,
+            source_domain_generation=self._domain_identity.domain_generation,
             source_dataset_uuid=str(self._state.dataset_uuid),
             source_revision=int(self._state.edit_revision),
             source_fingerprint=str(self._state.source.source_fingerprint),
+            source_history_hash=str(self._state.history_hash),
         )
         self._phase = "CAMERAS"
         self._index = 0
@@ -362,7 +388,9 @@ class ProjectionSnapshotProviderHandle:
     def _finalize(self) -> None:
         """완성된 순수 값을 지문화하고 불변 Snapshot을 한 번만 공개합니다."""
 
-        if self._state is None or runtime_restore_token(self._scene) != self._token:
+        if self._state is None or self._domain_identity is None:
+            raise ValueError("Modifier Snapshot 완료 Domain token이 없습니다.")
+        if domain_for_scene(self._scene, required=True).identity != self._domain_identity:
             raise ValueError("Modifier Snapshot 완료 token 검증에 실패했습니다.")
         settings = self._scene.colmap_import
         cameras = tuple(self._cameras)
@@ -371,9 +399,12 @@ class ProjectionSnapshotProviderHandle:
         content_fingerprint = self._fingerprint().finish()
         self.result = ColmapTransferSnapshot(
             schema_version=TRANSFER_SCHEMA_VERSION,
+            source_domain_uuid=self._domain_identity.domain_uuid,
+            source_domain_generation=self._domain_identity.domain_generation,
             source_dataset_uuid=str(self._state.dataset_uuid),
             source_revision=int(self._state.edit_revision),
             source_fingerprint=str(self._state.source.source_fingerprint),
+            source_history_hash=str(self._state.history_hash),
             content_fingerprint=content_fingerprint,
             model_directory=str(self._state.source.model_directory),
             images_directory=str(self._state.source.images_directory),
@@ -393,26 +424,21 @@ class ProjectionSnapshotProviderHandle:
 
 
 def projection_snapshot_is_current(context: Any, snapshot: ColmapTransferSnapshot) -> bool:
-    """Modifier Scene의 UUID·Revision·원본 지문이 생성 시 token과 같은지 확인합니다."""
+    """Modifier Domain 복합 Identity가 생성 시점과 같은지 확인합니다."""
 
     scene = _scene(context)
-    settings = getattr(scene, "colmap_import", None)
-    if settings is None:
+    try:
+        domain = domain_for_scene(scene, required=True)
+        identity = domain.identity
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return False
     return bool(
-        str(settings.dataset_uuid or "") == snapshot.source_dataset_uuid
-        and int(settings.edit_revision) == snapshot.source_revision
-        and str(settings.source_fingerprint or "") == snapshot.source_fingerprint
-        and (
-            not str(getattr(settings, "active_model_directory", "") or "")
-            or str(getattr(settings, "active_model_directory", "") or "")
-            == snapshot.model_directory
-        )
-        and (
-            not str(getattr(settings, "active_images_directory", "") or "")
-            or str(getattr(settings, "active_images_directory", "") or "")
-            == snapshot.images_directory
-        )
+        identity.domain_uuid == snapshot.source_domain_uuid
+        and identity.domain_generation == snapshot.source_domain_generation
+        and identity.dataset_uuid == snapshot.source_dataset_uuid
+        and identity.edit_revision == snapshot.source_revision
+        and identity.source_fingerprint == snapshot.source_fingerprint
+        and identity.history_hash == snapshot.source_history_hash
     )
 
 

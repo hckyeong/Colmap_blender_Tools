@@ -1139,8 +1139,12 @@ def _schedule_paint_entry(context: Any, session: PaintSession) -> None:
     )
 
 
-def finish_paint_session(context: Any) -> None:
-    """Texture Paint를 종료하고 Overlay를 보존한 채 사용자 상태를 복구합니다."""
+def finish_paint_session(
+    context: Any,
+    *,
+    restore_resolution: bool = True,
+) -> None:
+    """Texture Paint를 종료하고 선택적으로 Render 해상도를 조건부 복구합니다."""
     scene = context.scene
     settings = _settings(scene)
     if settings is None:
@@ -1150,7 +1154,11 @@ def finish_paint_session(context: Any) -> None:
     try:
         from .paint_runtime import stop_paint_runtime
 
-        stop_paint_runtime(context, scene=scene)
+        stop_paint_runtime(
+            context,
+            scene=scene,
+            restore_resolution=bool(restore_resolution),
+        )
     except (ImportError, AttributeError, RuntimeError):
         pass
     try:

@@ -23,20 +23,11 @@ PACKAGE_NAME = (
     if USE_INSTALLED
     else "tools.modifier"
 )
-SHARED_PACKAGE_NAME = (
-    "bl_ext.user_default.colmap_tools.shared.colmap_dataset"
-    if USE_INSTALLED
-    else "shared.colmap_dataset"
-)
 blender_colmap = importlib.import_module(PACKAGE_NAME)
-shared_dataset = importlib.import_module(SHARED_PACKAGE_NAME)
-dataset_registry = importlib.import_module(
-    f"{SHARED_PACKAGE_NAME}.blender.registry"
-)
 ownership = importlib.import_module(f"{PACKAGE_NAME}.blender.ownership")
 runtime_state = importlib.import_module(f"{PACKAGE_NAME}.blender.runtime_state")
-undo_domain_coordinator = importlib.import_module(
-    f"{PACKAGE_NAME}.blender.undo_domain_coordinator"
+modifier_runtime_domain = importlib.import_module(
+    f"{PACKAGE_NAME}.blender.modifier_runtime_domain"
 )
 modifier_session = importlib.import_module(
     f"{PACKAGE_NAME}.blender.modifier_session"
@@ -160,6 +151,31 @@ def _simulate_f7(window) -> None:
     window.event_simulate(type="F7", value="RELEASE", x=x, y=y)
 
 
+def _simulate_modifier_undo(window, *, redo: bool = False) -> None:
+    """Modifier Control View에 실제 Ctrl+Z 또는 Ctrl+Shift+Z 입력을 보냅니다."""
+
+    override = _control_override(window)
+    region = override["region"]
+    x = int(region.x + max(region.width // 2, 1))
+    y = int(region.y + max(region.height // 2, 1))
+    window.event_simulate(
+        type="Z",
+        value="PRESS",
+        x=x,
+        y=y,
+        ctrl=True,
+        shift=redo,
+    )
+    window.event_simulate(
+        type="Z",
+        value="RELEASE",
+        x=x,
+        y=y,
+        ctrl=True,
+        shift=redo,
+    )
+
+
 def _remove_point(settings) -> None:
     """실제 Point Edit Mode에서 첫 Point를 선택해 Remove를 실행합니다."""
 
@@ -240,9 +256,16 @@ def _workflow_tick():
                     == ("1", "1", "1"),
                     "전용 Workspace Import 결과 Count가 잘못되었습니다.",
                 )
+                domain = modifier_runtime_domain.domain_for_scene(
+                    bpy.context.scene,
+                    required=True,
+                )
                 _assert(
-                    dataset_registry.snapshot(bpy.context.scene).dataset_revision == 1,
-                    "전용 Workspace Import가 공용 Dataset Revision을 만들지 못했습니다.",
+                    domain.dataset_state is runtime_state.ensure_runtime(
+                        bpy.context.scene
+                    )
+                    and domain.journal.revision == 0,
+                    "전용 Workspace Import가 독립 Runtime과 빈 Journal을 만들지 못했습니다.",
                 )
                 managed_objects = _managed_scene_objects(settings)
                 _assert(
@@ -265,7 +288,6 @@ def _workflow_tick():
                     > 1.0,
                     "COLMAP Point 범위의 자동 Frame All이 실행되지 않았습니다.",
                 )
-                bpy.ops.ed.undo_push(message="COLMAP Modifier Import Baseline")
                 _assert(
                     bpy.ops.colmap.review_look_through("EXEC_DEFAULT") == {"FINISHED"},
                     settings.review_status,
@@ -332,46 +354,66 @@ def _workflow_tick():
                     "전용 Workspace Undo Last Filter 복원이 실패했습니다.",
                 )
                 _remove_point(settings)
+                domain = modifier_runtime_domain.domain_for_scene(
+                    bpy.context.scene,
+                    required=True,
+                )
                 _assert(
                     settings.edit_revision == 1
-                    and dataset_registry.snapshot(
-                        bpy.context.scene
-                    ).dataset_revision
-                    == 2,
-                    "Point Remove가 Modifier와 공용 Dataset Revision을 증가시키지 않았습니다.",
+                    and domain.journal.revision == 1
+                    and domain.journal.poll_undo(),
+                    "Point Remove가 Modifier Runtime과 전용 Journal을 갱신하지 않았습니다.",
                 )
-                bpy.ops.ed.undo_push(message="COLMAP Modifier Point Remove")
-            _STAGE = "GLOBAL_UNDO"
-            return 0.1
-
-        if _STAGE == "GLOBAL_UNDO":
-            with bpy.context.temp_override(**_control_override(window)):
-                _assert(
-                    bpy.ops.ed.undo() == {"FINISHED"},
-                    "Point Remove의 Blender Global Undo가 실패했습니다.",
-                )
+                _simulate_modifier_undo(window)
             _STAGE = "WAIT_UNDO"
             return 0.1
 
         if _STAGE == "WAIT_UNDO":
             with bpy.context.temp_override(**_control_override(window)):
                 settings = bpy.context.scene.colmap_import
-                if undo_domain_coordinator.undo_domain_reconcile_pending():
-                    return 0.1
                 state = runtime_state.ensure_runtime(bpy.context.scene)
                 if settings.edit_revision != 0 or len(state.current_reconstruction.points3d) != 1:
                     return 0.1
+                domain = modifier_runtime_domain.domain_for_scene(
+                    bpy.context.scene,
+                    required=True,
+                )
                 _assert(
-                    dataset_registry.snapshot(
-                        bpy.context.scene
-                    ).dataset_revision
-                    == 1,
-                    "Global Undo가 공용 Dataset Revision을 복원하지 못했습니다.",
+                    domain.journal.poll_redo() and not domain.journal.poll_undo(),
+                    "Ctrl+Z가 Modifier 전용 Journal만 되돌리지 못했습니다.",
                 )
                 _assert(
                     SESSION.phase == SESSION_ACTIVE,
-                    "Global Undo 뒤 Modifier Workspace Session이 비활성화되었습니다.",
+                    "Modifier Undo 뒤 Workspace Session이 비활성화되었습니다.",
                 )
+                _simulate_modifier_undo(window, redo=True)
+            _STAGE = "WAIT_REDO"
+            return 0.1
+
+        if _STAGE == "WAIT_REDO":
+            with bpy.context.temp_override(**_control_override(window)):
+                settings = bpy.context.scene.colmap_import
+                state = runtime_state.ensure_runtime(bpy.context.scene)
+                if settings.edit_revision != 1 or state.current_reconstruction.points3d:
+                    return 0.1
+                domain = modifier_runtime_domain.domain_for_scene(
+                    bpy.context.scene,
+                    required=True,
+                )
+                _assert(
+                    domain.journal.poll_undo() and not domain.journal.poll_redo(),
+                    "Ctrl+Shift+Z가 Modifier 전용 Journal을 다시 적용하지 못했습니다.",
+                )
+                _simulate_modifier_undo(window)
+            _STAGE = "WAIT_SECOND_UNDO"
+            return 0.1
+
+        if _STAGE == "WAIT_SECOND_UNDO":
+            with bpy.context.temp_override(**_control_override(window)):
+                settings = bpy.context.scene.colmap_import
+                state = runtime_state.ensure_runtime(bpy.context.scene)
+                if settings.edit_revision != 0 or len(state.current_reconstruction.points3d) != 1:
+                    return 0.1
                 _remove_point(settings)
                 settings.export_backup_enabled = False
                 settings.export_output_format = "BINARY"
@@ -379,12 +421,15 @@ def _workflow_tick():
                     bpy.ops.colmap.export("EXEC_DEFAULT") == {"FINISHED"},
                     settings.export_status,
                 )
+                domain = modifier_runtime_domain.domain_for_scene(
+                    bpy.context.scene,
+                    required=True,
+                )
                 _assert(
-                    dataset_registry.snapshot(
-                        bpy.context.scene
-                    ).dataset_revision
-                    == 2,
-                    "Export가 편집된 공용 Dataset Revision을 변경했습니다.",
+                    domain.journal.revision == 0
+                    and not domain.journal.poll_undo()
+                    and not domain.journal.poll_redo(),
+                    "Export가 새 기준선과 빈 Modifier Journal을 만들지 않았습니다.",
                 )
                 exported = binary_io.read_model_binary(_MODEL_DIRECTORY, modern=False)
                 _assert(
@@ -491,7 +536,6 @@ def _workflow_tick():
             print("COLMAP_MODIFIER_WORKSPACE_WORKFLOW_GUI_OK")
             _TEMP_DIRECTORY.cleanup()
             blender_colmap.unregister()
-            shared_dataset.unregister()
             bpy.ops.wm.quit_blender()
             return None
     except Exception as error:
@@ -500,10 +544,7 @@ def _workflow_tick():
         try:
             blender_colmap.unregister()
         finally:
-            try:
-                shared_dataset.unregister()
-            finally:
-                bpy.ops.wm.quit_blender()
+            bpy.ops.wm.quit_blender()
         raise
     return 0.05
 
@@ -514,7 +555,6 @@ def main() -> None:
     global _DEFAULT_OBJECT_HIDE_STATES
     global _SOURCE_WORKSPACE_POINTER
     _SOURCE_WORKSPACE_POINTER = bpy.context.window.workspace.as_pointer()
-    shared_dataset.register()
     blender_colmap.register()
     _DEFAULT_OBJECT_HIDE_STATES = {
         object_name: bool(obj.hide_get(view_layer=bpy.context.view_layer))

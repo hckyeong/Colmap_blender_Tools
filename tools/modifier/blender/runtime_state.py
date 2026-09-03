@@ -5,11 +5,18 @@ from __future__ import annotations
 import json
 import heapq
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from ..core.edit_replay import history_hash, replay_history, replay_operation_indexed
 from ..core.edits import AnyEditOperation, deserialize_history, serialize_history
+from ..core.edit_journal import EditJournal
+from ..core.edit_types import (
+    REMOVE_IMAGES_OPERATION,
+    REMOVE_POINTS_OPERATION,
+    EditOperation,
+)
 from ..core.fingerprint import source_fingerprint
 from ..core.indexes import RelationshipIndexes
 from ..core.layout import resolve_layout
@@ -25,6 +32,22 @@ from ..core.export_validation import reconstruction_counts
 from ..core.runtime_restore_job import (
     RuntimeSourceRestoreJob,
     RuntimeSourceRestorePlan,
+)
+from ..core.removal import (
+    plan_image_observation_removal,
+    plan_point_removal,
+)
+from .modifier_runtime_domain import (
+    ModifierRuntimeDomain,
+    bind_domain,
+    clear_domains,
+    clear_transient_bindings,
+    create_domain,
+    domain_by_uuid,
+    domain_for_dataset,
+    domain_for_scene,
+    install_domain,
+    retire_domain,
 )
 
 
@@ -43,8 +66,8 @@ class DatasetRuntimeState:
     image_path_manifest: ImagePathManifest | None
 
 
-_STATES: dict[str, DatasetRuntimeState] = {}
 _RESTORE_JOBS: dict[int, "RuntimeRestoreJob"] = {}
+_PREPARED_JOURNALS: dict[int, tuple[DatasetRuntimeState, EditJournal]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +84,8 @@ class RuntimeRestoreToken:
     images_directory: str
     input_format: str
     schema_version: int
+    domain_uuid: str
+    domain_generation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,33 +109,81 @@ def _pointer(value: Any) -> int:
 
 
 def runtime_restore_token(scene: Any) -> RuntimeRestoreToken:
-    """현재 Scene의 Runtime 복원 권위 token을 불변 값으로 캡처합니다."""
+    """Domain 우선, COLD에서는 Scene mirror로 복원 token을 캡처합니다."""
 
     settings = getattr(scene, "colmap_import", None)
     if settings is None:
         raise ValueError("COLMAP Modifier Scene 설정이 없습니다.")
-    dataset_uuid = str(settings.dataset_uuid or "")
-    model_directory = str(settings.active_model_directory or "")
+    domain = domain_for_scene(scene)
+    if domain is not None:
+        domain.assert_integrity()
+        state = domain.dataset_state
+        source = state.source
+        return RuntimeRestoreToken(
+            scene_pointer=_pointer(scene),
+            dataset_uuid=str(state.dataset_uuid),
+            edit_revision=int(state.edit_revision),
+            history_hash=str(state.history_hash),
+            source_fingerprint=str(source.source_fingerprint),
+            dataset_root=str(source.dataset_root),
+            model_directory=str(source.model_directory),
+            images_directory=str(source.images_directory),
+            input_format=str(source.input_format).upper(),
+            schema_version=int(source.schema_version),
+            domain_uuid=domain.domain_uuid,
+            domain_generation=domain.domain_generation,
+        )
+
+    dataset_uuid = str(getattr(settings, "dataset_uuid", "") or "")
+    model_directory = str(
+        getattr(settings, "active_model_directory", "") or ""
+    )
     if not dataset_uuid or not model_directory:
         raise ValueError("먼저 COLMAP 데이터셋을 Import하십시오.")
     try:
-        schema_version = int(str(settings.schema_version or "").strip())
+        schema_version = int(
+            str(getattr(settings, "schema_version", "") or "").strip()
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "저장된 COLMAP Source Schema가 없습니다. "
             "COLMAP 데이터를 다시 Import하십시오."
         ) from exc
+    mirrored_domain_uuid = str(getattr(settings, "domain_uuid", "") or "")
+    try:
+        normalized_domain_uuid = str(uuid.UUID(mirrored_domain_uuid))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "새 Modifier 저장 구조의 Domain UUID가 없습니다. "
+            "Dataset을 다시 Import하십시오."
+        ) from exc
+    if mirrored_domain_uuid != normalized_domain_uuid:
+        raise ValueError(
+            "저장된 Modifier Domain UUID 형식이 올바르지 않습니다. "
+            "Dataset을 다시 Import하십시오."
+        )
+    domain_generation = int(getattr(settings, "domain_generation", 0) or 0)
+    if domain_generation < 0:
+        raise ValueError("저장된 Domain generation이 올바르지 않습니다.")
     return RuntimeRestoreToken(
         scene_pointer=_pointer(scene),
         dataset_uuid=dataset_uuid,
-        edit_revision=int(settings.edit_revision),
-        history_hash=str(settings.history_hash or ""),
-        source_fingerprint=str(settings.source_fingerprint or ""),
-        dataset_root=str(settings.active_dataset_root or ""),
+        edit_revision=int(getattr(settings, "edit_revision", 0)),
+        history_hash=str(getattr(settings, "history_hash", "") or ""),
+        source_fingerprint=str(
+            getattr(settings, "source_fingerprint", "") or ""
+        ),
+        dataset_root=str(getattr(settings, "active_dataset_root", "") or ""),
         model_directory=model_directory,
-        images_directory=str(settings.active_images_directory or ""),
-        input_format=str(settings.active_input_format or "AUTO").upper(),
+        images_directory=str(
+            getattr(settings, "active_images_directory", "") or ""
+        ),
+        input_format=str(
+            getattr(settings, "active_input_format", "AUTO") or "AUTO"
+        ).upper(),
         schema_version=schema_version,
+        domain_uuid=normalized_domain_uuid,
+        domain_generation=domain_generation,
     )
 
 
@@ -124,21 +197,26 @@ def _restore_token_is_current(scene: Any, token: RuntimeRestoreToken) -> bool:
 
 
 def cached_runtime_matches_scene(scene: Any) -> bool:
-    """파일 재해시 없이 전역 Runtime과 Scene 편집 token의 일치 여부를 반환합니다."""
+    """Scene에 바인딩 가능한 Domain 권위 Runtime의 존재 여부를 반환합니다."""
 
     try:
-        token = runtime_restore_token(scene)
+        domain = domain_for_scene(scene)
+        if domain is None:
+            return False
+        domain.assert_integrity()
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return False
-    cached = _STATES.get(token.dataset_uuid)
-    return bool(
-        cached is not None
-        and cached.dataset_uuid == token.dataset_uuid
-        and cached.source.source_fingerprint == token.source_fingerprint
-        and cached.edit_revision == token.edit_revision
-        and cached.index_revision == token.edit_revision
-        and cached.history_hash == token.history_hash
-    )
+    return True
+
+
+def write_domain_settings(settings, domain: ModifierRuntimeDomain) -> None:
+    """Domain 식별자·저장 세대·Dirty·오류를 Scene mirror에 함께 기록합니다."""
+
+    settings.domain_uuid = domain.domain_uuid
+    settings.domain_generation = domain.domain_generation
+    settings.domain_saved_generation = max(0, int(domain.saved_generation))
+    settings.domain_persistence_dirty = bool(domain.persistence_dirty)
+    settings.domain_restore_error = str(domain.frozen_reason or "")
 
 
 class _RelationshipIndexBuildJob:
@@ -297,6 +375,33 @@ class _RelationshipIndexBuildJob:
         self.done = True
 
 
+def _plan_for_operation(
+    current: Reconstruction,
+    indexes: RelationshipIndexes,
+    operation: AnyEditOperation,
+    expected_revision: int,
+):
+    """schema 2 operation을 동일 Core planner의 제거 계획으로 복원합니다."""
+
+    if not isinstance(operation, EditOperation):
+        return None
+    if operation.operation_type == REMOVE_POINTS_OPERATION:
+        return plan_point_removal(
+            current,
+            indexes,
+            operation.requested_point3d_ids,
+            source_revision=expected_revision,
+        )
+    if operation.operation_type == REMOVE_IMAGES_OPERATION:
+        return plan_image_observation_removal(
+            current,
+            indexes,
+            operation.requested_image_ids,
+            source_revision=expected_revision,
+        )
+    raise ValueError(f"지원하지 않는 편집 작업입니다: {operation.operation_type}")
+
+
 class RuntimeRestoreJob:
     """저장된 Modifier Scene에서 Runtime을 증분 복원하고 마지막에만 설치합니다."""
 
@@ -330,6 +435,10 @@ class RuntimeRestoreJob:
         self._indexes: RelationshipIndexes | None = None
         self._operation_index = 0
         self._expected_revision = 0
+        self._journal = EditJournal(
+            token.dataset_uuid,
+            token.source_fingerprint,
+        )
         self._point_iterator: Any = None
         self._point_chunks: list[list[int]] = []
         self._point_merge: Any = None
@@ -346,6 +455,34 @@ class RuntimeRestoreJob:
             0,
             "저장된 원본 확인 중",
         )
+
+    @classmethod
+    def completed_from_domain(
+        cls,
+        scene: Any,
+        token: RuntimeRestoreToken,
+        state: DatasetRuntimeState,
+    ) -> "RuntimeRestoreJob":
+        """원본을 읽지 않고 Domain cache hit를 완료된 Job으로 감쌉니다."""
+
+        job = cls.__new__(cls)
+        job.scene = scene
+        job.token = token
+        job._operations = state.operations
+        job._journal = domain_for_scene(scene, required=True).journal
+        job.done = True
+        job.failed = False
+        job.error = None
+        job.result = state
+        job._phase = "DONE"
+        job.progress = RuntimeRestoreProgress(
+            "DONE",
+            1.0,
+            1,
+            1,
+            "Modifier Runtime 준비 완료",
+        )
+        return job
 
     def advance(self, work_budget_ms: float = 20.0) -> RuntimeRestoreProgress:
         """한 UI Tick의 예산 안에서 복원 단계를 전진시킵니다."""
@@ -452,14 +589,42 @@ class RuntimeRestoreJob:
         if self._current is None or self._indexes is None:
             raise RuntimeError("편집 이력을 적용할 Runtime 기준선이 없습니다.")
         operation = self._operations[self._operation_index]
-        self._current, self._indexes, self._expected_revision = replay_operation_indexed(
-            self._current,
-            self._indexes,
+        before_reconstruction = self._current
+        before_indexes = self._indexes
+        plan = _plan_for_operation(
+            before_reconstruction,
+            before_indexes,
             operation,
-            dataset_uuid=self.token.dataset_uuid,
-            source_fingerprint=self.token.source_fingerprint,
-            expected_revision=self._expected_revision,
+            self._expected_revision,
         )
+        after_reconstruction, after_indexes, resulting_revision = (
+            replay_operation_indexed(
+                before_reconstruction,
+                before_indexes,
+                operation,
+                dataset_uuid=self.token.dataset_uuid,
+                source_fingerprint=self.token.source_fingerprint,
+                expected_revision=self._expected_revision,
+            )
+        )
+        if plan is None:
+            self._journal = EditJournal(
+                self.token.dataset_uuid,
+                self.token.source_fingerprint,
+                initial_revision=resulting_revision,
+            )
+        else:
+            self._journal.append_rebuilt(
+                before_reconstruction=before_reconstruction,
+                before_indexes=before_indexes,
+                after_reconstruction=after_reconstruction,
+                after_indexes=after_indexes,
+                plan=plan,
+                operation=operation,
+            )
+        self._current = after_reconstruction
+        self._indexes = after_indexes
+        self._expected_revision = resulting_revision
         self._operation_index += 1
         total = len(self._operations)
         self.progress = RuntimeRestoreProgress(
@@ -541,7 +706,21 @@ class RuntimeRestoreJob:
             point_id_order=tuple(self._point_id_order),
             image_path_manifest=self._loaded.image_path_manifest,
         )
-        install_state(rebuilt)
+        settings = self.scene.colmap_import
+        domain = install_state(
+            rebuilt,
+            scene=self.scene,
+            domain_uuid=self.token.domain_uuid,
+            domain_generation=self.token.domain_generation,
+            journal=self._journal,
+            mark_dirty=bool(
+                getattr(settings, "domain_persistence_dirty", False)
+            ),
+        )
+        domain.saved_generation = int(
+            getattr(settings, "domain_saved_generation", 0) or 0
+        )
+        write_domain_settings(settings, domain)
         self.result = rebuilt
         self.done = True
         self.progress = RuntimeRestoreProgress(
@@ -580,6 +759,16 @@ def request_runtime_restore(scene: Any) -> RuntimeRestoreJob:
         return current
     if current is not None and not current.done:
         current.abort()
+    domain = domain_for_scene(scene)
+    if domain is not None:
+        domain.assert_integrity()
+        job = RuntimeRestoreJob.completed_from_domain(
+            scene,
+            token,
+            domain.dataset_state,
+        )
+        _RESTORE_JOBS[key] = job
+        return job
     job = RuntimeRestoreJob(scene, token)
     _RESTORE_JOBS[key] = job
     return job
@@ -605,18 +794,57 @@ def cancel_runtime_restore(scene: Any | None = None) -> None:
             job.abort()
 
 
-def _make_state(
+def _make_state_and_journal(
     loaded: LoadedReconstruction,
     operations: tuple[AnyEditOperation, ...],
-) -> DatasetRuntimeState:
+) -> tuple[DatasetRuntimeState, EditJournal]:
+    """Import/COLD 기준선에서 state와 schema 2 warm Journal을 함께 재구축합니다."""
+
     current, indexes = replay_history(
         loaded.reconstruction,
-        operations,
+        (),
         loaded.source.dataset_uuid,
         loaded.source.source_fingerprint,
         validation_token=loaded.validation_token,
     )
-    return DatasetRuntimeState(
+    journal = EditJournal(
+        loaded.source.dataset_uuid,
+        loaded.source.source_fingerprint,
+    )
+    expected_revision = 0
+    for operation in operations:
+        before_reconstruction = current
+        before_indexes = indexes
+        plan = _plan_for_operation(
+            before_reconstruction,
+            before_indexes,
+            operation,
+            expected_revision,
+        )
+        current, indexes, expected_revision = replay_operation_indexed(
+            before_reconstruction,
+            before_indexes,
+            operation,
+            dataset_uuid=loaded.source.dataset_uuid,
+            source_fingerprint=loaded.source.source_fingerprint,
+            expected_revision=expected_revision,
+        )
+        if plan is None:
+            journal = EditJournal(
+                loaded.source.dataset_uuid,
+                loaded.source.source_fingerprint,
+                initial_revision=expected_revision,
+            )
+        else:
+            journal.append_rebuilt(
+                before_reconstruction=before_reconstruction,
+                before_indexes=before_indexes,
+                after_reconstruction=current,
+                after_indexes=indexes,
+                plan=plan,
+                operation=operation,
+            )
+    state = DatasetRuntimeState(
         dataset_uuid=loaded.source.dataset_uuid,
         source=loaded.source,
         baseline_reconstruction=loaded.reconstruction,
@@ -629,6 +857,18 @@ def _make_state(
         point_id_order=tuple(sorted(current.points3d)),
         image_path_manifest=loaded.image_path_manifest,
     )
+    return state, journal
+
+
+def _make_state(
+    loaded: LoadedReconstruction,
+    operations: tuple[AnyEditOperation, ...],
+) -> DatasetRuntimeState:
+    """기존 반환 API를 유지하며 설치 대기 Journal도 함께 준비합니다."""
+
+    state, journal = _make_state_and_journal(loaded, operations)
+    _PREPARED_JOURNALS[id(state)] = (state, journal)
+    return state
 
 
 def prepare_import_state(settings, loaded: LoadedReconstruction) -> DatasetRuntimeState:
@@ -697,56 +937,170 @@ def state_from_successful_export(
     )
 
 
-def install_state(state: DatasetRuntimeState) -> None:
-    """완전히 검증된 Runtime 상태만 Dataset UUID Registry에 설치합니다."""
+def _prepared_journal(state: DatasetRuntimeState) -> EditJournal | None:
+    """_make_state가 함께 만든 설치 대기 Journal을 객체 identity로 꺼냅니다."""
+
+    prepared = _PREPARED_JOURNALS.pop(id(state), None)
+    if prepared is None:
+        return None
+    prepared_state, journal = prepared
+    return journal if prepared_state is state else None
+
+
+def _journal_for_install(
+    state: DatasetRuntimeState,
+    existing: ModifierRuntimeDomain | None,
+    supplied: EditJournal | None,
+) -> EditJournal:
+    """명시·준비·기존 순서로 설치할 Journal을 선택하거나 barrier를 만듭니다."""
+
+    journal = supplied or _prepared_journal(state)
+    if journal is None and existing is not None:
+        previous_state = existing.dataset_state
+        previous_journal = existing.journal
+        if state is previous_state or state.operations == previous_state.operations:
+            journal = previous_journal
+        elif (
+            len(state.operations) == len(previous_state.operations) + 1
+            and state.operations[:-1] == previous_state.operations
+            and isinstance(state.operations[-1], EditOperation)
+            and getattr(previous_journal, "revision", -1)
+            == previous_state.edit_revision
+        ):
+            operation = state.operations[-1]
+            plan = _plan_for_operation(
+                previous_state.current_reconstruction,
+                previous_state.indexes,
+                operation,
+                previous_state.edit_revision,
+            )
+            previous_journal.append_rebuilt(
+                before_reconstruction=previous_state.current_reconstruction,
+                before_indexes=previous_state.indexes,
+                after_reconstruction=state.current_reconstruction,
+                after_indexes=state.indexes,
+                plan=plan,
+                operation=operation,
+            )
+            journal = previous_journal
+    if journal is None:
+        journal = EditJournal(
+            state.dataset_uuid,
+            state.source.source_fingerprint,
+            initial_revision=state.edit_revision,
+        )
+    if (
+        journal.dataset_uuid != state.dataset_uuid
+        or journal.source_fingerprint != state.source.source_fingerprint
+        or journal.revision != state.edit_revision
+    ):
+        raise ValueError("설치할 Journal token이 Runtime state와 일치하지 않습니다.")
+    return journal
+
+
+def install_state(
+    state: DatasetRuntimeState,
+    scene: Any | None = None,
+    domain_uuid: str | None = None,
+    domain_generation: int | None = None,
+    journal: EditJournal | None = None,
+    mark_dirty: bool = False,
+) -> ModifierRuntimeDomain:
+    """기존 호출을 유지하며 Runtime state를 Domain Registry에 설치·바인딩합니다."""
 
     if state.edit_revision != state.index_revision:
         raise ValueError(
             "Runtime 모델 revision과 관계 인덱스 revision이 일치하지 않습니다."
         )
-    _STATES[state.dataset_uuid] = state
+    explicit_domain = domain_by_uuid(domain_uuid) if domain_uuid else None
+    dataset_domain = domain_for_dataset(state.dataset_uuid)
+    if (
+        explicit_domain is None
+        and domain_uuid
+        and dataset_domain is not None
+        and dataset_domain.domain_uuid != domain_uuid
+    ):
+        raise ValueError("같은 Dataset의 다른 Domain이 이미 설치되어 있습니다.")
+    existing = explicit_domain or dataset_domain
+    if existing is not None and (
+        existing.dataset_state.source.source_fingerprint
+        != state.source.source_fingerprint
+    ):
+        retire_domain(existing.domain_uuid)
+        existing = None
+
+    selected_journal = _journal_for_install(state, existing, journal)
+    if existing is None:
+        domain = create_domain(
+            state,
+            selected_journal,
+            domain_uuid=domain_uuid,
+            domain_generation=(
+                int(domain_generation) if domain_generation is not None else 0
+            ),
+            persistence_dirty=bool(mark_dirty),
+        )
+        install_domain(domain, scene)
+    else:
+        if domain_generation is not None and existing.domain_generation != int(
+            domain_generation
+        ):
+            raise ValueError("설치 대상 Domain generation이 현재 Domain과 다릅니다.")
+        if existing.dataset_state is not state:
+            existing.replace_state(
+                state,
+                status="Modifier Runtime state 설치",
+                mark_dirty=bool(mark_dirty),
+                advance_generation=domain_generation is None,
+            )
+        else:
+            existing.persistence_dirty = (
+                existing.persistence_dirty or bool(mark_dirty)
+            )
+        existing.journal = selected_journal
+        domain = existing
+        if scene is not None:
+            bind_domain(scene, domain)
+    if scene is not None:
+        settings = getattr(scene, "colmap_import", None)
+        if settings is not None:
+            write_domain_settings(settings, domain)
+    return domain
 
 
 def clear_runtime() -> None:
-    """모든 증분 복원 작업을 취소하고 설치된 Modifier Runtime을 폐기합니다."""
+    """모든 복원 작업과 준비 Journal 및 전체 Domain Registry를 폐기합니다."""
 
     cancel_runtime_restore()
-    _STATES.clear()
+    _PREPARED_JOURNALS.clear()
+    clear_domains()
 
 
 def discard_runtime_for_global_undo() -> None:
-    """Global Undo가 교체할 ID와 연결된 모든 재생성 가능 Runtime을 폐기합니다."""
+    """Global Undo 전 restore와 Scene binding만 정리하고 Domain·Journal은 보존합니다."""
 
     cancel_runtime_restore()
-    _STATES.clear()
+    _PREPARED_JOURNALS.clear()
+    clear_transient_bindings()
 
 
 def cached_runtime(dataset_uuid: str) -> DatasetRuntimeState | None:
-    """파일 재검사 없이 현재 세션의 캐시된 Runtime만 반환합니다."""
-    return _STATES.get(dataset_uuid)
+    """파일 재검사 없이 Dataset에 설치된 Domain 권위 state를 반환합니다."""
+
+    domain = domain_for_dataset(dataset_uuid)
+    return domain.dataset_state if domain is not None else None
 
 
 def cached_runtime_for_pending(scene) -> DatasetRuntimeState:
-    """Pending 등록에서 source 재해시 없이 현재 Runtime token만 검증합니다."""
-    settings = scene.colmap_import
-    if not settings.dataset_uuid:
-        raise ValueError("먼저 COLMAP 데이터셋을 Import하십시오.")
-    cached = _STATES.get(settings.dataset_uuid)
-    if cached is None:
+    """Pending 등록에서 Scene mirror 대신 바인딩된 Domain 권위를 반환합니다."""
+
+    domain = domain_for_scene(scene)
+    if domain is None:
         raise ValueError(
-            "현재 Runtime Cache가 없습니다. Import 또는 파일 재로드 복원을 먼저 완료하십시오."
+            "현재 Runtime Domain이 없습니다. Import 또는 파일 재로드 복원을 먼저 완료하십시오."
         )
-    if (
-        cached.dataset_uuid != settings.dataset_uuid
-        or cached.source.source_fingerprint != settings.source_fingerprint
-        or cached.edit_revision != settings.edit_revision
-        or cached.index_revision != cached.edit_revision
-        or cached.history_hash != settings.history_hash
-    ):
-        raise ValueError(
-            "현재 Scene과 Runtime Cache token이 일치하지 않습니다. 다시 Import하십시오."
-        )
-    return cached
+    domain.require_editable()
+    return domain.dataset_state
 
 
 def validated_runtime_token(state: DatasetRuntimeState) -> ValidatedRuntimeToken:
@@ -772,28 +1126,9 @@ def validated_runtime_token(state: DatasetRuntimeState) -> ValidatedRuntimeToken
 
 
 def cached_runtime_for_export(scene) -> DatasetRuntimeState:
-    """Source 재해시 없이 Scene·Runtime history token을 Export 전에 검증합니다."""
+    """Source 재해시 없이 Domain state 자체를 Export 전에 검증합니다."""
 
-    settings = scene.colmap_import
     state = cached_runtime_for_pending(scene)
-    operations = deserialize_history(settings.edit_history_json)
-    if (
-        len(operations) != settings.edit_revision
-        or history_hash(operations) != settings.history_hash
-        or operations != state.operations
-    ):
-        raise ValueError(
-            "Scene의 편집 이력과 Runtime Cache가 일치하지 않습니다. 다시 Import하십시오."
-        )
-    if (
-        settings.active_model_directory != str(state.source.model_directory)
-        or settings.active_input_format != state.source.input_format
-        or settings.active_layout != state.source.layout
-    ):
-        raise ValueError(
-            "Scene의 source 경로 또는 형식이 Runtime Cache와 일치하지 않습니다. "
-            "다시 Import하십시오."
-        )
     validated_runtime_token(state)
     return state
 
@@ -832,27 +1167,22 @@ def _verify_source(settings) -> None:
 
 
 def ensure_runtime(scene) -> DatasetRuntimeState:
+    """WARM은 Domain을 즉시 반환하고 Domain이 없을 때만 source를 복원합니다."""
+
     settings = scene.colmap_import
     if not settings.dataset_uuid or not settings.active_model_directory:
         raise ValueError("먼저 COLMAP 데이터셋을 Import하십시오.")
+    domain = domain_for_scene(scene)
+    if domain is not None:
+        domain.require_editable()
+        return domain.dataset_state
+
+    token = runtime_restore_token(scene)
     _verify_source(settings)
     operations = deserialize_history(settings.edit_history_json)
     expected_hash = history_hash(operations)
     if settings.history_hash != expected_hash:
         raise ValueError("Scene의 편집 이력 hash가 일치하지 않습니다.")
-    cached = _STATES.get(settings.dataset_uuid)
-    if (
-        cached is not None
-        and cached.source.source_fingerprint == settings.source_fingerprint
-        and cached.edit_revision == settings.edit_revision
-        and cached.history_hash == expected_hash
-    ):
-        if cached.index_revision != cached.edit_revision:
-            raise ValueError(
-                "Runtime 모델 revision과 관계 인덱스 revision이 일치하지 않습니다."
-            )
-        return cached
-
     loaded = load_reconstruction(
         settings.active_dataset_root,
         settings.active_model_directory,
@@ -865,7 +1195,15 @@ def ensure_runtime(scene) -> DatasetRuntimeState:
     rebuilt = _make_state(loaded, operations)
     if rebuilt.edit_revision != settings.edit_revision:
         raise ValueError("Scene의 편집 revision과 이력 길이가 일치하지 않습니다.")
-    install_state(rebuilt)
+    install_state(
+        rebuilt,
+        scene=scene,
+        domain_uuid=token.domain_uuid,
+        domain_generation=token.domain_generation,
+        mark_dirty=bool(
+            getattr(settings, "domain_persistence_dirty", False)
+        ),
+    )
     return rebuilt
 
 
@@ -901,6 +1239,8 @@ def write_history_settings(settings, state: DatasetRuntimeState) -> None:
 
 
 def write_source_settings(settings, state: DatasetRuntimeState) -> None:
+    """권위 Runtime source 정보를 Scene 영속 mirror에 기록합니다."""
+
     source = state.source
     settings.active_dataset_root = str(source.dataset_root)
     settings.active_sparse_root = str(source.sparse_root)

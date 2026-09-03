@@ -152,6 +152,26 @@ def scene_marker_session_owned_by(scene: Any, tool_id: str) -> bool:
     return existing is not None and existing.tool_id == normalized_tool_id
 
 
+def scene_marker_session_owned_by_window(
+    scene: Any,
+    tool_id: str,
+    window: Any,
+) -> bool:
+    """Scene lease가 지정 도구와 정확한 Window에 함께 속하는지 확인합니다."""
+
+    normalized_tool_id = _tool_id(tool_id)
+    scene_pointer = _pointer(scene)
+    window_pointer = _pointer(window)
+    if not scene_pointer or not window_pointer:
+        return False
+    existing = _SCENE_MARKER_SESSIONS.get(scene_pointer)
+    return bool(
+        existing is not None
+        and existing.tool_id == normalized_tool_id
+        and existing.window_pointer == window_pointer
+    )
+
+
 def scene_marker_session_owner(scene: Any) -> str:
     """Scene Marker 세션 소유 도구 ID를 반환하고 미소유이면 빈 문자열을 반환합니다."""
 
@@ -174,5 +194,6 @@ __all__ = [
     "clear_scene_marker_sessions",
     "release_scene_marker_session",
     "scene_marker_session_owned_by",
+    "scene_marker_session_owned_by_window",
     "scene_marker_session_owner",
 ]

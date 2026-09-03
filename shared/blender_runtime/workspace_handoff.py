@@ -65,6 +65,7 @@ _PENDING_HANDOFFS: dict[int, _PendingHandoff] = {}
 _LAST_WORKSPACE_POINTERS: dict[int, int] = {}
 _MSGBUS_OWNER = object()
 _RUNTIME_REGISTERED = False
+_HANDOFF_TICK_RUNNING = False
 
 
 def workspace_tool_id(workspace: Any) -> str:
@@ -330,8 +331,8 @@ def _restore_requested_destination(pending: _PendingHandoff, window: Any) -> boo
     return False
 
 
-def _handoff_tick() -> float | None:
-    """이전 도구 종료 뒤 대상 도구를 시작하거나 선택한 일반 Workspace로 복귀합니다."""
+def _advance_handoffs() -> float | None:
+    """대기 중인 도구 종료와 다음 Workspace 진입을 한 단계 전진시킵니다."""
 
     if not _PENDING_HANDOFFS:
         return None
@@ -402,10 +403,23 @@ def _handoff_tick() -> float | None:
     return _TICK_INTERVAL_SECONDS if _PENDING_HANDOFFS else None
 
 
+def _handoff_tick() -> float | None:
+    """Blender 화면 갱신 중 같은 전환 Timer가 중첩 실행되지 않도록 보호합니다."""
+
+    global _HANDOFF_TICK_RUNNING
+    if _HANDOFF_TICK_RUNNING:
+        return _TICK_INTERVAL_SECONDS if _PENDING_HANDOFFS else None
+    _HANDOFF_TICK_RUNNING = True
+    try:
+        return _advance_handoffs()
+    finally:
+        _HANDOFF_TICK_RUNNING = False
+
+
 def _ensure_handoff_timer() -> None:
     """대기 요청이 있을 때 공용 전환 Timer를 중복 없이 등록합니다."""
 
-    if not bpy.app.timers.is_registered(_handoff_tick):
+    if not _HANDOFF_TICK_RUNNING and not bpy.app.timers.is_registered(_handoff_tick):
         bpy.app.timers.register(_handoff_tick, first_interval=0.0)
 
 

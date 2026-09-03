@@ -1,5 +1,42 @@
 # 통합 구현 현황
 
+## 0.3.36 Align 진입 Object Mode 자동 전환
+
+- Align 진입 시 Edit·Sculpt·Texture Paint를 포함한 비 Object Mode를 Blender 기본 Object Mode로 자동 전환합니다.
+- 다른 COLMAP 도구에서 넘어오면 기존 세션 종료를 완료한 뒤 Align 작업공간 생성 직전에 전환합니다.
+- 현재 Window·Screen·View Layer·활성 Object를 검증하고 실패 시 부분 Align 세션을 만들지 않습니다.
+
+Blender Background에서 Edit·Sculpt·Texture Paint 전환을 통과했고, Source와 실제 설치본의 숨김 GUI에서 Edit Mode → 실제 Align 작업공간 → 활성 세션 진입을 검증했습니다. Production 전체 검사와 격리 설치본 검사를 통과했고 실제 Blender `user_default` 설치 버전 `0.3.36`도 확인했습니다.
+
+Production ZIP은 `build/colmap_tools-0.3.36.zip`이며 SHA-256은 `22F4CC3907759029181DE52A5A26D92B1A19D863A8DA8D5849704C5082C45542`, 크기는 28,731,889바이트입니다.
+
+## 0.3.35 Modifier·Projection Painting Camera 세션 격리
+
+- Modifier와 Projection Painting의 Camera 쓰기 권한을 현재 Window·Workspace·Scene Marker 사용권으로 제한했습니다.
+- 비활성 도구의 Frame Handler, Debounce와 Repair Timer는 `scene.camera`, Render 해상도와 Background Image를 변경하지 않습니다.
+- 작업공간 생성과 Camera 연결을 분리해 Workspace와 화면 구성이 `READY`가 된 다음 UI Tick에서만 Camera 세션을 연결합니다.
+- 작업공간 준비 실패 시 Camera·Marker·View Layer 권한을 모두 반납하고 실패 Workspace를 정리해 삭제된 Workspace 참조를 다시 사용하지 않습니다.
+- Modifier Camera 권한 검사를 Timeline과 Viewport의 공통 독립 경계로 분리해 제품 모듈의 순환 의존성을 제거했습니다.
+
+Modifier Core 216개, Architecture 12개, Coexistence 11개, Projection Core 40개를 통과했습니다. Projection Painting Camera Background 19개와 Modifier Camera Background 전체를 통과했고, Source와 실제 설치본의 숨김 Blender GUI에서 Modifier → Projection Painting → Modifier → 일반 Workspace Camera·Marker 교대를 검증했습니다. 격리 설치본 검사와 실제 Blender `user_default` 설치 버전 `0.3.35` 확인도 완료했습니다.
+
+Production ZIP은 `build/colmap_tools-0.3.35.zip`이며 SHA-256은 `60AB1B837F680D8999DF6C485A0794FEDADC80C336F196E5E95884A9069C1D58`, 크기는 28,731,259바이트입니다.
+
+## 0.3.34 Modifier 독립 Runtime·전용 Undo/Redo
+
+- Modifier의 현재 Reconstruction과 확정 편집 이력을 독립 Python Runtime Domain의 권위로 전환했습니다.
+- 변경 범위 Forward/Inverse Delta를 가진 전용 Journal이 Point·Camera 제거, Pending Filter 적용, Reset의 Undo·Redo를 관리합니다.
+- Modifier Workspace의 `Ctrl+Z`, `Ctrl+Shift+Z`, `Ctrl+Y`만 전용 Journal로 라우팅하고 빈 Journal과 `Ctrl+Alt+Z`도 Blender Global Undo로 넘기지 않습니다.
+- 다른 Workspace의 Global Undo는 Domain·Journal을 보존하고 이전 Blender 참조만 폐기한 뒤 Runtime 기준으로 Point·Camera·Marker 표시를 다시 동기화합니다.
+- Import는 Loader 결과를 Domain에 직접 설치하고 Export 성공은 새 Baseline과 빈 Journal로 전환합니다.
+- Source Metadata, Domain Identity와 확정 Operation만 Active/Staging Text에 원자 저장하며, 재실행 때 Source·Operation으로 Runtime과 Undo Command를 자동 재구축합니다. Redo Stack은 비워집니다.
+- Projection Painting 수동 업데이트는 Domain UUID·Generation·Revision·History Hash가 포함된 불변 Snapshot을 복사하며 Modifier Runtime·Journal을 공유하지 않습니다.
+- 자동 마이그레이션은 제공하지 않습니다. `0.3.33` 이하에서 저장한 기존 Modifier 데이터는 한 번 재Import한 뒤 `.blend`를 다시 저장해야 합니다.
+
+Modifier Core 216개, Architecture 12개, Coexistence 11개, Projection Core 40개와 Shared Transfer 8개를 통과했습니다. Modifier Blender Background 전체와 실제 GUI `Ctrl+Z → Ctrl+Shift+Z → Ctrl+Z`, F7, BIN Export, Workspace 재진입을 Source와 설치본 양쪽에서 검증했습니다. 격리 설치본 검사와 실제 Blender `user_default` 설치 버전 `0.3.34` 확인도 완료했습니다.
+
+Production ZIP은 `build/colmap_tools-0.3.34.zip`이며 SHA-256은 `AE85BE8034C49567180B79462E7FC157CD8CCDDDE4931ABD8F1E6A80C925DAC7`, 크기는 28,725,664바이트입니다.
+
 ## 0.3.33 Modifier 빠른 Runtime 복원
 
 - 신규·수동 Import의 전체 무결성 검사는 유지하고, 저장된 동일 Source의 COLD Runtime 복원만 전용 `RuntimeSourceRestoreJob`으로 분리했습니다.

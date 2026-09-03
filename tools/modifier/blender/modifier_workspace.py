@@ -482,12 +482,27 @@ def _rehydrate_viewport_runtime(window: Any, area: Any, state: Any) -> tuple[str
         settings = getattr(bpy.context.scene, "colmap_import", None)
         if settings is None or not settings.dataset_uuid or not settings.active_model_directory:
             return ()
+        from .edit_coordinator import synchronize_scene
+        from .modifier_runtime_domain import domain_for_scene
+        from .runtime_state import (
+            write_domain_settings,
+            write_history_settings,
+            write_source_settings,
+        )
         from .camera_filter_queue import restore_pending_filters
         from .camera_review_session import (
             ensure_review_session,
             update_review_background_from_settings,
         )
 
+        domain = domain_for_scene(bpy.context.scene, required=True)
+        write_source_settings(settings, state)
+        write_history_settings(settings, state)
+        write_domain_settings(settings, domain)
+        settings.camera_count = str(len(state.current_reconstruction.cameras))
+        settings.image_count = str(len(state.current_reconstruction.images))
+        settings.point3d_count = str(len(state.current_reconstruction.points3d))
+        warnings.extend(synchronize_scene(bpy.context, state, settings))
         review_session = ensure_review_session(bpy.context, state=state)
         restore_pending_filters(
             bpy.context,
@@ -622,6 +637,9 @@ def _complete_workspace_activation(window: Any) -> None:
         schedule_sidebar_activation()
     mark_workspace_ready(workspace, window.screen, MODIFIER_WORKSPACE_SPEC)
     activate_session(window, area)
+    from .modifier_input_guard import start_modifier_input_guard
+
+    start_modifier_input_guard(window)
     try:
         _schedule_runtime_restore(window, area)
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
@@ -907,6 +925,7 @@ def _deactivate_modifier_marker_session(context: Any) -> int:
 
     from .camera_review_session import current_review_session
     from .camera_review_timeline import (
+        cancel_modifier_camera_requests,
         detach_modifier_timeline_markers_from_scene,
         detach_review_timeline_markers,
         refresh_timeline_manifest_revision,
@@ -914,6 +933,7 @@ def _deactivate_modifier_marker_session(context: Any) -> int:
     )
 
     scene = context.scene
+    cancel_modifier_camera_requests(scene)
     review_session = current_review_session(context)
     removed_count = 0
     if review_session is not None and review_session.scene is scene:
@@ -939,6 +959,9 @@ def exit_modifier_workspace(context: Any) -> tuple[str, ...]:
     if session_source_workspace() is None:
         raise ModifierWorkspaceError("진입 전 Workspace를 찾을 수 없어 종료할 수 없습니다.")
 
+    from .modifier_input_guard import rearm_modifier_input_guard, stop_modifier_input_guard
+
+    stop_modifier_input_guard()
     _finish_active_edit_modes(context)
     _deactivate_modifier_marker_session(context)
     warnings = _release_viewport_runtime(context)
@@ -948,6 +971,7 @@ def exit_modifier_workspace(context: Any) -> tuple[str, ...]:
         SESSION.exit_requested = False
         try:
             _activate_modifier_marker_session(context.window)
+            rearm_modifier_input_guard(context.window)
         except Exception as marker_error:
             SESSION.status_message = (
                 f"{SESSION.status_message}; Marker Session 복구 실패: {marker_error}"
@@ -1073,8 +1097,12 @@ def clear_modifier_session_before_load(*_args) -> None:
     window = session_target_window()
     scene = getattr(window, "scene", None)
     if scene is not None:
-        from .camera_review_timeline import release_modifier_marker_session
+        from .camera_review_timeline import (
+            cancel_modifier_camera_requests,
+            release_modifier_marker_session,
+        )
 
+        cancel_modifier_camera_requests(scene)
         release_modifier_marker_session(scene)
     SESSION.clear()
 

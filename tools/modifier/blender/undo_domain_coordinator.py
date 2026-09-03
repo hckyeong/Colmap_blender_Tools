@@ -14,8 +14,11 @@ class COLMAPUndoProtectionSnapshot:
 
     window_pointer: int
     scene_name: str
+    domain_uuid: str
+    domain_generation: int
     dataset_uuid: str
     source_fingerprint: str
+    history_hash: str
     current_image_id: int | None
     current_index: int
     current_frame: int
@@ -60,6 +63,13 @@ def _capture_navigation_snapshot(context) -> COLMAPUndoProtectionSnapshot:
 
     scene = getattr(context, "scene", None)
     settings = getattr(scene, "colmap_import", None)
+    try:
+        from .modifier_runtime_domain import domain_for_scene
+
+        domain = domain_for_scene(scene) if scene is not None else None
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        domain = None
+    identity = domain.identity if domain is not None else None
     scene_pointer = _pointer(scene)
     timeline_active = False
     if scene_pointer:
@@ -76,9 +86,30 @@ def _capture_navigation_snapshot(context) -> COLMAPUndoProtectionSnapshot:
     return COLMAPUndoProtectionSnapshot(
         window_pointer=_window_key(context),
         scene_name=str(getattr(scene, "name", "") or ""),
-        dataset_uuid=str(getattr(settings, "dataset_uuid", "") or ""),
+        domain_uuid=str(
+            identity.domain_uuid
+            if identity is not None
+            else getattr(settings, "domain_uuid", "") or ""
+        ),
+        domain_generation=int(
+            identity.domain_generation
+            if identity is not None
+            else getattr(settings, "domain_generation", 0) or 0
+        ),
+        dataset_uuid=str(
+            identity.dataset_uuid
+            if identity is not None
+            else getattr(settings, "dataset_uuid", "") or ""
+        ),
         source_fingerprint=str(
-            getattr(settings, "source_fingerprint", "") or ""
+            identity.source_fingerprint
+            if identity is not None
+            else getattr(settings, "source_fingerprint", "") or ""
+        ),
+        history_hash=str(
+            identity.history_hash
+            if identity is not None
+            else getattr(settings, "history_hash", "") or ""
         ),
         current_image_id=_parse_image_id(
             getattr(settings, "review_current_image_id", "")
@@ -105,6 +136,8 @@ def abandon_transient_state_for_global_undo() -> None:
     from .import_progress_session import (
         abandon_import_progress_sessions_for_global_undo,
     )
+    from .modifier_input_guard import stop_modifier_input_guard
+    from .modifier_runtime_domain import clear_transient_bindings
     from .runtime_state import discard_runtime_for_global_undo
     from .selection import clear_snapshots
 
@@ -112,9 +145,10 @@ def abandon_transient_state_for_global_undo() -> None:
     abandon_edit_sessions_for_global_undo()
     abandon_import_progress_sessions_for_global_undo()
     abandon_export_progress_sessions_for_global_undo()
+    stop_modifier_input_guard()
     clear_pending_runtime()
     clear_snapshots()
-
+    clear_transient_bindings()
     discard_runtime_for_global_undo()
 
 
@@ -251,7 +285,7 @@ def _restore_review(context, state, snapshot) -> None:
 
 
 def _perform_reconcile(context, snapshot) -> None:
-    """복원된 Scene history를 유일한 권위로 Runtime과 표시 상태를 만듭니다."""
+    """Global Undo와 무관한 Runtime 권위로 Mirror와 파생 표시만 복원합니다."""
 
     scene = context.scene
     settings = getattr(scene, "colmap_import", None)
@@ -259,31 +293,38 @@ def _perform_reconcile(context, snapshot) -> None:
         return
 
     _normalize_restored_modes(settings)
-    if not settings.dataset_uuid or not settings.active_model_directory:
+    from .modifier_runtime_domain import bind_domain, domain_by_uuid, domain_for_scene
+
+    domain = domain_by_uuid(snapshot.domain_uuid) if snapshot.domain_uuid else None
+    if domain is None:
+        domain = domain_for_scene(scene)
+    if domain is None:
         settings.review_status = (
-            "Blender Undo/Redo 완료: 활성 COLMAP 데이터셋이 없습니다."
+            "Blender Undo/Redo 완료: 연결된 Modifier Runtime Domain이 없습니다."
         )
         return
 
     from .edit_coordinator import synchronize_scene
-    from .runtime_state import ensure_runtime
+    from .runtime_state import write_history_settings, write_source_settings
 
-    state = ensure_runtime(scene)
-    if (
-        state.dataset_uuid != settings.dataset_uuid
-        or state.source.source_fingerprint != settings.source_fingerprint
-        or state.edit_revision != settings.edit_revision
-        or state.index_revision != state.edit_revision
-        or state.history_hash != settings.history_hash
-    ):
-        raise ValueError(
-            "복원된 Scene과 재생성한 COLMAP Runtime token이 일치하지 않습니다."
-        )
+    domain.assert_integrity()
+    state = domain.dataset_state
+    bind_domain(scene, domain)
+    write_source_settings(settings, state)
+    write_history_settings(settings, state)
+    settings.domain_uuid = domain.domain_uuid
+    settings.domain_generation = domain.domain_generation
+    settings.domain_saved_generation = max(0, domain.saved_generation)
+    settings.domain_persistence_dirty = domain.persistence_dirty
+    settings.domain_restore_error = domain.frozen_reason
+    settings.camera_count = str(len(state.current_reconstruction.cameras))
+    settings.image_count = str(len(state.current_reconstruction.images))
+    settings.point3d_count = str(len(state.current_reconstruction.points3d))
 
     warnings = synchronize_scene(context, state, settings)
     context.view_layer.update()
     _restore_review(context, state, snapshot)
-    settings.review_status = "Blender Undo/Redo 뒤 COLMAP 상태를 재생성했습니다."
+    settings.review_status = "Blender Undo/Redo 뒤 Modifier 표시를 Runtime 기준으로 복원했습니다."
     if warnings:
         settings.warning_summary = "\n".join(warnings)
     _RECOVERY_REQUIRED_DATASETS.discard(state.dataset_uuid)
@@ -327,16 +368,34 @@ def process_pending_undo_reconcile():
                 _perform_reconcile(bpy.context, snapshot)
     except Exception as exc:
         settings = getattr(scene, "colmap_import", None)
-        dataset_uuid = str(getattr(settings, "dataset_uuid", "") or "")
+        try:
+            from .modifier_runtime_domain import domain_for_scene
+
+            domain = domain_for_scene(scene)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            domain = None
+        dataset_uuid = str(
+            domain.dataset_state.dataset_uuid
+            if domain is not None
+            else getattr(settings, "dataset_uuid", "") or ""
+        )
         if dataset_uuid:
             _RECOVERY_REQUIRED_DATASETS.add(dataset_uuid)
         if settings is not None:
             settings.review_status = (
-                "COLMAP Undo 복구에 실패했습니다. 다시 Import해야 합니다: "
+                "Modifier 표시 복원에 실패했습니다. Runtime 편집은 유지됩니다: "
                 f"{exc}"
             )
     finally:
         _RECONCILE_RUNNING = False
+        try:
+            from .modifier_input_guard import start_modifier_input_guard
+            from .modifier_session import SESSION, SESSION_ACTIVE
+
+            if SESSION.phase == SESSION_ACTIVE and window is not None:
+                start_modifier_input_guard(window)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
     return 0.0 if _PENDING_RECONCILE is not None else None
 
 
@@ -345,9 +404,16 @@ def undo_domain_mutation_blocked(context) -> bool:
 
     settings = getattr(getattr(context, "scene", None), "colmap_import", None)
     dataset_uuid = str(getattr(settings, "dataset_uuid", "") or "")
+    try:
+        from .modifier_runtime_domain import domain_for_scene
+
+        domain = domain_for_scene(getattr(context, "scene", None))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        domain = None
     return bool(
         _RECONCILE_RUNNING
         or _PENDING_RECONCILE is not None
+        or (domain is not None and not domain.editable)
         or (dataset_uuid and dataset_uuid in _RECOVERY_REQUIRED_DATASETS)
     )
 

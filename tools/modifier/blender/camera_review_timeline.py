@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import bpy
 from bpy.app.handlers import persistent
 
+from .camera_review_authority import (
+    modifier_camera_session_is_active,
+    set_modifier_scene_camera,
+)
 from .ownership import DATASET_UUID_KEY, OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
 
 
@@ -379,7 +383,12 @@ def restore_timeline_state(session, snapshot: TimelineStateSnapshot) -> None:
 
 
 def _session_token(session) -> tuple[object, ...]:
+    """Review 데이터와 Modifier Workspace 세대를 하나의 지연 작업 Token으로 묶습니다."""
+
+    from .modifier_session import SESSION
+
     return (
+        SESSION.generation,
         session.dataset_uuid,
         session.source_fingerprint,
         session.edit_revision,
@@ -440,7 +449,7 @@ def _sync_review_properties(session) -> None:
 
 def attach_session(session) -> None:
     """frame handler가 parse나 Scene scan 없이 찾을 수 있도록 세션을 연결합니다."""
-    if not modifier_marker_session_owned(session.scene):
+    if not modifier_camera_session_is_active(session):
         _TIMELINE_SESSIONS.pop(session.scene_pointer, None)
         return
     _TIMELINE_SESSIONS[session.scene_pointer] = session
@@ -516,6 +525,41 @@ def _deactivate_timeline_runtime(session) -> None:
         process_pending_marker_guard_updates
     ):
         bpy.app.timers.unregister(process_pending_marker_guard_updates)
+
+
+def cancel_modifier_camera_requests(scene) -> None:
+    """Modifier Runtime을 보존하고 지정 Scene의 Camera Timer 요청만 폐기합니다."""
+
+    try:
+        scene_pointer = int(scene.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return
+    _PENDING_UPDATES.pop(scene_pointer, None)
+    _MARKER_GUARD_DIRTY_AT.pop(scene_pointer, None)
+    _MARKER_GUARD_REPAIRING.discard(scene_pointer)
+    if not _PENDING_UPDATES and bpy.app.timers.is_registered(
+        process_pending_timeline_updates
+    ):
+        bpy.app.timers.unregister(process_pending_timeline_updates)
+    if not _MARKER_GUARD_DIRTY_AT and bpy.app.timers.is_registered(
+        process_pending_marker_guard_updates
+    ):
+        bpy.app.timers.unregister(process_pending_marker_guard_updates)
+
+
+def modifier_camera_session_settled(scene) -> bool:
+    """지정 Scene의 Modifier Camera 요청과 활성 권한이 모두 끝났는지 확인합니다."""
+
+    try:
+        scene_pointer = int(scene.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return True
+    session = _TIMELINE_SESSIONS.get(scene_pointer)
+    return bool(
+        scene_pointer not in _PENDING_UPDATES
+        and scene_pointer not in _MARKER_GUARD_DIRTY_AT
+        and not modifier_camera_session_is_active(session)
+    )
 
 
 def _scene_marker_session_functions():
@@ -1024,6 +1068,8 @@ def _apply_timeline_target(
 ) -> None:
     """작업 집합·Review pair·Scene Camera·UI를 하나의 복구 경계로 적용합니다."""
 
+    if not modifier_camera_session_is_active(session):
+        raise RuntimeError("활성 Modifier Camera 세션이 아닙니다.")
     if (
         session.review_index.image_id_to_index.get(target_image_id)
         != target_index
@@ -1062,7 +1108,9 @@ def _apply_timeline_target(
             raise ValueError("Timeline 대상 Camera cache가 없습니다.")
         session.current_index = target_index
         session.current_image_id = target_image_id
-        session.scene.camera = camera
+        if not modifier_camera_session_is_active(session):
+            raise RuntimeError("Timeline Commit 전에 Modifier Camera 세션이 변경되었습니다.")
+        set_modifier_scene_camera(session, camera)
         _sync_review_properties(session)
         update_review_view_for_current(
             SimpleNamespace(scene=session.scene),
@@ -1072,6 +1120,8 @@ def _apply_timeline_target(
         rollback_failures: list[str] = []
         session.current_index = old_index
         session.current_image_id = old_image_id
+        if not modifier_camera_session_is_active(session):
+            raise
         if working_set_prepared and old_index >= 0:
             try:
                 from .camera_review_images import update_working_set
@@ -1381,7 +1431,11 @@ def build_or_refresh_timeline(
 
 def sync_playhead_to_current(session) -> None:
     """Previous/Next와 Build에서 현재 pair를 활성 Timeline frame에 맞춥니다."""
-    if not session.timeline_active or session.current_image_id is None:
+    if (
+        not session.timeline_active
+        or session.current_image_id is None
+        or not modifier_camera_session_is_active(session)
+    ):
         return
     frame = session.frame_start + session.current_index
     if (
@@ -1394,7 +1448,10 @@ def sync_playhead_to_current(session) -> None:
     session.update_guard = True
     try:
         session.scene.frame_set(frame)
-        session.scene.camera = session.camera_objects[session.current_image_id]
+        set_modifier_scene_camera(
+            session,
+            session.camera_objects[session.current_image_id],
+        )
     finally:
         session.update_guard = False
 
@@ -1405,6 +1462,11 @@ def _schedule_update(
     target_image_id: int,
     target_frame: int,
 ) -> None:
+    """활성 Modifier Camera 세션의 최신 Timeline 대상만 Timer에 예약합니다."""
+
+    if not modifier_camera_session_is_active(session):
+        _PENDING_UPDATES.pop(session.scene_pointer, None)
+        return
     previous_frame = (
         session.frame_start + session.current_index
         if session.current_index >= 0
@@ -1434,8 +1496,12 @@ def frame_change_post(scene, *_args) -> None:
     try:
         scene_pointer = scene.as_pointer()
         session = _TIMELINE_SESSIONS.get(scene_pointer)
+        if session is not None and not modifier_camera_session_is_active(session):
+            cancel_modifier_camera_requests(scene)
+            return
         if (
             session is None
+            or not modifier_camera_session_is_active(session)
             or not session.timeline_active
             or not session.timeline_manifest_signature
             or session.update_guard
@@ -1475,7 +1541,8 @@ def process_pending_timeline_updates():
     for update in pending:
         session = update.session
         if (
-            not session.timeline_active
+            not modifier_camera_session_is_active(session)
+            or not session.timeline_active
             or update.session_token != _session_token(session)
             or update.target_image_id in session.pending_image_ids
             or (
@@ -1492,7 +1559,8 @@ def process_pending_timeline_updates():
         settings = session.scene.colmap_import
         try:
             if (
-                update.session_token != _session_token(session)
+                not modifier_camera_session_is_active(session)
+                or update.session_token != _session_token(session)
                 or (
                     session.current_index,
                     session.current_image_id,
@@ -1514,7 +1582,11 @@ def process_pending_timeline_updates():
                 rollback_scene_camera=update.previous_scene_camera,
             )
         except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as exc:
-            settings.review_status = f"Timeline frame 전환 실패: {exc}"
+            if (
+                modifier_camera_session_is_active(session)
+                and update.session_token == _session_token(session)
+            ):
+                settings.review_status = f"Timeline frame 전환 실패: {exc}"
     return None
 
 
@@ -1526,7 +1598,7 @@ def _marker_guard_session_valid(session) -> bool:
             session.timeline_active
             and session.timeline_refresh_enabled
             and session.timeline_manifest_signature
-            and modifier_marker_session_owned(session.scene)
+            and modifier_camera_session_is_active(session)
             and not session.update_guard
             and settings.dataset_uuid == session.dataset_uuid
             and settings.source_fingerprint == session.source_fingerprint
@@ -1543,8 +1615,8 @@ def _resync_after_marker_restore(session) -> tuple[str, ...]:
     _PENDING_UPDATES.pop(scene_pointer, None)
 
     current_camera = session.camera_objects.get(session.current_image_id)
-    if current_camera is not None:
-        session.scene.camera = current_camera
+    if current_camera is not None and modifier_camera_session_is_active(session):
+        set_modifier_scene_camera(session, current_camera)
         try:
             from .camera_review_viewport import update_review_view_for_current
 
@@ -1673,7 +1745,7 @@ def process_pending_marker_guard_updates():
     for scene_pointer in ready_scene_pointers:
         _MARKER_GUARD_DIRTY_AT.pop(scene_pointer, None)
         session = _TIMELINE_SESSIONS.get(scene_pointer)
-        if session is None:
+        if session is None or not modifier_camera_session_is_active(session):
             continue
         try:
             restore_moved_owned_markers(session)
@@ -1732,6 +1804,7 @@ __all__ = [
     "attach_review_timeline_markers",
     "acquire_modifier_marker_session",
     "build_or_refresh_timeline",
+    "cancel_modifier_camera_requests",
     "capture_owned_marker_refresh_token",
     "capture_timeline_state",
     "detach_session",
@@ -1740,6 +1813,8 @@ __all__ = [
     "detach_review_timeline_markers",
     "frame_change_post",
     "marker_base_name",
+    "modifier_camera_session_is_active",
+    "modifier_camera_session_settled",
     "modifier_marker_session_owned",
     "modifier_review_markers_attached",
     "process_pending_marker_guard_updates",
@@ -1751,6 +1826,7 @@ __all__ = [
     "restore_moved_owned_markers",
     "restore_timeline_runtime_from_manifest",
     "restore_timeline_state",
+    "set_modifier_scene_camera",
     "sync_playhead_to_current",
     "timeline_marker_guard_post",
     "unregister_frame_change_handler",

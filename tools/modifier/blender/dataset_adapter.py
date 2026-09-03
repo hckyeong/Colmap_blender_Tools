@@ -9,24 +9,12 @@ from typing import Any
 try:
     from ....shared.colmap_dataset.contracts import DatasetImportMetadata
     from ....shared.colmap_dataset.blender.registry import (
-        begin_edit_commit,
-        begin_import_commit,
-        refresh_source_metadata,
-        register_display_listener,
-        snapshot,
         unregister_display_listener,
-        update_display_settings,
     )
 except ImportError:
     from shared.colmap_dataset.contracts import DatasetImportMetadata
     from shared.colmap_dataset.blender.registry import (
-        begin_edit_commit,
-        begin_import_commit,
-        refresh_source_metadata,
-        register_display_listener,
-        snapshot,
         unregister_display_listener,
-        update_display_settings,
     )
 
 
@@ -89,15 +77,17 @@ def build_import_metadata(loaded: Any, reconstruction: Any, settings: Any) -> Da
 
 
 def matching_import_identity(scene: Any, settings: Any) -> tuple[str | None, Path | None]:
-    """같은 Source 재Import에 공용 UUID를 우선하고 Legacy 설정을 보조로 사용합니다."""
+    """같은 Source 재Import에는 Modifier Domain과 자기 Scene Mirror만 사용합니다."""
 
-    if _shared_property_available(scene):
-        current = snapshot(scene)
-        if current.available:
-            try:
-                return current.dataset_uuid, Path(current.model_directory).resolve()
-            except (OSError, RuntimeError, ValueError):
-                return None, None
+    try:
+        from .modifier_runtime_domain import domain_for_scene
+
+        domain = domain_for_scene(scene)
+        if domain is not None:
+            state = domain.dataset_state
+            return state.dataset_uuid, Path(state.source.model_directory).resolve()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None, None
     if not settings.dataset_uuid or not settings.active_model_directory:
         return None, None
     try:
@@ -112,31 +102,17 @@ def prepare_modifier_import_commit(
     runtime_state: Any,
     settings: Any,
 ):
-    """Modifier Scene commit과 함께 적용할 공용 Dataset transaction을 준비합니다."""
+    """신규 Import에서 Legacy 공용 Dataset을 더 이상 권위로 갱신하지 않습니다."""
 
-    if not _shared_property_available(scene):
-        return None
-    metadata = build_import_metadata(
-        loaded,
-        runtime_state.current_reconstruction,
-        settings,
-    )
-    return begin_import_commit(scene, metadata)
+    del scene, loaded, runtime_state, settings
+    return None
 
 
 def prepare_modifier_edit_commit(scene: Any, new_state: Any):
-    """확정 편집 Scene 동기화와 함께 적용할 공용 Revision transaction을 준비합니다."""
+    """확정 편집이 Legacy 공용 Revision을 변경하지 않도록 빈 경계를 반환합니다."""
 
-    if not _shared_property_available(scene):
-        return None
-    reconstruction = new_state.current_reconstruction
-    return begin_edit_commit(
-        scene,
-        dataset_uuid=str(new_state.dataset_uuid),
-        camera_count=len(reconstruction.cameras),
-        image_count=len(reconstruction.images),
-        point3d_count=len(reconstruction.points3d),
-    )
+    del scene, new_state
+    return None
 
 
 def refresh_shared_source_after_export(
@@ -145,12 +121,9 @@ def refresh_shared_source_after_export(
     reconstruction: Any,
     settings: Any,
 ) -> None:
-    """Export 성공의 새 Source 기준값을 Dataset Revision 증가 없이 반영합니다."""
+    """Export 결과를 Legacy 공용 Dataset에 다시 쓰지 않습니다."""
 
-    if not _shared_property_available(scene):
-        return
-    metadata = build_import_metadata(loaded, reconstruction, settings)
-    refresh_source_metadata(scene, metadata)
+    del scene, loaded, reconstruction, settings
 
 
 def synchronize_display_from_modifier(
@@ -158,18 +131,9 @@ def synchronize_display_from_modifier(
     context: Any,
     *field_names: str,
 ) -> None:
-    """Modifier UI 표시값을 같은 UUID의 공용 Dataset 속성에 한 Revision으로 반영합니다."""
+    """Modifier 표시 설정을 독립 상태로 유지하고 Legacy 공유 쓰기를 생략합니다."""
 
-    if _DISPLAY_SYNC_IN_PROGRESS:
-        return
-    scene = getattr(settings, "id_data", None) or getattr(context, "scene", None)
-    if not _shared_property_available(scene):
-        return
-    current = snapshot(scene)
-    if not current.available or current.dataset_uuid != str(settings.dataset_uuid):
-        return
-    values = {field_name: getattr(settings, field_name) for field_name in field_names}
-    update_display_settings(scene, **values)
+    del settings, context, field_names
 
 
 def _apply_shared_display_to_modifier(
@@ -206,13 +170,11 @@ def _apply_shared_display_to_modifier(
 
 
 def register_modifier_dataset_adapter() -> None:
-    """Modifier의 공용 표시 속성 소비 Adapter를 등록합니다."""
-
-    register_display_listener("modifier", _apply_shared_display_to_modifier)
+    """Legacy Dataset은 읽기 전용 입력이므로 신규 표시 Listener를 등록하지 않습니다."""
 
 
 def unregister_modifier_dataset_adapter() -> None:
-    """Modifier가 등록한 공용 표시 속성 소비 Adapter만 해제합니다."""
+    """구버전 등록이 남아 있으면 Modifier 표시 Listener만 안전하게 해제합니다."""
 
     unregister_display_listener("modifier")
 

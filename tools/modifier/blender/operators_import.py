@@ -58,6 +58,7 @@ from .runtime_state import (
     prepare_import_state,
     write_history_settings,
 )
+from .modifier_runtime_domain import domain_for_scene, retire_domain
 from .scene_bridge import commit_staging
 from .selection import clear_snapshots
 
@@ -454,6 +455,7 @@ def _commit_import(context, session) -> None:
     """검증된 staging을 원자 commit하고 Runtime·Review 상태를 완료합니다."""
 
     settings = context.scene.colmap_import
+    previous_domain = domain_for_scene(context.scene)
     loaded = session.job.result
     runtime_state = session.runtime_state
     if runtime_state is None or session.scene_job is None:
@@ -512,7 +514,16 @@ def _commit_import(context, session) -> None:
         shared_commit.complete()
     settings.warning_summary = "\n".join((*loaded.warnings, *cleanup_warnings))
     write_history_settings(settings, runtime_state)
-    install_state(runtime_state)
+    installed_domain = install_state(
+        runtime_state,
+        scene=context.scene,
+        mark_dirty=True,
+    )
+    if (
+        previous_domain is not None
+        and previous_domain.domain_uuid != installed_domain.domain_uuid
+    ):
+        retire_domain(previous_domain.domain_uuid)
     _initialize_review_after_import(context, runtime_state)
 
     clear_snapshots()

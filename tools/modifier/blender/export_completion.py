@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from ..core.export_types import ExportTransactionError
+from ..core.edit_journal import EditJournal
 from .camera_edit_session import force_end_camera_mode
 from .camera_review_session import ensure_review_session
 from .dataset_adapter import refresh_shared_source_after_export
 from .point_edit_session import force_end_point_mode
 from .runtime_state import (
-    install_state,
     state_from_successful_export,
+    write_domain_settings,
     write_history_settings,
     write_source_settings,
 )
+from .modifier_runtime_domain import domain_for_scene
 from .selection import clear_snapshots
 
 
@@ -37,17 +39,42 @@ def commit_exported_runtime(context, state, result) -> tuple[str, ...]:
     """디스크 저장 성공 결과를 Blender Runtime의 새 기준선으로 전환합니다."""
 
     settings = context.scene.colmap_import
+    domain = domain_for_scene(context.scene, required=True)
+    if domain.dataset_state is not state:
+        raise ValueError("Export 완료 대상과 현재 Modifier Runtime Domain이 다릅니다.")
     exported_state = state_from_successful_export(state, result.loaded)
-    install_state(exported_state)
-    write_source_settings(settings, exported_state)
-    write_history_settings(settings, exported_state)
-    settings.camera_count = str(
-        len(exported_state.current_reconstruction.cameras)
+    exported_journal = EditJournal(
+        exported_state.dataset_uuid,
+        exported_state.source.source_fingerprint,
     )
-    settings.image_count = str(len(exported_state.current_reconstruction.images))
-    settings.point3d_count = str(
-        len(exported_state.current_reconstruction.points3d)
-    )
+    try:
+        domain.replace_baseline(
+            exported_state,
+            exported_journal,
+            status="Export 결과를 새 Modifier 기준선으로 설치했습니다.",
+            mark_dirty=True,
+        )
+        write_source_settings(settings, exported_state)
+        write_history_settings(settings, exported_state)
+        write_domain_settings(settings, domain)
+        settings.camera_count = str(
+            len(exported_state.current_reconstruction.cameras)
+        )
+        settings.image_count = str(len(exported_state.current_reconstruction.images))
+        settings.point3d_count = str(
+            len(exported_state.current_reconstruction.points3d)
+        )
+    except Exception as exc:
+        domain.freeze(
+            "Export 파일은 기록됐지만 새 Runtime 기준선을 설치하지 못했습니다: "
+            f"{exc}"
+        )
+        write_domain_settings(settings, domain)
+        raise RuntimeError(
+            "Export 파일 기록 뒤 Modifier Runtime 기준선 설치에 실패했습니다. "
+            "Dataset을 다시 Import하십시오. "
+            f"원인: {exc}"
+        ) from exc
     refresh_shared_source_after_export(
         context.scene,
         result.loaded,

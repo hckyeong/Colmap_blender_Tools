@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import tempfile
-import weakref
 from pathlib import Path
 
 import bmesh
@@ -42,7 +41,9 @@ from tools.modifier.blender.undo_domain_coordinator import (
     COLMAPUndoProtectionSnapshot,
     capture_undo_protection_snapshot,
     clear_undo_domain_state,
+    current_undo_protection_snapshot,
     process_pending_undo_reconcile,
+    schedule_undo_domain_reconcile,
     undo_domain_reconcile_pending,
 )
 from tests.modifier.fixture_utils import make_legacy_text_multi_point
@@ -119,6 +120,8 @@ def make_review_fixture(root: Path) -> None:
 def process_rehydrate():
     """Background mode에서 예약된 최신 Timer 작업을 동기적으로 완료합니다."""
 
+    if not undo_domain_reconcile_pending():
+        schedule_undo_domain_reconcile(current_undo_protection_snapshot())
     for _index in range(8):
         process_pending_undo_reconcile()
         if not undo_domain_reconcile_pending():
@@ -157,14 +160,16 @@ def assert_authoritative_state(
     image_count,
     previous_runtime,
 ):
+    """Global Undo 뒤 독립 Runtime identity와 권위 상태가 그대로인지 검사합니다."""
+
     settings = scene.colmap_import
     state = ensure_runtime(scene)
     assert_true(
-        state is not previous_runtime
+        state is previous_runtime
         and state.current_reconstruction
-        is not previous_runtime.current_reconstruction
-        and state.indexes is not previous_runtime.indexes,
-        "Global Undo 뒤 Runtime·Reconstruction·Indexes identity가 재생성되지 않았습니다.",
+        is previous_runtime.current_reconstruction
+        and state.indexes is previous_runtime.indexes,
+        "Global Undo가 독립 Runtime·Reconstruction·Indexes identity를 변경했습니다.",
     )
     assert_true(
         settings.edit_revision == revision
@@ -243,12 +248,7 @@ try:
         )
         scene = bpy.context.scene
         baseline_runtime = ensure_runtime(scene)
-        baseline_session = ensure_review_session(bpy.context)
-        assert_true(
-            baseline_session.timeline_active,
-            "Import 뒤 자동 Timeline이 활성화되지 않았습니다.",
-        )
-        del baseline_session
+        ensure_review_session(bpy.context)
         # Background mode는 시작 시 Undo System이 비활성이라 기준 Step을
         # 명시적으로 한 번 초기화해야 합니다. 이후에는 Remove가 만든 Step을
         # 즉시 Undo하므로 별도의 작업 Step을 사이에 끼우지 않습니다.
@@ -274,14 +274,13 @@ try:
             # Stack에 materialize하지 않으므로 GUI와 같은 완료 Step을 만듭니다.
             bpy.ops.ed.undo_push(message="Point Remove Operator Step")
         edited_runtime = ensure_runtime(scene)
-        edited_session = ensure_review_session(bpy.context)
-        edited_session_ref = weakref.ref(edited_session)
+        ensure_review_session(bpy.context)
         assert_true(
             edited_runtime.edit_revision == 1
             and len(edited_runtime.current_reconstruction.points3d) == 2,
             "Point Remove 기준 상태를 만들지 못했습니다.",
         )
-        del bm, point_object, edited_session, settings, scene
+        del bm, point_object, settings, scene
 
         # Remove가 만든 Global Undo Step을 즉시 되돌립니다. 별도의 사용자
         # Object용 undo_push를 끼우지 않아 Operator 소유권도 함께 검증합니다.
@@ -294,22 +293,12 @@ try:
         scene = bpy.context.scene
         restored_runtime = assert_authoritative_state(
             scene,
-            revision=0,
-            point_count=3,
+            revision=1,
+            point_count=2,
             image_count=1,
             previous_runtime=edited_runtime,
         )
-        restored_session = current_review_session(bpy.context, strict=True)
-        assert_true(
-            edited_session_ref() is None
-            and restored_session.edit_revision == 0
-            and restored_session.index_revision == 0
-            and restored_session.timeline_active
-            and restored_session.current_image_id == 7,
-            "Global Undo 뒤 Camera Review·Timeline이 새 Session으로 재연결되지 않았습니다.",
-        )
-        restored_session_ref = weakref.ref(restored_session)
-        del restored_session, scene
+        del scene
 
         # Redo도 Undo가 복원한 Scene history를 권위로 새 Runtime을 만듭니다.
         with view3d_override():
@@ -326,29 +315,20 @@ try:
             image_count=1,
             previous_runtime=restored_runtime,
         )
-        redone_session = current_review_session(bpy.context, strict=True)
-        assert_true(
-            restored_session_ref() is None
-            and redone_session.edit_revision == 1
-            and redone_session.timeline_active
-            and redone_session.current_image_id == 7,
-            "Global Redo 뒤 Camera Review가 새 revision으로 재연결되지 않았습니다.",
-        )
-        del redone_session, scene
+        del scene
 
-        # 다음 Dataset으로 전환하기 전 Point 편집을 기준 상태로 되돌립니다.
+        # 다음 Dataset으로 전환하기 전 Modifier 전용 Undo로 기준 상태를 되돌립니다.
         with view3d_override():
             assert_true(
-                bpy.ops.ed.undo() == {"FINISHED"},
-                "기준 상태 Undo에 실패했습니다.",
+                bpy.ops.colmap.undo_last_edit() == {"FINISHED"},
+                "Modifier 전용 기준 상태 Undo에 실패했습니다.",
             )
-        process_rehydrate()
         assert_authoritative_state(
             bpy.context.scene,
             revision=0,
             point_count=3,
             image_count=1,
-            previous_runtime=redone_runtime,
+            previous_runtime=ensure_runtime(bpy.context.scene),
         )
 
         review_root = Path(directory) / "undo_camera_filter_dataset"
@@ -362,8 +342,7 @@ try:
         )
         scene = bpy.context.scene
         filter_baseline_runtime = ensure_runtime(scene)
-        filter_baseline_session = ensure_review_session(bpy.context)
-        filter_baseline_session_ref = weakref.ref(filter_baseline_session)
+        ensure_review_session(bpy.context)
         with view3d_override():
             bpy.ops.ed.undo_push(message="Initialize Before Camera Filter")
             assert_true(
@@ -374,15 +353,14 @@ try:
             )
             bpy.ops.ed.undo_push(message="Camera Filter Operator Step")
         filtered_runtime = ensure_runtime(scene)
-        filtered_session = ensure_review_session(bpy.context)
-        filtered_session_ref = weakref.ref(filtered_session)
+        ensure_review_session(bpy.context)
         assert_true(
             filtered_runtime.edit_revision == 1
             and len(filtered_runtime.current_reconstruction.images) == 2
             and len(filtered_runtime.current_reconstruction.points3d) == 2,
             "Camera Filter 기준 상태를 만들지 못했습니다.",
         )
-        del filter_baseline_session, filtered_session, settings, scene
+        del settings, scene
 
         with view3d_override():
             assert_true(
@@ -393,9 +371,9 @@ try:
         scene = bpy.context.scene
         restored_filter_runtime = assert_authoritative_state(
             scene,
-            revision=0,
-            point_count=3,
-            image_count=3,
+            revision=1,
+            point_count=2,
+            image_count=2,
             previous_runtime=filtered_runtime,
         )
         restored_filter_session = current_review_session(
@@ -404,15 +382,11 @@ try:
         )
         restored_filter_settings = scene.colmap_import
         assert_true(
-            restored_filter_runtime is not filter_baseline_runtime
-            and filtered_session_ref() is None
-            and filter_baseline_session_ref() is None
-            and restored_filter_session.timeline_active
-            and restored_filter_session.current_image_id == 1
-            and restored_filter_settings.review_current_image_id == "1"
-            and bool(restored_filter_session.resident_images),
-            "Camera Filter Undo 뒤 복원 Scene의 Camera·Background가 "
-            "새 Session에 반영되지 않았습니다.",
+            restored_filter_runtime is filtered_runtime
+            and restored_filter_runtime is not filter_baseline_runtime
+            and restored_filter_session.edit_revision == 1
+            and restored_filter_settings.edit_revision == 1,
+            "Camera Filter Global Undo가 독립 Runtime 편집 결과를 변경했습니다.",
         )
         next_frame = restored_filter_session.frame_start + min(
             1,
@@ -421,12 +395,9 @@ try:
         scene.frame_set(next_frame)
         process_pending_timeline_updates()
         assert_true(
-            current_review_session(
-                bpy.context,
-                strict=True,
-            ).current_image_id
-            == restored_filter_session.review_index.frame_to_image_id[next_frame],
-            "Camera Filter Undo 뒤 Timeline 이동이 Review를 갱신하지 못했습니다.",
+            ensure_runtime(scene) is restored_filter_runtime
+            and ensure_runtime(scene).edit_revision == 1,
+            "비활성 Modifier의 Timeline 이동이 독립 Runtime을 변경했습니다.",
         )
 finally:
     blender_colmap.unregister()

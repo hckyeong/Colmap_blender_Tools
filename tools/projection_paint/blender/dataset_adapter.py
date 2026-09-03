@@ -427,7 +427,16 @@ def bind_shared_dataset(scene: Any, reason: str = "") -> CameraManifest:
     scene.frame_end = manifest.frame_end
     runtime = install_camera_runtime(scene, manifest)
     scene.frame_set(active_entry.frame)
-    scene.camera = runtime.objects[active_entry.camera_uuid]
+    from .camera_scene import (
+        apply_projection_camera_state,
+        projection_camera_session_is_active,
+    )
+
+    if projection_camera_session_is_active(scene):
+        apply_projection_camera_state(
+            scene,
+            runtime.objects[active_entry.camera_uuid],
+        )
     settings.current_image_id = str(active_entry.image_id)
     settings.current_image_name = active_entry.image_name
     settings.status = (

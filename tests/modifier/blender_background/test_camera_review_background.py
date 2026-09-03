@@ -24,6 +24,7 @@ from tools.modifier.blender import (
     camera_review_viewport,
     edit_workflows,
     lifecycle,
+    modifier_session,
     modifier_workspace,
     operators_import,
     state_handlers,
@@ -65,12 +66,50 @@ from tools.modifier.blender.ownership import (
     SOURCE_FINGERPRINT_KEY,
 )
 from tools.modifier.blender.panels import CLASSES as PANEL_CLASSES
+from tools.modifier.blender.modifier_workspace_contract import MODIFIER_WORKSPACE_SPEC
 from tests.modifier.fixture_utils import make_modern_text
+from shared.blender_runtime.workspace_factory import (
+    STATE_READY,
+    WORKSPACE_OWNER_KEY as SHARED_WORKSPACE_OWNER_KEY,
+    WORKSPACE_SCHEMA_KEY,
+    WORKSPACE_SEED_SCHEMA_KEY,
+    WORKSPACE_STATE_KEY,
+    WORKSPACE_TOOL_ID_KEY,
+    WORKSPACE_UUID_KEY,
+)
 
 
 def assert_true(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def _activate_modifier_camera_session_for_test(scene) -> None:
+    """현재 Background Window를 유효한 Modifier Camera 세션으로 활성화합니다."""
+
+    window = bpy.context.window
+    workspace = window.workspace
+    workspace[SHARED_WORKSPACE_OWNER_KEY] = "colmap_tools"
+    workspace[WORKSPACE_TOOL_ID_KEY] = MODIFIER_WORKSPACE_SPEC.tool_id
+    workspace[WORKSPACE_UUID_KEY] = "modifier-camera-review-background"
+    workspace[WORKSPACE_SCHEMA_KEY] = MODIFIER_WORKSPACE_SPEC.workspace_schema
+    workspace[WORKSPACE_SEED_SCHEMA_KEY] = MODIFIER_WORKSPACE_SPEC.seed_schema
+    workspace[WORKSPACE_STATE_KEY] = STATE_READY
+    session = modifier_session.SESSION
+    session.generation += 1
+    session.phase = modifier_session.SESSION_ACTIVE
+    session.target_window_ref = window
+    session.target_window_pointer = window.as_pointer()
+    session.modifier_workspace_ref = workspace
+    session.modifier_workspace_pointer = workspace.as_pointer()
+    session.modifier_workspace_name = workspace.name
+    control_area = next(
+        (area for area in window.screen.areas if area.type == "VIEW_3D"),
+        next(iter(window.screen.areas)),
+    )
+    session.bind_control_area(window, control_area)
+    camera_review_timeline.release_modifier_marker_session(scene)
+    camera_review_timeline.acquire_modifier_marker_session(scene, window=window)
 
 
 def _write_ppm(path: Path, rgb: tuple[int, int, int]) -> None:
@@ -224,6 +263,7 @@ try:
         not COLMAP_OT_review_background_toggle.poll(bpy.context),
         "비활성 Modifier 세션에서 F7 Background 토글이 허용되었습니다.",
     )
+    _activate_modifier_camera_session_for_test(scene)
     camera_review_timeline.register_frame_change_handler()
     camera_review_timeline.register_frame_change_handler()
     assert_true(
@@ -510,7 +550,10 @@ try:
             and camera_review_timeline.restore_moved_owned_markers(session) == (),
             "비활성 Modifier의 Handler 또는 Guard가 Marker를 다시 생성했습니다.",
         )
-        camera_review_timeline.acquire_modifier_marker_session(scene)
+        camera_review_timeline.acquire_modifier_marker_session(
+            scene,
+            window=bpy.context.window,
+        )
         assert_true(
             camera_review_timeline.attach_review_timeline_markers(session) == 4
             and camera_review_timeline.modifier_review_markers_attached(scene),
@@ -2179,7 +2222,10 @@ try:
             and not camera_review_timeline.modifier_marker_session_owned(scene),
             "ReviewSession 없는 Workspace 종료가 Scene-only Marker/lease를 정리하지 못했습니다.",
         )
-        camera_review_timeline.acquire_modifier_marker_session(scene)
+        camera_review_timeline.acquire_modifier_marker_session(
+            scene,
+            window=bpy.context.window,
+        )
         modern_session = ensure_review_session(bpy.context)
         camera_review_timeline.attach_review_timeline_markers(modern_session)
         camera_review_session.clear_review_sessions(bpy.context)

@@ -25,6 +25,14 @@ from tools.modifier.blender import (
 from tools.modifier.blender.camera_review_session import (
     current_review_session,
 )
+from tools.modifier.blender.edit_workflows import (
+    PendingRemove,
+    apply_pending_remove,
+    undo_last_edit,
+)
+from tools.modifier.blender.modifier_runtime_domain import domain_for_scene
+from tools.modifier.blender.runtime_state import ensure_runtime
+from tools.modifier.core.removal import plan_point_removal
 
 
 def assert_true(condition, message):
@@ -85,8 +93,14 @@ def _marker_snapshot(scene) -> tuple[tuple[object, ...], ...]:
 
 
 def _process_load_restore() -> None:
-    result = state_handlers.process_pending_load_restore()
-    assert_true(result is None, "로드 복원 작업이 예상 밖의 재시도를 요청했습니다.")
+    """자동 Runtime 복원 Timer를 완료될 때까지 수동으로 전진시킵니다."""
+
+    if bpy.app.timers.is_registered(state_handlers.process_pending_load_restore):
+        bpy.app.timers.unregister(state_handlers.process_pending_load_restore)
+    for _index in range(512):
+        if state_handlers.process_pending_load_restore() is None:
+            return
+    raise AssertionError("저장된 Modifier Runtime 자동 복원이 완료되지 않았습니다.")
 
 
 blender_colmap.register()
@@ -102,6 +116,30 @@ try:
         assert_true(
             bpy.ops.colmap.import_model() == {"FINISHED"},
             settings.status,
+        )
+
+        state = ensure_runtime(scene)
+        removal_plan = plan_point_removal(
+            state.current_reconstruction,
+            state.indexes,
+            (100,),
+            source_revision=state.edit_revision,
+        )
+        pending_remove = PendingRemove(
+            target_kind="POINTS",
+            dataset_uuid=state.dataset_uuid,
+            source_fingerprint=state.source.source_fingerprint,
+            edit_revision=state.edit_revision,
+            index_revision=state.index_revision,
+            history_hash=state.history_hash,
+            selected_point3d_ids=(100,),
+            selected_image_ids=(),
+            plan=removal_plan,
+        )
+        apply_pending_remove(bpy.context, state, pending_remove)
+        assert_true(
+            100 not in ensure_runtime(scene).current_reconstruction.points3d,
+            "저장 전 Modifier 독립 편집을 준비하지 못했습니다.",
         )
 
         session = current_review_session(bpy.context, strict=True)
@@ -124,6 +162,10 @@ try:
             "Camera Review 기준 파일 저장에 실패했습니다.",
         )
         assert_true(
+            not bpy.data.is_dirty,
+            "Modifier Domain 저장 완료 처리가 .blend를 다시 미저장 상태로 만들었습니다.",
+        )
+        assert_true(
             bpy.ops.wm.open_mainfile(filepath=str(blend_path)) == {"FINISHED"},
             "Camera Review 기준 파일 재열기에 실패했습니다.",
         )
@@ -135,25 +177,32 @@ try:
             current_review_session(bpy.context) is None,
             "로드 복원 Timer 전 구 Camera Review Session이 남았습니다.",
         )
-        with patch(
-            "tools.modifier.blender.runtime_state.ensure_runtime"
-        ) as ensure_runtime, patch(
-            "tools.modifier.core.loader.load_reconstruction"
-        ) as load_reconstruction:
-            state_handlers.invalidate_loaded_state()
-            state_handlers._schedule_load_restore()
-            _process_load_restore()
-        ensure_runtime.assert_not_called()
-        load_reconstruction.assert_not_called()
+        state_handlers.invalidate_loaded_state()
+        _process_load_restore()
         assert_true(
-            current_review_session(bpy.context) is None
+            runtime_state.cached_runtime_matches_scene(scene)
+            and settings.status_kind == "SUCCESS"
+            and not settings.domain_restore_error
             and not bpy.app.timers.is_registered(
                 state_handlers.process_pending_load_restore
             )
-            and not _marker_snapshot(scene)
             and loaded_manifest_json == marker_manifest_before_save
             and settings.review_marker_manifest_json == loaded_manifest_json,
-            "비활성 Workspace 로드가 Runtime 없이 저장 표시 데이터를 유지하지 못했습니다.",
+            "파일 Load가 저장된 Domain 작업 이력을 자동 Runtime으로 복원하지 못했습니다. "
+            f"status={settings.status!r}, error={settings.domain_restore_error!r}",
+        )
+        restored_domain = domain_for_scene(scene, required=True)
+        assert_true(
+            restored_domain.journal.poll_undo()
+            and not restored_domain.journal.poll_redo()
+            and 100 not in restored_domain.dataset_state.current_reconstruction.points3d,
+            "파일 Load가 저장 Operation의 Undo Delta를 다시 만들지 못했습니다.",
+        )
+        undo_last_edit(bpy.context)
+        assert_true(
+            100 in ensure_runtime(scene).current_reconstruction.points3d
+            and domain_for_scene(scene, required=True).journal.poll_redo(),
+            "재실행 뒤 Modifier 전용 Undo가 저장 편집을 복구하지 못했습니다.",
         )
 
         fake_window = SimpleNamespace(scene=scene)
@@ -176,16 +225,11 @@ try:
         ) as activate_markers:
             modifier_workspace._schedule_runtime_restore(fake_window, fake_area)
             assert_true(
-                modifier_workspace._RUNTIME_RESTORE_TASK is not None
-                and not runtime_state.cached_runtime_matches_scene(scene)
-                and settings.status_kind == "IMPORTING",
-                "Modifier Workspace 진입이 COLD Runtime 복원을 지연 시작하지 못했습니다.",
+                modifier_workspace._RUNTIME_RESTORE_TASK is None
+                and runtime_state.cached_runtime_matches_scene(scene)
+                and settings.status_kind == "SUCCESS",
+                "Modifier Workspace 재진입이 자동 복원된 WARM Runtime을 재사용하지 못했습니다.",
             )
-            for _index in range(256):
-                if modifier_workspace._process_runtime_restore() is None:
-                    break
-            else:
-                raise AssertionError("Modifier Workspace Runtime 복원이 완료되지 않았습니다.")
         if bpy.app.timers.is_registered(modifier_workspace._process_runtime_restore):
             bpy.app.timers.unregister(modifier_workspace._process_runtime_restore)
         assert_true(

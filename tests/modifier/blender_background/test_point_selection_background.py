@@ -685,6 +685,18 @@ try:
             and review_session.timeline_active,
             "Undo Last Edit 뒤 Review/Timeline revision이 즉시 갱신되지 않았습니다.",
         )
+        assert_true(
+            bpy.ops.colmap.redo_last_edit() == {"FINISHED"}
+            and settings.edit_revision == 1
+            and not ensure_runtime(scene).current_reconstruction.points3d,
+            "Modifier 전용 Redo가 마지막 Point 제거를 다시 적용하지 못했습니다.",
+        )
+        assert_true(
+            bpy.ops.colmap.undo_last_edit() == {"FINISHED"}
+            and settings.edit_revision == 0
+            and len(managed_objects("POINT_MESH")[0].data.vertices) == 1,
+            "Redo 뒤 Modifier 전용 Undo가 Point를 다시 복원하지 못했습니다.",
+        )
 
         # 관측 Camera 선택은 Point mode를 종료하고 Camera target으로 전환합니다.
         point_object = managed_objects("POINT_MESH")[0]
@@ -764,6 +776,18 @@ try:
             and review_session.current_image_id == 7
             and review_session.timeline_active,
             "Reset Edits 뒤 Review/Timeline이 즉시 복구되지 않았습니다.",
+        )
+        assert_true(
+            bpy.ops.colmap.undo_last_edit() == {"FINISHED"}
+            and settings.edit_revision == 1
+            and settings.image_count == "0",
+            "같은 Session에서 Reset Command를 Undo하지 못했습니다.",
+        )
+        assert_true(
+            bpy.ops.colmap.redo_last_edit() == {"FINISHED"}
+            and settings.edit_revision == 0
+            and settings.image_count == "1",
+            "Undo한 Reset Command를 다시 적용하지 못했습니다.",
         )
         assert_true(
             bpy.ops.colmap.import_model() == {"FINISHED"},

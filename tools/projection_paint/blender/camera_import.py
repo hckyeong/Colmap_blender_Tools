@@ -125,9 +125,12 @@ class CameraImportRequest:
     camera_frustum_size: float = DEFAULT_CAMERA_FRUSTUM_SIZE
     core_validated: bool = False
     snapshot_schema_version: int = 0
+    source_domain_uuid: str = ""
+    source_domain_generation: int = 0
     source_dataset_uuid: str = ""
     source_revision: int = 0
     source_modifier_fingerprint: str = ""
+    source_history_hash: str = ""
     content_fingerprint: str = ""
     snapshot_created_at: str = ""
     preferred_image_id: int = 0
@@ -602,7 +605,13 @@ class CameraImportJob:
                 for obj in self.collection.objects
                 if owned_uuid_of(obj) == preferred_entry.camera_uuid
             )
-            self.scene.camera = first_camera
+            from .camera_scene import (
+                apply_projection_camera_state,
+                projection_camera_session_is_active,
+            )
+
+            if projection_camera_session_is_active(self.scene):
+                apply_projection_camera_state(self.scene, first_camera)
             settings = getattr(self.scene, "projection_paint", None)
             if settings is not None:
                 for attribute in (
@@ -616,9 +625,12 @@ class CameraImportJob:
                     "marker_manifest_json",
                     "snapshot_uuid",
                     "snapshot_revision",
+                    "source_modifier_domain_uuid",
+                    "source_modifier_domain_generation",
                     "source_modifier_dataset_uuid",
                     "source_modifier_revision",
                     "source_modifier_fingerprint",
+                    "source_modifier_history_hash",
                     "source_content_fingerprint",
                     "snapshot_camera_count",
                     "snapshot_image_count",
@@ -651,12 +663,21 @@ class CameraImportJob:
                 if int(self.request.snapshot_schema_version) > 0:
                     settings.snapshot_uuid = manifest.dataset_uuid
                     settings.snapshot_revision = manifest.dataset_revision
+                    settings.source_modifier_domain_uuid = str(
+                        self.request.source_domain_uuid
+                    )
+                    settings.source_modifier_domain_generation = int(
+                        self.request.source_domain_generation
+                    )
                     settings.source_modifier_dataset_uuid = str(
                         self.request.source_dataset_uuid
                     )
                     settings.source_modifier_revision = int(self.request.source_revision)
                     settings.source_modifier_fingerprint = str(
                         self.request.source_modifier_fingerprint
+                    )
+                    settings.source_modifier_history_hash = str(
+                        self.request.source_history_hash
                     )
                     settings.source_content_fingerprint = str(
                         self.request.content_fingerprint
@@ -697,8 +718,11 @@ class CameraImportJob:
                         tag_snapshot_resource(
                             resource,
                             snapshot_uuid=manifest.dataset_uuid,
+                            source_domain_uuid=self.request.source_domain_uuid,
+                            source_domain_generation=self.request.source_domain_generation,
                             source_dataset_uuid=self.request.source_dataset_uuid,
                             source_revision=self.request.source_revision,
+                            source_history_hash=self.request.source_history_hash,
                             schema_version=self.request.snapshot_schema_version,
                         )
             self._fault("before_runtime")

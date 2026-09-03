@@ -10,8 +10,10 @@ from typing import Any, Callable
 from .camera_scene import (
     CameraManifestEntry,
     activate_managed_frame,
+    apply_projection_camera_state,
     consume_committed_frame_request,
     install_camera_runtime,
+    projection_camera_session_is_active,
     runtime_for_scene,
     scene_manifest,
 )
@@ -238,9 +240,11 @@ def _apply_camera_resolution(runtime: PaintRuntime, camera: Any, image: Any) -> 
         settings.original_render_width = int(render.resolution_x)
         settings.original_render_height = int(render.resolution_y)
         settings.render_resolution_overridden = True
-    if (int(render.resolution_x), int(render.resolution_y)) != (width, height):
-        render.resolution_x = width
-        render.resolution_y = height
+    apply_projection_camera_state(
+        runtime.scene,
+        camera,
+        render_resolution=(width, height, int(render.resolution_percentage)),
+    )
     settings.applied_render_width = width
     settings.applied_render_height = height
 
@@ -296,7 +300,15 @@ def _restore_frame_source_commit_snapshot(
 
     scene = runtime.scene
     settings = scene.projection_paint
-    scene.camera = snapshot.scene_camera
+    apply_projection_camera_state(
+        scene,
+        snapshot.scene_camera,
+        render_resolution=(
+            snapshot.render_resolution[0],
+            snapshot.render_resolution[1],
+            int(scene.render.resolution_percentage),
+        ),
+    )
     settings.stencil_texture = snapshot.stencil_texture
     if _pointer(snapshot.stencil_texture):
         snapshot.stencil_texture.image = snapshot.stencil_texture_image
@@ -305,7 +317,6 @@ def _restore_frame_source_commit_snapshot(
     settings.current_image_id = snapshot.current_image_id
     settings.current_image_name = snapshot.current_image_name
     settings.stencil_frame_corners_json = snapshot.frame_corners_json
-    scene.render.resolution_x, scene.render.resolution_y = snapshot.render_resolution
     settings.render_resolution_overridden = snapshot.render_resolution_overridden
     settings.original_render_width, settings.original_render_height = (
         snapshot.original_render_resolution
@@ -367,7 +378,24 @@ def _stage_current_source(
         raise PaintRuntimeError(f"현재 Frame {frame}에 관리 Camera가 없습니다.")
     if expected_image_id is not None and int(entry.image_id) != int(expected_image_id):
         raise PaintRuntimeError("예약한 IMAGE_ID Source 요청이 변경되었습니다.")
-    current_request = request_is_current or (lambda: True)
+    camera_runtime = runtime_for_scene(runtime.scene)
+    camera_token = (
+        camera_runtime.camera_session_token if camera_runtime is not None else None
+    )
+    supplied_request = request_is_current or (lambda: True)
+
+    def current_request() -> bool:
+        """호출자 요청과 Projection Camera 세대가 모두 최신인지 확인합니다."""
+
+        return bool(
+            supplied_request()
+            and camera_token is not None
+            and projection_camera_session_is_active(
+                runtime.scene,
+                token=camera_token,
+            )
+        )
+
     if not current_request():
         raise PaintRuntimeError("최신 Frame Source 요청이 변경되었습니다.")
     path = runtime.image_paths.get(entry.image_id)
@@ -705,7 +733,15 @@ def _restore_reconnect_snapshot(
     runtime.cache.invalidate()
     try:
         scene.frame_set(snapshot.frame)
-        scene.camera = snapshot.scene_camera
+        apply_projection_camera_state(
+            scene,
+            snapshot.scene_camera,
+            render_resolution=(
+                snapshot.render_resolution[0],
+                snapshot.render_resolution[1],
+                int(scene.render.resolution_percentage),
+            ),
+        )
         restore_viewport_navigation(context, snapshot.navigation)
     except Exception as exc:
         errors.append(str(exc))
@@ -755,7 +791,6 @@ def _restore_reconnect_snapshot(
     except Exception as exc:
         errors.append(str(exc))
     try:
-        scene.render.resolution_x, scene.render.resolution_y = snapshot.render_resolution
         settings.render_resolution_overridden = snapshot.render_resolution_overridden
         settings.original_render_width, settings.original_render_height = (
             snapshot.original_render_resolution
@@ -1110,7 +1145,7 @@ def refresh_frame_source(
     """Frame Source를 최신 요청으로 원자 갱신하고 성공 여부를 반환합니다."""
 
     settings = getattr(scene, "projection_paint", None)
-    if settings is None:
+    if settings is None or not projection_camera_session_is_active(scene):
         return False
     try:
         runtime = ensure_paint_runtime(scene)
@@ -1257,7 +1292,10 @@ def schedule_paint_reconcile(scene: Any, reason: str) -> None:
         """현재 Scene Pointer가 유효할 때 Paint 연결을 Blender 상태에서 복구합니다."""
         import bpy
 
-        if _pointer(scene) != scene_pointer:
+        if (
+            _pointer(scene) != scene_pointer
+            or not projection_camera_session_is_active(scene)
+        ):
             return None
         from .paint_state import reconcile_paint_state
 
@@ -1305,7 +1343,11 @@ def stop_paint_runtime(
         lifecycle_registry().unregister_timer(_viewport_tracking_tick)
         lifecycle_registry().unregister_timer(_paint_tool_edge_tick)
     settings = getattr(active_scene, "projection_paint", None)
-    if settings is None or not restore_resolution:
+    if (
+        settings is None
+        or not restore_resolution
+        or not projection_camera_session_is_active(active_scene)
+    ):
         return
     if bool(settings.render_resolution_overridden):
         current = (

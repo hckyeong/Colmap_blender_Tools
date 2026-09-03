@@ -67,12 +67,17 @@ def _modifier_camera_view_active(context) -> bool:
     """활성 Modifier 세션의 3D Viewport가 Camera View인지 확인합니다."""
 
     from .modifier_session import is_session_active_for_window
+    from .camera_review_timeline import modifier_camera_session_is_active
 
     area = getattr(context, "area", None)
     space = getattr(context, "space_data", None)
     region_3d = getattr(space, "region_3d", None)
     return bool(
         is_session_active_for_window(getattr(context, "window", None))
+        and modifier_camera_session_is_active(
+            current_review_session(context),
+            window=getattr(context, "window", None),
+        )
         and area is not None
         and area.type == "VIEW_3D"
         and region_3d is not None

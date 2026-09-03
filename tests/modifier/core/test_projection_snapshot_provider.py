@@ -43,20 +43,21 @@ class ProjectionSnapshotProviderTests(unittest.TestCase):
                 27: SimpleNamespace(resolved_image_path=image_b),
             }
             state = SimpleNamespace(
-                dataset_uuid="modifier-dataset",
+                dataset_uuid="22222222-2222-4222-8222-222222222222",
                 edit_revision=6,
+                history_hash="b" * 64,
                 current_reconstruction=reconstruction,
                 source=SimpleNamespace(
-                    source_fingerprint="source-fingerprint",
+                    source_fingerprint="a" * 64,
                     model_directory=root,
                     images_directory=root,
                 ),
                 image_path_manifest=SimpleNamespace(entries=entries),
             )
             settings = SimpleNamespace(
-                dataset_uuid="modifier-dataset",
+                dataset_uuid=state.dataset_uuid,
                 edit_revision=6,
-                source_fingerprint="source-fingerprint",
+                source_fingerprint=state.source.source_fingerprint,
                 axis_preset="BLENDER",
                 axis_forward="Y",
                 axis_up="Z",
@@ -64,13 +65,30 @@ class ProjectionSnapshotProviderTests(unittest.TestCase):
                 camera_frustum_size=2.5,
             )
             scene = SimpleNamespace(colmap_import=settings)
+            identity = SimpleNamespace(
+                domain_uuid="11111111-1111-4111-8111-111111111111",
+                domain_generation=7,
+                dataset_uuid=state.dataset_uuid,
+                source_fingerprint=state.source.source_fingerprint,
+                edit_revision=state.edit_revision,
+                history_hash=state.history_hash,
+            )
+            domain = SimpleNamespace(dataset_state=state, identity=identity)
             with patch(
                 "tools.modifier.blender.projection_snapshot_provider.ensure_runtime",
                 return_value=state,
+            ), patch(
+                "tools.modifier.blender.projection_snapshot_provider.domain_for_scene",
+                return_value=domain,
             ):
                 snapshot = build_projection_snapshot(scene)
                 self.assertTrue(projection_snapshot_is_current(scene, snapshot))
-                settings.edit_revision += 1
+                domain.identity = SimpleNamespace(
+                    **{
+                        **identity.__dict__,
+                        "domain_generation": identity.domain_generation + 1,
+                    }
+                )
                 self.assertFalse(projection_snapshot_is_current(scene, snapshot))
 
         self.assertEqual(tuple(item.camera_id for item in snapshot.cameras), (2, 19))

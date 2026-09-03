@@ -27,6 +27,9 @@ SNAPSHOT_ROLE_KEY = "pp_snapshot_role"
 SNAPSHOT_RECORD_ID_KEY = "pp_snapshot_record_id"
 SNAPSHOT_SOURCE_UUID_KEY = "pp_snapshot_source_uuid"
 SNAPSHOT_SOURCE_REVISION_KEY = "pp_snapshot_source_revision"
+SNAPSHOT_SOURCE_DOMAIN_UUID_KEY = "pp_snapshot_source_domain_uuid"
+SNAPSHOT_SOURCE_DOMAIN_GENERATION_KEY = "pp_snapshot_source_domain_generation"
+SNAPSHOT_SOURCE_HISTORY_HASH_KEY = "pp_snapshot_source_history_hash"
 PROJECT_STENCIL_DRAW_BRUSH_ROLE = "PROJECT_STENCIL_DRAW_BRUSH"
 
 CURRENT_SCHEMA = 1
@@ -149,8 +152,11 @@ def tag_snapshot_resource(
     id_block: Any,
     *,
     snapshot_uuid: str,
+    source_domain_uuid: str,
+    source_domain_generation: int,
     source_dataset_uuid: str,
     source_revision: int,
+    source_history_hash: str,
     schema_version: int,
 ) -> None:
     """PP COLMAP ID에 독립 Snapshot 출처와 역할 Metadata를 추가합니다."""
@@ -162,8 +168,11 @@ def tag_snapshot_resource(
     id_block[SNAPSHOT_SCHEMA_KEY] = int(schema_version)
     id_block[SNAPSHOT_ROLE_KEY] = str(id_block.get(RECORD_KIND_KEY, "") or "")
     id_block[SNAPSHOT_RECORD_ID_KEY] = str(id_block.get(RECORD_ID_KEY, "") or "")
+    id_block[SNAPSHOT_SOURCE_DOMAIN_UUID_KEY] = str(source_domain_uuid)
+    id_block[SNAPSHOT_SOURCE_DOMAIN_GENERATION_KEY] = int(source_domain_generation)
     id_block[SNAPSHOT_SOURCE_UUID_KEY] = str(source_dataset_uuid)
     id_block[SNAPSHOT_SOURCE_REVISION_KEY] = int(source_revision)
+    id_block[SNAPSHOT_SOURCE_HISTORY_HASH_KEY] = str(source_history_hash)
     try:
         return (
             str(id_block.get(DATASET_UUID_KEY, "") or ""),

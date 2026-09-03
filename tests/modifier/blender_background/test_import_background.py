@@ -776,14 +776,8 @@ try:
         first_uuid = first_root[DATASET_UUID_KEY]
         shared_snapshot = shared_dataset_snapshot(scene)
         assert_true(
-            shared_snapshot.available
-            and shared_snapshot.dataset_uuid == first_uuid
-            and shared_snapshot.dataset_revision == 1
-            and shared_snapshot.display_revision == 1
-            and shared_snapshot.camera_count == 1
-            and shared_snapshot.image_count == 1
-            and shared_snapshot.point3d_count == 1,
-            "첫 Modifier Import가 공용 Dataset 메타데이터와 Revision을 확정하지 못했습니다.",
+            not shared_snapshot.available,
+            "Modifier Import가 제거된 Legacy 공용 Dataset 권위를 다시 갱신했습니다.",
         )
         assert_true(
             first_root.get(COMMON_OWNER_KEY) == "colmap_dataset"
@@ -817,12 +811,8 @@ try:
         first_camera_data = first_camera_object.data
         shared_resources = shared_dataset_resources(scene)
         assert_true(
-            shared_resources is not None
-            and shared_resources.root_collection is first_root
-            and shared_resources.point_object is first_point_object
-            and shared_resources.axis_root is first_axis_root
-            and shared_resources.camera_objects[7] is first_camera_object,
-            "공용 Dataset Registry가 Modifier 생성 Blender ID를 같은 Pointer로 찾지 못했습니다.",
+            shared_resources is None,
+            "Modifier 생성 Blender ID가 Legacy 공용 Runtime Registry에 등록되었습니다.",
         )
         assert_true(
             first_camera_object.get(COMMON_RECORD_ID_KEY) == "7"
@@ -889,21 +879,20 @@ try:
             < 1e-8,
             "초기 Point Scale이 Modifier 입력에 반영되지 않았습니다.",
         )
-        common_display_revision = shared_dataset_snapshot(scene).display_revision
+        modifier_point_size_before_shared_change = settings.point_size
         scene.colmap_dataset.point_size = 0.03125
         assert_true(
-            abs(settings.point_size - 0.03125) < 1.0e-8
+            abs(settings.point_size - modifier_point_size_before_shared_change) < 1.0e-8
             and abs(
                 getattr(
                     point_modifiers[0].properties.inputs,
                     point_scale_socket,
                 ).value
-                - 0.03125
+                - modifier_point_size_before_shared_change
             )
             < 1.0e-8
-            and shared_dataset_snapshot(scene).display_revision
-            == common_display_revision + 1,
-            "공용 Point Scale 변경이 Modifier UI와 Geometry Nodes에 역동기화되지 않았습니다.",
+            and not shared_dataset_snapshot(scene).available,
+            "Legacy 공용 Point Scale 변경이 독립 Modifier 표시를 변경했습니다.",
         )
         settings.point_size = 0.0375
         assert_true(
@@ -1008,14 +997,8 @@ try:
         bpy.context.view_layer.update()
         shared_display_snapshot = shared_dataset_snapshot(scene)
         assert_true(
-            shared_display_snapshot.display_revision > shared_snapshot.display_revision
-            and shared_display_snapshot.point_size == settings.point_size
-            and shared_display_snapshot.camera_frustum_size
-            == settings.camera_frustum_size
-            and shared_display_snapshot.axis_preset == settings.axis_preset
-            and shared_display_snapshot.axis_forward == settings.axis_forward
-            and shared_display_snapshot.axis_up == settings.axis_up,
-            "Modifier 표시 UI와 공용 Dataset 표시 속성이 동기화되지 않았습니다.",
+            not shared_display_snapshot.available,
+            "Modifier 표시 UI 변경이 Legacy 공용 Dataset을 갱신했습니다.",
         )
         assert_true(
             first_axis_root.matrix_world != Matrix.Identity(4),
@@ -1100,9 +1083,8 @@ try:
         )
         reloaded_shared_snapshot = shared_dataset_snapshot(scene)
         assert_true(
-            reloaded_shared_snapshot.dataset_uuid == first_uuid
-            and reloaded_shared_snapshot.dataset_revision == 2,
-            "같은 Source 재Import가 공용 UUID를 유지하고 Revision을 증가시키지 못했습니다.",
+            not reloaded_shared_snapshot.available,
+            "같은 Source 재Import가 Legacy 공용 Dataset을 다시 활성화했습니다.",
         )
         reloaded_axis_roots = [
             obj
@@ -1330,7 +1312,7 @@ try:
         assert_true(settings.dataset_uuid == active_uuid, "실패 뒤 마지막 성공 metadata가 바뀌었습니다.")
         assert_true(
             shared_dataset_snapshot(scene) == active_shared_snapshot,
-            "실패한 Import가 마지막 성공 공용 Dataset metadata를 변경했습니다.",
+            "실패한 Import가 비활성 Legacy 공용 Dataset 상태를 변경했습니다.",
         )
 
         other_root = root / "other_dataset"
@@ -1340,9 +1322,9 @@ try:
         different_snapshot = shared_dataset_snapshot(scene)
         assert_true(
             different_result == {"FINISHED"}
-            and different_snapshot.dataset_uuid != active_uuid
-            and different_snapshot.dataset_revision == 1,
-            "다른 Source Import가 새 공용 UUID와 초기 Revision을 만들지 못했습니다.",
+            and settings.dataset_uuid != active_uuid
+            and not different_snapshot.available,
+            "다른 Source Import가 새 독립 Domain을 만들지 못했습니다.",
         )
 finally:
     blender_colmap.unregister()

@@ -1,6 +1,6 @@
 """Projection Painting Blender Extension 진입점을 제공합니다."""
 
-__version__ = "0.1.88"
+__version__ = "0.1.89"
 
 
 def register():

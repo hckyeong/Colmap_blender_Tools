@@ -8,7 +8,13 @@ from typing import Any
 
 import bpy
 
-from .camera_scene import CameraManifestEntry, runtime_for_scene, scene_manifest
+from .camera_scene import (
+    CameraManifestEntry,
+    apply_projection_camera_state,
+    projection_camera_session_is_active,
+    runtime_for_scene,
+    scene_manifest,
+)
 from .ownership import (
     ensure_scene_uuid,
     is_owned,
@@ -166,16 +172,23 @@ def _apply_camera_frame(scene: Any, camera: Any) -> None:
     width, height = camera_dimensions(camera.data)
     if width <= 0 or height <= 0:
         raise CameraReviewError("현재 Camera의 COLMAP 해상도 Metadata가 없습니다.")
-    scene.camera = camera
-    scene.render.resolution_x = width
-    scene.render.resolution_y = height
-    scene.render.resolution_percentage = 100
+    apply_projection_camera_state(
+        scene,
+        camera,
+        render_resolution=(width, height, 100),
+    )
 
 
 def _activate_viewport_camera(context: Any, camera: Any) -> None:
     """호출된 3D Viewport를 지정 Camera View로 전환합니다."""
 
     area, space, rv3d = _viewport_context(context)
+    if not projection_camera_session_is_active(
+        context.scene,
+        window=getattr(context, "window", None),
+    ):
+        raise CameraReviewError("활성 Projection Paint Camera 세션이 아닙니다.")
+    space.use_local_camera = True
     space.camera = camera
     rv3d.view_perspective = "CAMERA"
     area.tag_redraw()
@@ -366,7 +379,7 @@ def update_camera_review_style(scene: Any, context: Any = None) -> bool:
     """현재 Review 슬롯의 표시 여부와 Alpha만 변경합니다."""
 
     settings = _settings(scene)
-    if settings is None:
+    if settings is None or not projection_camera_session_is_active(scene):
         return False
     camera_data, slot = _managed_slot(scene)
     if slot is None:
@@ -386,7 +399,11 @@ def sync_camera_review(scene: Any, context: Any = None) -> bool:
 
     settings = _settings(scene)
     entry = _current_entry(scene)
-    if settings is None or entry is None:
+    if (
+        settings is None
+        or entry is None
+        or not projection_camera_session_is_active(scene)
+    ):
         return False
     settings.current_image_id = str(entry.image_id)
     settings.current_image_name = str(entry.image_name)
@@ -431,7 +448,14 @@ def initialize_camera_review(context: Any) -> int:
 
     scene = getattr(context, "scene", None)
     entry = _current_entry(scene) if scene is not None else None
-    if scene is None or entry is None:
+    if (
+        scene is None
+        or entry is None
+        or not projection_camera_session_is_active(
+            scene,
+            window=getattr(context, "window", None),
+        )
+    ):
         raise CameraReviewError("현재 Frame에 관리 Camera가 없습니다.")
     camera = _camera_for_entry(scene, entry)
     if camera is None or getattr(camera, "type", "") != "CAMERA":
@@ -449,7 +473,10 @@ def update_camera_review_from_settings(settings: Any, context: Any) -> None:
     """UI 토글과 Alpha 변경을 현재 Scene의 Review 배경에 즉시 반영합니다."""
 
     scene = getattr(context, "scene", None) if context is not None else None
-    if scene is None:
+    if scene is None or not projection_camera_session_is_active(
+        scene,
+        window=getattr(context, "window", None),
+    ):
         return
     try:
         if bool(settings.review_background_enabled):
@@ -464,6 +491,8 @@ def update_camera_review_from_settings(settings: Any, context: Any) -> None:
 def refresh_camera_review(scene: Any, context: Any = None) -> bool:
     """Handler 경계에서 Review 오류를 상태로 격리하고 성공 여부를 반환합니다."""
 
+    if not projection_camera_session_is_active(scene):
+        return False
     try:
         return sync_camera_review(scene, context)
     except CameraReviewError as exc:
@@ -537,6 +566,10 @@ class PP_OT_review_look_through(bpy.types.Operator):
             and snapshot_is_ready(scene)
             and _current_entry(scene) is not None
             and _viewport_available(context)
+            and projection_camera_session_is_active(
+                scene,
+                window=getattr(context, "window", None),
+            )
         )
 
     def execute(self, context: Any) -> set[str]:
@@ -572,6 +605,10 @@ class PP_OT_review_background_toggle(bpy.types.Operator):
             scene is not None
             and snapshot_is_ready(scene)
             and _camera_view_active(context)
+            and projection_camera_session_is_active(
+                scene,
+                window=getattr(context, "window", None),
+            )
         )
 
     def execute(self, context: Any) -> set[str]:

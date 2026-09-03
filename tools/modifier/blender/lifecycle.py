@@ -39,6 +39,7 @@ from .dataset_adapter import (
     unregister_modifier_dataset_adapter,
 )
 from .camera_review_timeline import (
+    modifier_camera_session_settled,
     detach_modifier_timeline_markers_for_scenes,
     modifier_marker_session_owned,
     modifier_review_markers_attached,
@@ -61,6 +62,10 @@ from .operators_camera_edit_mode import CLASSES as CAMERA_EDIT_MODE_OPERATOR_CLA
 from .operators_point_edit_mode import CLASSES as POINT_EDIT_MODE_OPERATOR_CLASSES
 from .operators_point_selection import CLASSES as POINT_SELECTION_OPERATOR_CLASSES
 from .operators_modifier_workspace import CLASSES as MODIFIER_WORKSPACE_OPERATOR_CLASSES
+from .modifier_input_guard import (
+    CLASSES as MODIFIER_INPUT_GUARD_CLASSES,
+    stop_modifier_input_guard,
+)
 from .panels import CLASSES as PANEL_CLASSES
 from .point_display import register_point_scale_sync, unregister_point_scale_sync
 from .projection_snapshot_provider import (
@@ -105,6 +110,7 @@ CLASSES = (
     *EXPORT_PROGRESS_OPERATOR_CLASSES,
     *EXPORT_OPERATOR_CLASSES,
     *DELETE_GUARD_CLASSES,
+    *MODIFIER_INPUT_GUARD_CLASSES,
     *MODIFIER_WORKSPACE_OPERATOR_CLASSES,
     *PANEL_CLASSES,
 )
@@ -164,6 +170,7 @@ def _modifier_handoff_is_settled(window) -> bool:
             or (
                 not modifier_marker_session_owned(scene)
                 and not modifier_review_markers_attached(scene)
+                and modifier_camera_session_settled(scene)
             )
         )
     )
@@ -285,6 +292,7 @@ def unregister():
     if not _REGISTERED:
         return
     _detach_modifier_markers_before_unregister()
+    stop_modifier_input_guard()
     _REGISTERED = False
     from .camera_filter_queue import (
         clear_pending_runtime,

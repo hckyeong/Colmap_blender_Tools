@@ -241,11 +241,26 @@ def depsgraph_update_handler(scene: Any, depsgraph: Any) -> None:
 
 
 def frame_change_handler(scene: Any, *_args: Any) -> None:
-    """현재 Frame의 Camera 검증과 전환 작업만 예약합니다."""
+    """활성 Camera 세션의 Frame만 예약하고 비활성 pending은 조용히 폐기합니다."""
 
     if lifecycle_registry().suspended:
         return
-    from .camera_scene import queue_frame_change
+    from .camera_scene import (
+        cancel_projection_frame_requests,
+        projection_camera_session_is_active,
+        queue_frame_change,
+        runtime_for_scene,
+    )
+
+    runtime = runtime_for_scene(scene)
+    if runtime is None:
+        return
+    if not projection_camera_session_is_active(
+        scene,
+        token=runtime.camera_session_token,
+    ):
+        cancel_projection_frame_requests(scene)
+        return
 
     queue_frame_change(scene)
 

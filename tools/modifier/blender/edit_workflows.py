@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..core.edit_replay import history_hash, replay_history
+from ..core.edit_delta import EditStateToken
+from ..core.edit_journal import EditCommand, EditJournalCheckpoint, capture_edit_command
+from ..core.edit_replay import history_hash
 from ..core.edits import (
     ImageObservationRemovalPlan,
     PointRemovalPlan,
@@ -14,7 +16,6 @@ from ..core.edits import (
     point_operation_from_report,
     serialize_history,
 )
-from ..core.indexes import build_relationship_indexes
 from ..core.removal import (
     apply_image_observation_removal_indexed,
     apply_point_removal_indexed,
@@ -34,10 +35,18 @@ from .point_edit_session import (
 from .runtime_state import (
     clear_runtime,
     ensure_runtime,
-    install_state,
     state_with_current,
+    write_domain_settings,
     write_history_settings,
     write_source_settings,
+)
+from .modifier_runtime_domain import (
+    ModifierDomainCheckpoint,
+    domain_for_scene,
+)
+from .modifier_input_guard import (
+    clear_modifier_input_guard_transaction_lock,
+    set_modifier_input_guard_transaction_lock,
 )
 from .selection import (
     clear_snapshots,
@@ -69,6 +78,8 @@ def update_counts(
     observing_count: int,
     camera_target_count: int = 0,
 ) -> None:
+    """현재 선택·관측·Camera 대상 수를 Scene 표시 Mirror에 기록합니다."""
+
     settings.selected_point_count = selected_count
     settings.observing_camera_count = observing_count
     settings.derived_orphan_count = 0
@@ -81,18 +92,63 @@ def _rollback_atomic_review_edit(
     old_values: dict[str, object],
     review_snapshot,
 ) -> tuple[str, ...]:
-    """Filter 후처리 실패에서 이전 권위 Runtime/Scene/Review를 복구합니다."""
+    """Filter 후처리 실패에서 이전 Scene 표시와 Review를 복구합니다."""
+
     settings = context.scene.colmap_import
     for name, value in old_values.items():
         setattr(settings, name, value)
     warnings = synchronize_scene(context, previous_state, settings)
-    install_state(previous_state)
     clear_snapshots()
     lock_managed_selection_objects(context, previous_state.dataset_uuid)
     from .camera_review_session import restore_review_edit_snapshot
 
     restore_review_edit_snapshot(context, review_snapshot)
     return warnings
+
+
+def _runtime_token(state) -> EditStateToken:
+    """현재 Runtime state를 warm Delta 검증용 불변 token으로 변환합니다."""
+
+    return EditStateToken(
+        dataset_uuid=state.dataset_uuid,
+        source_fingerprint=state.source.source_fingerprint,
+        edit_revision=state.edit_revision,
+        index_revision=state.index_revision,
+    )
+
+
+def modifier_undo_available(scene) -> bool:
+    """현재 Scene의 독립 Journal에 되돌릴 Command가 있는지 반환합니다."""
+
+    try:
+        domain = domain_for_scene(scene)
+        return bool(domain is not None and domain.editable and domain.journal.poll_undo())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def modifier_redo_available(scene) -> bool:
+    """현재 Scene의 독립 Journal에 다시 적용할 Command가 있는지 반환합니다."""
+
+    try:
+        domain = domain_for_scene(scene)
+        return bool(domain is not None and domain.editable and domain.journal.poll_redo())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _restore_domain_transaction(
+    domain,
+    domain_checkpoint: ModifierDomainCheckpoint,
+    journal_checkpoint: EditJournalCheckpoint,
+    runtime_rollback=None,
+) -> None:
+    """실패한 편집의 Runtime 값과 Domain·Journal 메타데이터를 이전 경계로 복구합니다."""
+
+    if runtime_rollback is not None:
+        runtime_rollback()
+    domain.journal.restore_checkpoint(journal_checkpoint)
+    domain.restore_checkpoint(domain_checkpoint)
 
 
 def commit_edit(
@@ -102,15 +158,39 @@ def commit_edit(
     *,
     atomic_review: bool = False,
     previous_state=None,
+    journal_command: EditCommand | None = None,
+    domain_checkpoint: ModifierDomainCheckpoint | None = None,
+    journal_checkpoint: EditJournalCheckpoint | None = None,
+    runtime_rollback=None,
+    camera_list_changed_override: bool | None = None,
 ) -> tuple[str, ...]:
-    """설정과 Scene을 커밋하고 성공한 경우에만 Runtime을 교체합니다."""
+    """독립 Runtime을 먼저 갱신하고 Scene 표시 실패 시 전체 Transaction을 복구합니다."""
+
     settings = context.scene.colmap_import
     serialize_history(new_state.operations)
     if previous_state is None:
         previous_state = ensure_runtime(context.scene)
+    domain = domain_for_scene(context.scene, required=True)
+    if domain_checkpoint is None:
+        domain.require_editable()
+    elif domain_checkpoint.frozen_reason:
+        raise RuntimeError(
+            "Modifier Runtime 편집이 동결되었습니다: "
+            f"{domain_checkpoint.frozen_reason}"
+        )
+    if domain.dataset_state is not previous_state:
+        raise ValueError("편집 시작 Runtime과 현재 Modifier Domain 권위가 다릅니다.")
+    if domain_checkpoint is None:
+        domain_checkpoint = domain.checkpoint()
+    if journal_checkpoint is None:
+        journal_checkpoint = domain.journal.checkpoint()
     camera_list_changed = (
-        frozenset(previous_state.current_reconstruction.images)
-        != frozenset(new_state.current_reconstruction.images)
+        bool(camera_list_changed_override)
+        if camera_list_changed_override is not None
+        else (
+            frozenset(previous_state.current_reconstruction.images)
+            != frozenset(new_state.current_reconstruction.images)
+        )
     )
     review_snapshot = None
     if atomic_review:
@@ -157,11 +237,32 @@ def commit_edit(
         "point_edit_mode_active": settings.point_edit_mode_active,
         "camera_edit_mode_active": settings.camera_edit_mode_active,
         "remove_target": settings.remove_target,
+        "domain_uuid": settings.domain_uuid,
+        "domain_generation": settings.domain_generation,
+        "domain_saved_generation": settings.domain_saved_generation,
+        "domain_persistence_dirty": settings.domain_persistence_dirty,
+        "domain_restore_error": settings.domain_restore_error,
     }
     shared_commit = prepare_modifier_edit_commit(context.scene, new_state)
+    runtime_committed = False
+    set_modifier_input_guard_transaction_lock("Modifier 편집 Transaction이 진행 중입니다.")
     try:
+        if journal_command is not None:
+            domain.journal.push(journal_command)
+        if (
+            domain.journal.history != new_state.operations
+            or domain.journal.revision != new_state.edit_revision
+        ):
+            raise ValueError("Modifier Journal과 새 Runtime state가 일치하지 않습니다.")
+        domain.replace_state(
+            new_state,
+            status=status,
+            mark_dirty=True,
+        )
+        runtime_committed = True
         write_history_settings(settings, new_state)
         write_source_settings(settings, new_state)
+        write_domain_settings(settings, domain)
         settings.image_count = str(len(new_state.current_reconstruction.images))
         settings.camera_count = str(len(new_state.current_reconstruction.cameras))
         settings.point3d_count = str(len(new_state.current_reconstruction.points3d))
@@ -169,13 +270,38 @@ def commit_edit(
         if shared_commit is not None:
             shared_commit.apply()
         warnings = synchronize_scene(context, new_state, settings)
-    except Exception:
+    except Exception as exc:
         if shared_commit is not None:
             shared_commit.rollback()
+        if runtime_committed or journal_command is not None or runtime_rollback is not None:
+            try:
+                _restore_domain_transaction(
+                    domain,
+                    domain_checkpoint,
+                    journal_checkpoint,
+                    runtime_rollback,
+                )
+            except Exception as rollback_exc:
+                domain.freeze(
+                    "편집 실패 뒤 Runtime 복구에도 실패했습니다: "
+                    f"{rollback_exc}"
+                )
+                raise RuntimeError(
+                    "Modifier 편집 실패 뒤 독립 Runtime 복구에도 실패했습니다. "
+                    f"원래 오류: {exc}; 복구 오류: {rollback_exc}"
+                ) from exc
         for name, value in old_values.items():
             setattr(settings, name, value)
+        try:
+            synchronize_scene(context, previous_state, settings)
+        except Exception as display_rollback_exc:
+            raise RuntimeError(
+                "Modifier 편집 실패 뒤 Blender 표시 복구에도 실패했습니다. "
+                f"원래 오류: {exc}; 표시 복구 오류: {display_rollback_exc}"
+            ) from exc
         raise
-    install_state(new_state)
+    finally:
+        clear_modifier_input_guard_transaction_lock()
     clear_snapshots()
     lock_managed_selection_objects(context, new_state.dataset_uuid)
     update_counts(settings, 0, 0, 0)
@@ -197,6 +323,12 @@ def commit_edit(
     except Exception as exc:
         if atomic_review:
             try:
+                _restore_domain_transaction(
+                    domain,
+                    domain_checkpoint,
+                    journal_checkpoint,
+                    runtime_rollback,
+                )
                 rollback_warnings = _rollback_atomic_review_edit(
                     context,
                     previous_state,
@@ -476,7 +608,7 @@ def apply_pending_remove(
     *,
     atomic_review: bool = False,
 ) -> tuple[str, ...]:
-    """검증된 제거 계획을 Core에 적용하고 Scene까지 커밋합니다."""
+    """검증된 제거 결과의 변경 범위 Delta를 캡처해 Runtime과 Scene에 커밋합니다."""
     if pending.target_kind == "POINTS":
         result, result_indexes, report = apply_point_removal_indexed(
             state.current_reconstruction,
@@ -518,6 +650,14 @@ def apply_pending_remove(
         result_indexes,
         operations,
     )
+    command = capture_edit_command(
+        state.current_reconstruction,
+        state.indexes,
+        result,
+        result_indexes,
+        pending.plan,
+        operation,
+    )
     force_end_point_mode(context, state.dataset_uuid)
     force_end_camera_mode(context, state.dataset_uuid)
     return commit_edit(
@@ -526,11 +666,12 @@ def apply_pending_remove(
         status,
         atomic_review=atomic_review,
         previous_state=state,
+        journal_command=command,
     )
 
 
 def undo_last_edit(context):
-    """가장 최근 편집을 제외한 이력을 재생하고 Scene에 반영합니다."""
+    """Modifier Journal의 마지막 변경 범위 Delta만 역적용해 Scene에 반영합니다."""
     from .camera_filter_queue import require_no_pending_filters
 
     require_no_pending_filters(context, "Undo Last Edit")
@@ -538,25 +679,108 @@ def undo_last_edit(context):
     force_end_point_mode(context, settings.dataset_uuid)
     force_end_camera_mode(context, settings.dataset_uuid)
     state = ensure_runtime(context.scene)
-    operations = state.operations[:-1]
-    current, indexes = replay_history(
-        state.baseline_reconstruction,
-        operations,
-        state.dataset_uuid,
-        state.source.source_fingerprint,
+    domain = domain_for_scene(context.scene, required=True)
+    domain_checkpoint = domain.checkpoint()
+    journal_checkpoint = domain.journal.checkpoint()
+    previous_image_ids = frozenset(state.current_reconstruction.images)
+    resulting_token = domain.journal.undo(
+        state.current_reconstruction,
+        state.indexes,
+        _runtime_token(state),
     )
-    new_state = state_with_current(state, current, indexes, operations)
+    if resulting_token is None:
+        raise ValueError("되돌릴 Modifier 편집 기록이 없습니다.")
+    new_state = state_with_current(
+        state,
+        state.current_reconstruction,
+        state.indexes,
+        domain.journal.history,
+    )
+
+    def rollback_runtime() -> None:
+        """표시 Commit 실패 시 방금 역적용한 Delta를 다시 적용합니다."""
+
+        restored = domain.journal.redo(
+            state.current_reconstruction,
+            state.indexes,
+            resulting_token,
+        )
+        if restored is None:
+            raise RuntimeError("Undo Rollback에 사용할 Redo Command가 없습니다.")
+
     commit_edit(
         context,
         new_state,
         "마지막 COLMAP 편집을 되돌렸습니다.",
         previous_state=state,
+        domain_checkpoint=domain_checkpoint,
+        journal_checkpoint=journal_checkpoint,
+        runtime_rollback=rollback_runtime,
+        camera_list_changed_override=(
+            previous_image_ids
+            != frozenset(new_state.current_reconstruction.images)
+        ),
     )
-    return state
+    return new_state
+
+
+def redo_last_edit(context):
+    """Modifier Journal의 마지막 Redo 변경 범위 Delta만 재적용해 Scene에 반영합니다."""
+
+    from .camera_filter_queue import require_no_pending_filters
+
+    require_no_pending_filters(context, "Redo Last Edit")
+    settings = context.scene.colmap_import
+    force_end_point_mode(context, settings.dataset_uuid)
+    force_end_camera_mode(context, settings.dataset_uuid)
+    state = ensure_runtime(context.scene)
+    domain = domain_for_scene(context.scene, required=True)
+    domain_checkpoint = domain.checkpoint()
+    journal_checkpoint = domain.journal.checkpoint()
+    previous_image_ids = frozenset(state.current_reconstruction.images)
+    resulting_token = domain.journal.redo(
+        state.current_reconstruction,
+        state.indexes,
+        _runtime_token(state),
+    )
+    if resulting_token is None:
+        raise ValueError("다시 적용할 Modifier 편집 기록이 없습니다.")
+    new_state = state_with_current(
+        state,
+        state.current_reconstruction,
+        state.indexes,
+        domain.journal.history,
+    )
+
+    def rollback_runtime() -> None:
+        """표시 Commit 실패 시 방금 재적용한 Delta를 다시 역적용합니다."""
+
+        restored = domain.journal.undo(
+            state.current_reconstruction,
+            state.indexes,
+            resulting_token,
+        )
+        if restored is None:
+            raise RuntimeError("Redo Rollback에 사용할 Undo Command가 없습니다.")
+
+    commit_edit(
+        context,
+        new_state,
+        "마지막 COLMAP 편집을 다시 적용했습니다.",
+        previous_state=state,
+        domain_checkpoint=domain_checkpoint,
+        journal_checkpoint=journal_checkpoint,
+        runtime_rollback=rollback_runtime,
+        camera_list_changed_override=(
+            previous_image_ids
+            != frozenset(new_state.current_reconstruction.images)
+        ),
+    )
+    return new_state
 
 
 def reset_edits(context) -> tuple[object | None, bool]:
-    """모든 편집 이력을 초기화하고 source 불일치 여부를 함께 반환합니다."""
+    """현재 Session의 Reset Command로 모든 편집을 초기화하고 복구 가능하게 유지합니다."""
     from .camera_filter_queue import require_no_pending_filters
 
     require_no_pending_filters(context, "Reset Edits")
@@ -565,12 +789,22 @@ def reset_edits(context) -> tuple[object | None, bool]:
     force_end_camera_mode(context, settings.dataset_uuid)
     try:
         state = ensure_runtime(context.scene)
-        baseline_indexes = build_relationship_indexes(state.baseline_reconstruction)
+        domain = domain_for_scene(context.scene, required=True)
+        domain_checkpoint = domain.checkpoint()
+        journal_checkpoint = domain.journal.checkpoint()
+        previous_image_ids = frozenset(state.current_reconstruction.images)
+        resulting_token = domain.journal.reset(
+            state.current_reconstruction,
+            state.indexes,
+            _runtime_token(state),
+        )
+        if resulting_token is None:
+            raise ValueError("초기화할 Modifier 편집 기록이 없습니다.")
         new_state = state_with_current(
             state,
-            state.baseline_reconstruction,
-            baseline_indexes,
-            (),
+            state.current_reconstruction,
+            state.indexes,
+            domain.journal.history,
         )
     except ValueError as exc:
         if "source" not in str(exc) and "fingerprint" not in str(exc):
@@ -588,10 +822,29 @@ def reset_edits(context) -> tuple[object | None, bool]:
             "Import를 실행해 현재 source로 장면을 갱신하십시오."
         )
         return None, True
+
+    def rollback_runtime() -> None:
+        """표시 Commit 실패 시 Reset Command를 Undo해 이전 편집을 복원합니다."""
+
+        restored = domain.journal.undo(
+            state.current_reconstruction,
+            state.indexes,
+            resulting_token,
+        )
+        if restored is None:
+            raise RuntimeError("Reset Rollback에 사용할 Command가 없습니다.")
+
     commit_edit(
         context,
         new_state,
         "모든 COLMAP 편집을 초기화했습니다.",
         previous_state=state,
+        domain_checkpoint=domain_checkpoint,
+        journal_checkpoint=journal_checkpoint,
+        runtime_rollback=rollback_runtime,
+        camera_list_changed_override=(
+            previous_image_ids
+            != frozenset(new_state.current_reconstruction.images)
+        ),
     )
-    return state, False
+    return new_state, False

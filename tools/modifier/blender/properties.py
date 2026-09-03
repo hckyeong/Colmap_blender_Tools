@@ -290,6 +290,12 @@ class COLMAP_PG_import_settings(bpy.types.PropertyGroup):
     active_layout: StringProperty(options={"HIDDEN"})
     source_fingerprint: StringProperty(options={"HIDDEN"})
     dataset_uuid: StringProperty(options={"HIDDEN"})
+    # 독립 Runtime 식별자는 UI 권위가 아닌 저장·재연결용 Mirror입니다.
+    domain_uuid: StringProperty(options={"HIDDEN"})
+    domain_generation: IntProperty(default=0, min=0, options={"HIDDEN"})
+    domain_saved_generation: IntProperty(default=0, min=0, options={"HIDDEN"})
+    domain_persistence_dirty: BoolProperty(default=False, options={"HIDDEN"})
+    domain_restore_error: StringProperty(default="", options={"HIDDEN"})
     schema_version: StringProperty(options={"HIDDEN"})
     selected_files_json: StringProperty(options={"HIDDEN"})
     camera_count: StringProperty(options={"HIDDEN"})

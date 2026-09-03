@@ -12,6 +12,7 @@ from .camera_filter_queue import (
 )
 from .ownership import DATASET_UUID_KEY, OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
 from .operation_guard import export_mutation_allowed
+from .edit_workflows import modifier_redo_available, modifier_undo_available
 from .modifier_session import CONTROL_PANEL_CATEGORY, modifier_panel_poll
 from .status_display import (
     STATUS_VISIBLE_ROWS,
@@ -234,10 +235,20 @@ class COLMAP_PT_point_selection(_COLMAPModifierPanelMixin, bpy.types.Panel):
         )
         remove_row.operator("colmap.remove", icon="TRASH")
 
-        row = layout.row(align=True)
-        row.enabled = bool(not pending and settings.edit_revision > 0)
-        row.operator("colmap.undo_last_edit", icon="LOOP_BACK")
-        row.operator("colmap.reset_edits", icon="FILE_REFRESH")
+        history_row = layout.row(align=True)
+        undo_column = history_row.column(align=True)
+        undo_column.enabled = bool(
+            not pending and modifier_undo_available(context.scene)
+        )
+        undo_column.operator("colmap.undo_last_edit", icon="LOOP_BACK")
+        redo_column = history_row.column(align=True)
+        redo_column.enabled = bool(
+            not pending and modifier_redo_available(context.scene)
+        )
+        redo_column.operator("colmap.redo_last_edit", icon="LOOP_FORWARDS")
+        reset_row = layout.row()
+        reset_row.enabled = bool(not pending and settings.edit_revision > 0)
+        reset_row.operator("colmap.reset_edits", icon="FILE_REFRESH")
 
 
 class COLMAP_PT_camera_review(_COLMAPModifierPanelMixin, bpy.types.Panel):

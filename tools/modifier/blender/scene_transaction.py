@@ -77,6 +77,28 @@ class _CommitSnapshot:
     old_collection_state: tuple[tuple[bpy.types.Collection, dict], ...]
 
 
+def _copy_custom_property_value(value):
+    """롤백 뒤에도 유효하도록 Blender IDProperty 값을 순수 Python 값으로 복제합니다."""
+    if hasattr(value, "to_list"):
+        return [_copy_custom_property_value(item) for item in value.to_list()]
+    if hasattr(value, "items"):
+        return {
+            str(key): _copy_custom_property_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_copy_custom_property_value(item) for item in value]
+    return value
+
+
+def _snapshot_custom_properties(data_block) -> dict:
+    """Blender IDProperty 참조가 삭제로 무효화되지 않도록 값을 깊게 복제합니다."""
+    return {
+        str(key): _copy_custom_property_value(value)
+        for key, value in data_block.items()
+    }
+
+
 def build_staging(
     loaded: LoadedReconstruction,
     point_size: float = 0.05,
@@ -195,7 +217,10 @@ def _capture_commit_snapshot(transaction: _SameDatasetCommit) -> _CommitSnapshot
     old_axis_state = (
         None
         if existing_axis_root is None
-        else (existing_axis_root.matrix_world.copy(), dict(existing_axis_root.items()))
+        else (
+            existing_axis_root.matrix_world.copy(),
+            _snapshot_custom_properties(existing_axis_root),
+        )
     )
     existing_point = transaction.existing_point
     old_point_node_group = transaction.existing_modifier.node_group
@@ -217,7 +242,7 @@ def _capture_commit_snapshot(transaction: _SameDatasetCommit) -> _CommitSnapshot
             existing_point.matrix_parent_inverse.copy(),
             existing_point.matrix_basis.copy(),
         ),
-        old_point_properties=dict(existing_point.items()),
+        old_point_properties=_snapshot_custom_properties(existing_point),
         old_point_selection_state=(
             existing_point.hide_select,
             existing_point.select_get(),
@@ -233,7 +258,7 @@ def _capture_commit_snapshot(transaction: _SameDatasetCommit) -> _CommitSnapshot
                 camera.parent,
                 camera.matrix_parent_inverse.copy(),
                 camera.matrix_basis.copy(),
-                dict(camera.items()),
+                _snapshot_custom_properties(camera),
                 camera.hide_select,
                 camera.select_get(),
                 tuple(
@@ -246,7 +271,7 @@ def _capture_commit_snapshot(transaction: _SameDatasetCommit) -> _CommitSnapshot
             if image_id in transaction.staged_cameras
         },
         old_collection_state=tuple(
-            (collection, dict(collection.items()))
+            (collection, _snapshot_custom_properties(collection))
             for collection in (
                 transaction.existing_root,
                 transaction.existing_points_collection,

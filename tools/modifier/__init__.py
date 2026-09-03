@@ -1,6 +1,6 @@
 """COLMAP Modifier Extension 진입점입니다."""
 
-__version__ = "0.17.4"
+__version__ = "0.17.5"
 
 
 def register():

@@ -518,6 +518,13 @@ def stage_stencil_source(
 ) -> None:
     """현재 Frame Source와 Camera를 Blender Pointer 상태에 기록합니다."""
     session.validate_resources()
+    from .camera_scene import (
+        apply_projection_camera_state,
+        projection_camera_session_is_active,
+    )
+
+    if not projection_camera_session_is_active(session.scene):
+        raise StencilSessionError("활성 Projection Paint Camera 세션이 아닙니다.")
     if image is None or _pointer(image) == 0 or min(int(value) for value in image.size) <= 0:
         raise StencilSessionError("현재 Frame Source Image가 유효하지 않습니다.")
     settings = session.scene.projection_paint
@@ -531,7 +538,7 @@ def stage_stencil_source(
     texture = ensure_stencil_texture(session.scene)
     texture.image = image
     if camera is not None and _pointer(camera):
-        session.scene.camera = camera
+        apply_projection_camera_state(session.scene, camera)
 
 
 def bind_stencil_source(
@@ -569,6 +576,7 @@ def _enter_camera_view(session: StencilSession) -> None:
     if camera is None or _pointer(camera) == 0 or getattr(camera, "data", None) is None:
         raise StencilSessionError("Stencil을 연결할 Scene Camera가 없습니다.")
     if session.space is not None and _pointer(session.space):
+        session.space.use_local_camera = True
         session.space.camera = camera
     if session.rv3d is not None and _pointer(session.rv3d):
         session.rv3d.view_perspective = "CAMERA"

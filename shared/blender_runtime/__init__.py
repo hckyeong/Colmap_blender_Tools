@@ -6,6 +6,7 @@ from .scene_marker_session import (
     clear_scene_marker_sessions,
     release_scene_marker_session,
     scene_marker_session_owned_by,
+    scene_marker_session_owned_by_window,
     scene_marker_session_owner,
 )
 
@@ -61,6 +62,7 @@ __all__ = [
     "release_scene_marker_session",
     "screen_matches_workspace",
     "scene_marker_session_owned_by",
+    "scene_marker_session_owned_by_window",
     "scene_marker_session_owner",
     "source_workspace_from_metadata",
     "workspace_is_used_by_other_window",

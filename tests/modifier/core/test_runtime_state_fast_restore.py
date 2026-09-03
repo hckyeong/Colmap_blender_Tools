@@ -97,6 +97,11 @@ def _scene_for(loaded, operations) -> _FakeScene:
             active_input_format=source.input_format,
             schema_version=str(source.schema_version),
             edit_history_json=serialize_history(operations),
+            domain_uuid="11111111-1111-4111-8111-111111111111",
+            domain_generation=3,
+            domain_saved_generation=3,
+            domain_persistence_dirty=False,
+            domain_restore_error="",
         )
     )
 

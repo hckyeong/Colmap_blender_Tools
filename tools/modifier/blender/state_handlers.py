@@ -9,6 +9,7 @@ from .axis_display import migrate_loaded_axis_presets
 from .camera_review_session import clear_review_sessions
 from .camera_filter_queue import (
     PENDING_STATUS_STALE,
+    clear_pending_filters,
     clear_pending_runtime,
     has_pending_filter_data,
     release_pending_overlay,
@@ -21,7 +22,23 @@ from .import_progress_session import clear_import_progress_sessions
 from .managed_scene import iter_managed_roots
 from .modifier_data_visibility import synchronize_modifier_data_visibility
 from .modifier_session import SESSION, SESSION_ACTIVE, is_session_active_for_window
-from .runtime_state import clear_runtime
+from .modifier_input_guard import (
+    rearm_modifier_input_guard,
+    stop_modifier_input_guard,
+)
+from .modifier_persistence_handlers import (
+    register_modifier_persistence_handlers,
+    restore_domain_mirror_from_active,
+    unregister_modifier_persistence_handlers,
+)
+from .runtime_state import (
+    clear_runtime,
+    request_runtime_restore,
+    runtime_restore_job,
+    write_domain_settings,
+    write_history_settings,
+    write_source_settings,
+)
 from .selection import clear_snapshots
 from .undo_domain_coordinator import (
     capture_undo_protection_snapshot,
@@ -119,6 +136,9 @@ def invalidate_transient_state(
     *_args,
     schedule_pending_restore: bool = True,
 ) -> None:
+    """파일 Load 경계에서 Blender ID 참조와 모든 프로세스 Runtime을 정리합니다."""
+
+    stop_modifier_input_guard()
     clear_import_progress_sessions()
     clear_export_progress_sessions()
     warnings = release_pending_overlay(bpy.context)
@@ -157,7 +177,7 @@ def reconcile_after_undo_redo(*_args) -> None:
 
 @persistent
 def invalidate_loaded_state(*_args) -> None:
-    """새 `.blend` load에서 비영속 History와 모든 임시 Runtime을 폐기합니다."""
+    """새 `.blend` load에서 Runtime을 비우고 ACTIVE Payload 자동 복원을 예약합니다."""
 
     global _PENDING_RESTORE_SCHEDULED
     migrate_loaded_axis_presets(bpy.context)
@@ -165,24 +185,82 @@ def invalidate_loaded_state(*_args) -> None:
         bpy.app.timers.unregister(_restore_pending_after_state_change)
     _PENDING_RESTORE_SCHEDULED = False
     invalidate_transient_state(schedule_pending_restore=False)
+    try:
+        clear_pending_filters(bpy.context)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    scene = getattr(bpy.context, "scene", None)
+    if scene is not None and restore_domain_mirror_from_active(scene):
+        _schedule_load_restore()
     _schedule_visibility_synchronization()
 
 
 def process_pending_load_restore():
-    """구버전 호출 호환을 유지하되 파일 로드 Runtime 복원은 수행하지 않습니다."""
+    """ACTIVE Payload의 Source·Operation을 UI Tick 예산으로 자동 복원합니다."""
 
-    return None
+    scene = getattr(bpy.context, "scene", None)
+    settings = getattr(scene, "colmap_import", None)
+    if scene is None or settings is None:
+        return None
+    try:
+        job = runtime_restore_job(scene)
+        if job is None:
+            job = request_runtime_restore(scene)
+        progress = job.advance(work_budget_ms=20.0)
+        settings.status_kind = "IMPORTING" if not job.done else "SUCCESS"
+        settings.status = str(progress.message)
+        if not job.done:
+            return 0.01
+        state = job.result
+        if state is None:
+            raise RuntimeError("자동 복원된 Modifier Runtime 결과가 없습니다.")
+        from .edit_coordinator import synchronize_scene
+        from .modifier_runtime_domain import domain_for_scene
+
+        domain = domain_for_scene(scene, required=True)
+        write_source_settings(settings, state)
+        write_history_settings(settings, state)
+        write_domain_settings(settings, domain)
+        settings.camera_count = str(len(state.current_reconstruction.cameras))
+        settings.image_count = str(len(state.current_reconstruction.images))
+        settings.point3d_count = str(len(state.current_reconstruction.points3d))
+        settings.point_edit_mode_active = False
+        settings.camera_edit_mode_active = False
+        settings.remove_target = "NONE"
+        settings.selected_point_count = 0
+        settings.observing_camera_count = 0
+        settings.derived_orphan_count = 0
+        settings.camera_target_count = 0
+        warnings = synchronize_scene(bpy.context, state, settings)
+        if warnings:
+            settings.warning_summary = "\n".join(warnings)
+        settings.domain_restore_error = ""
+        settings.status_kind = "SUCCESS"
+        settings.status = "저장된 Modifier Runtime 자동 복원을 완료했습니다."
+        if SESSION.phase == SESSION_ACTIVE:
+            rearm_modifier_input_guard(getattr(bpy.context, "window", None))
+        _schedule_visibility_synchronization()
+        return None
+    except Exception as exc:
+        settings.domain_restore_error = str(exc)
+        settings.domain_persistence_dirty = False
+        settings.status_kind = "ERROR"
+        settings.status = (
+            "저장된 Modifier Runtime 자동 복원에 실패했습니다. "
+            f"Dataset을 다시 Import하십시오: {exc}"
+        )
+        return None
 
 
 def _schedule_load_restore() -> None:
-    """구버전 호출 호환을 위해 generation만 폐기하고 복원 Timer는 만들지 않습니다."""
+    """파일 Load 자동 Runtime 복원 Timer를 중복 없이 예약합니다."""
 
     global _LOAD_RESTORE_GENERATION
 
     _LOAD_RESTORE_GENERATION += 1
-    if not bpy.app.timers.is_registered(process_pending_load_restore):
-        return
-    bpy.app.timers.unregister(process_pending_load_restore)
+    if bpy.app.timers.is_registered(process_pending_load_restore):
+        bpy.app.timers.unregister(process_pending_load_restore)
+    bpy.app.timers.register(process_pending_load_restore, first_interval=0.0)
 
 
 def register_state_handlers() -> None:
@@ -190,6 +268,7 @@ def register_state_handlers() -> None:
 
     if invalidate_loaded_state not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(invalidate_loaded_state)
+    register_modifier_persistence_handlers()
     for handlers in (
         bpy.app.handlers.undo_pre,
         bpy.app.handlers.redo_pre,
@@ -213,6 +292,7 @@ def unregister_state_handlers() -> None:
     global _VISIBILITY_SYNC_SCHEDULED
     if invalidate_loaded_state in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(invalidate_loaded_state)
+    unregister_modifier_persistence_handlers()
     for handlers in (
         bpy.app.handlers.undo_pre,
         bpy.app.handlers.redo_pre,

@@ -35,11 +35,17 @@ from tools.projection_paint.blender.camera_scene import (
     _frame_source_debounce_tick,
     _repair_timer,
     activate_managed_frame,
+    activate_projection_camera_session,
     clear_camera_runtime,
+    finish_projection_camera_session_exit,
+    invalidate_projection_camera_session,
+    projection_camera_session_is_active,
+    projection_camera_session_token,
     queue_frame_change,
     runtime_for_scene,
 )
 from tools.projection_paint.blender import paint_runtime as paint_runtime_module
+from tools.projection_paint.blender import paint_workspace as paint_workspace_module
 from tools.projection_paint.blender.paint_tool_bridge import active_tool_id
 from tools.projection_paint.blender.paint_runtime import (
     reconnect_current_frame,
@@ -54,6 +60,67 @@ from shared.blender_runtime.scene_marker_session import (
     acquire_scene_marker_session,
     release_scene_marker_session,
 )
+from shared.blender_runtime.workspace_factory import (
+    STATE_READY,
+    WORKSPACE_OWNER_KEY,
+    WORKSPACE_SCHEMA_KEY,
+    WORKSPACE_SEED_SCHEMA_KEY,
+    WORKSPACE_SOURCE_KEY,
+    WORKSPACE_STATE_KEY,
+    WORKSPACE_TOOL_ID_KEY,
+    WORKSPACE_UUID_KEY,
+)
+from tools.projection_paint.blender.paint_workspace import PAINT_WORKSPACE_SPEC
+from tools.projection_paint.blender.ownership import tag_owned
+from tools.projection_paint.blender.paint_workspace import (
+    ORIGIN_WORKSPACE_KEY,
+    WORKSPACE_KIND,
+    _activate_open_workspace_camera_session,
+    open_paint_workspace,
+    paint_workspace_exit_settled,
+    request_paint_workspace_exit,
+)
+from tools.projection_paint.blender.state_handlers import frame_change_handler
+
+
+def _activate_test_camera_session(scene) -> None:
+    """현재 Background Workspace를 유효한 Projection Camera 세션으로 표시합니다."""
+
+    window = bpy.context.window
+    workspace = window.workspace
+    workspace[WORKSPACE_OWNER_KEY] = "colmap_tools"
+    workspace[WORKSPACE_TOOL_ID_KEY] = PAINT_WORKSPACE_SPEC.tool_id
+    workspace[WORKSPACE_UUID_KEY] = "projection-camera-review-background"
+    workspace[WORKSPACE_SCHEMA_KEY] = PAINT_WORKSPACE_SPEC.workspace_schema
+    workspace[WORKSPACE_SEED_SCHEMA_KEY] = PAINT_WORKSPACE_SPEC.seed_schema
+    workspace[WORKSPACE_STATE_KEY] = STATE_READY
+    tag_owned(
+        workspace,
+        WORKSPACE_KIND,
+        owned_uuid="projection-camera-review-background",
+    )
+    scene.projection_paint.paint_workspace = workspace
+    acquire_scene_marker_session(scene, "projection_paint", window=window)
+    activate_projection_camera_session(scene, window)
+
+
+def _new_source_workspace(paint_workspace):
+    """테스트용 Paint Workspace가 종료 후 복귀할 일반 Workspace를 생성합니다."""
+
+    window = bpy.context.window
+    if window.workspace is not paint_workspace:
+        window.workspace = paint_workspace
+    result = bpy.ops.workspace.duplicate()
+    if result != {"FINISHED"}:
+        raise AssertionError("테스트용 일반 Workspace를 복제하지 못했습니다.")
+    source = window.workspace
+    source.name = "Camera Session Source"
+    for key in tuple(source.keys()):
+        del source[key]
+    window.workspace = paint_workspace
+    paint_workspace[WORKSPACE_SOURCE_KEY] = source.name
+    paint_workspace[ORIGIN_WORKSPACE_KEY] = source.name
+    return source
 
 
 def _save_test_image(path: Path, color: tuple[float, float, float, float]) -> None:
@@ -145,7 +212,7 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         _save_test_image(images / "a.png", (1.0, 0.0, 0.0, 1.0))
         _save_test_image(images / "b.png", (0.0, 1.0, 0.0, 1.0))
         self.scene = bpy.context.scene
-        acquire_scene_marker_session(self.scene, "projection_paint")
+        _activate_test_camera_session(self.scene)
         CameraImportJob(self.scene, _request(images)).run_to_completion()
         settings = self.scene.projection_paint
         settings.image_path_manifest_json = json.dumps(
@@ -155,7 +222,9 @@ class CameraReviewBackgroundTests(unittest.TestCase):
     def tearDown(self) -> None:
         """Extension과 임시 Source Image 파일을 정리합니다."""
 
+        camera_session = invalidate_projection_camera_session(self.scene)
         release_scene_marker_session(self.scene, "projection_paint")
+        finish_projection_camera_session_exit(camera_session)
         addon.unregister()
         self.directory.cleanup()
 
@@ -165,6 +234,29 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         settings = self.scene.projection_paint
         self.assertEqual(settings.review_background_alpha, 1.0)
         self.assertFalse(settings.review_background_enabled)
+
+    def test_workspace_open_defers_camera_session_until_ready_tick(self) -> None:
+        """작업공간 열기는 Camera 연결을 예약하고 READY Tick에서만 활성화합니다."""
+
+        window = bpy.context.window
+        workspace = window.workspace
+        camera_exit = invalidate_projection_camera_session(self.scene, window)
+        release_scene_marker_session(self.scene, "projection_paint")
+        finish_projection_camera_session_exit(camera_exit)
+
+        with patch.object(
+            paint_workspace_module,
+            "_schedule_open_workspace_configuration",
+        ) as schedule:
+            opened = open_paint_workspace(bpy.context)
+
+        self.assertIs(opened, workspace)
+        self.assertFalse(projection_camera_session_is_active(self.scene))
+        schedule.assert_called_once_with(self.scene, window, workspace)
+
+        _activate_open_workspace_camera_session(self.scene, window, workspace)
+
+        self.assertTrue(projection_camera_session_is_active(self.scene))
 
     def test_frame_switch_reuses_owned_slot_and_preserves_user_slot(self) -> None:
         """Frame 전환이 Review 슬롯만 재사용하고 사용자 배경 슬롯은 보존합니다."""
@@ -242,6 +334,114 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         self.assertEqual(commit.call_count, 1)
         self.assertEqual(commit.call_args.args[1], 2)
         self.assertIsNone(runtime.pending_frame)
+
+    def test_exit_cancels_pending_before_modifier_camera_becomes_active(self) -> None:
+        """Paint 종료 뒤 지연 요청이 Modifier Camera와 Source 상태를 덮어쓰지 않는지 검증합니다."""
+
+        runtime = runtime_for_scene(self.scene)
+        settings = self.scene.projection_paint
+        preserved_layer = settings.layers.add()
+        preserved_layer.name = "Preserved Camera Session Layer"
+        queue_frame_change(self.scene, changed_at=900.0)
+        runtime.pending_frame_retry_count = 2
+        runtime.pending_frame_next_attempt_at = 900.31
+        runtime.pending_frame_error = "종료 시 폐기할 이전 요청"
+        paint_workspace = bpy.context.window.workspace
+        source_workspace = _new_source_workspace(paint_workspace)
+
+        request_paint_workspace_exit(bpy.context)
+
+        self.assertIs(bpy.context.window.workspace, source_workspace)
+        self.assertTrue(paint_workspace_exit_settled(self.scene, bpy.context.window))
+        self.assertIs(runtime_for_scene(self.scene), runtime)
+        self.assertEqual(len(settings.layers), 1)
+        self.assertEqual(settings.layers[0].name, preserved_layer.name)
+        self.assertIsNone(runtime.pending_frame)
+        self.assertEqual(runtime.pending_frame_retry_count, 0)
+        self.assertEqual(runtime.pending_frame_error, "")
+        self.assertFalse(projection_camera_session_is_active(self.scene))
+
+        modifier_data = bpy.data.cameras.new("Modifier IMAGE_118 Data")
+        modifier_camera = bpy.data.objects.new("Modifier IMAGE_118", modifier_data)
+        self.scene.collection.objects.link(modifier_camera)
+        modifier_image = bpy.data.images.new("Modifier IMAGE_118 Background", 8, 8)
+        modifier_slot = modifier_data.background_images.new()
+        modifier_slot.image = modifier_image
+        modifier_data.show_background_images = True
+        self.scene.camera = modifier_camera
+        source_state = (
+            str(settings.current_image_id),
+            str(settings.current_image_name),
+            int(settings.active_image_id),
+            settings.stencil_source_image,
+            str(settings.status),
+            str(settings.status_kind),
+        )
+
+        with patch(
+            "tools.projection_paint.blender.camera_scene._commit_pending_frame_source"
+        ) as commit:
+            for frame in range(99, 119):
+                self.scene.frame_set(frame)
+                frame_change_handler(self.scene)
+            _frame_source_debounce_tick(now=900.31)
+
+        self.assertEqual(commit.call_count, 0)
+        self.assertIs(self.scene.camera, modifier_camera)
+        self.assertIs(modifier_slot.image, modifier_image)
+        self.assertEqual(
+            (
+                str(settings.current_image_id),
+                str(settings.current_image_name),
+                int(settings.active_image_id),
+                settings.stencil_source_image,
+                str(settings.status),
+                str(settings.status_kind),
+            ),
+            source_state,
+        )
+
+    def test_undo_rebuild_issues_new_token_and_load_ignores_stale_window(self) -> None:
+        """Undo는 활성 Window에 새 토큰을 발급하고 Load는 이전 Window 권한을 재사용하지 않습니다."""
+
+        from tools.projection_paint.blender import camera_scene as camera_scene_module
+        from tools.projection_paint.blender.lifecycle import lifecycle_registry
+
+        registry = lifecycle_registry()
+        old_token = projection_camera_session_token(self.scene)
+        self.assertIsNotNone(old_token)
+        current_frame = int(self.scene.frame_current)
+        original_activate = camera_scene_module.activate_managed_frame
+
+        registry.barrier("undo_test")
+        self.assertFalse(projection_camera_session_is_active(self.scene))
+        with patch.object(
+            camera_scene_module,
+            "activate_managed_frame",
+            wraps=original_activate,
+        ) as activate:
+            registry.rebuild(self.scene, "undo_test")
+
+        new_token = projection_camera_session_token(self.scene)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(new_token, old_token)
+        self.assertEqual(new_token.generation > old_token.generation, True)
+        self.assertEqual(activate.call_count, 1)
+        self.assertEqual(activate.call_args.args[1], current_frame)
+
+        source_workspace = _new_source_workspace(bpy.context.window.workspace)
+        registry.barrier("load_test")
+        bpy.context.window.workspace = source_workspace
+        external_camera = bpy.data.objects.new(
+            "Load External Camera",
+            bpy.data.cameras.new("Load External Camera Data"),
+        )
+        self.scene.collection.objects.link(external_camera)
+        self.scene.camera = external_camera
+        registry.rebuild(self.scene, "load_test")
+
+        self.assertIsNone(projection_camera_session_token(self.scene))
+        self.assertIs(self.scene.camera, external_camera)
 
     def test_new_frame_restarts_debounce_wait(self) -> None:
         """대기 중 새 Frame이 들어오면 마지막 입력 시각부터 0.30초를 다시 기다립니다."""
@@ -486,31 +686,27 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         """Camera View 단축키가 Projection Paint Workspace에서만 동작하는지 검증합니다."""
 
         settings = self.scene.projection_paint
-        paint_workspace = object()
-        foreign_workspace = object()
-        poll_scene = SimpleNamespace(
-            projection_paint=SimpleNamespace(
-                paint_workspace=paint_workspace,
-            )
-        )
+        window = bpy.context.window
+        paint_workspace = window.workspace
+        foreign_workspace = SimpleNamespace()
         camera_context = SimpleNamespace(
             scene=self.scene,
-            window=SimpleNamespace(workspace=paint_workspace),
+            window=window,
             area=SimpleNamespace(type="VIEW_3D"),
             space_data=SimpleNamespace(
                 region_3d=SimpleNamespace(view_perspective="CAMERA")
             ),
         )
         projection_context = SimpleNamespace(
-            scene=poll_scene,
-            window=SimpleNamespace(workspace=paint_workspace),
+            scene=self.scene,
+            window=window,
             area=SimpleNamespace(type="VIEW_3D"),
             space_data=SimpleNamespace(
                 region_3d=SimpleNamespace(view_perspective="CAMERA")
             ),
         )
         foreign_context = SimpleNamespace(
-            scene=poll_scene,
+            scene=self.scene,
             window=SimpleNamespace(workspace=foreign_workspace),
             area=SimpleNamespace(type="VIEW_3D"),
             space_data=SimpleNamespace(
@@ -518,8 +714,8 @@ class CameraReviewBackgroundTests(unittest.TestCase):
             ),
         )
         perspective_context = SimpleNamespace(
-            scene=poll_scene,
-            window=SimpleNamespace(workspace=paint_workspace),
+            scene=self.scene,
+            window=window,
             area=SimpleNamespace(type="VIEW_3D"),
             space_data=SimpleNamespace(
                 region_3d=SimpleNamespace(view_perspective="PERSP")
@@ -578,6 +774,7 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         self.assertEqual(self.scene.render.resolution_x, 64)
         self.assertEqual(self.scene.render.resolution_y, 32)
         self.assertEqual(self.scene.render.resolution_percentage, 100)
+        self.assertTrue(space.use_local_camera)
         self.assertIs(space.camera, expected_camera)
         self.assertEqual(rv3d.view_perspective, "CAMERA")
         self.assertTrue(redraws)
@@ -587,14 +784,14 @@ class CameraReviewBackgroundTests(unittest.TestCase):
 
         rv3d = SimpleNamespace(view_perspective="PERSP")
         space = SimpleNamespace(type="VIEW_3D", region_3d=rv3d, camera=None)
-        overlay = SimpleNamespace(show_relationship_lines=True)
-        window_space = SimpleNamespace(overlay=overlay)
-        redraws = []
-        viewport_area = SimpleNamespace(
-            type="VIEW_3D",
-            spaces=SimpleNamespace(active=window_space),
-            tag_redraw=lambda: redraws.append(True),
+        viewport_area = next(
+            area
+            for area in bpy.context.window.screen.areas
+            if area.type == "VIEW_3D"
         )
+        overlay = viewport_area.spaces.active.overlay
+        overlay.show_relationship_lines = True
+        redraws = []
         context = SimpleNamespace(
             scene=self.scene,
             area=SimpleNamespace(
@@ -603,9 +800,7 @@ class CameraReviewBackgroundTests(unittest.TestCase):
             ),
             space_data=space,
             window_manager=None,
-            window=SimpleNamespace(
-                screen=SimpleNamespace(areas=(viewport_area,)),
-            ),
+            window=bpy.context.window,
         )
         session = SimpleNamespace(
             result=SimpleNamespace(camera_count=2, point_count=0),

@@ -612,7 +612,14 @@ def _rebuild_projection_marker_session(scene: Any, _reason: str, _epoch: int) ->
 
     if scene is None:
         return
-    from .camera_scene import attach_projection_markers, detach_projection_markers
+    from .camera_scene import (
+        activate_managed_frame,
+        activate_projection_camera_session,
+        attach_projection_markers,
+        detach_projection_markers,
+        invalidate_projection_camera_session,
+        runtime_for_scene,
+    )
     from .paint_workspace import PAINT_WORKSPACE_SPEC
     try:
         from ....shared.blender_runtime.scene_marker_session import (
@@ -649,9 +656,22 @@ def _rebuild_projection_marker_session(scene: Any, _reason: str, _epoch: int) ->
 
         activate_projection_dataset_view_layer(scene, active_window)
         acquire_scene_marker_session(scene, "projection_paint", window=active_window)
+        camera_token = activate_projection_camera_session(scene, active_window)
         if snapshot_is_ready(scene):
             attach_projection_markers(scene)
+        runtime = runtime_for_scene(scene)
+        if (
+            runtime is not None
+            and runtime.camera_session_token == camera_token
+            and int(scene.frame_current) in runtime.entries_by_frame
+        ):
+            activate_managed_frame(
+                scene,
+                int(scene.frame_current),
+                refresh_source=False,
+            )
         return
+    invalidate_projection_camera_session(scene)
     detach_projection_markers(scene)
     if scene_marker_session_owned_by(scene, "projection_paint"):
         release_scene_marker_session(scene, "projection_paint")
@@ -761,7 +781,10 @@ def _unregister_paint_handoff_adapter() -> None:
 def _detach_projection_marker_sessions_on_unregister() -> None:
     """Extension 해제 전에 모든 Scene의 검증된 Projection Marker와 자기 lease를 정리합니다."""
 
-    from .camera_scene import detach_projection_markers
+    from .camera_scene import (
+        detach_projection_markers,
+        invalidate_projection_camera_session,
+    )
     try:
         from ....shared.blender_runtime.scene_marker_session import (
             release_scene_marker_session,
@@ -776,6 +799,7 @@ def _detach_projection_marker_sessions_on_unregister() -> None:
     failures: list[Exception] = []
     for scene in tuple(bpy.data.scenes):
         try:
+            invalidate_projection_camera_session(scene)
             detach_projection_markers(scene)
             if scene_marker_session_owned_by(scene, "projection_paint"):
                 release_scene_marker_session(scene, "projection_paint")

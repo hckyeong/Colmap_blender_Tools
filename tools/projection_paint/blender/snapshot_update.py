@@ -155,19 +155,25 @@ def snapshot_is_ready(scene: Any) -> bool:
 
 
 def snapshot_update_available(scene: Any) -> bool:
-    """현재 Modifier 출처가 마지막 PP Snapshot과 다른지 반환합니다."""
+    """현재 Modifier 복합 Identity가 마지막 독립 Snapshot과 다른지 반환합니다."""
 
     settings = getattr(scene, "projection_paint", None)
     modifier = getattr(scene, "colmap_import", None)
     if settings is None or modifier is None or not snapshot_is_ready(scene):
         return False
     return bool(
-        str(getattr(modifier, "dataset_uuid", "") or "")
+        str(getattr(modifier, "domain_uuid", "") or "")
+        != str(settings.source_modifier_domain_uuid or "")
+        or int(getattr(modifier, "domain_generation", 0))
+        != int(settings.source_modifier_domain_generation)
+        or str(getattr(modifier, "dataset_uuid", "") or "")
         != str(settings.source_modifier_dataset_uuid or "")
         or int(getattr(modifier, "edit_revision", 0))
         != int(settings.source_modifier_revision)
         or str(getattr(modifier, "source_fingerprint", "") or "")
         != str(settings.source_modifier_fingerprint or "")
+        or str(getattr(modifier, "history_hash", "") or "")
+        != str(settings.source_modifier_history_hash or "")
     )
 
 

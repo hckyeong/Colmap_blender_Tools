@@ -56,6 +56,7 @@ from tools.modifier.blender.runtime_state import (
     validated_runtime_token,
 )
 from tools.modifier.core.edit_history import serialize_history
+from tools.modifier.core.edit_journal import EditJournal, EditJournalCheckpoint
 from tools.modifier.core.edit_replay import history_hash
 from tools.modifier.core.edit_types import (
     EDIT_SCHEMA_VERSION,
@@ -336,7 +337,12 @@ try:
     settings.review_pending_camera_count = 1
     baseline_polls = _mutation_poll_results(bpy.context)
     assert_true(
-        all(baseline_polls.values()),
+        not baseline_polls["Undo"]
+        and all(
+            available
+            for name, available in baseline_polls.items()
+            if name != "Undo"
+        ),
         f"Export 비활성 기준 poll이 예상과 다릅니다: {baseline_polls}",
     )
 
@@ -510,8 +516,8 @@ try:
         input_format="text",
         layout="legacy",
         selected_files=(),
-        source_fingerprint="guard-fingerprint",
-        dataset_uuid="guard-dataset",
+        source_fingerprint="a" * 64,
+        dataset_uuid="8a04913d-e149-4539-965f-8d486217d2d2",
         schema_version=1,
     )
     operation = EditOperation(
@@ -546,7 +552,20 @@ try:
         point_id_order=(),
         image_path_manifest=None,
     )
-    install_state(old_runtime)
+    old_journal = EditJournal(source.dataset_uuid, source.source_fingerprint)
+    old_journal.restore_checkpoint(
+        EditJournalCheckpoint(
+            revision=1,
+            history=old_operations,
+            undo_stack=(),
+            redo_stack=(),
+        )
+    )
+    install_state(
+        old_runtime,
+        scene=bpy.context.scene,
+        journal=old_journal,
+    )
     settings.dataset_uuid = source.dataset_uuid
     settings.source_fingerprint = source.source_fingerprint
     settings.active_model_directory = str(source.model_directory)
@@ -588,7 +607,7 @@ try:
         baseline_reconstruction=Reconstruction(),
         current_reconstruction=Reconstruction(),
     )
-    install_state(replacement_runtime)
+    install_state(replacement_runtime, scene=bpy.context.scene)
     assert_true(
         COLMAP_OT_export_progress.modal(
             runtime_swap_operator,
