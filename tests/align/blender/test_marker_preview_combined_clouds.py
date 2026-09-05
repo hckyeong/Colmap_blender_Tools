@@ -1,4 +1,4 @@
-"""마커 미리보기의 P 점군과 A Ghost 합성·GPU 제출 계약을 검증합니다."""
+"""마커 미리보기의 P/A 일반 렌더 합성과 GPU 제출 계약을 검증합니다."""
 
 from __future__ import annotations
 
@@ -221,15 +221,12 @@ def _pass_signature(draw_passes: tuple[object, ...]) -> tuple[tuple[object, ...]
     )
 
 
-def test_preview_draw_passes_keep_a_view_and_overlay_a_ghost_only_in_p_view() -> None:
-    """일반 역할별 표시를 유지하고 preview P 뷰에만 A Ghost를 추가하는지 검증합니다."""
+def test_preview_draw_passes_keep_a_view_and_overlay_reference_normally_in_p_view() -> None:
+    """역할별 표시를 유지하고 preview P 뷰의 A도 일반 불투명 상태로 추가하는지 검증합니다."""
     from tools.align.alignment import cancel_marker_preview
     from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
     from tools.align.state import RUNTIME
-    from tools.align.viewport.renderer import (
-        _PREVIEW_GHOST_OPACITY,
-        point_cloud_draw_passes_for_role,
-    )
+    from tools.align.viewport.renderer import point_cloud_draw_passes_for_role
 
     with _preview_draw_fixture() as fixture:
         normal_reference = _pass_signature(point_cloud_draw_passes_for_role(ROLE_REFERENCE))
@@ -250,9 +247,9 @@ def test_preview_draw_passes_keep_a_view_and_overlay_a_ghost_only_in_p_view() ->
             (
                 (fixture.reference_model.model_id,),
                 ROLE_REFERENCE,
-                _PREVIEW_GHOST_OPACITY,
-                False,
-                "NONE",
+                1.0,
+                True,
+                None,
             ),
         )
 
@@ -288,11 +285,13 @@ def test_preview_moving_mvp_uses_delta_times_committed_alignment_exactly_once() 
         draw_passes = renderer.point_cloud_draw_passes_for_role(ROLE_MOVING)
         assert draw_passes[0].role == ROLE_MOVING
         assert draw_passes[1].role == ROLE_REFERENCE
-        assert draw_passes[1].depth_write is False
+        assert draw_passes[1].opacity == 1.0
+        assert draw_passes[1].depth_write is True
+        assert draw_passes[1].depth_test is None
 
 
 def test_point_cloud_submitter_executes_each_preview_pass_once() -> None:
-    """P preview 점군 제출기가 P와 A Ghost pass를 순서대로 한 번씩만 실행하는지 검증합니다."""
+    """P preview 점군 제출기가 불투명 P와 A pass를 순서대로 한 번씩 실행하는지 검증합니다."""
     from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
     from tools.align.viewport import renderer
 
@@ -312,11 +311,11 @@ def test_point_cloud_submitter_executes_each_preview_pass_once() -> None:
 
     assert submitted == [
         (("preview-moving",), ROLE_MOVING, 1.0, True, None, None),
-        (("preview-reference",), ROLE_REFERENCE, 0.35, False, "NONE", None),
+        (("preview-reference",), ROLE_REFERENCE, 1.0, True, None, None),
     ]
 
 
-def test_preview_geometry_does_not_submit_a_second_ghost_point_cloud() -> None:
+def test_preview_geometry_does_not_submit_duplicate_point_clouds() -> None:
     """대표 삼각형 처리기가 점군 pass를 중복 제출하지 않고 도형만 담당하는지 검증합니다."""
     from tools.align.constants import ROLE_MOVING
     from tools.align.viewport import renderer
@@ -377,8 +376,19 @@ def test_preview_triangle_is_hidden_after_icp_alignment_finishes() -> None:
         renderer.preview_triangle_vertices = original_triangle_vertices
 
 
-def test_ghost_draw_restores_depth_state_and_uses_requested_opacity() -> None:
-    """A Ghost 제출이 깊이 정책을 적용한 뒤 이전 GPU 상태를 빠짐없이 복원하는지 검증합니다."""
+def test_preview_triangle_faces_remain_translucent() -> None:
+    """일반 형상과 달리 세 마커를 잇는 A/P 삼각형 면만 반투명인지 검증합니다."""
+    from tools.align.viewport import renderer
+
+    face_colors = (
+        renderer._PREVIEW_REFERENCE_TRIANGLE_FACE_COLOR,
+        renderer._PREVIEW_MOVING_TRIANGLE_FACE_COLOR,
+    )
+    assert all(0.0 < color[3] < 1.0 for color in face_colors)
+
+
+def test_normal_draw_restores_depth_state_and_uses_full_opacity() -> None:
+    """일반 점군 제출이 깊이 쓰기를 복원하고 완전 불투명으로 그리는지 검증합니다."""
     from tools.align.constants import ROLE_REFERENCE
     from tools.align.viewport import renderer
 
@@ -388,7 +398,7 @@ def test_ghost_draw_restores_depth_state_and_uses_requested_opacity() -> None:
         def __init__(self) -> None:
             """검증 시작 전 GPU 깊이 상태를 비기본값으로 구성합니다."""
             self.depth_test = "LESS_EQUAL"
-            self.depth_mask = True
+            self.depth_mask = False
             self.events: list[tuple[str, object]] = []
 
         def depth_test_get(self) -> str:
@@ -477,22 +487,20 @@ def test_ghost_draw_restores_depth_state_and_uses_requested_opacity() -> None:
         renderer.gpu = fake_gpu
         renderer.bpy = fake_bpy
         renderer._point_shader = lambda: fake_shader
-        renderer._prepared_batch_for_model = lambda model_id: fake_batch if model_id == "ghost-a" else None
+        renderer._prepared_batch_for_model = lambda model_id: fake_batch if model_id == "normal-a" else None
         renderer._model_view_projection_matrix = lambda _base, _model_id: Matrix.Identity(4)
         renderer._draw_model_point_clouds(
-            ("ghost-a",),
+            ("normal-a",),
             ROLE_REFERENCE,
-            opacity=0.35,
-            depth_write=False,
-            depth_test="NONE",
         )
 
         assert fake_batch.draw_count == 1
-        assert ("depth_test", "NONE") in fake_state.events
-        assert ("depth_mask", False) in fake_state.events
+        assert ("depth_test", "NONE") not in fake_state.events
+        assert ("depth_test", "LESS_EQUAL") in fake_state.events
+        assert ("depth_mask", True) in fake_state.events
         assert fake_state.depth_test == "LESS_EQUAL"
-        assert fake_state.depth_mask is True
-        assert ("opacity", 0.35) in fake_shader.uniforms
+        assert fake_state.depth_mask is False
+        assert ("opacity", 1.0) in fake_shader.uniforms
         assert fake_shader.bind_count == 1
     finally:
         renderer.gpu = original_gpu
@@ -503,7 +511,7 @@ def test_ghost_draw_restores_depth_state_and_uses_requested_opacity() -> None:
 
 
 def test_preview_p_view_submits_reused_real_gpu_batches() -> None:
-    """preview P 뷰의 P와 A Ghost가 실제 Blender GPU batch로 제출되는지 검증합니다."""
+    """preview P 뷰의 불투명 P와 A가 실제 Blender GPU batch로 제출되는지 검증합니다."""
     import gpu
 
     from tools.align import registration
@@ -550,14 +558,15 @@ def test_preview_p_view_submits_reused_real_gpu_batches() -> None:
 
 
 def run_all() -> None:
-    """마커 preview 점군 합성과 실제 GPU 제출 회귀를 순서대로 실행합니다."""
+    """마커 preview 일반 렌더 합성과 실제 GPU 제출 회귀를 순서대로 실행합니다."""
     _add_source_path()
-    test_preview_draw_passes_keep_a_view_and_overlay_a_ghost_only_in_p_view()
+    test_preview_draw_passes_keep_a_view_and_overlay_reference_normally_in_p_view()
     test_preview_moving_mvp_uses_delta_times_committed_alignment_exactly_once()
     test_point_cloud_submitter_executes_each_preview_pass_once()
-    test_preview_geometry_does_not_submit_a_second_ghost_point_cloud()
+    test_preview_geometry_does_not_submit_duplicate_point_clouds()
     test_preview_triangle_is_hidden_after_icp_alignment_finishes()
-    test_ghost_draw_restores_depth_state_and_uses_requested_opacity()
+    test_preview_triangle_faces_remain_translucent()
+    test_normal_draw_restores_depth_state_and_uses_full_opacity()
     test_preview_p_view_submits_reused_real_gpu_batches()
     print("test_marker_preview_combined_clouds: 통과")
 

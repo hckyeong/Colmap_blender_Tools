@@ -1,0 +1,148 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e671b87..395667f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,7 +158,7 @@ endif()
+ # TBB (optional)
+ # Must come before CGAL so it can use TBB properly
+ if ( CCCORELIB_USE_TBB )
+-	find_package( TBB COMPONENTS tbb 2022.0.0 CONFIG )
++	find_package( TBB 2022.0.0 EXACT COMPONENTS tbb CONFIG REQUIRED )
+ 
+ 	set( CCCORELIB_USE_QT_CONCURRENT OFF )
+ 	if ( TBB_FOUND )
+diff --git a/include/DgmOctree.h b/include/DgmOctree.h
+index 1c84b0c..6b1edcd 100644
+--- a/include/DgmOctree.h
++++ b/include/DgmOctree.h
+@@ -1228,7 +1228,7 @@ namespace CCCoreLib
+ 		struct MultiThreadingWrapper
+ 		{
+ 			octreeCellFunc cellFunc = nullptr;
+-			bool cellFuncSuccess = true;
++			std::atomic_bool cellFuncSuccess { true };
+ 			DgmOctree* octree = nullptr;
+ 			GenericProgressCallback* progressCb = nullptr;
+ 			NormalizedProgress* normProgressCb = nullptr;
+diff --git a/src/DgmOctree.cpp b/src/DgmOctree.cpp
+index 3e490f1..a92864c 100644
+--- a/src/DgmOctree.cpp
++++ b/src/DgmOctree.cpp
+@@ -220,7 +220,11 @@ void DgmOctree::MultiThreadingWrapper::launchOctreeCellFunc(const octreeCellDesc
+ 			cell.points->addPointIndex(pointsAndCodes[i].theIndex);
+ 		}
+ 
+-		cellFuncSuccess &= (*cellFunc)(cell, userParams, normProgressCb);
++		// 병렬 셀 작업이 실패하면 공유 성공 상태를 원자적으로 내립니다.
++		if (!(*cellFunc)(cell, userParams, normProgressCb))
++		{
++			cellFuncSuccess.store(false, std::memory_order_relaxed);
++		}
+ 
+ #if defined(CC_CORE_LIB_USES_QT_CONCURRENT)
+ 		if (normProgressCb)
+diff --git a/src/DistanceComputationTools.cpp b/src/DistanceComputationTools.cpp
+index cec8a47..e640504 100644
+--- a/src/DistanceComputationTools.cpp
++++ b/src/DistanceComputationTools.cpp
+@@ -18,6 +18,7 @@
+ 
+ //system
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ 
+ #ifndef CC_DEBUG
+@@ -930,8 +931,9 @@ namespace CCCoreLib
+ 		const DgmOctree* octree = nullptr;
+ 		NormalizedProgress* normProgressCb = nullptr;
+ 		const GridAndMeshIntersection* intersection_MT = nullptr;
+-		bool cellFunc_success = true;
+-		int cellFunc_MT_results = DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::SUCCESS;
++		//! 병렬 작업의 성공 여부와 오류 코드를 원자적으로 공유합니다.
++		std::atomic_bool cellFunc_success { true };
++		std::atomic_int cellFunc_MT_results { DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::SUCCESS };
+ 		DistanceComputationTools::Cloud2MeshDistancesComputationParams params_MT;
+ 
+ 		//'processTriangles' mechanism (based on bit mask)
+@@ -946,9 +948,10 @@ namespace CCCoreLib
+ }
+ static CCCoreLib::MultiThreadingWrapper s_multiThreadingWrapper;
+ 
++// 병렬 셀 하나를 처리하고 실패 상태를 원자적으로 공유합니다.
+ static void CloudMeshDistCellFunc_MT(const DgmOctree::IndexAndCode& desc)
+ {
+-	if (!s_multiThreadingWrapper.cellFunc_success)
++	if (!s_multiThreadingWrapper.cellFunc_success.load(std::memory_order_acquire))
+ 	{
+ 		//skip this cell if the process is aborted / has failed
+ 		return;
+@@ -967,8 +970,8 @@ static void CloudMeshDistCellFunc_MT(const DgmOctree::IndexAndCode& desc)
+ #endif
+ 		if (!s_multiThreadingWrapper.normProgressCb->oneStep())
+ 		{
+-			s_multiThreadingWrapper.cellFunc_success = false;
+-			s_multiThreadingWrapper.cellFunc_MT_results = DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::CANCELED_BY_USER;
++			s_multiThreadingWrapper.cellFunc_MT_results.store(DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::CANCELED_BY_USER, std::memory_order_relaxed);
++			s_multiThreadingWrapper.cellFunc_success.store(false, std::memory_order_release);
+ 			return;
+ 		}
+ 	}
+@@ -987,8 +990,8 @@ static void CloudMeshDistCellFunc_MT(const DgmOctree::IndexAndCode& desc)
+ 	catch (const std::bad_alloc&)
+ 	{
+ 		//not enough memory
+-		s_multiThreadingWrapper.cellFunc_success = false;
+-		s_multiThreadingWrapper.cellFunc_MT_results = DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::ERROR_OUT_OF_MEMORY;
++		s_multiThreadingWrapper.cellFunc_MT_results.store(DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::ERROR_OUT_OF_MEMORY, std::memory_order_relaxed);
++		s_multiThreadingWrapper.cellFunc_success.store(false, std::memory_order_release);
+ 		return;
+ 	}
+ 
+@@ -1218,8 +1221,8 @@ static void CloudMeshDistCellFunc_MT(const DgmOctree::IndexAndCode& desc)
+ 												s_multiThreadingWrapper.params_MT) )
+ 		{
+ 			//not enough memory
+-			s_multiThreadingWrapper.cellFunc_success = false;
+-			s_multiThreadingWrapper.cellFunc_MT_results = DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::ERROR_OUT_OF_MEMORY;
++			s_multiThreadingWrapper.cellFunc_MT_results.store(DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::ERROR_OUT_OF_MEMORY, std::memory_order_relaxed);
++			s_multiThreadingWrapper.cellFunc_success.store(false, std::memory_order_release);
+ 			return;
+ 		}
+ 	}
+@@ -1572,6 +1575,7 @@ int DistanceComputationTools::computePoint2MeshDistancesWithOctree(	const CCVect
+ 	return DISTANCE_COMPUTATION_RESULTS::SUCCESS;
+ }
+ 
++// 옥트리 셀을 병렬 처리하고 원자적으로 수집한 최종 상태를 반환합니다.
+ int DistanceComputationTools::computeCloud2MeshDistancesWithOctree(	const DgmOctree* octree,
+ 																	const GridAndMeshIntersection& intersection,
+ 																	Cloud2MeshDistancesComputationParams& params,
+@@ -1815,8 +1819,8 @@ int DistanceComputationTools::computeCloud2MeshDistancesWithOctree(	const DgmOct
+ 
+ 		s_multiThreadingWrapper.octree = octree;
+ 		s_multiThreadingWrapper.normProgressCb = &nProgress;
+-		s_multiThreadingWrapper.cellFunc_success = true;
+-		s_multiThreadingWrapper.cellFunc_MT_results = DISTANCE_COMPUTATION_RESULTS::SUCCESS;
++		s_multiThreadingWrapper.cellFunc_success.store(true, std::memory_order_relaxed);
++		s_multiThreadingWrapper.cellFunc_MT_results.store(DISTANCE_COMPUTATION_RESULTS::SUCCESS, std::memory_order_relaxed);
+ 		s_multiThreadingWrapper.params_MT = params;
+ 		s_multiThreadingWrapper.intersection_MT = &intersection;
+ 		//acceleration structure
+@@ -1846,11 +1850,13 @@ int DistanceComputationTools::computeCloud2MeshDistancesWithOctree(	const DgmOct
+ 
+ 		//clean acceleration structure
+ 		s_multiThreadingWrapper.bitArrayPool_MT.clear();
+-		if (!s_multiThreadingWrapper.cellFunc_success && s_multiThreadingWrapper.cellFunc_MT_results == DISTANCE_COMPUTATION_RESULTS::SUCCESS)
++		const bool cellFuncSuccess = s_multiThreadingWrapper.cellFunc_success.load(std::memory_order_acquire);
++		int cellFuncResult = s_multiThreadingWrapper.cellFunc_MT_results.load(std::memory_order_relaxed);
++		if (!cellFuncSuccess && cellFuncResult == DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 		{
+-			s_multiThreadingWrapper.cellFunc_MT_results = DISTANCE_COMPUTATION_RESULTS::ERROR_EXECUTE_CLOUD_MESH_DIST_CELL_FUNC_MT_FAILURE;
++			cellFuncResult = DISTANCE_COMPUTATION_RESULTS::ERROR_EXECUTE_CLOUD_MESH_DIST_CELL_FUNC_MT_FAILURE;
+ 		}
+-		return (s_multiThreadingWrapper.cellFunc_success ? DISTANCE_COMPUTATION_RESULTS::SUCCESS : s_multiThreadingWrapper.cellFunc_MT_results);
++		return (cellFuncSuccess ? DISTANCE_COMPUTATION_RESULTS::SUCCESS : cellFuncResult);
+ 	}
+ #endif // ENABLE_CLOUD2MESH_DIST_MT
+ }

@@ -7,7 +7,9 @@ from .codec import (
     payload_fingerprint_for_snapshot,
 )
 from .types import (
+    ProjectAxesSnapshot,
     ProjectCatalogSnapshot,
+    ProjectCompanionSourceSnapshot,
     ProjectMarkerPairSnapshot,
     ProjectMarkerPointSnapshot,
     ProjectMarkerSnapshot,
@@ -19,7 +21,9 @@ from .types import (
 
 
 __all__ = (
+    "ProjectAxesSnapshot",
     "ProjectCatalogSnapshot",
+    "ProjectCompanionSourceSnapshot",
     "ProjectMarkerPairSnapshot",
     "ProjectMarkerPointSnapshot",
     "ProjectMarkerSnapshot",

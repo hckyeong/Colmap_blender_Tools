@@ -13,7 +13,6 @@ import numpy as np
 from .constants import (
     GEOMETRY_KIND_TRIANGLE_MESH,
     OBJ_DISPLAY_VERTEX_LIMIT,
-    OBJ_MAX_TRIANGLE_FACES,
 )
 from .display_axes import (
     DEFAULT_AXIS_PRESET,
@@ -22,7 +21,12 @@ from .display_axes import (
     ModelDisplayTransform,
     create_model_display_transform,
 )
-from .mesh_io import ObjReader, ObjReaderError, TriangleMeshModelData
+from .mesh_io import TriangleMeshModelData
+from .mesh_io.embedded_obj_store import (
+    build_triangle_proxy_from_embedded_mesh,
+    commit_embedded_obj_mesh,
+)
+from .mesh_io.obj_native_import import NativeObjStaging, import_obj_to_staging
 from .mesh_io.validation import validate_obj_limits
 from .model_repository import (
     DuplicateModelSourceError,
@@ -170,9 +174,15 @@ class MeshImportJob:
     gpu_batch_prepared: bool = field(default=False, repr=False)
     started_at: float = field(default_factory=perf_counter, repr=False)
     display_transform: ModelDisplayTransform = field(init=False)
-    reader: ObjReader | None = field(default=None, repr=False)
+    reader: Any = field(default=None, repr=False)
     fingerprint_job: _FileFingerprintJob | None = field(default=None, repr=False)
     display_builder: IncrementalDisplayIndexBuilder | None = field(default=None, repr=False)
+    native_staging: NativeObjStaging | None = field(default=None, repr=False)
+    source_size_before: int = field(default=0, repr=False)
+    source_mtime_ns_before: int = field(default=0, repr=False)
+    geometry_only: bool = False
+    stage_only: bool = False
+    prepare_gpu: bool = True
 
     def __post_init__(self) -> None:
         """작업 시작 시 표시 축·정점 표시 상한·예상 fingerprint를 검증합니다."""
@@ -219,22 +229,25 @@ class MeshImportJob:
         self.progress = max(self.progress, min(1.0, max(0.0, float(progress))))
 
     def _cleanup_staging(self) -> None:
-        """reader·임시 배열·staged 메시 참조를 끊어 부분 상태가 남지 않게 합니다."""
+        """Native Mesh와 임시 배열을 해제해 실패·취소 Data Block이 남지 않게 합니다."""
         if self.reader is not None and not self.reader.done:
             self.reader.cancel()
         if self.fingerprint_job is not None:
             self.fingerprint_job.close()
         if self.display_builder is not None:
             self.display_builder.cancel()
+        if self.native_staging is not None:
+            self.native_staging.discard()
         self.reader = None
         self.fingerprint_job = None
         self.display_builder = None
         self.parsed_result = None
         self.display_indices = None
         self.staged_model = None
+        self.native_staging = None
 
     def _step_fingerprint(self, *, after_read: bool, time_budget_seconds: float) -> bool:
-        """가져오기 전·후 OBJ 지문을 같은 증분 작업으로 계산하고 일치 여부를 확인합니다."""
+        """구버전 복원에서만 OBJ SHA-256을 가져오기 전후 계산해 저장 지문과 비교합니다."""
         if self.fingerprint_job is None:
             self.fingerprint_job = _FileFingerprintJob(Path(self.source_path))
         self.fingerprint_job.step(time_budget_seconds)
@@ -250,13 +263,31 @@ class MeshImportJob:
         self.fingerprint_job.close()
         self.fingerprint_job = None
         if after_read:
-            if fingerprint != self.source_fingerprint_before:
+            if (
+                fingerprint != self.source_fingerprint_before
+                or fingerprint != self.expected_source_fingerprint
+            ):
                 raise MeshImportJobError("가져오기 중 OBJ source 파일이 변경되었습니다. 다시 시도하십시오.")
-        else:
-            self.source_fingerprint_before = fingerprint
-            if self.expected_source_fingerprint and fingerprint != self.expected_source_fingerprint:
-                raise MeshImportJobError("저장된 OBJ source fingerprint와 현재 원본이 다릅니다.")
+            return True
+        self.source_fingerprint_before = fingerprint
+        if fingerprint != self.expected_source_fingerprint:
+            raise MeshImportJobError("저장된 OBJ source fingerprint와 현재 원본이 다릅니다.")
         return True
+
+    def commit_staging(self) -> None:
+        """stage_only 호출자가 Repository 등록 성공 뒤 내장 Mesh 소유권을 확정합니다."""
+
+        if self.native_staging is None:
+            raise MeshImportJobError("확정할 OBJ native staging이 없습니다.")
+        self.native_staging.commit()
+        self.native_staging = None
+
+    def discard_staging(self) -> None:
+        """stage_only 호출자가 상위 transaction 실패 때 내장 후보를 폐기합니다."""
+
+        if self.native_staging is not None:
+            self.native_staging.discard()
+            self.native_staging = None
 
     def _cancel(self) -> str:
         """취소 경로에서 GPU cache와 임시 배열을 해제하고 Runtime을 건드리지 않습니다."""
@@ -283,7 +314,7 @@ class MeshImportJob:
         return "CANCELLED"
 
     def _commit(self, runtime: Any) -> None:
-        """Repository·catalog·GPU를 하나의 등록 단위로 확정하고 실패 시 모두 되돌립니다."""
+        """Repository·catalog 등록 실패 시 추가한 모델과 실제 준비한 GPU만 되돌립니다."""
         model = self.staged_model
         if model is None:
             raise MeshImportJobError("확정할 staged OBJ 메시가 없습니다.")
@@ -313,16 +344,42 @@ class MeshImportJob:
                 select_after_import=(not was_empty and not runtime.marker_selection.has_draft and not runtime.marker_selection.completed_pairs),
                 geometry_kind=GEOMETRY_KIND_TRIANGLE_MESH,
             )
+            self.commit_staging()
         except Exception:
             if repository_added:
                 repository.remove_model(model.model_id)
             catalog.restore_snapshot(catalog_snapshot)
-            _discard_gpu_batch_for_model(model.model_id)
-            self.gpu_batch_prepared = False
+            if self.gpu_batch_prepared:
+                _discard_gpu_batch_for_model(model.model_id)
+                self.gpu_batch_prepared = False
+            self.discard_staging()
             raise
 
+    def _complete(self) -> str:
+        """준비된 모델과 원본 지문을 보존하고 읽기용 임시 참조만 해제합니다."""
+        model = self.staged_model
+        if model is None:
+            raise MeshImportJobError("완료할 staged OBJ 메시가 없습니다.")
+        self.stage = MESH_IMPORT_STAGE_COMPLETED
+        self.progress = 1.0
+        action = "준비했습니다" if self.stage_only else "추가했습니다"
+        self.result_message = (
+            f"OBJ 메시를 {action}. 정점 {model.vertex_count:,}개, "
+            f"UV {model.texture_coordinate_count:,}개, "
+            f"텍스처 {model.diffuse_texture_count:,}개, "
+            f"원본 면 {model.original_polygon_count:,}개, "
+            f"정렬용 삼각면 {model.face_count:,}개, OBJ 내장됨, "
+            f"등록 정점 {model.registration_vertex_indices.size:,}개"
+        )
+        self.parsed_result = None
+        self.reader = None
+        self.fingerprint_job = None
+        self.display_builder = None
+        self.display_indices = None
+        return "FINISHED"
+
     def step(self, runtime: Any | None = None, *, time_budget_seconds: float = 0.025) -> str:
-        """OBJ 작업의 한 단계를 처리하고 RUNNING·FINISHED·CANCELLED를 반환합니다."""
+        """OBJ를 단계별로 준비하고 준비 전용이면 등록 없이 완료 상태를 반환합니다."""
         if self.is_terminal:
             return "FINISHED" if self.stage == MESH_IMPORT_STAGE_COMPLETED else "CANCELLED"
         if self.cancel_requested:
@@ -332,67 +389,72 @@ class MeshImportJob:
             if self.stage == MESH_IMPORT_STAGE_FILE_CHECK:
                 if source.suffix.casefold() != ".obj" or not source.is_file():
                     raise MeshImportJobError("선택한 경로가 존재하는 OBJ 파일이 아닙니다.")
-                if source.stat().st_size < 1:
+                stat = source.stat()
+                if stat.st_size < 1:
                     raise MeshImportJobError("OBJ 파일이 비어 있습니다.")
+                self.source_size_before = int(stat.st_size)
+                self.source_mtime_ns_before = int(stat.st_mtime_ns)
                 self.source_path = canonical_source_path(source)
                 self._advance(MESH_IMPORT_STAGE_HASH_SOURCE_BEFORE, 0.05)
                 return "RUNNING"
             if self.stage == MESH_IMPORT_STAGE_HASH_SOURCE_BEFORE:
-                if not self._step_fingerprint(after_read=False, time_budget_seconds=time_budget_seconds):
-                    return "RUNNING"
+                if self.expected_source_fingerprint:
+                    if not self._step_fingerprint(after_read=False, time_budget_seconds=time_budget_seconds):
+                        return "RUNNING"
                 self._advance(MESH_IMPORT_STAGE_READ_OBJ, 0.12)
                 return "RUNNING"
             if self.stage == MESH_IMPORT_STAGE_READ_OBJ:
-                if self.reader is None:
-                    self.reader = ObjReader(self.source_path)
-                self.reader.step(time_budget_seconds)
-                self.current_count = self.reader.progress.triangle_count
-                self.total_count = OBJ_MAX_TRIANGLE_FACES
-                self.progress = max(self.progress, 0.12 + 0.50 * self.reader.progress.fraction)
-                if self.reader.error is not None:
-                    raise self.reader.error
-                if not self.reader.done:
-                    return "RUNNING"
-                self.parsed_result = self.reader.model
-                self.current_count = self.parsed_result.triangle_count
-                self.total_count = OBJ_MAX_TRIANGLE_FACES
+                if self.native_staging is None:
+                    self.native_staging = import_obj_to_staging(self.source_path)
+                self.parsed_result = self.native_staging.mesh
+                self.current_count = len(self.parsed_result.polygons)
+                self.total_count = self.current_count
                 self._advance(MESH_IMPORT_STAGE_VALIDATE, 0.62)
                 return "RUNNING"
             if self.stage == MESH_IMPORT_STAGE_VALIDATE:
-                result = self.parsed_result
-                if result is None:
-                    raise MeshImportJobError("OBJ parser 결과가 없습니다.")
-                validate_obj_limits(vertex_count=result.vertex_count, triangle_count=result.triangle_count)
+                mesh = self.parsed_result
+                if mesh is None or len(mesh.vertices) < 1 or len(mesh.polygons) < 1:
+                    raise MeshImportJobError("Blender OBJ Importer가 빈 Mesh를 반환했습니다.")
                 self._advance(MESH_IMPORT_STAGE_HASH_SOURCE_AFTER, 0.70)
                 return "RUNNING"
             if self.stage == MESH_IMPORT_STAGE_HASH_SOURCE_AFTER:
-                if not self._step_fingerprint(after_read=True, time_budget_seconds=time_budget_seconds):
+                stat = Path(self.source_path).stat()
+                if (
+                    int(stat.st_size) != self.source_size_before
+                    or int(stat.st_mtime_ns) != self.source_mtime_ns_before
+                ):
+                    raise MeshImportJobError("가져오기 중 OBJ source 파일이 변경되었습니다. 다시 시도하십시오.")
+                if self.expected_source_fingerprint and not self._step_fingerprint(
+                    after_read=True,
+                    time_budget_seconds=time_budget_seconds,
+                ):
                     return "RUNNING"
                 self._advance(MESH_IMPORT_STAGE_PREPARE_MODEL, 0.76)
                 return "RUNNING"
             if self.stage == MESH_IMPORT_STAGE_PREPARE_MODEL:
-                result = self.parsed_result
-                if result is None:
-                    raise MeshImportJobError("OBJ parser 결과가 없습니다.")
+                mesh = self.parsed_result
+                if mesh is None:
+                    raise MeshImportJobError("Blender OBJ Importer 결과가 없습니다.")
                 model_id = str(self.model_id_factory()).strip()
                 if not model_id:
                     raise MeshImportJobError("OBJ 모델 ID를 생성하지 못했습니다.")
                 display_name = self.display_name_hint.strip() or Path(self.source_path).stem
-                self.staged_model = TriangleMeshModelData(
+                commit_embedded_obj_mesh(
+                    mesh,
+                    model_id=model_id,
+                    source_path=self.source_path,
+                    geometry_revision=1,
+                )
+                self.staged_model = build_triangle_proxy_from_embedded_mesh(
+                    mesh,
                     model_id=model_id,
                     display_name=display_name,
-                    source_path=Path(self.source_path),
-                    vertices_float64=result.vertices_float64,
-                    triangles_uint32=result.triangles_uint32,
-                    registration_vertex_indices=result.registration_vertex_indices,
-                    display_vertex_indices=result.registration_vertex_indices,
-                    bounds_min=result.bounds_min,
-                    bounds_max=result.bounds_max,
-                    texcoords_float64=result.texcoords_float64,
-                    texcoord_component_counts_uint8=result.texcoord_component_counts_uint8,
-                    triangle_texcoord_indices_int32=result.triangle_texcoord_indices_int32,
-                    materials=result.materials,
-                    triangle_material_indices_int32=result.triangle_material_indices_int32,
+                    source_path=self.source_path,
+                    geometry_only=self.geometry_only,
+                )
+                validate_obj_limits(
+                    vertex_count=self.staged_model.vertex_count,
+                    triangle_count=self.staged_model.proxy_triangle_count,
                 )
                 self._advance(MESH_IMPORT_STAGE_PREPARE_DISPLAY_SAMPLE, 0.82)
                 return "RUNNING"
@@ -438,7 +500,18 @@ class MeshImportJob:
                     triangle_texcoord_indices_int32=model.triangle_texcoord_indices_int32,
                     materials=model.materials,
                     triangle_material_indices_int32=model.triangle_material_indices_int32,
+                    triangle_polygon_indices_uint32=model.triangle_polygon_indices_uint32,
+                    triangle_loop_indices_uint32=model.triangle_loop_indices_uint32,
+                    embedded_asset_uuid=model.embedded_asset_uuid,
+                    embedded_asset_schema_version=model.embedded_asset_schema_version,
+                    embedded_data_name_hint=model.embedded_data_name_hint,
+                    original_polygon_count=model.original_polygon_count,
                 )
+                if self.stage_only:
+                    return self._complete()
+                if not self.prepare_gpu:
+                    self._advance(MESH_IMPORT_STAGE_COMMIT, 0.94)
+                    return "RUNNING"
                 self._advance(MESH_IMPORT_STAGE_PREPARE_GPU, 0.88)
                 return "RUNNING"
             if self.stage == MESH_IMPORT_STAGE_PREPARE_GPU:
@@ -452,21 +525,7 @@ class MeshImportJob:
                 if runtime is None:
                     raise MeshImportJobError("OBJ Data Layer 등록에는 Runtime이 필요합니다.")
                 self._commit(runtime)
-                self.stage = MESH_IMPORT_STAGE_COMPLETED
-                self.progress = 1.0
-                self.result_message = (
-                    f"OBJ 메시를 추가했습니다. 정점 {self.staged_model.vertex_count:,}개, "
-                    f"UV {self.staged_model.texture_coordinate_count:,}개, "
-                    f"텍스처 {self.staged_model.diffuse_texture_count:,}개, "
-                    f"삼각면 {self.staged_model.face_count:,}개, "
-                    f"등록 정점 {self.staged_model.registration_vertex_indices.size:,}개"
-                )
-                self.parsed_result = None
-                self.reader = None
-                self.fingerprint_job = None
-                self.display_builder = None
-                self.display_indices = None
-                return "FINISHED"
+                return self._complete()
             raise MeshImportJobError(f"알 수 없는 OBJ 가져오기 단계입니다: {self.stage}")
         except Exception as error:
             return self._fail(error)
@@ -479,6 +538,12 @@ def create_mesh_import_job(source_path: str | Path, **kwargs: Any) -> MeshImport
 
 def run_mesh_import_job(runtime: Any, source_path: str | Path, **kwargs: Any) -> MeshImportJob:
     """Blender 외부 테스트에서 OBJ job을 끝까지 실행하고 결과를 반환합니다."""
+
+    from .axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(runtime)
+    if axis_reason is not None:
+        raise MeshImportJobError(axis_reason)
     job = create_mesh_import_job(source_path, **kwargs)
     while not job.is_terminal:
         job.step(runtime)

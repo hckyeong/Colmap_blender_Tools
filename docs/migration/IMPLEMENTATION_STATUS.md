@@ -442,6 +442,8 @@ Blender 5.2 Background 대상 회귀 99개를 통과했습니다. `build/colmap_
 - Align의 마커 정렬용 대표 삼각형은 ICP 완료 결과 미리보기부터 숨기고, 점군·마커·승인 흐름은 유지
 - Align OBJ의 `vt`와 face-corner UV 인덱스를 Runtime에 불변 보존하고, 정렬 결과 Export·Reflection·왕복 검증·Blender UV Layer 재수입까지 연결
 - Align OBJ의 MTL diffuse 재질과 이미지 경로를 Runtime에 보존하고, `COLMAP RGB` 텍스처 표시·생성 MTL·원본 이미지 바이트 복사·SHA-256 왕복 검증까지 연결
+- Align 독립·연결 OBJ를 UUID 기반 비연결 Fake User Mesh로 `.blend`에 내장하고, 원본 Polygon·Loop UV·재질은 Export에, `calc_loop_triangles()` 프록시는 표시·피킹·마커·CCCoreLib에만 사용하는 계약
+- Align 프로젝트 schema v8에서 외부 OBJ SHA 의존성을 제거하고, 외부 OBJ 삭제 뒤 복원·Export, 구버전 일회성 내장 이전, 레이어 삭제·새 프로젝트·실패 rollback의 소유 Data Block 수명주기 검증
 - Align OBJ Export를 모델 표시 이름의 OBJ·MTL과 원본 이름 이미지가 한 폴더에 놓이는 구조로 변경하고, 중복 파일명과 Windows 260자 경로 제한을 생성 전에 명확한 오류로 보고
 - Modifier 원본 변경 경고 시 Workspace 활성 상태와 표시 설정은 유지하고, Projection Paint 재진입 시 소유 COLMAP Collection 표시와 Point Geometry 갱신을 복원하는 계약
 - `Scene.colmap_dataset`과 중립 소유 키를 권위로 삼는 Scene별 단일 공용 COLMAP Dataset 계층

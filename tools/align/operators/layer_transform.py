@@ -106,6 +106,12 @@ def layer_transform_active_block_reason() -> str | None:
 def layer_transform_start_block_reason(role: str | None = None) -> str | None:
     """새 G/R/S 또는 Gizmo 변환을 시작할 수 없는 단일 정확한 이유를 반환합니다."""
 
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(RUNTIME)
+    if axis_reason is not None:
+        return axis_reason
+
     restore_reason = restore_input_block_reason()
     if restore_reason is not None:
         return restore_reason

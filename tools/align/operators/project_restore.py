@@ -103,7 +103,7 @@ class COLMAPALIGN_OT_retry_project_restore(bpy.types.Operator):
 
 
 class COLMAPALIGN_OT_cancel_project_restore(bpy.types.Operator):
-    """실행 중인 프로젝트 자동 복원을 취소하고 빈 Runtime을 유지합니다."""
+    """실행 중인 프로젝트 자동 복원을 취소하고 기존 정상 Runtime을 유지합니다."""
 
     bl_idname = "colmap_align.cancel_project_restore"
     bl_label = "복원 취소"
@@ -117,7 +117,7 @@ class COLMAPALIGN_OT_cancel_project_restore(bpy.types.Operator):
         return RUNTIME.project_restore.phase in {"RESTORING", "NEEDS_RELINK"}
 
     def execute(self, _context):
-        """저장 Text는 유지한 채 restore ImportJob과 부분 Runtime을 비웁니다."""
+        """저장 Text와 기존 작업을 유지한 채 복원용 가져오기와 임시 상태를 폐기합니다."""
 
         if not cancel_project_restore():
             return {"CANCELLED"}

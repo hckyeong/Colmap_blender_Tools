@@ -4,6 +4,8 @@
 
 ## 현행 문서
 
+- [Align main 마이그레이션 계획서](COLMAP_Align_main_마이그레이션_계획서.md)
+- [Align main 승격 검토](COLMAP_Align_main_승격_검토.md)
 - [독립 도구 통합 계획서](COLMAP_Tools_독립도구_통합_계획서.md)
 - [Workspace 격리 구조변경 계획서](COLMAP_Tools_Workspace_격리_구조변경_계획서.md)
 - [Camera Marker 세션 격리 구조변경 계획서](COLMAP_Tools_Camera_Marker_세션격리_구조변경_계획서.md)
@@ -14,6 +16,9 @@
 - [Modifier Runtime 중복 무결성 검사 제거·빠른 복원 구조변경 계획서](COLMAP_Modifier_Runtime_중복무결성검사_제거_빠른복원_구조변경_계획서.md)
 - [Modifier 전용 Undo·Redo 도메인 구조변경 계획서](COLMAP_Modifier_전용_Undo_Redo_도메인_구조변경_계획서.md)
 - [Align OBJ UV 보존 구조변경 계획서](COLMAP_Align_OBJ_UV_보존_구조변경_계획서.md)
+- [Align OBJ 내장 원본 토폴로지·정렬 프록시 계획서](COLMAP_Align_OBJ_원본토폴로지_보존_정렬프록시_계획서.md)
+- [Align CCCoreLib CPU 멀티스레드 적용 계획서](COLMAP_Align_CCCoreLib_CPU_멀티스레드_적용_계획서.md)
+- [Align CCCoreLib 단일 세션 워커·지오메트리 캐시 구조 변경 계획서](COLMAP_Align_CCCoreLib_단일세션워커_지오메트리캐시_계획서.md)
 - [Projection Paint Blender 기본 도구 완전 호환 구조변경 계획서](COLMAP_Projection_Paint_Blender_기본도구_완전호환_구조변경_계획서.md)
 - [Projection Paint 레이어 선택·활성화·삭제 UX 구조변경 계획서](COLMAP_Projection_Paint_레이어_선택_활성화_삭제_UX_구조변경_계획서.md)
 - [Projection Paint 가시 Layer Texture Export UX 구조변경 계획서](COLMAP_Projection_Paint_가시레이어_Texture_Export_UX_구조변경_계획서.md)

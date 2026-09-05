@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 from types import MappingProxyType
 from typing import Literal
 
@@ -38,6 +39,9 @@ class DisplayAxisPreset:
 DEFAULT_AXIS_PRESET = "REALITY_CAPTURE"
 """기준 Blender COLMAP Importer와 동일한 기본 표시 축 프리셋입니다."""
 
+RC_OBJ_AXIS_PRESET = "REALITY_CAPTURE_OBJ"
+"""별도 내보내기 회전이 없는 RC 표준 OBJ의 원본 축 프리셋입니다."""
+
 BLENDER_AXIS_PRESET = "BLENDER"
 """기존 COLMAP Align 무변환 표시와 같은 Blender 축 프리셋입니다."""
 
@@ -48,14 +52,21 @@ CUSTOM_AXIS_PRESET = "CUSTOM"
 AXIS_PRESETS = (
     DisplayAxisPreset(
         DEFAULT_AXIS_PRESET,
-        "RealityCapture (RC)",
-        "RealityCapture 좌표를 Blender 표시축에 맞춥니다",
+        "RC COLMAP",
+        "RC COLMAP 원본 좌표를 공통 표시 축에 맞춥니다",
         "Z",
         "-Y",
     ),
     DisplayAxisPreset(
+        RC_OBJ_AXIS_PRESET,
+        "RC 표준 OBJ",
+        "RC 표준 OBJ의 Y Forward, Z Up 원본 축을 사용합니다",
+        "Y",
+        "Z",
+    ),
+    DisplayAxisPreset(
         BLENDER_AXIS_PRESET,
-        "Blender",
+        "원본 축 유지",
         "Blender의 Y Forward, Z Up 좌표를 그대로 표시합니다",
         "Y",
         "Z",
@@ -76,7 +87,7 @@ AXIS_PRESETS = (
     ),
     DisplayAxisPreset(
         CUSTOM_AXIS_PRESET,
-        "Custom",
+        "직접 설정",
         "Forward Axis와 Up Axis를 직접 설정합니다",
         None,
         None,
@@ -210,6 +221,30 @@ def _transform_fingerprint(
     return digest.hexdigest()
 
 
+def normalize_extra_rotation(values: object) -> tuple[float, float, float]:
+    """유한한 XYZ 도 단위 추가 회전을 한 바퀴 안의 안정된 값으로 정규화합니다."""
+    angles = np.asarray(values, dtype=np.float64)
+    if angles.shape != (3,) or not np.isfinite(angles).all():
+        raise ValueError("추가 회전은 유한한 X/Y/Z 도 단위 값이어야 합니다.")
+    return tuple(0.0 if math.remainder(float(v), 360.0) == 0.0 else math.remainder(float(v), 360.0) for v in angles)
+
+
+def _axis_matrix_with_rotation(forward: str, up: str, angles: tuple[float, float, float]) -> np.ndarray:
+    """원본 축 정규화 뒤 고정 기준축의 X·Y·Z 추가 회전을 순서대로 적용합니다."""
+    matrix = np.asarray(axis_conversion(from_forward=forward, from_up=up, to_forward="Y", to_up="Z").to_4x4(), dtype=np.float64)
+    if angles == (0.0, 0.0, 0.0):
+        return matrix
+    x, y, z = np.deg2rad(angles)
+    cx, cy, cz = np.cos((x, y, z))
+    sx, sy, sz = np.sin((x, y, z))
+    rx = np.array(((1, 0, 0), (0, cx, -sx), (0, sx, cx)), dtype=np.float64)
+    ry = np.array(((cy, 0, sy), (0, 1, 0), (-sy, 0, cy)), dtype=np.float64)
+    rz = np.array(((cz, -sz, 0), (sz, cz, 0), (0, 0, 1)), dtype=np.float64)
+    extra = np.eye(4, dtype=np.float64)
+    extra[:3, :3] = rz @ ry @ rx
+    return extra @ matrix
+
+
 @dataclass(frozen=True, slots=True)
 class ModelDisplayTransform:
     """한 COLMAP 모델의 원본 좌표와 분리된 불변 표시 축 변환입니다."""
@@ -220,9 +255,10 @@ class ModelDisplayTransform:
     matrix_float64: np.ndarray
     inverse_float64: np.ndarray
     fingerprint: str = ""
+    rotation_xyz_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
-        """축·행렬·역행렬 관계를 검증해 안전한 모델 표시 변환으로 고정합니다."""
+        """원본 축·추가 회전·행렬 관계를 검증해 불변 정규화 값으로 고정합니다."""
 
         preset = axis_preset_for_id(self.preset_id)
         forward, up = validate_axis_pair(self.forward_axis, self.up_axis)
@@ -236,6 +272,11 @@ class ModelDisplayTransform:
         inverse = _freeze_matrix(self.inverse_float64, "표시 축 역행렬")
         if not np.allclose(matrix @ inverse, np.identity(4), rtol=0.0, atol=1.0e-12):
             raise ValueError("표시 축 행렬과 역행렬의 곱이 Identity가 아닙니다.")
+        angles = normalize_extra_rotation(self.rotation_xyz_degrees)
+        expected = _axis_matrix_with_rotation(forward, up, angles)
+        if not np.allclose(matrix, expected, rtol=0.0, atol=1.0e-12):
+            raise ValueError("축 설정과 추가 회전으로 재현한 행렬이 저장된 행렬과 다릅니다.")
+        object.__setattr__(self, "rotation_xyz_degrees", angles)
         fingerprint = _transform_fingerprint(preset.identifier, forward, up, matrix)
         if self.fingerprint and self.fingerprint != fingerprint:
             raise ValueError("표시 축 변환 fingerprint가 행렬 값과 일치하지 않습니다.")
@@ -251,8 +292,10 @@ def create_model_display_transform(
     preset_id: str,
     forward_axis: str,
     up_axis: str,
+    *,
+    rotation_xyz_degrees: object = (0.0, 0.0, 0.0),
 ) -> ModelDisplayTransform:
-    """선택 snapshot으로 source→Blender 표시 축 변환과 역행렬을 생성합니다."""
+    """원본 축과 선택적 추가 회전으로 공통 표시 기준의 불변 변환을 생성합니다."""
 
     preset = axis_preset_for_id(preset_id)
     forward, up = validate_axis_pair(forward_axis, up_axis)
@@ -262,15 +305,8 @@ def create_model_display_transform(
             f"{preset.label} 프리셋의 축과 전달된 값이 일치하지 않습니다: "
             f"{forward} / {up}"
         )
-    matrix = np.asarray(
-        axis_conversion(
-            from_forward=forward,
-            from_up=up,
-            to_forward="Y",
-            to_up="Z",
-        ).to_4x4(),
-        dtype=np.float64,
-    )
+    angles = normalize_extra_rotation(rotation_xyz_degrees)
+    matrix = _axis_matrix_with_rotation(forward, up, angles)
     inverse = np.linalg.inv(matrix)
     return ModelDisplayTransform(
         preset_id=preset.identifier,
@@ -278,7 +314,15 @@ def create_model_display_transform(
         up_axis=up,
         matrix_float64=matrix,
         inverse_float64=inverse,
+        rotation_xyz_degrees=angles,
     )
+
+
+def companion_default_display_transform(owner_transform: ModelDisplayTransform) -> ModelDisplayTransform:
+    """새 RC 연결 메시만 표준 OBJ 축으로 초기화하고 다른 입력은 소유 축을 복사합니다."""
+    if owner_transform.preset_id == DEFAULT_AXIS_PRESET:
+        return create_model_display_transform(RC_OBJ_AXIS_PRESET, "Y", "Z")
+    return owner_transform
 
 
 def identity_display_transform() -> ModelDisplayTransform:
@@ -363,6 +407,7 @@ __all__ = (
     "AXIS_PRESETS",
     "BLENDER_AXIS_PRESET",
     "CUSTOM_AXIS_PRESET",
+    "RC_OBJ_AXIS_PRESET",
     "DEFAULT_AXIS_PRESET",
     "DEFAULT_FORWARD_AXIS",
     "DEFAULT_UP_AXIS",
@@ -374,6 +419,8 @@ __all__ = (
     "axis_summary",
     "axes_for_preset",
     "create_model_display_transform",
+    "companion_default_display_transform",
+    "normalize_extra_rotation",
     "display_bounds",
     "display_position",
     "display_positions",

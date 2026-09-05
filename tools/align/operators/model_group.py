@@ -9,22 +9,34 @@ import bpy
 from bpy.props import BoolProperty, StringProperty
 
 from ..alignment.types import AlignmentProvenanceRecord
+from ..axis_settings import axis_edit_active_block_reason
+from ..display_axes import create_model_display_transform
 from ..constants import (
+    GEOMETRY_KIND_TRIANGLE_MESH,
     MODEL_ACTIVATION_SOURCE_MANUAL,
     MODEL_COMMAND_TOGGLE_LAYER_GROUP,
     MODEL_STATUS_REGISTERED,
 )
 from ..logging_utils import get_logger
+from ..mesh_io.embedded_obj_store import (
+    find_embedded_obj_mesh,
+    remove_embedded_obj_mesh,
+    retire_embedded_obj_mesh,
+    validate_embedded_obj_mesh,
+)
 from ..project_persistence.runtime import (
     clear_project_state_after_last_model,
     notify_project_state_changed,
     restore_input_block_reason,
+    sync_project_state_if_dirty,
 )
 from ..model_repository import model_point_count
+from ..marker_capture import marker_capture_change_block_reason
 from ..properties import sync_marker_pair_list
 from ..session import is_session_active_for_window, session_align_workspace
 from ..status import set_workspace_status_text
 from ..state import RUNTIME
+from ..viewport.point_data import surface_model_data_for_id
 from ..viewport.renderer import discard_gpu_batch_for_model, request_redraw
 from .marker_alignment import is_marker_preview_active
 from .layer_transform import layer_transform_active_block_reason
@@ -87,8 +99,43 @@ def _merge_export_block_reason() -> str | None:
     return None
 
 
+def _owned_embedded_assets_for_model(model_id: str) -> tuple[str, ...]:
+    """삭제할 레이어의 주 OBJ와 연결 OBJ가 소유한 내장 UUID를 미리 검증합니다."""
+
+    repository = RUNTIME.model_repository
+    main = repository.models.get(model_id)
+    companion = repository.companion_mesh_for_model_id(model_id)
+    candidates = (
+        (main, getattr(main, "geometry_kind", "") == GEOMETRY_KIND_TRIANGLE_MESH),
+        (companion, companion is not None),
+    )
+    asset_uuids: list[str] = []
+    for model_data, embedded_required in candidates:
+        if model_data is None:
+            continue
+        asset_uuid = str(getattr(model_data, "embedded_asset_uuid", "")).strip()
+        if not asset_uuid:
+            if embedded_required:
+                raise RuntimeError("삭제할 OBJ 레이어의 내장 Mesh UUID가 누락되었습니다.")
+            continue
+        mesh = find_embedded_obj_mesh(asset_uuid)
+        validate_embedded_obj_mesh(
+            mesh,
+            expected_asset_uuid=asset_uuid,
+            expected_model_id=model_id,
+            expected_revision=int(getattr(model_data, "geometry_revision", 0)),
+        )
+        asset_uuids.append(asset_uuid)
+    if len(set(asset_uuids)) != len(asset_uuids):
+        raise RuntimeError("주 OBJ와 연결 OBJ가 같은 내장 Mesh UUID를 공유합니다.")
+    return tuple(asset_uuids)
+
+
 def model_deletion_block_reason(model_id: str | None = None) -> str | None:
     """선택 모델 삭제를 시작할 수 없는 정확한 이유를 반환합니다."""
+    axes_reason = axis_edit_active_block_reason(RUNTIME)
+    if axes_reason is not None:
+        return axes_reason
     catalog = RUNTIME.model_catalog
     target_model_id = str(model_id or catalog.selected_model_id or "").strip()
     restore_reason = restore_input_block_reason()
@@ -123,7 +170,7 @@ def model_deletion_block_reason(model_id: str | None = None) -> str | None:
 
 
 def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
-    """원본 파일을 보존하며 모델·마커·표시 캐시를 하나의 경계에서 삭제합니다."""
+    """모델 삭제를 원자 확정하고 소유 내장 Mesh와 부속 Data Block을 정리합니다."""
     normalized_id = str(model_id).strip()
     reason = model_deletion_block_reason(normalized_id)
     if reason is not None:
@@ -137,6 +184,16 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
     display_transform = repository.display_transform_for_model_id(normalized_id)
     alignment_transform = repository.alignment_transform_for_model_id(normalized_id)
     source_metadata = repository.source_metadata.get(normalized_id)
+    # 연결 메시·개별 축·평가 캐시는 삭제 실패 시 원래 객체와 존재 여부까지 복원합니다.
+    companion_snapshot = tuple(
+        (mapping, normalized_id in mapping, mapping.get(normalized_id))
+        for mapping in (
+            repository.companion_meshes,
+            repository.companion_sources,
+            repository.companion_display_transforms,
+            repository.icp_confidence_cache,
+        )
+    )
     point_count = model_point_count(model)
 
     catalog_snapshot = catalog.snapshot()
@@ -148,6 +205,7 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
         for cache_key, batch in RUNTIME.gpu_batches.items()
         if _gpu_batch_belongs_to_model(cache_key, normalized_id)
     }
+    embedded_asset_uuids = _owned_embedded_assets_for_model(normalized_id)
 
     try:
         removed_model = repository.remove_model(normalized_id)
@@ -158,12 +216,32 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
         removed_pair_count = selection.remove_pairs_for_model(normalized_id)
         RUNTIME.point_clouds.pop(normalized_id, None)
         discard_gpu_batch_for_model(normalized_id)
+        if repository.models:
+            notify_project_state_changed("모델 삭제 완료")
+            sync_project_state_if_dirty(force=True)
+        else:
+            clear_project_state_after_last_model()
     except Exception:
         catalog.restore_snapshot(catalog_snapshot)
         selection.restore_snapshot(marker_snapshot)
         if normalized_id not in repository.models:
-            repository.add_model(model, display_transform, source_metadata)
+            imported_display = (
+                create_model_display_transform(
+                    source_metadata.axis_preset,
+                    source_metadata.axis_forward,
+                    source_metadata.axis_up,
+                )
+                if source_metadata is not None
+                else display_transform
+            )
+            repository.add_model(model, imported_display, source_metadata)
+            repository.set_display_transform(normalized_id, display_transform)
             repository.set_alignment_transform(normalized_id, alignment_transform)
+        for mapping, present, value in companion_snapshot:
+            if present:
+                mapping[normalized_id] = value
+            else:
+                mapping.pop(normalized_id, None)
         if point_cloud_present:
             RUNTIME.point_clouds[normalized_id] = point_cloud
         else:
@@ -172,19 +250,34 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
         RUNTIME.gpu_batches.update(gpu_snapshot)
         raise
 
+    for asset_uuid in embedded_asset_uuids:
+        try:
+            remove_embedded_obj_mesh(asset_uuid, expected_model_id=normalized_id)
+        except Exception as error:
+            try:
+                retire_embedded_obj_mesh(asset_uuid, expected_model_id=normalized_id)
+            except Exception:
+                _LOGGER.exception(
+                    "event=embedded_obj_retire_failed model_id=%s asset_uuid=%s",
+                    normalized_id,
+                    asset_uuid,
+                )
+            _LOGGER.error(
+                "event=embedded_obj_remove_failed model_id=%s asset_uuid=%s reason=%s",
+                normalized_id,
+                asset_uuid,
+                error,
+            )
+
     RUNTIME.undo_journal.clear()
     RUNTIME.clear_data_layer_click()
     _LOGGER.info(
-        "event=model_deleted model_id=%s points=%d marker_pairs=%d source_preserved=%s",
+        "event=model_deleted model_id=%s points=%d marker_pairs=%d embedded_assets=%d",
         normalized_id,
         point_count,
         removed_pair_count,
-        model.source_path,
+        len(embedded_asset_uuids),
     )
-    if repository.models:
-        notify_project_state_changed("모델 삭제 완료")
-    else:
-        clear_project_state_after_last_model()
     return ModelDeletionResult(
         model_id=normalized_id,
         display_name=record.display_name,
@@ -226,7 +319,11 @@ def _commit_group_change(
     *,
     allow_demote: bool,
 ) -> set[str]:
-    """A/P 그룹 전환을 하나의 공용 세션 Undo 명령으로 확정합니다."""
+    """축 편집 중 그룹 변경을 차단하고 A/P 전환을 하나의 세션 Undo로 확정합니다."""
+    axes_reason = axis_edit_active_block_reason(RUNTIME)
+    if axes_reason is not None:
+        _report_status(operator, {"WARNING"}, axes_reason)
+        return {"CANCELLED"}
     restore_reason = restore_input_block_reason()
     if restore_reason is not None:
         _report_status(operator, {"WARNING"}, restore_reason)
@@ -319,6 +416,7 @@ class COLMAPALIGN_OT_select_data_layer(bpy.types.Operator):
             and not is_marker_preview_active()
             and _merge_export_block_reason() is None
             and layer_transform_active_block_reason() is None
+            and axis_edit_active_block_reason(RUNTIME) is None
             and restore_input_block_reason() is None
         )
 
@@ -337,6 +435,10 @@ class COLMAPALIGN_OT_select_data_layer(bpy.types.Operator):
 
     def execute(self, _context):
         """선택 모드에 맞춰 단일·Ctrl 토글·Shift 범위를 적용하고 Undo에는 기록하지 않습니다."""
+        axes_reason = axis_edit_active_block_reason(RUNTIME)
+        if axes_reason is not None:
+            _report_status(self, {"WARNING"}, axes_reason)
+            return {"CANCELLED"}
         preview_reason = _marker_preview_block_reason()
         if preview_reason is not None:
             _report_status(self, {"WARNING"}, preview_reason)
@@ -391,6 +493,7 @@ class COLMAPALIGN_OT_toggle_data_layer_group(bpy.types.Operator):
             and not is_marker_preview_active()
             and _merge_export_block_reason() is None
             and layer_transform_active_block_reason() is None
+            and axis_edit_active_block_reason(RUNTIME) is None
             and restore_input_block_reason() is None
         )
 
@@ -419,6 +522,7 @@ class COLMAPALIGN_OT_activate_data_layer(bpy.types.Operator):
             and not is_marker_preview_active()
             and _merge_export_block_reason() is None
             and layer_transform_active_block_reason() is None
+            and axis_edit_active_block_reason(RUNTIME) is None
             and restore_input_block_reason() is None
         )
 
@@ -439,6 +543,14 @@ class COLMAPALIGN_OT_toggle_data_layer_visibility(bpy.types.Operator):
     model_id: StringProperty(options={"HIDDEN"})
 
     @classmethod
+    def description(cls, _context, properties):
+        """전체 표시 아이콘의 툴팁에 해당 레이어 이름을 표시합니다."""
+        model_id = getattr(properties, "model_id", "")
+        record = RUNTIME.model_catalog.models.get(model_id)
+        name = record.display_name if record is not None else model_id
+        return f"{name}: 데이터셋 전체 표시를 전환합니다"
+
+    @classmethod
     def poll(cls, context):
         """활성 COLMAP Align 세션에서만 레이어 표시 토글을 허용합니다."""
         return bool(
@@ -451,7 +563,11 @@ class COLMAPALIGN_OT_toggle_data_layer_visibility(bpy.types.Operator):
         )
 
     def execute(self, _context):
-        """독립 표시 상태를 반전하고 GPU 재그리기만 요청합니다."""
+        """입력 대상 잠금을 검사한 뒤 전체 표시 상태를 반전합니다."""
+        capture_reason = marker_capture_change_block_reason(RUNTIME, self.model_id)
+        if capture_reason is not None:
+            _report_status(self, {"WARNING"}, capture_reason)
+            return {"CANCELLED"}
         preview_reason = _marker_preview_block_reason()
         if preview_reason is not None:
             _report_status(self, {"WARNING"}, preview_reason)
@@ -466,6 +582,63 @@ class COLMAPALIGN_OT_toggle_data_layer_visibility(bpy.types.Operator):
             return {"CANCELLED"}
         _report_status(self, {"INFO"}, RUNTIME.model_catalog.message)
         notify_project_state_changed("Data Layers 표시 상태 변경")
+        request_redraw()
+        return {"FINISHED"}
+
+
+class COLMAPALIGN_OT_toggle_data_layer_geometry(bpy.types.Operator):
+    """데이터셋에서 점군 또는 연결·독립 메시 하나를 표시 형상으로 선택합니다."""
+
+    bl_idname = "colmap_align.toggle_data_layer_geometry"
+    bl_label = "데이터셋 형상 선택"
+    bl_description = "점군 또는 메시 하나를 선택합니다. 숨기기는 눈 버튼을 사용합니다"
+    bl_options = {"INTERNAL"}
+
+    model_id: StringProperty(options={"HIDDEN"})
+    geometry_kind: StringProperty(options={"HIDDEN"})
+
+    @classmethod
+    def description(cls, _context, properties):
+        """형상 표시 아이콘에 대상 레이어 이름과 점군·메시 구분을 표시합니다."""
+        model_id = getattr(properties, "model_id", "")
+        record = RUNTIME.model_catalog.models.get(model_id)
+        name = record.display_name if record is not None else model_id
+        geometry = "점군" if getattr(properties, "geometry_kind", "") == "COLMAP_POINT_CLOUD" else "메시"
+        return f"{name}: {geometry} 표시를 선택합니다"
+
+    @classmethod
+    def poll(cls, context):
+        """가져오기·복원 이외에는 정렬 미리보기 중에도 형상 표시만 변경할 수 있습니다."""
+        return bool(
+            is_session_active_for_window(context.window)
+            and not RUNTIME.import_in_progress
+            and restore_input_block_reason() is None
+        )
+
+    def execute(self, _context):
+        """입력 대상 잠금을 검사하고 클릭한 행의 형상 하나를 선택합니다."""
+        capture_reason = marker_capture_change_block_reason(RUNTIME, self.model_id)
+        if capture_reason is not None:
+            _report_status(self, {"WARNING"}, capture_reason)
+            return {"CANCELLED"}
+        RUNTIME.clear_data_layer_click()
+        catalog = RUNTIME.model_catalog
+        record = catalog.models.get(self.model_id)
+        if record is None:
+            _report_status(self, {"WARNING"}, "표시를 변경할 데이터셋을 찾을 수 없습니다.")
+            return {"CANCELLED"}
+        if self.geometry_kind == "COLMAP_POINT_CLOUD" and record.geometry_kind == "COLMAP_POINT_CLOUD":
+            values = {"show_points": True, "show_surface": False}
+        elif self.geometry_kind == "TRIANGLE_MESH" and surface_model_data_for_id(self.model_id) is not None:
+            values = {"show_points": False, "show_surface": True}
+        else:
+            _report_status(self, {"WARNING"}, "표시를 변경할 연결 표면을 찾을 수 없습니다.")
+            return {"CANCELLED"}
+        if not catalog.set_geometry_visibility(self.model_id, **values):
+            _report_status(self, {"WARNING"}, catalog.message)
+            return {"CANCELLED"}
+        _report_status(self, {"INFO"}, catalog.message)
+        notify_project_state_changed("데이터셋 점군·표면 표시 변경")
         request_redraw()
         return {"FINISHED"}
 
@@ -489,6 +662,7 @@ class COLMAPALIGN_OT_delete_selected_model(bpy.types.Operator):
             and not is_marker_preview_active()
             and _merge_export_block_reason() is None
             and layer_transform_active_block_reason() is None
+            and axis_edit_active_block_reason(RUNTIME) is None
             and restore_input_block_reason() is None
         )
 
@@ -554,5 +728,6 @@ CLASSES = (
     COLMAPALIGN_OT_toggle_data_layer_group,
     COLMAPALIGN_OT_activate_data_layer,
     COLMAPALIGN_OT_toggle_data_layer_visibility,
+    COLMAPALIGN_OT_toggle_data_layer_geometry,
     COLMAPALIGN_OT_delete_selected_model,
 )

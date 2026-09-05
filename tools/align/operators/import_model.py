@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from time import perf_counter
+from pathlib import Path
 from typing import Any
 
 import bpy
@@ -62,6 +63,12 @@ def _is_import_session_context(context: bpy.types.Context) -> bool:
 
 def _import_preview_block_reason() -> str | None:
     """미리보기·변환·내보내기 중 새 가져오기를 차단할 정확한 사유를 반환합니다."""
+
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(RUNTIME)
+    if axis_reason is not None:
+        return axis_reason
     if is_marker_preview_active():
         return "마커 정렬 미리보기를 취소한 뒤 COLMAP 모델을 가져오십시오."
     if bool(getattr(RUNTIME.merge_export, "is_running", False)):
@@ -105,7 +112,7 @@ def _show_import_popup(
 
 
 def _completion_popup_lines(job: Any) -> tuple[str, ...]:
-    """완료된 ImportJob의 원본·표시 점 수와 축·경과 시간을 팝업 행으로 만듭니다."""
+    """완료된 데이터셋의 점군·연결 표면·축·시간을 팝업 행으로 만듭니다."""
     model = getattr(job, "staged_model", None)
     if model is None:
         return (str(getattr(job, "result_message", "COLMAP 모델 가져오기 완료")),)
@@ -133,6 +140,9 @@ def _completion_popup_lines(job: Any) -> tuple[str, ...]:
         "Sampling: Deterministic Random",
         axis_line,
         f"Elapsed: {elapsed_seconds:.1f}s",
+    ) + (
+        (f"연결 표면: {job.staged_companion_mesh.face_count:,}면",)
+        if getattr(job, "staged_companion_mesh", None) is not None else ()
     )
 
 
@@ -190,6 +200,28 @@ def _on_file_browser_axis_up_changed(operator: Any, _context: Any) -> None:
         operator.axis_forward = forward
     if up != operator.axis_up:
         operator.axis_up = up
+
+
+def _companion_preview(operator: Any) -> tuple[str, tuple[str, ...]]:
+    """선택한 COLMAP 폴더의 연결 OBJ 후보를 파일 탐색기용으로 요약합니다."""
+    if not operator.import_companion_obj or not str(operator.directory).strip():
+        return "", ()
+    from ..colmap_io import discover_sparse_model_with_dataset_root
+    from ..companion_discovery import discover_companion_obj_candidates
+
+    try:
+        root, _layout = discover_sparse_model_with_dataset_root(
+            bpy.path.abspath(operator.directory), operator.input_format,
+        )
+        candidates = discover_companion_obj_candidates(root)
+    except (ValueError, OSError, RuntimeError) as error:
+        return str(error), ()
+    names = tuple(path.name for path in candidates)
+    if len(names) == 1:
+        return f"자동 연결: {names[0]}", names
+    if not names:
+        return "이 폴더에는 연결할 OBJ가 없습니다.", ()
+    return f"OBJ {len(names)}개: 아래 파일 경로로 하나를 선택하십시오.", names
 
 
 def _remove_import_timer(window_manager: Any) -> None:
@@ -267,6 +299,17 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
         subtype="DIR_PATH",
         options={"SKIP_SAVE"},
     )
+    import_companion_obj: BoolProperty(
+        name="OBJ 함께 불러오기",
+        description="데이터셋 루트의 OBJ 형상을 같은 표시 축으로 연결합니다",
+        default=True,
+    )
+    companion_obj_path: StringProperty(
+        name="OBJ 파일",
+        description="비워두면 OBJ 하나를 자동 연결하며, 여러 개면 루트의 파일 하나를 지정합니다",
+        subtype="FILE_PATH",
+        options={"SKIP_SAVE"},
+    )
     filter_folder: BoolProperty(
         name="Folders Only",
         description="COLMAP Dataset Root 또는 sparse model 폴더만 선택합니다.",
@@ -326,7 +369,7 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
         )
 
     def invoke(self, context: bpy.types.Context, _event: bpy.types.Event):
-        """마지막 선택값을 파일 탐색기에 넣고 사용자 확인 전에는 상태를 바꾸지 않습니다."""
+        """마지막 표시·연결 옵션으로 파일 탐색기를 열고 모델은 아직 추가하지 않습니다."""
         settings = context.scene.colmap_align_settings
         if not self.properties.is_property_set("directory"):
             self.directory = (
@@ -335,6 +378,8 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
             )
         if not self.properties.is_property_set("input_format"):
             self.input_format = settings.import_input_format
+        if not self.properties.is_property_set("import_companion_obj"):
+            self.import_companion_obj = settings.import_companion_obj
         if not self.properties.is_property_set("display_point_limit"):
             self.display_point_limit = settings.import_display_point_limit
         if not self.properties.is_property_set("axis_preset"):
@@ -350,9 +395,20 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def draw(self, _context: bpy.types.Context) -> None:
-        """파일 탐색기 우측 옵션 영역에 형식·표시 점·표시 축 설정을 그립니다."""
+        """파일 탐색기에 COLMAP 형식·OBJ 연결·표시 점·공통 축을 그립니다."""
         layout = self.layout
         layout.prop(self, "input_format")
+        companion_box = layout.box()
+        companion_box.prop(self, "import_companion_obj")
+        if self.import_companion_obj:
+            message, candidates = getattr(self, "_companion_preview_value", ("", ()))
+            if message:
+                companion_box.label(text=message, icon="INFO")
+            companion_box.prop(self, "companion_obj_path", text="OBJ 파일")
+            if len(candidates) > 1:
+                for name in candidates[:5]:
+                    companion_box.label(text=name, icon="MESH_DATA")
+            companion_box.label(text="COLMAP과 같은 축 적용 · 텍스처 제외")
         point_box = layout.box()
         point_box.label(text="Viewport Points")
         point_box.prop(self, "display_point_limit", text="Point Limit")
@@ -385,14 +441,16 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
         axis_box.label(text="COLMAP 원본 좌표·카메라 자세는 변경하지 않습니다.", icon="INFO")
 
     def check(self, _context: bpy.types.Context) -> bool:
-        """파일 탐색기 속성 변경 때 축 입력을 유효한 snapshot으로 보정합니다."""
+        """파일 탐색기의 축 입력과 연결 OBJ 후보 안내를 갱신합니다."""
+        before = getattr(self, "_companion_preview_value", None)
+        self._companion_preview_value = _companion_preview(self)
         try:
-            return _sync_file_browser_axis_pair(self)
+            return _sync_file_browser_axis_pair(self) or before != self._companion_preview_value
         except ValueError:
-            return False
+            return before != self._companion_preview_value
 
     def execute(self, context: bpy.types.Context):
-        """확정한 파일 탐색기 snapshot을 저장하고 내부 TIMER 작업에 전달합니다."""
+        """표시·연결 선택을 검증하고 하나의 데이터셋 가져오기 작업에 전달합니다."""
         restore_reason = restore_input_block_reason()
         if restore_reason is not None:
             _report_status(self, {"WARNING"}, restore_reason)
@@ -412,10 +470,32 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
             _report_status(self, {"ERROR"}, "COLMAP Folder를 선택하십시오.")
             return {"CANCELLED"}
         source_path = bpy.path.abspath(source_path)
+        companion_path = ""
+        if self.import_companion_obj:
+            from ..colmap_io import discover_sparse_model_with_dataset_root
+            from ..companion_discovery import resolve_companion_obj_path
+            from ..colmap_io.discovery import standard_sparse_model_paths
+
+            try:
+                dataset_root, layout = discover_sparse_model_with_dataset_root(source_path, self.input_format)
+                selected_obj = self.companion_obj_path.strip()
+                if selected_obj:
+                    selected_obj = bpy.path.abspath(selected_obj)
+                resolved_obj = resolve_companion_obj_path(dataset_root, selected_obj)
+                if resolved_obj is not None:
+                    if Path(source_path).resolve() != layout.source_path.resolve() and len(
+                        standard_sparse_model_paths(dataset_root, self.input_format)
+                    ) > 1:
+                        raise ValueError("OBJ와 연결할 sparse 모델 폴더를 직접 선택하십시오.")
+                    companion_path = str(resolved_obj)
+            except (ValueError, OSError, RuntimeError) as error:
+                _report_status(self, {"ERROR"}, str(error))
+                return {"CANCELLED"}
         display_point_limit = int(self.display_point_limit)
         settings.import_last_directory = source_path
         settings.import_dataset_root = source_path
         settings.import_input_format = self.input_format
+        settings.import_companion_obj = self.import_companion_obj
         settings.import_display_point_limit = display_point_limit
         settings.import_axis_preset = self.axis_preset
         settings.import_axis_forward = axis_forward
@@ -438,6 +518,8 @@ class COLMAPALIGN_OT_import_model(bpy.types.Operator):
             axis_preset=self.axis_preset,
             axis_forward=axis_forward,
             axis_up=axis_up,
+            import_companion_obj=self.import_companion_obj,
+            companion_obj_path=companion_path,
         )
         return result
 
@@ -451,6 +533,8 @@ class COLMAPALIGN_OT_import_model_job(bpy.types.Operator):
     bl_options = {"INTERNAL"}
 
     source_path: StringProperty(name="COLMAP Dataset Root", options={"HIDDEN"})
+    import_companion_obj: BoolProperty(default=True, options={"HIDDEN"})
+    companion_obj_path: StringProperty(default="", options={"HIDDEN"})
     input_format: EnumProperty(
         name="COLMAP 입력 형식",
         items=_INPUT_FORMAT_ITEMS,
@@ -537,7 +621,7 @@ class COLMAPALIGN_OT_import_model_job(bpy.types.Operator):
         return result
 
     def _start(self, context: bpy.types.Context) -> set[str]:
-        """Runtime 작업을 만들고 Blender 이벤트 TIMER와 진행 막대를 등록합니다."""
+        """COLMAP·연결 OBJ 작업을 만들고 이벤트 TIMER와 진행 막대를 등록합니다."""
         preview_reason = _import_preview_block_reason()
         if preview_reason is not None:
             _report_status(self, {"WARNING"}, preview_reason)
@@ -551,6 +635,8 @@ class COLMAPALIGN_OT_import_model_job(bpy.types.Operator):
                 axis_preset=self.axis_preset,
                 axis_forward=self.axis_forward,
                 axis_up=self.axis_up,
+                import_companion_obj=self.import_companion_obj,
+                companion_obj_path=self.companion_obj_path,
             )
         except ImportJobError as error:
             _report_status(self, {"ERROR"}, str(error))

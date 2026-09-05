@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import json
 from math import isfinite
 from typing import Any, Final
 
@@ -24,6 +25,21 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+
+def _normalize_marker_geometry_dependencies(values: object) -> tuple[tuple[str, str], ...]:
+    """감사 기록과 계산 초기값의 마커 형상 종속성을 정렬된 불변 쌍으로 검증합니다."""
+    from ..constants import MARKER_GEOMETRY_SOURCES
+
+    dependencies = set()
+    for model_id, source in values:
+        model_id = str(model_id).strip()
+        source = str(source).strip().upper()
+        if not model_id or source not in MARKER_GEOMETRY_SOURCES:
+            raise ValueError("마커 형상 종속성의 소유자 또는 출처가 올바르지 않습니다.")
+        dependencies.add((model_id, source))
+    return tuple(sorted(dependencies))
+
+
 @dataclass(frozen=True, slots=True)
 class AlignmentProvenanceRecord:
     """최종 정렬의 출처와 품질 지표만 보관하는 작은 불변 감사 기록입니다."""
@@ -40,9 +56,12 @@ class AlignmentProvenanceRecord:
     icp_rmse: float | None = None
     icp_status: str | None = None
     committed_at_utc: str = ""
+    marker_geometry_dependencies: tuple[tuple[str, str], ...] = ()
+    solver_geometry_dependencies: tuple[tuple[str, str], ...] = ()
+    engine_metadata_json: str = ""
 
     def __post_init__(self) -> None:
-        """감사 레코드의 식별자와 선택 품질 수치를 정규화합니다."""
+        """감사 기록의 품질·마커/정밀 입력 출처·엔진 메타데이터를 검증합니다."""
 
         model_id = str(self.model_id).strip()
         method = str(self.method).strip().upper()
@@ -100,9 +119,30 @@ class AlignmentProvenanceRecord:
         object.__setattr__(self, "icp_rmse", normalized_values["icp_rmse"])
         object.__setattr__(self, "icp_status", icp_status)
         object.__setattr__(self, "committed_at_utc", committed_at_utc)
+        object.__setattr__(
+            self, "marker_geometry_dependencies",
+            _normalize_marker_geometry_dependencies(self.marker_geometry_dependencies),
+        )
+        object.__setattr__(self, "solver_geometry_dependencies",
+                           _normalize_marker_geometry_dependencies(self.solver_geometry_dependencies))
+        metadata = str(self.engine_metadata_json)
+        if metadata:
+            if len(metadata.encode("utf-8")) > 262144:
+                raise ValueError("정렬 엔진 출처 정보가 256 KiB 제한을 초과했습니다.")
+            decoded = json.loads(metadata)
+            if not isinstance(decoded, dict):
+                raise ValueError("정렬 엔진 출처 정보는 JSON 객체여야 합니다.")
+            metadata = json.dumps(decoded, ensure_ascii=False, sort_keys=True,
+                                  separators=(",", ":"), allow_nan=False)
+        object.__setattr__(self, "engine_metadata_json", metadata)
+
+    @property
+    def geometry_dependencies(self) -> tuple[tuple[str, str], ...]:
+        """축 변경 시 무효화할 마커와 정밀 정렬의 형상 출처를 합칩니다."""
+        return tuple(sorted(set(self.marker_geometry_dependencies + self.solver_geometry_dependencies)))
 
     def to_mapping(self) -> dict[str, Any]:
-        """보고서 JSON에 쓸 명시적 원시값 사본을 반환합니다."""
+        """기존 감사 필드와 실제 사용한 형상·엔진 출처를 저장 값으로 반환합니다."""
 
         return {
             "model_id": self.model_id,
@@ -117,6 +157,14 @@ class AlignmentProvenanceRecord:
             "icp_rmse": self.icp_rmse,
             "icp_status": self.icp_status,
             "committed_at_utc": self.committed_at_utc,
+            **(
+                {"marker_geometry_dependencies": [list(item) for item in self.marker_geometry_dependencies]}
+                if self.marker_geometry_dependencies else {}
+            ),
+            **({"solver_geometry_dependencies": [list(item) for item in self.solver_geometry_dependencies]}
+               if self.solver_geometry_dependencies else {}),
+            **({"engine_metadata": json.loads(self.engine_metadata_json)}
+               if self.engine_metadata_json else {}),
         }
 
 
@@ -570,9 +618,10 @@ class IcpAlignmentSeed:
     model_revision_snapshot: tuple[tuple[str, int], ...]
     marker_signature: str
     initialization_mode: str = "MARKER_PREVIEW"
+    marker_geometry_dependencies: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
-        """마커 정합 또는 현재 정렬 초기값의 snapshot 관계를 검증합니다."""
+        """초기화 모드와 정렬 스냅샷·마커 형상 종속성의 관계를 검증합니다."""
 
         moving_model_id = str(self.moving_model_id).strip()
         reference_model_ids = tuple(str(model_id).strip() for model_id in self.reference_model_ids)
@@ -630,6 +679,13 @@ class IcpAlignmentSeed:
         object.__setattr__(self, "model_revision_snapshot", revisions)
         object.__setattr__(self, "marker_signature", signature)
         object.__setattr__(self, "initialization_mode", initialization_mode)
+        dependencies = _normalize_marker_geometry_dependencies(self.marker_geometry_dependencies)
+        if initialization_mode == "CURRENT_ALIGNMENT" and dependencies:
+            raise ValueError("직접 정렬 초기값에는 마커 형상 종속성을 넣을 수 없습니다.")
+        allowed_models = {moving_model_id, *reference_model_ids}
+        if any(model_id not in allowed_models for model_id, _source in dependencies):
+            raise ValueError("마커 형상 종속성이 계산 대상 모델을 벗어났습니다.")
+        object.__setattr__(self, "marker_geometry_dependencies", dependencies)
 
     @property
     def uses_marker_preview(self) -> bool:

@@ -11,6 +11,7 @@ from ..constants import (
     MARKER_COMMAND_CANCEL,
     MARKER_COMMAND_CONFIRM,
     MARKER_COMMAND_NONE,
+    MARKER_GEOMETRY_SOURCE_MAIN,
     MARKER_COMMAND_PAIR_CREATE,
     MARKER_COMMAND_PAIR_DELETE,
     MARKER_COMMAND_PAIR_EDIT,
@@ -27,7 +28,9 @@ from ..session import (
     redo_session_marker_state,
     undo_session_marker_state,
 )
+from ..axis_settings import axis_edit_active_block_reason
 from ..state import RUNTIME
+from ..status import set_window_status_text
 from ..viewport.picking import find_viewport_under_mouse, pick_nearest_point
 from ..viewport.registry import find_window_region, refresh_registry, resolve_area
 from ..viewport.renderer import request_redraw
@@ -130,6 +133,7 @@ class COLMAPALIGN_OT_add_marker_pair(bpy.types.Operator):
             and not RUNTIME.import_in_progress
             and not RUNTIME.modal_active
             and not is_marker_preview_active()
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not _is_export_input_locked()
             and restore_input_block_reason() is None
             and RUNTIME.workspace_setup_task is None
@@ -139,14 +143,12 @@ class COLMAPALIGN_OT_add_marker_pair(bpy.types.Operator):
         )
 
     def invoke(self, context, _event):
-        """실제 모달을 메인 Window override로 실행해 창 소유권을 고정합니다."""
+        """레이어 선택을 유지하고 메인 창에서 입력 기준 검증과 모달 시작을 요청합니다."""
         resolved = _resolve_main_context(context)
         if resolved is None:
             self.report({"ERROR"}, "COLMAP Align 메인 듀얼 뷰가 유효하지 않습니다.")
             return {"CANCELLED"}
         main_window, area, region = resolved
-        if RUNTIME.model_catalog.clear_alignment_selection():
-            request_redraw()
         try:
             with context.temp_override(
                 window=main_window,
@@ -163,7 +165,7 @@ class COLMAPALIGN_OT_add_marker_pair(bpy.types.Operator):
             self.report({"ERROR"}, f"메인 창에서 마커 선택을 시작하지 못했습니다: {error}")
             return {"CANCELLED"}
         if "RUNNING_MODAL" not in result:
-            self.report({"ERROR"}, "메인 창의 마커 모달 도구가 시작되지 않았습니다.")
+            self.report({"WARNING"}, RUNTIME.marker_selection.message or "메인 창의 마커 모달 도구가 시작되지 않았습니다.")
             return {"CANCELLED"}
         return {"FINISHED"}
 
@@ -184,6 +186,7 @@ class COLMAPALIGN_OT_edit_marker_pair(bpy.types.Operator):
             and not RUNTIME.import_in_progress
             and not RUNTIME.modal_active
             and not is_marker_preview_active()
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not _is_export_input_locked()
             and restore_input_block_reason() is None
             and RUNTIME.marker_selection.active_pair is not None
@@ -232,6 +235,7 @@ class COLMAPALIGN_OT_delete_marker_pair(bpy.types.Operator):
             and not RUNTIME.import_in_progress
             and not RUNTIME.modal_active
             and not is_marker_preview_active()
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not _is_export_input_locked()
             and restore_input_block_reason() is None
             and RUNTIME.marker_selection.active_pair is not None
@@ -328,6 +332,7 @@ class COLMAPALIGN_OT_undo_marker_selection(bpy.types.Operator):
         return bool(
             is_session_active_for_window(context.window)
             and not is_marker_preview_active()
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not _is_export_input_locked()
             and _session_can_undo()
             and restore_input_block_reason() is None
@@ -352,6 +357,7 @@ class COLMAPALIGN_OT_redo_marker_selection(bpy.types.Operator):
         return bool(
             is_session_active_for_window(context.window)
             and not is_marker_preview_active()
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not _is_export_input_locked()
             and _session_can_redo()
             and restore_input_block_reason() is None
@@ -388,21 +394,25 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
             resolved
             and is_session_active_for_window(context.window)
             and not is_marker_preview_active()
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not _is_export_input_locked()
             and restore_input_block_reason() is None
             and resolved[0].as_pointer() == context.window.as_pointer()
         )
 
     def invoke(self, context, _event):
-        """새 또는 편집 드래프트와 그 전용 Undo 범위를 동시에 시작합니다."""
+        """표시·종류·원본 기준을 고정하고 새 또는 편집 드래프트와 Undo를 시작합니다."""
         baseline = RUNTIME.marker_selection.snapshot()
         if self.operation == DRAFT_MODE_EDIT:
-            started = RUNTIME.marker_selection.begin_edit_draft(self.target_pair_id)
+            started = RUNTIME.marker_selection.begin_edit_draft(self.target_pair_id, runtime=RUNTIME)
         else:
-            started = RUNTIME.marker_selection.begin_create_draft()
-        if not started or not RUNTIME.undo_journal.begin_scope(baseline):
+            started = RUNTIME.marker_selection.begin_create_draft(runtime=RUNTIME)
+        if not started:
+            self._report_input_rejection(context, RUNTIME.marker_selection.message)
+            return {"CANCELLED"}
+        if not RUNTIME.undo_journal.begin_scope(baseline):
             RUNTIME.marker_selection.restore_snapshot(baseline)
-            self.report({"WARNING"}, "마커 드래프트를 시작하지 못했습니다.")
+            self._report_input_rejection(context, "마커 드래프트의 되돌리기 범위를 시작하지 못했습니다.")
             return {"CANCELLED"}
         RUNTIME.modal_active = True
         RUNTIME.clear_marker_command()
@@ -415,6 +425,13 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
         context.window_manager.modal_handler_add(self)
         request_redraw()
         return {"RUNNING_MODAL"}
+
+    def _report_input_rejection(self, context, message: str) -> None:
+        """입력 거부 이유를 후보·Undo 변경 없이 상태 표시줄과 화면에 전달합니다."""
+        RUNTIME.marker_selection.message = message
+        set_window_status_text(context.window, message)
+        self.report({"WARNING"}, message)
+        request_redraw()
 
     def _remove_lifecycle_timer(self, context) -> None:
         """모달 명령을 소비할 Window Timer를 누수 없이 제거합니다."""
@@ -446,7 +463,11 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
         return self._finish(context, {"CANCELLED"})
 
     def _confirm_selection(self, context) -> set[str] | None:
-        """준비된 드래프트를 하나의 생성 또는 편집 명령으로 확정합니다."""
+        """입력 지문을 검사한 뒤 드래프트를 하나의 생성 또는 편집 명령으로 확정합니다."""
+        reason = RUNTIME.marker_selection.draft_geometry_rejection_message()
+        if reason is not None:
+            self._report_input_rejection(context, reason)
+            return None
         before_commit = RUNTIME.marker_selection.snapshot()
         draft = RUNTIME.marker_selection.draft
         pair = RUNTIME.marker_selection.commit_draft()
@@ -482,7 +503,7 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
         return None
 
     def modal(self, context, event):
-        """버튼 명령만 종료에 사용하고 일반 A/P 점 클릭만 선택 입력으로 소비합니다."""
+        """탐색은 허용하고 일반 클릭의 입력 지문·역할 종류 거부 사유를 보고합니다."""
         if not is_session_active_for_window(context.window):
             return self._cancel_selection(context)
         command_result = self._apply_pending_command(context)
@@ -518,26 +539,32 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
         area, region, role = viewport
         region_3d = area.spaces.active.region_3d
         mouse_region = (event.mouse_x - region.x, event.mouse_y - region.y)
+        reason = RUNTIME.marker_selection.draft_geometry_rejection_message()
+        if reason is not None:
+            self._report_input_rejection(context, reason)
+            return {"RUNNING_MODAL"}
         picked = pick_nearest_point(role, region, region_3d, mouse_region)
         if picked is None:
             return {"PASS_THROUGH"}
+        pick_arguments = {
+            "model_id": picked.model_id,
+            "point_kind": getattr(picked, "point_kind", "COLMAP_POINT"),
+            "source_point_id": getattr(picked, "source_point_id", picked.point3d_id),
+            "geometry_source": getattr(picked, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN),
+        }
         if not RUNTIME.marker_selection.can_select_draft_point(
-            role,
-            picked.point3d_id,
-            picked.position,
-            model_id=picked.model_id,
-            point_kind=getattr(picked, "point_kind", "COLMAP_POINT"),
-            source_point_id=getattr(picked, "source_point_id", picked.point3d_id),
+            role, picked.point3d_id, picked.position, **pick_arguments,
         ):
+            reason = RUNTIME.marker_selection._draft_pick_rejection_message(
+                role, picked.point3d_id, picked.position, **pick_arguments,
+            )
+            if reason and reason != "이미 선택한 점입니다.":
+                self._report_input_rejection(context, reason)
+                return {"RUNNING_MODAL"}
             return {"PASS_THROUGH"}
         before = RUNTIME.marker_selection.snapshot()
         changed = RUNTIME.marker_selection.select_draft_point(
-            role,
-            picked.point3d_id,
-            picked.position,
-            model_id=picked.model_id,
-            point_kind=getattr(picked, "point_kind", "COLMAP_POINT"),
-            source_point_id=getattr(picked, "source_point_id", picked.point3d_id),
+            role, picked.point3d_id, picked.position, **pick_arguments,
         )
         if changed:
             after = RUNTIME.marker_selection.snapshot()

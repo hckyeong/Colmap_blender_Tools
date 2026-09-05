@@ -191,12 +191,9 @@ def _draw_pass_signature(draw_passes) -> tuple[tuple[object, ...], ...]:
 
 
 def _assert_preview_point_cloud_contract() -> None:
-    """GUI 미리보기에서 A는 유지되고 P에는 변환 P와 A Ghost가 함께 제출되는지 확인합니다."""
+    """GUI 미리보기에서 P와 A 형상이 모두 일반 불투명 상태로 제출되는지 확인합니다."""
     from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
-    from tools.align.viewport.renderer import (
-        _PREVIEW_GHOST_OPACITY,
-        point_cloud_draw_passes_for_role,
-    )
+    from tools.align.viewport.renderer import point_cloud_draw_passes_for_role
 
     assert _NORMAL_REFERENCE_DRAW_PASSES is not None
     assert _NORMAL_MOVING_DRAW_PASSES is not None
@@ -208,9 +205,9 @@ def _assert_preview_point_cloud_contract() -> None:
     assert moving_passes[1] == (
         _NORMAL_REFERENCE_DRAW_PASSES[0][0],
         ROLE_REFERENCE,
-        _PREVIEW_GHOST_OPACITY,
-        False,
-        "NONE",
+        1.0,
+        True,
+        None,
     )
 
 

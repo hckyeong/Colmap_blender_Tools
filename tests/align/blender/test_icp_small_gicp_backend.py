@@ -162,7 +162,7 @@ def test_small_gicp_is_explicit_external_backend() -> None:
 
 
 def test_bundled_small_gicp_python_uses_addon_relative_runtime_path() -> None:
-    """Small GICP 내장 Python이 애드온 설치 위치 아래 고정 상대경로를 사용하는지 확인합니다."""
+    """Small GICP 내장 Python 경로가 실제 Align 모듈 위치를 기준으로 유지되는지 확인합니다."""
 
     from tools.align.properties import bundled_small_gicp_python_path
 
@@ -170,7 +170,9 @@ def test_bundled_small_gicp_python_uses_addon_relative_runtime_path() -> None:
     assert python_path.name == "python.exe"
     assert python_path.parent.name == "python"
     assert python_path.parent.parent.name == "runtime"
-    assert python_path.parent.parent.parent.name == "colmap_align"
+    from tools.align import properties
+
+    assert python_path.parent.parent.parent == Path(properties.__file__).resolve().parent
 
 
 def test_small_gicp_result_requires_own_library_version() -> None:

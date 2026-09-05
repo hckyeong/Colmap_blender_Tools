@@ -1,0 +1,58 @@
+--- a/src/RegistrationTools.cpp
++++ b/src/RegistrationTools.cpp
+@@ -144,6 +144,7 @@
+ 	PointCloud* CPSetPlain;
+ };
+ 
++// 공개 ICP 등록을 수행하며 단계 배율 경계를 실제 점군과 반환 변환에 동일하게 적용합니다.
+ ICPRegistrationTools::RESULT_TYPE ICPRegistrationTools::Register(	GenericIndexedCloudPersist* inputModelCloud,
+ 																	GenericIndexedMesh* inputModelMesh,
+ 																	GenericIndexedCloudPersist* inputDataCloud,
+@@ -811,18 +812,9 @@
+ 
+ 				if (params.adjustScale)
+ 				{
+-					double newScale = transform.s * currentTrans.s;
+-					if (std::isfinite(params.minScale))
+-					{
+-						newScale = std::max(newScale, params.minScale);
+-					}
+-					if (std::isfinite(params.maxScale))
+-					{
+-						newScale = std::min(newScale, params.maxScale);
+-					}
+-
+-					transform.T *= (newScale / transform.s);
+-					transform.s = newScale;
++					// 점군에 적용한 단계 변환과 같은 배율을 누적합니다.
++					transform.T *= currentTrans.s;
++					transform.s *= currentTrans.s;
+ 				}
+ 
+ 				transform.T += currentTrans.T;
+@@ -879,6 +871,25 @@
+ 		{
+ 			result = ICP_ERROR_REGISTRATION_STEP;
+ 			break;
++		}
++
++		// 점군을 바꾸기 전에 누적 배율 경계와 대응점 중심을 함께 보존합니다.
++		if (params.adjustScale)
++		{
++			double boundedScale = transform.s * currentTrans.s;
++			if (std::isfinite(params.minScale))
++				boundedScale = std::max(boundedScale, params.minScale);
++			if (std::isfinite(params.maxScale))
++				boundedScale = std::min(boundedScale, params.maxScale);
++			const double stepScale = boundedScale / transform.s;
++			if (stepScale != currentTrans.s)
++			{
++				currentTrans.s = stepScale;
++				const CCVector3d rotatedCenter = currentTrans.R.isValid()
++					? currentTrans.R * CCVector3d(dataGravityCenter)
++					: CCVector3d(dataGravityCenter);
++				currentTrans.T = CCVector3d(modelGravityCenter) - currentTrans.s * rotatedCenter;
++			}
+ 		}
+ 
+ 		//restore original data sets (if any were stored)

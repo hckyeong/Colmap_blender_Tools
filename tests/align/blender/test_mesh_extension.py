@@ -215,23 +215,23 @@ def test_obj_invalid_faces_and_coordinates_are_rejected() -> None:
             raise AssertionError(f"잘못된 OBJ 입력을 허용했습니다: {index}")
 
 
-def test_obj_face_limit_is_exact_and_hard() -> None:
-    """정확히 600,000면은 허용하고 600,001번째 면은 즉시 거부하는지 확인합니다."""
+def test_obj_import_accepts_faces_beyond_previous_hard_limit() -> None:
+    """600,000면 경계를 넘은 OBJ를 읽고 Native 검증이 중복면만 정리하는지 확인합니다."""
 
     import tools.align.mesh_importer as mesh_importer
-    from tools.align.constants import OBJ_MAX_TRIANGLE_FACES
-    from tools.align.mesh_io import ObjReaderError, read_obj
+    from tools.align.mesh_io import read_obj
     from tools.align.state import RuntimeState
 
     prefix = "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
     face = "f 1 2 3\n"
+    face_count = 600_001
     with TemporaryDirectory() as temporary_directory:
         accepted = _write_obj(
             Path(temporary_directory) / "accepted.obj",
-            prefix + face * OBJ_MAX_TRIANGLE_FACES,
+            prefix + face * face_count,
         )
         accepted_result = read_obj(accepted)
-        assert accepted_result.triangle_count == OBJ_MAX_TRIANGLE_FACES
+        assert accepted_result.triangle_count == face_count
         del accepted_result
         runtime = RuntimeState()
         original_prepare = mesh_importer._prepare_gpu_batch_for_model
@@ -247,17 +247,8 @@ def test_obj_face_limit_is_exact_and_hard() -> None:
         finally:
             mesh_importer._prepare_gpu_batch_for_model = original_prepare
             mesh_importer._discard_gpu_batch_for_model = original_discard
-        assert runtime.model_repository.models["face-limit"].face_count == OBJ_MAX_TRIANGLE_FACES
-        rejected = _write_obj(
-            Path(temporary_directory) / "rejected.obj",
-            prefix + face * (OBJ_MAX_TRIANGLE_FACES + 1),
-        )
-        try:
-            read_obj(rejected)
-        except ObjReaderError as error:
-            assert "600,000" in str(error)
-        else:
-            raise AssertionError("600,001번째 OBJ 삼각면을 허용했습니다.")
+        model = runtime.model_repository.models["face-limit"]
+        assert model.original_polygon_count == 1 and model.face_count == 1
 
 
 def test_obj_reader_advances_in_bounded_steps() -> None:
@@ -327,7 +318,7 @@ def test_mesh_import_job_is_atomic_and_geometry_access_is_common() -> None:
         assert job.stage == mesh_importer.MESH_IMPORT_STAGE_COMPLETED
         assert runtime.model_catalog.models["mesh"].geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH
         assert runtime.model_repository.source_metadata["mesh"].geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH
-        assert model.texture_coordinate_count == 4
+        assert model.texture_coordinate_count == 6
         assert model.textured_face_count == 2
         assert model.has_complete_texture_coordinates is True
         assert model.material_count == 1
@@ -339,7 +330,11 @@ def test_mesh_import_job_is_atomic_and_geometry_access_is_common() -> None:
         )
         assert np.array_equal(
             model.triangle_texcoord_indices_int32,
-            np.asarray(((0, 1, 2), (3, 2, 1)), dtype=np.int32),
+            np.asarray(((0, 1, 2), (3, 4, 5)), dtype=np.int32),
+        )
+        assert np.allclose(
+            model.texcoords_float64[:, :2],
+            np.asarray(((0, 0), (1, 0), (0, 1), (1, 1), (0, 1), (1, 0)), dtype=np.float64),
         )
         from tools.align.viewport.renderer import _mesh_surface_arrays
 
@@ -356,8 +351,8 @@ def test_mesh_import_job_is_atomic_and_geometry_access_is_common() -> None:
         )
 
 
-def test_mesh_display_sample_maps_back_to_original_vertex_indices() -> None:
-    """표시 샘플 offset이 face가 참조한 OBJ 원본 정점 ID로 정확히 역매핑되는지 확인합니다."""
+def test_mesh_display_sample_uses_native_mesh_vertex_indices() -> None:
+    """표시 샘플이 Native Mesh에서 실제 Polygon이 참조하는 정점 ID만 사용하는지 확인합니다."""
 
     import tools.align.mesh_importer as mesh_importer
     from tools.align.state import RuntimeState
@@ -390,7 +385,8 @@ def test_mesh_display_sample_maps_back_to_original_vertex_indices() -> None:
             mesh_importer._prepare_gpu_batch_for_model = original_prepare
             mesh_importer._discard_gpu_batch_for_model = original_discard
         model = runtime.model_repository.models["sparse"]
-        assert set(int(value) for value in model.display_vertex_indices).issubset({1, 3, 4})
+        assert model.vertex_count == 3
+        assert set(int(value) for value in model.display_vertex_indices).issubset({0, 1, 2})
         assert model.display_vertex_indices.size == 2
 
 
@@ -549,11 +545,11 @@ def test_obj_cancel_leaves_runtime_empty() -> None:
 
 
 def test_mesh_models_feed_mixed_icp_snapshot_and_project_v2_roundtrip() -> None:
-    """두 OBJ 레이어가 기존 ICP 입력·프로젝트 v2 저장 경계에 함께 연결되는지 확인합니다."""
+    """두 OBJ 레이어가 기존 ICP 입력과 현재 프로젝트 저장 형식에 함께 연결되는지 확인합니다."""
 
     import tools.align.mesh_importer as mesh_importer
     from tools.align.alignment.icp_runtime import create_icp_input_snapshot
-    from tools.align.constants import GEOMETRY_KIND_TRIANGLE_MESH
+    from tools.align.constants import GEOMETRY_KIND_TRIANGLE_MESH, PROJECT_PERSISTENCE_SCHEMA_VERSION
     from tools.align.project_persistence.codec import decode_project_state, encode_project_state
     from tools.align.project_persistence.runtime import build_project_state_snapshot
     from tools.align.state import RuntimeState
@@ -606,7 +602,7 @@ def test_mesh_models_feed_mixed_icp_snapshot_and_project_v2_roundtrip() -> None:
 
         snapshot = build_project_state_snapshot(runtime)
         restored = decode_project_state(encode_project_state(snapshot))
-        assert restored.schema_version == 3
+        assert restored.schema_version == PROJECT_PERSISTENCE_SCHEMA_VERSION
         assert tuple(model.source.geometry_kind for model in restored.models) == (
             GEOMETRY_KIND_TRIANGLE_MESH,
             GEOMETRY_KIND_TRIANGLE_MESH,
@@ -750,11 +746,12 @@ def test_mesh_and_colmap_feed_icp_in_both_directions() -> None:
 
 
 def test_obj_project_restore_roundtrip_reimports_mesh_models() -> None:
-    """schema v2 snapshot 복원이 두 OBJ source를 다시 읽어 같은 메시 Data Layer를 구성하는지 확인합니다."""
+    """별도 준비 런타임에서 두 OBJ 원본을 복원한 뒤 같은 메시 계층으로 확정하는지 확인합니다."""
 
     import tools.align.mesh_importer as mesh_importer
     from tools.align.constants import PROJECT_RESTORE_PHASE_RESTORING
     from tools.align.project_persistence.runtime import (
+        _new_restore_staging,
         _preflight_restore_sources,
         _restore_timer,
         build_project_state_snapshot,
@@ -797,6 +794,7 @@ def test_obj_project_restore_roundtrip_reimports_mesh_models() -> None:
             restored_runtime.project_restore.snapshot = snapshot
             restored_runtime.project_restore.phase = PROJECT_RESTORE_PHASE_RESTORING
             _preflight_restore_sources(restored_runtime, snapshot)
+            _new_restore_staging(restored_runtime)
             for _index in range(1_000):
                 delay = _restore_timer(
                     restored_runtime,
@@ -881,10 +879,10 @@ def run_all() -> None:
     test_obj_uv_seams_components_negative_indices_and_partial_face_set()
     test_obj_mtl_diffuse_texture_and_face_materials_are_preserved()
     test_obj_invalid_faces_and_coordinates_are_rejected()
-    test_obj_face_limit_is_exact_and_hard()
+    test_obj_import_accepts_faces_beyond_previous_hard_limit()
     test_obj_reader_advances_in_bounded_steps()
     test_mesh_import_job_is_atomic_and_geometry_access_is_common()
-    test_mesh_display_sample_maps_back_to_original_vertex_indices()
+    test_mesh_display_sample_uses_native_mesh_vertex_indices()
     test_mesh_gpu_batch_prepares_surface_and_vertex_overlay()
     test_mesh_vertex_normals_are_area_weighted_and_normalized()
     test_obj_cancel_leaves_runtime_empty()

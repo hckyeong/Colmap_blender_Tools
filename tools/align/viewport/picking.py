@@ -13,6 +13,8 @@ from mathutils.bvhtree import BVHTree
 
 from ..constants import (
     MARKER_POINT_KIND_COLMAP,
+    MARKER_GEOMETRY_SOURCE_MAIN,
+    MARKER_GEOMETRY_SOURCE_COMPANION,
     MARKER_POINT_KIND_MESH_SURFACE,
     MARKER_POINT_KIND_MESH_VERTEX,
     PICK_RADIUS_PX,
@@ -20,6 +22,7 @@ from ..constants import (
     ROLE_REFERENCE,
 )
 from ..geometry_access import geometry_kind_for_model
+from ..marker_geometry import normalize_marker_geometry_source
 from ..display_axes import ModelDisplayTransform, display_positions
 from ..logging_utils import get_logger
 from ..model_repository import ModelRepositoryError
@@ -28,6 +31,7 @@ from .point_data import (
     effective_positions_for_model_id,
     effective_model_matrix_for_id,
     model_data_for_id,
+    visible_marker_geometry_for_id,
     point_arrays,
     runtime_models,
 )
@@ -35,7 +39,7 @@ from .registry import find_window_region, role_for_area
 
 
 _LOGGER = get_logger("viewport.picking")
-_MESH_SURFACE_BVH_CACHE: dict[tuple[str, int, int, int, int], BVHTree] = {}
+_MESH_SURFACE_BVH_CACHE: dict[tuple[str, str, int, int, int, int], BVHTree] = {}
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,7 @@ class PickResult:
     depth: float
     point_kind: str = MARKER_POINT_KIND_COLMAP
     source_point_id: int | None = None
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN
 
 
 def clear_mesh_surface_pick_cache() -> None:
@@ -57,11 +62,18 @@ def clear_mesh_surface_pick_cache() -> None:
     _MESH_SURFACE_BVH_CACHE.clear()
 
 
-def discard_mesh_surface_pick_cache_for_model(model_id: str) -> None:
-    """지정 모델의 이전 geometry revision BVH를 피킹 캐시에서 제거합니다."""
+def discard_mesh_surface_pick_cache_for_model(
+    model_id: str,
+    geometry_source: str | None = None,
+) -> None:
+    """소유 모델 전체 또는 지정 형상 슬롯의 이전 피킹 캐시를 제거합니다."""
 
     normalized_id = str(model_id)
-    stale_keys = tuple(key for key in _MESH_SURFACE_BVH_CACHE if key[0] == normalized_id)
+    source = None if geometry_source is None else normalize_marker_geometry_source(geometry_source)
+    stale_keys = tuple(
+        key for key in _MESH_SURFACE_BVH_CACHE
+        if key[0] == normalized_id and (source is None or key[1] == source)
+    )
     for key in stale_keys:
         _MESH_SURFACE_BVH_CACHE.pop(key, None)
 
@@ -126,6 +138,15 @@ def marker_source_model_ids(role: str) -> tuple[str, ...]:
     return ()
 
 
+def marker_pick_model_ids(role: str) -> tuple[str, ...]:
+    """역할에 속한 표시 레이어 중 주 형상 또는 연결 표면이 보이는 소유자를 반환합니다."""
+    return tuple(
+        model_id
+        for model_id in marker_source_model_ids(role)
+        if visible_marker_geometry_for_id(model_id) is not None
+    )
+
+
 def marker_source_model_id(role: str) -> str | None:
     """단일 모델이 필요한 기존 호출에 첫 피킹 모델 ID를 호환 반환합니다."""
     model_ids = marker_source_model_ids(role)
@@ -172,10 +193,14 @@ def _ray_in_source_local(
     model_id: str,
     ray_origin: np.ndarray,
     ray_direction: np.ndarray,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Project World 피킹 광선을 모델의 Source Local 광선으로 변환합니다."""
+    """선택한 형상 축과 소유자 공통 정렬을 역변환해 원본 피킹 광선을 만듭니다."""
 
-    model_matrix = effective_model_matrix_for_id(model_id)
+    source = normalize_marker_geometry_source(geometry_source)
+    model_matrix = effective_model_matrix_for_id(
+        model_id, companion=source == MARKER_GEOMETRY_SOURCE_COMPANION,
+    )
     try:
         inverse = np.linalg.inv(model_matrix)
     except np.linalg.LinAlgError as error:
@@ -224,8 +249,12 @@ def _ray_intersects_bounds(
     return far >= max(near, 0.0)
 
 
-def _mesh_surface_bvh(model_id: str, model_data: Any) -> BVHTree:
-    """모델 identity와 geometry revision이 같은 삼각면 BVH를 재사용합니다."""
+def _mesh_surface_bvh(
+    model_id: str,
+    model_data: Any,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
+) -> BVHTree:
+    """축·정렬에 무관한 원본 면 캐시를 소유자·형상 슬롯·리비전별로 재사용합니다."""
 
     vertices = np.asarray(
         getattr(model_data, "vertices_float64", getattr(model_data, "vertices")),
@@ -235,8 +264,10 @@ def _mesh_surface_bvh(model_id: str, model_data: Any) -> BVHTree:
         getattr(model_data, "triangles_uint32", getattr(model_data, "triangles")),
         dtype=np.uint32,
     )
+    source = normalize_marker_geometry_source(geometry_source)
     cache_key = (
         str(model_id),
+        source,
         id(model_data),
         int(getattr(model_data, "geometry_revision", 0)),
         int(vertices.shape[0]),
@@ -245,7 +276,7 @@ def _mesh_surface_bvh(model_id: str, model_data: Any) -> BVHTree:
     cached = _MESH_SURFACE_BVH_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    discard_mesh_surface_pick_cache_for_model(model_id)
+    discard_mesh_surface_pick_cache_for_model(model_id, source)
     tree = BVHTree.FromPolygons(
         vertices,
         triangles,
@@ -300,13 +331,15 @@ def _pick_model_mesh_surface_from_ray(
     region_3d: Any,
     ray_origin: np.ndarray,
     ray_direction: np.ndarray,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
 ) -> PickResult | None:
-    """메시의 가장 앞쪽 삼각면 교차점을 Source Local 면 마커로 반환합니다."""
+    """선택한 메시 슬롯의 앞쪽 교차점을 원본 면 좌표와 소유 ID로 반환합니다."""
 
     local_origin, local_direction = _ray_in_source_local(
         model_id,
         ray_origin,
         ray_direction,
+        geometry_source,
     )
     minimum = np.asarray(getattr(model_data, "bounds_min"), dtype=np.float64)
     maximum = np.asarray(getattr(model_data, "bounds_max"), dtype=np.float64)
@@ -315,6 +348,7 @@ def _pick_model_mesh_surface_from_ray(
     location, _normal, face_index, _distance = _mesh_surface_bvh(
         model_id,
         model_data,
+        geometry_source,
     ).ray_cast(Vector(local_origin.tolist()), Vector(local_direction.tolist()))
     if location is None or face_index is None:
         return None
@@ -333,10 +367,11 @@ def _pick_model_mesh_surface_from_ray(
         triangle,
     )
     if local_position is None:
-        local_position = np.asarray(location, dtype=np.float64)
+        return None
     project_position = effective_positions_for_model_id(
         model_id,
         local_position[np.newaxis, :],
+        companion=geometry_source == MARKER_GEOMETRY_SOURCE_COMPANION,
     )[0]
     ray_depth = float(np.dot(project_position - ray_origin, ray_direction))
     if not np.isfinite(project_position).all() or not math.isfinite(ray_depth) or ray_depth < 0.0:
@@ -350,6 +385,7 @@ def _pick_model_mesh_surface_from_ray(
         depth=ray_depth,
         point_kind=MARKER_POINT_KIND_MESH_SURFACE,
         source_point_id=int(face_index),
+        geometry_source=normalize_marker_geometry_source(geometry_source),
     )
 
 
@@ -405,8 +441,10 @@ def _pick_model_nearest_point(
     region_3d: Any,
     mouse_region: tuple[float, float],
     radius_squared: float,
+    ray_origin: np.ndarray | None = None,
+    ray_direction: np.ndarray | None = None,
 ) -> PickResult | None:
-    """한 모델의 표시 LOD를 벡터화 투영해 가장 가까운 원본 점을 반환합니다."""
+    """반경 안의 표시 점을 형상 간 비교와 같은 광선 깊이 우선순위로 선택합니다."""
     model_data = model_data_for_id(model_id)
     if model_data is None:
         return None
@@ -425,6 +463,10 @@ def _pick_model_nearest_point(
         region_3d,
         shown_positions,
     )
+    has_view_ray = ray_origin is not None and ray_direction is not None
+    if has_view_ray:
+        depths = (shown_positions - ray_origin) @ ray_direction
+        valid &= np.isfinite(depths) & (depths >= 0.0)
     mouse_x, mouse_y = mouse_region
     distance_squared = (
         (screen_positions[:, 0] - float(mouse_x)) ** 2
@@ -434,10 +476,13 @@ def _pick_model_nearest_point(
     if candidate_offsets.size == 0:
         return None
 
-    # 화면 거리 우선, 동일 거리에서는 앞쪽 깊이 우선으로 결정적으로 한 점을 고릅니다.
-    candidate_order = np.lexsort(
-        (depths[candidate_offsets], distance_squared[candidate_offsets])
+    # 실제 광선에서는 앞쪽 가림점을 보존하고 같은 깊이에서 화면 거리를 비교합니다.
+    candidate_keys = (
+        (distance_squared[candidate_offsets], depths[candidate_offsets])
+        if has_view_ray
+        else (depths[candidate_offsets], distance_squared[candidate_offsets])
     )
+    candidate_order = np.lexsort(candidate_keys)
     display_offset = int(candidate_offsets[int(candidate_order[0])])
     source_index = int(display_indices[display_offset])
     position = arrays.positions[source_index]
@@ -465,7 +510,7 @@ def pick_nearest_point_for_model_ids(
     mouse_region: tuple[float, float],
     radius: float = PICK_RADIUS_PX,
 ) -> PickResult | None:
-    """지정 모델 LOD를 화면 거리와 깊이 순으로 비교해 가장 가까운 점을 반환합니다."""
+    """모든 보이는 레이어의 실제 앞쪽 형상을 종류 제한 없이 마커 후보로 반환합니다."""
 
     if radius <= 0.0:
         return None
@@ -483,30 +528,22 @@ def pick_nearest_point_for_model_ids(
     best_result: PickResult | None = None
     for model_id in normalized_ids:
         try:
-            model_data = model_data_for_id(model_id)
-            if (
-                model_data is not None
-                and geometry_kind_for_model(model_data) == "TRIANGLE_MESH"
-                and ray_origin is not None
-                and ray_direction is not None
-            ):
+            visible_geometry = visible_marker_geometry_for_id(model_id)
+            if visible_geometry is None:
+                continue
+            geometry_source, model_data = visible_geometry
+            is_mesh = geometry_kind_for_model(model_data) == "TRIANGLE_MESH"
+            if is_mesh and ray_origin is not None and ray_direction is not None:
                 result = _pick_model_mesh_surface_from_ray(
-                    model_id,
-                    model_data,
-                    region,
-                    region_3d,
-                    ray_origin,
-                    ray_direction,
+                    model_id, model_data, region, region_3d,
+                    ray_origin, ray_direction, geometry_source,
                 )
             else:
                 result = None
-            if result is None:
+            if result is None and geometry_source == MARKER_GEOMETRY_SOURCE_MAIN:
                 result = _pick_model_nearest_point(
-                    model_id,
-                    region,
-                    region_3d,
-                    mouse_region,
-                    radius_squared,
+                    model_id, region, region_3d, mouse_region,
+                    radius_squared, ray_origin, ray_direction,
                 )
         except (ModelRepositoryError, TypeError, ValueError, IndexError) as error:
             _LOGGER.error(
@@ -517,7 +554,11 @@ def pick_nearest_point_for_model_ids(
             continue
         if result is None:
             continue
-        result_key = (result.screen_distance * result.screen_distance, result.depth)
+        result_key = (
+            (result.depth, result.screen_distance * result.screen_distance)
+            if ray_origin is not None
+            else (result.screen_distance * result.screen_distance, result.depth)
+        )
         if best_key is None or result_key < best_key:
             best_key = result_key
             best_result = result
@@ -531,10 +572,10 @@ def pick_nearest_point(
     mouse_region: tuple[float, float],
     radius: float = PICK_RADIUS_PX,
 ) -> PickResult | None:
-    """역할의 모든 허용 모델 LOD를 화면 거리와 깊이 순으로 함께 비교합니다."""
+    """역할별로 실제 보이는 주 형상·연결 표면의 최근접 후보를 반환합니다."""
 
     return pick_nearest_point_for_model_ids(
-        marker_source_model_ids(role),
+        marker_pick_model_ids(role),
         region,
         region_3d,
         mouse_region,
@@ -549,6 +590,7 @@ __all__ = (
     "find_viewport_under_mouse",
     "marker_source_model_id",
     "marker_source_model_ids",
+    "marker_pick_model_ids",
     "pick_nearest_point",
     "pick_nearest_point_for_model_ids",
 )

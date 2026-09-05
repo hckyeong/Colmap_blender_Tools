@@ -1,4 +1,4 @@
-"""정렬된 삼각형 메시를 canonical OBJ로 증분 기록하고 검증합니다."""
+"""정렬된 가변 Corner Polygon 메시를 canonical OBJ로 증분 기록하고 검증합니다."""
 
 from __future__ import annotations
 
@@ -188,7 +188,7 @@ def _texture_asset_snapshots(
 
 @dataclass(frozen=True, slots=True)
 class ObjExportModelSnapshot:
-    """한 A 그룹 메시의 불변 OBJ·재질·텍스처 기록 입력과 stale 지문을 보관합니다."""
+    """한 A 그룹 메시의 불변 Polygon·재질·텍스처 기록 입력과 stale 지문을 보관합니다."""
 
     model_id: str
     display_name: str
@@ -217,10 +217,29 @@ class ObjExportModelSnapshot:
     triangle_material_indices_int32: np.ndarray = field(
         default_factory=lambda: np.empty((0,), dtype=np.int32)
     )
+    polygon_loop_starts_uint32: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.uint32)
+    )
+    polygon_loop_totals_uint32: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.uint32)
+    )
+    loop_vertex_indices_uint32: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.uint32)
+    )
+    loop_texcoord_indices_int32: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.int32)
+    )
+    polygon_material_indices_int32: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.int32)
+    )
+    embedded_asset_uuid: str = ""
+    embedded_asset_schema_version: int = 0
+    embedded_data_name_hint: str = ""
+    polygon_topology_explicit: bool = False
     texture_assets: tuple[ObjTextureAssetSnapshot, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
-        """snapshot 식별자·배열·Project World 행렬을 기록 전에 엄격히 검증합니다."""
+        """snapshot 식별자와 Triangle 프록시·Polygon 원본 배열을 엄격히 검증합니다."""
 
         model_id = str(self.model_id).strip()
         display_name = str(self.display_name).strip()
@@ -230,7 +249,7 @@ class ObjExportModelSnapshot:
         vertices = _freeze_snapshot_array(self.vertices_float64, (None, 3), "OBJ 정점", np.float64)
         triangles = _freeze_snapshot_array(self.triangles_uint32, (None, 3), "OBJ 삼각면", np.uint32)
         if vertices.shape[0] < 1 or triangles.shape[0] < 1:
-            raise ValueError("OBJ snapshot에는 정점과 삼각면이 필요합니다.")
+            raise ValueError("OBJ snapshot에는 정점과 삼각형 프록시가 필요합니다.")
         if np.any(triangles >= vertices.shape[0]):
             raise ValueError("OBJ snapshot face 인덱스가 범위를 벗어났습니다.")
         if np.any(triangles[:, 0] == triangles[:, 1]) or np.any(triangles[:, 1] == triangles[:, 2]) or np.any(triangles[:, 0] == triangles[:, 2]):
@@ -284,10 +303,79 @@ class ObjExportModelSnapshot:
         )
         if np.any(face_materials < -1) or np.any(face_materials >= len(materials)):
             raise ValueError("OBJ snapshot 면 재질 인덱스가 재질 배열 범위를 벗어났습니다.")
+        embedded_uuid = str(self.embedded_asset_uuid).strip().replace("-", "").casefold()
+        embedded_schema = int(self.embedded_asset_schema_version)
+        embedded_name_hint = str(self.embedded_data_name_hint).strip()
+        if embedded_uuid:
+            if len(embedded_uuid) != 32 or any(value not in "0123456789abcdef" for value in embedded_uuid):
+                raise ValueError("OBJ snapshot 내장 asset UUID가 올바르지 않습니다.")
+            if embedded_schema < 1 or not embedded_name_hint:
+                raise ValueError("OBJ snapshot 내장 schema 또는 이름 힌트가 비어 있습니다.")
+        elif embedded_schema != 0 or embedded_name_hint:
+            raise ValueError("OBJ snapshot 내장 참조 필드가 서로 일치하지 않습니다.")
+        explicit_polygons = bool(self.polygon_topology_explicit or embedded_uuid)
+        if explicit_polygons:
+            polygon_starts = _freeze_snapshot_array(
+                self.polygon_loop_starts_uint32, (None,), "OBJ Polygon Loop 시작", np.uint32
+            )
+            polygon_totals = _freeze_snapshot_array(
+                self.polygon_loop_totals_uint32, (polygon_starts.shape[0],), "OBJ Polygon Corner 수", np.uint32
+            )
+            loop_vertices = _freeze_snapshot_array(
+                self.loop_vertex_indices_uint32, (None,), "OBJ Loop 정점 인덱스", np.uint32
+            )
+            if polygon_starts.shape[0] < 1 or np.any(polygon_totals < 3):
+                raise ValueError("OBJ snapshot Polygon은 하나 이상이며 Corner가 세 개 이상이어야 합니다.")
+            expected_loop_count = int(np.sum(polygon_totals, dtype=np.uint64))
+            if expected_loop_count != loop_vertices.shape[0]:
+                raise ValueError("OBJ snapshot Polygon Corner 수와 Loop 배열 길이가 다릅니다.")
+            expected_starts = np.empty_like(polygon_starts)
+            if expected_starts.shape[0] < 1:
+                raise ValueError("OBJ snapshot Polygon이 비어 있습니다.")
+            expected_starts[0] = 0
+            if expected_starts.shape[0] > 1:
+                expected_starts[1:] = np.cumsum(polygon_totals[:-1], dtype=np.uint64).astype(np.uint32)
+            if not np.array_equal(polygon_starts, expected_starts):
+                raise ValueError("OBJ snapshot Polygon Loop 범위가 연속적이지 않습니다.")
+            if np.any(loop_vertices >= vertices.shape[0]):
+                raise ValueError("OBJ snapshot Loop 정점 인덱스가 범위를 벗어났습니다.")
+            for start, total in zip(polygon_starts, polygon_totals, strict=True):
+                corners = loop_vertices[int(start) : int(start) + int(total)]
+                if np.unique(corners).shape[0] != corners.shape[0]:
+                    raise ValueError("OBJ snapshot Polygon이 같은 정점을 반복합니다.")
+            raw_loop_texcoords = np.asarray(self.loop_texcoord_indices_int32, dtype=np.int32)
+            if raw_loop_texcoords.shape == (0,) and texcoords.shape[0] == 0:
+                raw_loop_texcoords = np.full((loop_vertices.shape[0],), -1, dtype=np.int32)
+            loop_texcoords = _freeze_snapshot_array(
+                raw_loop_texcoords, (loop_vertices.shape[0],), "OBJ Loop UV 인덱스", np.int32
+            )
+            raw_polygon_materials = np.asarray(self.polygon_material_indices_int32, dtype=np.int32)
+            if raw_polygon_materials.shape == (0,) and not materials:
+                raw_polygon_materials = np.full((polygon_starts.shape[0],), -1, dtype=np.int32)
+            polygon_materials = _freeze_snapshot_array(
+                raw_polygon_materials,
+                (polygon_starts.shape[0],),
+                "OBJ Polygon 재질 인덱스",
+                np.int32,
+            )
+        else:
+            polygon_starts = np.arange(triangles.shape[0], dtype=np.uint32) * 3
+            polygon_totals = np.full((triangles.shape[0],), 3, dtype=np.uint32)
+            loop_vertices = np.ascontiguousarray(triangles.reshape((-1,)), dtype=np.uint32)
+            loop_texcoords = np.ascontiguousarray(face_texcoords.reshape((-1,)), dtype=np.int32)
+            polygon_materials = np.ascontiguousarray(face_materials, dtype=np.int32)
+        for start, total in zip(polygon_starts, polygon_totals, strict=True):
+            loop_uv = loop_texcoords[int(start) : int(start) + int(total)]
+            if not (np.all(loop_uv >= 0) or np.all(loop_uv == -1)):
+                raise ValueError("OBJ snapshot 한 Polygon은 UV가 모두 있거나 모두 없어야 합니다.")
+        if np.any(loop_texcoords < -1) or np.any(loop_texcoords[loop_texcoords >= 0] >= texcoords.shape[0]):
+            raise ValueError("OBJ snapshot Loop UV 인덱스가 범위를 벗어났습니다.")
+        if np.any(polygon_materials < -1) or np.any(polygon_materials >= len(materials)):
+            raise ValueError("OBJ snapshot Polygon 재질 인덱스가 재질 배열 범위를 벗어났습니다.")
         matrix = _matrix_value(self.project_world_matrix_float64, "Project World")
         vertex_count = int(self.vertex_count)
         face_count = int(self.face_count)
-        if vertex_count != vertices.shape[0] or face_count != triangles.shape[0]:
+        if vertex_count != vertices.shape[0] or face_count != polygon_starts.shape[0]:
             raise ValueError("OBJ snapshot count가 원본 배열과 일치하지 않습니다.")
         revision = int(self.geometry_revision)
         if revision < 0:
@@ -313,6 +401,11 @@ class ObjExportModelSnapshot:
         component_counts.setflags(write=False)
         face_texcoords.setflags(write=False)
         face_materials.setflags(write=False)
+        polygon_starts.setflags(write=False)
+        polygon_totals.setflags(write=False)
+        loop_vertices.setflags(write=False)
+        loop_texcoords.setflags(write=False)
+        polygon_materials.setflags(write=False)
         object.__setattr__(self, "project_world_matrix_float64", matrix)
         object.__setattr__(self, "vertices_float64", vertices)
         object.__setattr__(self, "triangles_uint32", triangles)
@@ -321,6 +414,15 @@ class ObjExportModelSnapshot:
         object.__setattr__(self, "triangle_texcoord_indices_int32", face_texcoords)
         object.__setattr__(self, "materials", materials)
         object.__setattr__(self, "triangle_material_indices_int32", face_materials)
+        object.__setattr__(self, "polygon_loop_starts_uint32", polygon_starts)
+        object.__setattr__(self, "polygon_loop_totals_uint32", polygon_totals)
+        object.__setattr__(self, "loop_vertex_indices_uint32", loop_vertices)
+        object.__setattr__(self, "loop_texcoord_indices_int32", loop_texcoords)
+        object.__setattr__(self, "polygon_material_indices_int32", polygon_materials)
+        object.__setattr__(self, "embedded_asset_uuid", embedded_uuid)
+        object.__setattr__(self, "embedded_asset_schema_version", embedded_schema)
+        object.__setattr__(self, "embedded_data_name_hint", embedded_name_hint)
+        object.__setattr__(self, "polygon_topology_explicit", explicit_polygons)
         texture_assets = _texture_asset_snapshots(filename, materials)
         texture_names = tuple(
             asset.output_relative_path.as_posix().casefold() for asset in texture_assets
@@ -346,13 +448,22 @@ class ObjExportModelSnapshot:
 
     @property
     def textured_face_count(self) -> int:
-        """snapshot에서 UV가 세 꼭짓점에 모두 연결된 면 개수를 반환합니다."""
+        """snapshot에서 모든 Corner에 UV가 연결된 Polygon 개수를 반환합니다."""
 
-        return int(np.count_nonzero(np.all(self.triangle_texcoord_indices_int32 >= 0, axis=1)))
+        count = 0
+        for start, total in zip(
+            self.polygon_loop_starts_uint32,
+            self.polygon_loop_totals_uint32,
+            strict=True,
+        ):
+            begin = int(start)
+            if np.all(self.loop_texcoord_indices_int32[begin : begin + int(total)] >= 0):
+                count += 1
+        return count
 
     @property
     def uv_coverage(self) -> float:
-        """전체 삼각면 중 UV가 연결된 면의 비율을 반환합니다."""
+        """전체 Polygon 중 UV가 연결된 면의 비율을 반환합니다."""
 
         return self.textured_face_count / self.face_count
 
@@ -453,6 +564,58 @@ def transformed_face_texcoord_indices(
     if snapshot.has_reflection:
         indices[:, [1, 2]] = indices[:, [2, 1]]
     return indices
+
+
+def transformed_polygon_corners(
+    snapshot: ObjExportModelSnapshot,
+    start: int = 0,
+    stop: int | None = None,
+) -> tuple[np.ndarray, ...]:
+    """Polygon Corner를 1 기반으로 복사하고 reflection이면 첫 Corner 뒤를 반전합니다."""
+
+    begin = int(start)
+    end = snapshot.face_count if stop is None else int(stop)
+    if begin < 0 or end < begin or end > snapshot.face_count:
+        raise ValueError("OBJ Polygon chunk 범위가 올바르지 않습니다.")
+    polygons: list[np.ndarray] = []
+    for polygon_index in range(begin, end):
+        loop_start = int(snapshot.polygon_loop_starts_uint32[polygon_index])
+        loop_total = int(snapshot.polygon_loop_totals_uint32[polygon_index])
+        corners = np.array(
+            snapshot.loop_vertex_indices_uint32[loop_start : loop_start + loop_total],
+            dtype=np.uint64,
+            copy=True,
+        ) + 1
+        if snapshot.has_reflection:
+            corners[1:] = corners[:0:-1]
+        polygons.append(corners)
+    return tuple(polygons)
+
+
+def transformed_polygon_texcoord_indices(
+    snapshot: ObjExportModelSnapshot,
+    start: int = 0,
+    stop: int | None = None,
+) -> tuple[np.ndarray, ...]:
+    """Polygon UV Corner를 복사하고 reflection이면 정점과 같은 순서로 반전합니다."""
+
+    begin = int(start)
+    end = snapshot.face_count if stop is None else int(stop)
+    if begin < 0 or end < begin or end > snapshot.face_count:
+        raise ValueError("OBJ Polygon UV chunk 범위가 올바르지 않습니다.")
+    polygons: list[np.ndarray] = []
+    for polygon_index in range(begin, end):
+        loop_start = int(snapshot.polygon_loop_starts_uint32[polygon_index])
+        loop_total = int(snapshot.polygon_loop_totals_uint32[polygon_index])
+        corners = np.array(
+            snapshot.loop_texcoord_indices_int32[loop_start : loop_start + loop_total],
+            dtype=np.int32,
+            copy=True,
+        )
+        if snapshot.has_reflection:
+            corners[1:] = corners[:0:-1]
+        polygons.append(corners)
+    return tuple(polygons)
 
 
 def _format_coordinate(value: float) -> str:
@@ -622,17 +785,17 @@ class IncrementalObjWriter:
         return end - begin
 
     def write_faces(self, start: int, stop: int | None = None) -> int:
-        """삼각면 chunk를 원본 정점·UV·재질 연결과 1 기반 인덱스로 기록합니다."""
+        """Polygon chunk를 원본 Corner·UV·재질 연결과 1 기반 인덱스로 기록합니다."""
 
         self._ensure_open()
         begin = int(start)
         end = self.snapshot.face_count if stop is None else int(stop)
         if begin != self._face_offset:
             raise ValueError("OBJ face chunk가 순서대로 전달되지 않았습니다.")
-        values = transformed_faces(self.snapshot, begin, end)
-        uv_indices = transformed_face_texcoord_indices(self.snapshot, begin, end)
-        material_indices = self.snapshot.triangle_material_indices_int32[begin:end]
-        for (i, j, k), (ui, uj, uk), material_index in zip(
+        values = transformed_polygon_corners(self.snapshot, begin, end)
+        uv_indices = transformed_polygon_texcoord_indices(self.snapshot, begin, end)
+        material_indices = self.snapshot.polygon_material_indices_int32[begin:end]
+        for vertex_corners, uv_corners, material_index in zip(
             values,
             uv_indices,
             material_indices,
@@ -647,12 +810,14 @@ class IncrementalObjWriter:
                         f"usemtl {self.snapshot.materials[normalized_material_index].name}\n"
                     )
                 self._current_material_index = normalized_material_index
-            if int(ui) >= 0:
-                self._stream.write(
-                    f"f {int(i)}/{int(ui) + 1} {int(j)}/{int(uj) + 1} {int(k)}/{int(uk) + 1}\n"
+            if int(uv_corners[0]) >= 0:
+                tokens = " ".join(
+                    f"{int(vertex_index)}/{int(uv_index) + 1}"
+                    for vertex_index, uv_index in zip(vertex_corners, uv_corners, strict=True)
                 )
             else:
-                self._stream.write(f"f {int(i)} {int(j)} {int(k)}\n")
+                tokens = " ".join(str(int(vertex_index)) for vertex_index in vertex_corners)
+            self._stream.write(f"f {tokens}\n")
         self._face_offset = end
         return end - begin
 
@@ -717,8 +882,8 @@ def validate_obj_material_links(
     ):
         raise ValueError("OBJ 출력 재질 이름 또는 순서가 snapshot과 다릅니다.")
     if not np.array_equal(
-        parsed.triangle_material_indices_int32,
-        snapshot.triangle_material_indices_int32,
+        parsed.polygon_material_indices_int32,
+        snapshot.polygon_material_indices_int32,
     ):
         raise ValueError("OBJ 출력 face 재질 연결이 snapshot과 다릅니다.")
     destination_root = Path(output_root)
@@ -770,21 +935,25 @@ def validate_obj_roundtrip(
     """기록한 OBJ를 다시 읽어 형상·UV·재질·텍스처 연결을 검증합니다."""
 
     try:
-        parsed = read_obj(path)
+        parsed = read_obj(path, preserve_polygons=True)
     except (ObjReaderError, OSError, ValueError) as error:
         raise ValueError(f"OBJ 출력 왕복 검증에 실패했습니다: {path}") from error
     if (
         parsed.vertex_count != snapshot.vertex_count
-        or parsed.triangle_count != snapshot.face_count
+        or parsed.polygon_count != snapshot.face_count
         or parsed.texture_coordinate_count != snapshot.texture_coordinate_count
     ):
-        raise ValueError("OBJ 출력 정점·UV·삼각면 수가 snapshot과 다릅니다.")
+        raise ValueError("OBJ 출력 정점·UV·Polygon 수가 snapshot과 다릅니다.")
     expected_vertices = transformed_vertices(snapshot)
     if not np.allclose(parsed.vertices_float64, expected_vertices, rtol=0.0, atol=float(tolerance)):
         raise ValueError("OBJ 출력 좌표가 Project World 변환 결과와 다릅니다.")
-    expected_faces = transformed_faces(snapshot) - 1
-    if not np.array_equal(parsed.triangles_uint32.astype(np.uint64, copy=False), expected_faces):
-        raise ValueError("OBJ 출력 face 연결 또는 winding이 snapshot과 다릅니다.")
+    expected_faces = transformed_polygon_corners(snapshot)
+    for polygon_index, expected in enumerate(expected_faces):
+        start = int(parsed.polygon_loop_starts_uint32[polygon_index])
+        total = int(parsed.polygon_loop_totals_uint32[polygon_index])
+        actual = parsed.loop_vertex_indices_uint32[start : start + total]
+        if total != expected.shape[0] or not np.array_equal(actual, expected - 1):
+            raise ValueError("OBJ 출력 Polygon Corner 연결 또는 winding이 snapshot과 다릅니다.")
     if not np.array_equal(
         parsed.texcoord_component_counts_uint8,
         snapshot.texcoord_component_counts_uint8,
@@ -797,19 +966,20 @@ def validate_obj_roundtrip(
         atol=float(tolerance),
     ):
         raise ValueError("OBJ 출력 UV 좌표가 snapshot과 다릅니다.")
-    expected_face_texcoords = transformed_face_texcoord_indices(snapshot)
-    if not np.array_equal(
-        parsed.triangle_texcoord_indices_int32,
-        expected_face_texcoords,
-    ):
-        raise ValueError("OBJ 출력 face UV 연결 또는 winding이 snapshot과 다릅니다.")
+    expected_face_texcoords = transformed_polygon_texcoord_indices(snapshot)
+    for polygon_index, expected in enumerate(expected_face_texcoords):
+        start = int(parsed.polygon_loop_starts_uint32[polygon_index])
+        total = int(parsed.polygon_loop_totals_uint32[polygon_index])
+        actual = parsed.loop_texcoord_indices_int32[start : start + total]
+        if total != expected.shape[0] or not np.array_equal(actual, expected):
+            raise ValueError("OBJ 출력 Polygon UV 연결 또는 winding이 snapshot과 다릅니다.")
     copied_texture_sha256 = validate_obj_material_roundtrip(parsed, snapshot, Path(path).parent)
     return ObjRoundTripValidation(
         vertex_count=parsed.vertex_count,
-        face_count=parsed.triangle_count,
+        face_count=parsed.polygon_count,
         texture_coordinate_count=parsed.texture_coordinate_count,
-        textured_face_count=parsed.textured_face_count,
-        uv_coverage=(parsed.textured_face_count / parsed.triangle_count),
+        textured_face_count=parsed.textured_polygon_count,
+        uv_coverage=(parsed.textured_polygon_count / parsed.polygon_count),
         bounds_min=tuple(float(value) for value in parsed.bounds_min),
         bounds_max=tuple(float(value) for value in parsed.bounds_max),
         output_sha256=sha256_file(path),
@@ -951,6 +1121,8 @@ __all__ = (
     "sha256_file",
     "transformed_faces",
     "transformed_face_texcoord_indices",
+    "transformed_polygon_corners",
+    "transformed_polygon_texcoord_indices",
     "transformed_vertices",
     "validate_obj_roundtrip",
     "validate_obj_material_links",

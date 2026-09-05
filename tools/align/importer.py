@@ -14,10 +14,12 @@ from .display_axes import (
     ModelDisplayTransform,
     axis_summary,
     create_model_display_transform,
+    companion_default_display_transform,
 )
 from .logging_utils import get_logger
 from .model_repository import (
     ColmapModelData,
+    CompanionMeshSourceMetadata,
     DuplicateModelSourceError,
     ImportedModelSourceMetadata,
     ModelRepositoryError,
@@ -52,6 +54,7 @@ IMPORT_STAGE_VALIDATE_MODEL = "VALIDATE_MODEL"
 IMPORT_STAGE_HASH_SOURCE_AFTER = "HASH_SOURCE_AFTER"
 IMPORT_STAGE_PREPARE_MODEL = "PREPARE_MODEL"
 IMPORT_STAGE_PREPARE_DISPLAY_SAMPLE = "PREPARE_DISPLAY_SAMPLE"
+IMPORT_STAGE_READ_COMPANION = "READ_COMPANION"
 IMPORT_STAGE_PREPARE_GPU = "PREPARE_GPU"
 IMPORT_STAGE_COMMIT = "COMMIT"
 IMPORT_STAGE_COMPLETED = "COMPLETED"
@@ -85,7 +88,7 @@ def _source_path_text(source_path: str | Path) -> str:
 
 
 def import_stage_label(stage: str) -> str:
-    """Runtime 단계 식별자를 UI에 표시할 짧은 한국어 문구로 변환합니다."""
+    """COLMAP·연결 OBJ 단계 식별자를 짧은 한국어 문구로 변환합니다."""
     labels = {
         IMPORT_STAGE_FILE_CHECK: "파일 검사",
         IMPORT_STAGE_HASH_SOURCE_BEFORE: "가져오기 전 원본 확인",
@@ -94,6 +97,7 @@ def import_stage_label(stage: str) -> str:
         IMPORT_STAGE_HASH_SOURCE_AFTER: "가져오기 후 원본 재확인",
         IMPORT_STAGE_PREPARE_MODEL: "원본 점 테이블 준비",
         IMPORT_STAGE_PREPARE_DISPLAY_SAMPLE: "뷰포트 표시 점 선택",
+        IMPORT_STAGE_READ_COMPANION: "연결 OBJ 형상 읽기",
         IMPORT_STAGE_PREPARE_GPU: "GPU 배치 준비",
         IMPORT_STAGE_COMMIT: "Data Layers 등록",
         IMPORT_STAGE_COMPLETED: "가져오기 완료",
@@ -111,12 +115,12 @@ def _point_count_from_parsed(model: Any) -> int:
 
 
 def _failure_message(reason: Exception | str) -> str:
-    """원인·영향·사용자 조치를 포함하는 실패 상태 문구를 구성합니다."""
+    """COLMAP·연결 OBJ의 원자 가져오기 실패 원인과 조치를 안내합니다."""
     return (
         "COLMAP 모델을 가져오지 못했습니다. "
         f"원인: {reason} "
         "영향: 데이터 레이어를 추가하지 않았습니다. "
-        "조치: 원본 sparse model의 파일 세트와 참조 무결성을 확인하십시오."
+        "조치: 원본 COLMAP·OBJ 파일과 연결 선택을 확인하십시오."
     )
 
 
@@ -128,8 +132,8 @@ def _reader_failure_reason(reader: Any) -> Exception:
     return ImportJobError("증분 COLMAP reader가 원인 정보 없이 실패했습니다.")
 
 
-def _prepare_gpu_batch_for_model(model_id: str, model_data: ColmapModelData) -> None:
-    """렌더러 공개 경계로 한 모델의 GPU 배치를 준비하고 실패를 전달합니다."""
+def _prepare_gpu_batch_for_model(model_id: str, model_data: Any) -> None:
+    """렌더러 공개 경계로 소유 모델의 점군·표면 배치를 준비합니다."""
     from .viewport import renderer
 
     prepare = getattr(renderer, "prepare_gpu_batch_for_model", None)
@@ -195,9 +199,16 @@ class ImportJob:
     gpu_batch_prepared: bool = field(default=False, repr=False)
     validation_performed: bool = field(default=False, repr=False)
     started_at: float = field(default_factory=perf_counter, repr=False)
+    import_companion_obj: bool = True
+    companion_obj_path: str = ""
+    companion_expected_fingerprint: str = ""
+    companion_job: Any = field(default=None, repr=False)
+    staged_companion_mesh: Any = field(default=None, repr=False)
+    companion_source_metadata: CompanionMeshSourceMetadata | None = field(default=None, repr=False)
+    prepare_gpu: bool = True
 
     def __post_init__(self) -> None:
-        """작업 축·표시 점 상한 snapshot을 초기 경계에서 검증합니다."""
+        """작업 축·표시 점 상한과 연결 OBJ 복원 조건을 검증합니다."""
         try:
             expected_transform = create_model_display_transform(
                 self.axis_preset,
@@ -223,6 +234,16 @@ class ImportJob:
         ):
             raise ImportJobError("복원할 COLMAP source fingerprint 형식이 올바르지 않습니다.")
         self.expected_source_fingerprint = expected_fingerprint
+        self.companion_obj_path = str(self.companion_obj_path).strip()
+        expected_companion = str(self.companion_expected_fingerprint).strip().lower()
+        if expected_companion and (
+            len(expected_companion) != 64
+            or any(value not in "0123456789abcdef" for value in expected_companion)
+        ):
+            raise ImportJobError("복원할 연결 OBJ 지문 형식이 올바르지 않습니다.")
+        if expected_companion and (not self.import_companion_obj or not self.companion_obj_path):
+            raise ImportJobError("연결 OBJ 복원에는 저장된 명시 파일 경로가 필요합니다.")
+        self.companion_expected_fingerprint = expected_companion
 
     @property
     def is_terminal(self) -> bool:
@@ -355,8 +376,20 @@ class ImportJob:
                 )
         return True
 
+    def _release_companion_job(self) -> None:
+        """연결 OBJ 작업과 아직 확정하지 않은 내장 Mesh를 정리합니다."""
+        job = self.companion_job
+        self.companion_job = None
+        if job is not None and not job.is_terminal:
+            job.request_cancel()
+            job.step()
+        if job is not None:
+            job.discard_staging()
+        self.staged_companion_mesh = None
+        self.companion_source_metadata = None
+
     def _cancel(self) -> ImportStepResult:
-        """임시 참조를 해제하고 기존 Runtime을 건드리지 않은 채 작업을 취소합니다."""
+        """COLMAP·연결 OBJ 임시 참조를 해제하고 기존 상태를 보존합니다."""
         self._release_reader()
         self._release_fingerprint_job()
         if self.display_index_builder is not None:
@@ -373,6 +406,7 @@ class ImportJob:
         if self.gpu_batch_prepared and self.staged_model is not None:
             _discard_gpu_batch_for_model(self.staged_model.model_id)
         self.gpu_batch_prepared = False
+        self._release_companion_job()
         self.layout = None
         self.parsed_model = None
         self.staged_model = None
@@ -387,7 +421,7 @@ class ImportJob:
         return "CANCELLED"
 
     def _fail(self, error: Exception, *, expected: bool) -> ImportStepResult:
-        """임시 참조를 해제하고 원자성 안내가 포함된 실패 상태를 기록합니다."""
+        """COLMAP·연결 OBJ 임시 상태를 정리하고 실패 원인을 기록합니다."""
         self._release_reader()
         self._release_fingerprint_job()
         if self.display_index_builder is not None:
@@ -405,6 +439,7 @@ class ImportJob:
         if self.gpu_batch_prepared and self.staged_model is not None:
             _discard_gpu_batch_for_model(self.staged_model.model_id)
         self.gpu_batch_prepared = False
+        self._release_companion_job()
         self.layout = None
         self.parsed_model = None
         self.staged_model = None
@@ -429,7 +464,7 @@ class ImportJob:
         return "CANCELLED"
 
     def _commit(self, runtime: Any) -> None:
-        """저장소·GPU·Data Layers를 실패 시 이전 스냅샷으로 되돌리며 함께 확정합니다."""
+        """COLMAP·연결 메시·카탈로그를 함께 등록하고 실패하면 되돌립니다."""
         model = self.staged_model
         if model is None:
             raise ImportJobError("확정할 staged COLMAP 모델이 없습니다.")
@@ -452,6 +487,11 @@ class ImportJob:
         try:
             repository.add_model(model, self.display_transform, source_metadata)
             repository_added = True
+            if self.staged_companion_mesh is not None:
+                repository.add_companion_mesh(
+                    model.model_id, self.staged_companion_mesh, self.companion_source_metadata,
+                    display_transform=companion_default_display_transform(self.display_transform),
+                )
             catalog.add_imported_model(
                 model.model_id,
                 model.display_name,
@@ -461,8 +501,13 @@ class ImportJob:
                     and not runtime.marker_selection.completed_pairs
                 ),
             )
+            if self.staged_companion_mesh is not None:
+                catalog.set_geometry_visibility(model.model_id, show_points=False, show_surface=True)
+            if self.companion_job is not None:
+                self.companion_job.commit_staging()
         except Exception:
-            _discard_gpu_batch_for_model(model.model_id)
+            if self.gpu_batch_prepared:
+                _discard_gpu_batch_for_model(model.model_id)
             self.gpu_batch_prepared = False
             if repository_added:
                 repository.remove_model(model.model_id)
@@ -470,7 +515,7 @@ class ImportJob:
             raise
 
     def _complete(self) -> ImportStepResult:
-        """성공한 모델의 요약 문구와 종료 상태를 기록합니다."""
+        """성공한 데이터셋의 점군·연결 표면 요약과 종료 상태를 기록합니다."""
         model = self.staged_model
         if model is None:
             raise ImportJobError("완료할 staged COLMAP 모델이 없습니다.")
@@ -487,6 +532,9 @@ class ImportJob:
             f"카메라 {model_camera_count(model):,} · 이미지 {model_image_count(model):,} · "
             f"표시 축 {axis_summary(self.display_transform)}"
         )
+        if self.staged_companion_mesh is not None:
+            self.result_message += f" · 연결 표면 {self.staged_companion_mesh.face_count:,}면"
+        self.companion_job = None
         elapsed = perf_counter() - self.started_at
         _LOGGER.info(
             "event=import_completed model_id=%s points=%s display_count=%s "
@@ -506,7 +554,7 @@ class ImportJob:
         return "FINISHED"
 
     def step(self, runtime: Any) -> ImportStepResult:
-        """한 TIMER tick에서 한 가져오기 단계만 실행하고 다음 호출 시점을 반환합니다."""
+        """한 TIMER에서 COLMAP 또는 연결 OBJ의 준비 단계를 진행합니다."""
         if self.is_terminal:
             return "FINISHED" if self.stage == IMPORT_STAGE_COMPLETED else "CANCELLED"
         if self.cancel_requested:
@@ -543,6 +591,18 @@ class ImportJob:
                     )
                 self.source_path = resolved_source_path
                 self.selected_format = self.layout.selected_format
+                if self.import_companion_obj:
+                    from .companion_discovery import resolve_companion_obj_path
+
+                    companion_path = resolve_companion_obj_path(self.dataset_root, self.companion_obj_path)
+                    self.companion_obj_path = str(companion_path) if companion_path is not None else ""
+                    if companion_path is not None and canonical_source_path(selected_root) != canonical_path:
+                        from .colmap_io.discovery import standard_sparse_model_paths
+
+                        if len(standard_sparse_model_paths(self.dataset_root, self.input_format)) > 1:
+                            raise ImportJobError("여러 sparse 모델 중 OBJ와 연결할 모델 폴더를 직접 선택하십시오.")
+                else:
+                    self.companion_obj_path = ""
                 self._advance(IMPORT_STAGE_HASH_SOURCE_BEFORE, 0.05)
                 return "RUNNING"
             if self.stage == IMPORT_STAGE_HASH_SOURCE_BEFORE:
@@ -664,16 +724,56 @@ class ImportJob:
                     DISPLAY_SAMPLE_POLICY,
                 )
                 self.display_index_builder = None
-                self._advance(IMPORT_STAGE_PREPARE_GPU, 0.90)
+                next_stage = IMPORT_STAGE_READ_COMPANION if self.companion_obj_path else IMPORT_STAGE_PREPARE_GPU
+                self._advance(next_stage, 0.90)
+                return "RUNNING"
+            if self.stage == IMPORT_STAGE_READ_COMPANION:
+                from .mesh_importer import create_mesh_import_job, MESH_IMPORT_STAGE_COMPLETED
+
+                if self.staged_model is None:
+                    raise ImportJobError("연결 표면을 소유할 COLMAP 모델이 준비되지 않았습니다.")
+                if self.companion_job is None:
+                    # 연결 표면은 별도 모델 ID나 표시 축을 소유하지 않습니다.
+                    self.companion_job = create_mesh_import_job(
+                        self.companion_obj_path,
+                        model_id_factory=lambda: self.staged_model.model_id,
+                        axis_preset=self.axis_preset,
+                        axis_forward=self.axis_forward,
+                        axis_up=self.axis_up,
+                        expected_source_fingerprint=self.companion_expected_fingerprint,
+                        dataset_root=self.dataset_root,
+                        geometry_only=True,
+                        stage_only=True,
+                    )
+                result = self.companion_job.step(time_budget_seconds=IMPORT_READ_TIME_BUDGET_SECONDS)
+                self.current_count = self.companion_job.current_count
+                self.total_count = self.companion_job.total_count
+                self.progress = max(self.progress, 0.90 + 0.05 * self.companion_job.progress)
+                if result == "RUNNING":
+                    return "RUNNING"
+                if self.companion_job.stage != MESH_IMPORT_STAGE_COMPLETED:
+                    raise ImportJobError(self.companion_job.error_message or self.companion_job.result_message)
+                self.staged_companion_mesh = self.companion_job.staged_model
+                self.companion_source_metadata = CompanionMeshSourceMetadata(
+                    source_path_absolute=self.companion_job.source_path,
+                    source_fingerprint="",
+                )
+                self._advance(IMPORT_STAGE_PREPARE_GPU, 0.95)
                 return "RUNNING"
             if self.stage == IMPORT_STAGE_PREPARE_GPU:
                 if self.staged_model is None:
                     raise ImportJobError("GPU 배치를 준비할 staged COLMAP 모델이 없습니다.")
+                if not self.prepare_gpu:
+                    self._advance(IMPORT_STAGE_COMMIT, 0.96)
+                    return "RUNNING"
+                # 배치 생성 중 실패해도 같은 소유자의 부분 자원을 정리합니다.
+                self.gpu_batch_prepared = True
                 _prepare_gpu_batch_for_model(
                     self.staged_model.model_id,
                     self.staged_model,
                 )
-                self.gpu_batch_prepared = True
+                if self.staged_companion_mesh is not None:
+                    _prepare_gpu_batch_for_model(self.staged_model.model_id, self.staged_companion_mesh)
                 self._advance(IMPORT_STAGE_COMMIT, 0.96)
                 return "RUNNING"
             if self.stage == IMPORT_STAGE_COMMIT:
@@ -698,8 +798,12 @@ def create_import_job(
     display_name_hint: str = "",
     expected_source_fingerprint: str = "",
     dataset_root: str | Path | None = None,
+    import_companion_obj: bool = True,
+    companion_obj_path: str = "",
+    companion_expected_fingerprint: str = "",
+    prepare_gpu: bool = True,
 ) -> ImportJob:
-    """선택한 sparse model·축·표시 점 상한 snapshot으로 작업을 생성합니다."""
+    """COLMAP·표시 설정과 선택적 연결 OBJ 조건으로 가져오기 작업을 만듭니다."""
     source_text = _source_path_text(source_path)
     if not source_text:
         raise ImportJobError("COLMAP sparse model 폴더 경로가 비어 있습니다.")
@@ -731,6 +835,10 @@ def create_import_job(
             ),
             display_name_hint=str(display_name_hint).strip(),
             expected_source_fingerprint=expected_source_fingerprint,
+            import_companion_obj=import_companion_obj,
+            companion_obj_path=companion_obj_path,
+            companion_expected_fingerprint=companion_expected_fingerprint,
+            prepare_gpu=prepare_gpu,
         )
     except ValueError as error:
         raise ImportJobError(f"표시 점 상한이 올바르지 않습니다: {error}") from error
@@ -745,8 +853,16 @@ def begin_import_job(
     axis_forward: str = DEFAULT_FORWARD_AXIS,
     axis_up: str = DEFAULT_UP_AXIS,
     display_point_limit: int = DEFAULT_DISPLAY_POINT_LIMIT,
+    import_companion_obj: bool = True,
+    companion_obj_path: str = "",
 ) -> ImportJob:
-    """마커 모달과 중첩되지 않는 단일 Runtime 표시 점 snapshot 작업을 시작합니다."""
+    """마커 입력과 중첩되지 않는 단일 COLMAP·연결 OBJ 작업을 시작합니다."""
+
+    from .axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(runtime)
+    if axis_reason is not None:
+        raise ImportJobError(axis_reason)
     from .project_persistence.runtime import restore_input_block_reason
 
     restore_reason = restore_input_block_reason(runtime)
@@ -763,6 +879,8 @@ def begin_import_job(
         axis_forward=axis_forward,
         axis_up=axis_up,
         display_point_limit=display_point_limit,
+        import_companion_obj=import_companion_obj,
+        companion_obj_path=companion_obj_path,
     )
     runtime.import_job = job
     _LOGGER.info(

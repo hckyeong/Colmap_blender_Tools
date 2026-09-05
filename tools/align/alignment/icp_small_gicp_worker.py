@@ -98,7 +98,7 @@ def _platform_architecture() -> str:
 
 
 def _small_gicp_environment_payload(*, run_smoke_test: bool) -> dict[str, Any]:
-    """CPython·NumPy·small_gicp GICP API와 선택 smoke test를 검사합니다."""
+    """CPython·NumPy·GICP API를 검사하고 정렬 모듈 로드와 합성 연산을 확인합니다."""
 
     payload: dict[str, Any] = {
         "python_implementation": platform.python_implementation(),
@@ -144,6 +144,8 @@ def _small_gicp_environment_payload(*, run_smoke_test: bool) -> dict[str, Any]:
         errors.append("small_gicp GICP API가 완전하지 않습니다.")
     if run_smoke_test and not errors:
         try:
+            # 실제 작업에서 사용하는 정렬 모듈의 독립 프로세스 의존성을 함께 검사합니다.
+            _load_solver_module("SMALL_GICP")
             grid = np.stack(
                 np.meshgrid(
                     np.arange(3, dtype=np.float64),

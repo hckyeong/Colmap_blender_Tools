@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from ..alignment import effective_alignment_for_model
+from ..axis_settings import effective_axis_transform
 from ..colmap_io.types import ColmapModelData
 from ..geometry_access import (
     bounds_for_model,
@@ -17,7 +18,13 @@ from ..geometry_access import (
     registration_point_ids_for_model,
     registration_positions_for_model,
 )
-from ..constants import GEOMETRY_KIND_COLMAP_POINT_CLOUD, GEOMETRY_KIND_TRIANGLE_MESH
+from ..constants import (
+    GEOMETRY_KIND_COLMAP_POINT_CLOUD,
+    GEOMETRY_KIND_TRIANGLE_MESH,
+    MARKER_GEOMETRY_SOURCE_MAIN,
+    MARKER_GEOMETRY_SOURCE_COMPANION,
+)
+from ..marker_geometry import marker_geometry_model_for_source, normalize_marker_geometry_source
 from ..display_axes import ModelDisplayTransform, identity_display_transform
 from ..model_repository import ModelRepositoryError
 from ..state import RUNTIME
@@ -52,12 +59,93 @@ def model_data_for_id(model_id: str) -> Any | None:
     return runtime_models().get(model_id)
 
 
-def display_transform_for_model_id(model_id: str) -> ModelDisplayTransform:
-    """모델의 원본 좌표를 표시 좌표로 바꿀 불변 축 변환을 반환합니다."""
+def companion_mesh_data_for_id(model_id: str) -> Any | None:
+    """소유 COLMAP ID에 연결된 표면을 저장소의 선택적 조회 경계로 반환합니다."""
     repository = getattr(RUNTIME, "model_repository", None)
-    transforms = getattr(repository, "display_transforms", None)
+    getter = getattr(repository, "companion_mesh_for_model_id", None)
+    if callable(getter):
+        return getter(model_id)
+    meshes = getattr(repository, "companion_meshes", None)
+    return meshes.get(model_id) if isinstance(meshes, Mapping) else None
+
+
+
+def marker_geometry_data_for_id(
+    model_id: str,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
+) -> Any | None:
+    """마커 슬롯의 실제 원본을 조회하고 주 형상의 명시적 테스트 자료를 지원합니다."""
+    source = normalize_marker_geometry_source(geometry_source)
+    repository = getattr(RUNTIME, "model_repository", None)
+    model = marker_geometry_model_for_source(repository, model_id, source)
+    if model is None and source == MARKER_GEOMETRY_SOURCE_MAIN:
+        return model_data_for_id(model_id)
+    return model
+
+
+def marker_geometry_is_visible(
+    model_id: str,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
+) -> bool:
+    """마커가 속한 형상 슬롯의 존재와 실제 표시 토글을 함께 확인합니다."""
+    model = marker_geometry_data_for_id(model_id, geometry_source)
+    return model is not None and model_geometry_is_visible(model_id, geometry_kind_for_model(model))
+
+
+def visible_marker_geometry_for_id(model_id: str) -> tuple[str, Any] | None:
+    """레이어에서 선택되어 보이는 하나의 마커 형상 슬롯과 원본을 반환합니다."""
+    for source in (MARKER_GEOMETRY_SOURCE_MAIN, MARKER_GEOMETRY_SOURCE_COMPANION):
+        model = marker_geometry_data_for_id(model_id, source)
+        if model is not None and model_geometry_is_visible(model_id, geometry_kind_for_model(model)):
+            return source, model
+    return None
+
+
+def surface_model_data_for_id(model_id: str) -> Any | None:
+    """독립 OBJ 또는 COLMAP 소유 연결 표면을 같은 소유 ID로 조회합니다."""
+    model = model_data_for_id(model_id)
+    if model is None:
+        return None
+    if geometry_kind_for_model(model) == GEOMETRY_KIND_TRIANGLE_MESH:
+        return model
+    return companion_mesh_data_for_id(model_id)
+
+
+def model_geometry_is_visible(model_id: str, geometry_kind: str) -> bool:
+    """전체 표시와 점군·표면 토글을 결합하되 카탈로그 없는 테스트 입력을 허용합니다."""
+    catalog = getattr(RUNTIME, "model_catalog", None)
+    record = getattr(catalog, "models", {}).get(model_id)
+    if record is None:
+        return True
+    if not bool(getattr(record, "is_visible", True)):
+        return False
+    field = "show_surface" if geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH else "show_points"
+    return bool(getattr(record, field, True))
+
+
+def display_transform_for_model_id(
+    model_id: str,
+    *,
+    companion: bool = False,
+) -> ModelDisplayTransform:
+    """주 형상 또는 연결 표면의 확정·임시 미리보기 축 변환을 반환합니다."""
+    repository = getattr(RUNTIME, "model_repository", None)
+    getter_name = (
+        "companion_display_transform_for_model_id"
+        if companion
+        else "display_transform_for_model_id"
+    )
+    transforms = getattr(
+        repository,
+        "companion_display_transforms" if companion else "display_transforms",
+        None,
+    )
     transform = transforms.get(model_id) if isinstance(transforms, Mapping) else None
     if isinstance(transform, ModelDisplayTransform):
+        if callable(getattr(repository, getter_name, None)):
+            models = getattr(repository, "models", None)
+            if isinstance(models, Mapping) and model_id in models:
+                return effective_axis_transform(RUNTIME, model_id, companion=companion)
         return transform
     if transform is not None:
         raise ModelRepositoryError(
@@ -72,9 +160,13 @@ def display_transform_for_model_id(model_id: str) -> ModelDisplayTransform:
     return _FIXTURE_IDENTITY_TRANSFORM
 
 
-def effective_model_matrix_for_id(model_id: str) -> np.ndarray:
-    """표시 축 뒤에 ICP·마커 미리보기·확정 순서의 유효 alignment 행렬을 반환합니다."""
-    display_transform = display_transform_for_model_id(model_id)
+def effective_model_matrix_for_id(
+    model_id: str,
+    *,
+    companion: bool = False,
+) -> np.ndarray:
+    """형상별 축 뒤에 소유 모델의 공통 유효 정렬을 적용한 행렬을 반환합니다."""
+    display_transform = display_transform_for_model_id(model_id, companion=companion)
     alignment = effective_alignment_for_model(RUNTIME, model_id)
     alignment_matrix = np.asarray(alignment.matrix_float64, dtype=np.float64)
     matrix = alignment_matrix @ np.asarray(display_transform.matrix_float64, dtype=np.float64)
@@ -88,10 +180,12 @@ def effective_model_matrix_for_id(model_id: str) -> np.ndarray:
 def effective_positions_for_model_id(
     model_id: str,
     source_positions: Any,
+    *,
+    companion: bool = False,
 ) -> np.ndarray:
-    """Source Local 점 배열을 현재 Project World 좌표 배열로 변환합니다."""
+    """선택한 형상의 원본 점 배열에 해당 축과 소유 모델의 공통 정렬을 적용합니다."""
     positions = _normalize_positions(source_positions)
-    matrix = effective_model_matrix_for_id(model_id)
+    matrix = effective_model_matrix_for_id(model_id, companion=companion)
     homogeneous = np.ones((positions.shape[0], 4), dtype=np.float64)
     homogeneous[:, :3] = positions
     transformed = homogeneous @ matrix.T
@@ -109,20 +203,29 @@ def effective_positions_for_model_id(
     )
 
 
-def effective_position_for_model_id(model_id: str, source_position: Any) -> np.ndarray:
-    """Source Local 점 하나를 현재 Project World 좌표로 변환합니다."""
+def effective_position_for_model_id(
+    model_id: str,
+    source_position: Any,
+    *,
+    companion: bool = False,
+) -> np.ndarray:
+    """선택한 형상의 원본 점 하나를 현재 프로젝트 좌표로 변환합니다."""
     position = np.asarray(source_position, dtype=np.float64)
     if position.shape != (3,) or not np.isfinite(position).all():
         raise ValueError("점 좌표는 유한한 길이 3 배열이어야 합니다.")
-    return effective_positions_for_model_id(model_id, position[np.newaxis, :])[0]
+    return effective_positions_for_model_id(
+        model_id, position[np.newaxis, :], companion=companion,
+    )[0]
 
 
 def effective_bounds_for_model_id(
     model_id: str,
     source_bounds_min: Any,
     source_bounds_max: Any,
+    *,
+    companion: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Source Local 축 정렬 경계를 현재 Project World 축 정렬 경계로 변환합니다."""
+    """선택한 형상의 원본 경계를 형상별 축·공통 정렬을 거친 프로젝트 경계로 바꿉니다."""
     minimum = np.asarray(source_bounds_min, dtype=np.float64)
     maximum = np.asarray(source_bounds_max, dtype=np.float64)
     if (
@@ -142,7 +245,9 @@ def effective_bounds_for_model_id(
         ],
         dtype=np.float64,
     )
-    transformed_corners = effective_positions_for_model_id(model_id, corners)
+    transformed_corners = effective_positions_for_model_id(
+        model_id, corners, companion=companion,
+    )
     return (
         np.ascontiguousarray(transformed_corners.min(axis=0), dtype=np.float64),
         np.ascontiguousarray(transformed_corners.max(axis=0), dtype=np.float64),

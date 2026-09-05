@@ -414,6 +414,12 @@ def begin_layer_transform(
 ) -> LayerTransformRuntimeState:
     """선택 역할 subset의 확정 기준값·pivot·입력 포인터를 한 번에 동결합니다."""
 
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(runtime)
+    if axis_reason is not None:
+        raise LayerTransformError(axis_reason)
+
     normalized_role = str(role).strip()
     normalized_phase = str(phase).strip().upper()
     if normalized_role not in _VALID_ROLES or normalized_phase not in _VALID_PHASES:

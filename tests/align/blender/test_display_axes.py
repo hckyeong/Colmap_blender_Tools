@@ -31,7 +31,7 @@ def _source_aabb_corners(minimum: np.ndarray, maximum: np.ndarray) -> np.ndarray
 
 
 def test_presets_match_reference_axis_contract() -> None:
-    """기준 Blender COLMAP Importer와 같은 프리셋 축과 Blender Identity를 확인합니다."""
+    """기존 프리셋 축을 유지하면서 RC 표준 OBJ의 독립 기본축을 확인합니다."""
     from tools.align.display_axes import (
         AXIS_PRESETS,
         BLENDER_AXIS_PRESET,
@@ -42,6 +42,7 @@ def test_presets_match_reference_axis_contract() -> None:
 
     assert tuple((item.identifier, item.forward_axis, item.up_axis) for item in AXIS_PRESETS) == (
         ("REALITY_CAPTURE", "Z", "-Y"),
+        ("REALITY_CAPTURE_OBJ", "Y", "Z"),
         ("BLENDER", "Y", "Z"),
         ("MAYA", "-Z", "Y"),
         ("HOUDINI", "-Z", "Y"),

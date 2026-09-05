@@ -274,7 +274,7 @@ def test_second_model_fingerprint_failure_rolls_back_entire_restore() -> None:
 
 
 def test_missing_source_relink_and_stale_timer_are_safe() -> None:
-    """누락 source의 모델별 Relink와 파일 교체 뒤 stale callback 무시를 함께 검증합니다."""
+    """v4 원본 루트·sparse 누락의 재연결과 파일 교체 뒤 이전 콜백 무시를 검증합니다."""
 
     from tools.align import importer
     from tools.align.project_persistence.runtime import (
@@ -301,6 +301,8 @@ def test_missing_source_relink_and_stale_timer_are_safe() -> None:
         missing_path = root / "missing" / "sparse"
         missing_second_source = replace(
             original_snapshot.models[1].source,
+            selected_root_absolute=str(missing_path.parent),
+            selected_root_relative="",
             sparse_path_absolute=str(missing_path),
             sparse_path_relative="",
         )
@@ -331,7 +333,7 @@ def test_missing_source_relink_and_stale_timer_are_safe() -> None:
         assert restored.project_persistence_dirty is True
         assert (
             restored.model_repository.source_metadata_for_model_id("model-p").selected_root_absolute
-            == canonical_source_path(second_source)
+            == canonical_source_path(second_source.parent)
         )
         assert sync_project_state_if_dirty(runtime=restored) is True
 

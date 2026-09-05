@@ -403,6 +403,12 @@ def _merge_export_browser_start_directory(context: Any) -> Path:
 def merge_export_start_block_reason(*, require_output_path: bool) -> str | None:
     """사전 검사·내보내기 시작 전에 보여줄 단일 차단 사유를 반환합니다."""
 
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(RUNTIME)
+    if axis_reason is not None:
+        return axis_reason
+
     restore_reason = restore_input_block_reason()
     if restore_reason is not None:
         return restore_reason

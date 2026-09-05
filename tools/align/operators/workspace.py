@@ -70,7 +70,11 @@ from ..session import (
 )
 from ..logging_utils import get_logger
 from ..state import RUNTIME
-from ..viewport.point_data import effective_bounds_for_model_id
+from ..viewport.point_data import (
+    companion_mesh_data_for_id,
+    effective_bounds_for_model_id,
+    model_geometry_is_visible,
+)
 from ..viewport.registry import (
     classify_areas,
     invalidate_registry,
@@ -876,7 +880,7 @@ def configure_workspace(context: Any, force_restore: bool = False) -> bool:
 
 
 def _bounds_for_model_ids(model_ids: list[str]) -> tuple[Vector, Vector] | None:
-    """모델별 유효 alignment와 표시 축을 반영한 경계를 우선 사용합니다."""
+    """보이는 각 형상의 축과 공통 소유 모델 정렬을 적용해 전체 경계를 합칩니다."""
     normalized_model_ids = [str(model_id).strip() for model_id in model_ids if str(model_id).strip()]
     if not normalized_model_ids:
         return None
@@ -904,13 +908,21 @@ def _bounds_for_model_ids(model_ids: list[str]) -> tuple[Vector, Vector] | None:
                 continue
             model_id = str(getattr(model, "model_id", model_id))
             try:
-                project_bounds.append(
-                    effective_bounds_for_model_id(
-                        model_id,
-                        model.bounds_min,
-                        model.bounds_max,
+                kind = getattr(model, "geometry_kind", "COLMAP_POINT_CLOUD")
+                geometries = [(model, False)] if model_geometry_is_visible(model_id, kind) else []
+                if kind != "TRIANGLE_MESH" and model_geometry_is_visible(model_id, "TRIANGLE_MESH"):
+                    companion = companion_mesh_data_for_id(model_id)
+                    if companion is not None:
+                        geometries.append((companion, True))
+                for geometry, is_companion in geometries:
+                    project_bounds.append(
+                        effective_bounds_for_model_id(
+                            model_id,
+                            geometry.bounds_min,
+                            geometry.bounds_max,
+                            **({"companion": True} if is_companion else {}),
+                        )
                     )
-                )
             except (
                 AttributeError,
                 LayerTransformError,
@@ -922,6 +934,8 @@ def _bounds_for_model_ids(model_ids: list[str]) -> tuple[Vector, Vector] | None:
                 raise WorkspaceConfigurationError(
                     f"화면 맞춤에 필요한 유효 좌표 변환을 준비하지 못했습니다: {model_id} ({error})"
                 ) from error
+        if not project_bounds:
+            return None
         minimum = Vector(
             min(float(bounds[0][index]) for bounds in project_bounds)
             for index in range(3)
@@ -936,7 +950,12 @@ def _bounds_for_model_ids(model_ids: list[str]) -> tuple[Vector, Vector] | None:
         raise WorkspaceConfigurationError(
             "화면 맞춤 대상 모델의 저장된 원본 경계를 찾을 수 없습니다."
         )
-    positions = [position for cloud in clouds for position in cloud.positions]
+    positions = [
+        position
+        for model_id, cloud in zip(normalized_model_ids, clouds, strict=True)
+        if model_geometry_is_visible(model_id, "COLMAP_POINT_CLOUD")
+        for position in cloud.positions
+    ]
     if not positions:
         return None
     minimum = Vector((min(point[index] for point in positions) for index in range(3)))

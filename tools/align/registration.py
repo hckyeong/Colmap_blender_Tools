@@ -11,6 +11,7 @@ try:
     from ...shared.blender_runtime.workspace_handoff import (
         WorkspaceHandoffAdapter,
         register_workspace_handoff_adapter,
+        request_workspace_activation,
         unregister_workspace_handoff_adapter,
         workspace_tool_id,
     )
@@ -19,6 +20,7 @@ except ImportError:
     from shared.blender_runtime.workspace_handoff import (
         WorkspaceHandoffAdapter,
         register_workspace_handoff_adapter,
+        request_workspace_activation,
         unregister_workspace_handoff_adapter,
         workspace_tool_id,
     )
@@ -49,6 +51,7 @@ from .project_persistence.runtime import (
 from .session import (
     abort_session_entry,
     clear_session_for_file_load,
+    is_align_workspace_for_window,
     request_session_exit,
     restore_session_for_unregister,
     session_target_window,
@@ -170,6 +173,7 @@ def _initialize_runtime() -> float | None:
         sync_marker_align_log(())
         RUNTIME.workspace_setup_error = ""
         schedule_project_restore_if_available()
+        _schedule_loaded_align_session_reconnect()
         _LOGGER.info("event=runtime_initialized model_count=%s", RUNTIME.model_catalog.model_count)
     except (AttributeError, RuntimeError) as error:
         RUNTIME.workspace_setup_error = f"런타임 초기화에 실패했습니다: {error}"
@@ -189,6 +193,91 @@ def _cancel_runtime_initialization() -> None:
     """등록 해제 전에 대기 중인 런타임 초기화 타이머를 제거합니다."""
     if bpy.app.timers.is_registered(_initialize_runtime):
         bpy.app.timers.unregister(_initialize_runtime)
+
+
+def _loaded_align_workspace_window():
+    """로드된 READY Align Workspace를 표시하는 재연결 대상 Window 하나를 반환합니다."""
+
+    manager = getattr(bpy.context, "window_manager", None)
+    if manager is None:
+        return None
+    candidates = tuple(
+        window
+        for window in tuple(manager.windows)
+        if is_align_workspace_for_window(window)
+    )
+    if not candidates:
+        return None
+    context_window = getattr(bpy.context, "window", None)
+    if context_window is not None:
+        try:
+            context_pointer = context_window.as_pointer()
+            matching = next(
+                (
+                    window
+                    for window in candidates
+                    if window.as_pointer() == context_pointer
+                ),
+                None,
+            )
+        except (AttributeError, ReferenceError):
+            matching = None
+        if matching is not None:
+            return matching
+    if len(candidates) == 1:
+        return candidates[0]
+    message = "저장된 COLMAP Align 작업공간이 여러 Blender 창에 열려 있어 자동 연결 대상을 결정할 수 없습니다."
+    RUNTIME.workspace_setup_error = message
+    RUNTIME.session.message = message
+    request_redraw()
+    return None
+
+
+def _reconnect_loaded_align_session() -> None:
+    """파일에 저장된 활성 Align Workspace를 공용 전환 계약으로 런타임 세션에 다시 연결합니다."""
+
+    if (
+        not _REGISTERED
+        or RUNTIME.session.phase != SESSION_INACTIVE
+        or RUNTIME.workspace_setup_task is not None
+    ):
+        return None
+    window = _loaded_align_workspace_window()
+    if window is None:
+        return None
+    try:
+        with bpy.context.temp_override(window=window):
+            result = request_workspace_activation(bpy.context, _ALIGN_HANDOFF_ADAPTER.tool_id)
+        _LOGGER.info("event=saved_align_session_reconnect_requested result=%s", result)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError) as error:
+        message = f"저장된 COLMAP Align 세션 자동 연결에 실패했습니다: {error}"
+        RUNTIME.workspace_setup_error = message
+        RUNTIME.session.message = message
+        request_redraw()
+        _LOGGER.exception("event=saved_align_session_reconnect_failed")
+    return None
+
+
+def _schedule_loaded_align_session_reconnect() -> bool:
+    """현재 파일이 Align Workspace에서 열렸을 때 중복 없는 0초 재연결 타이머를 예약합니다."""
+
+    if (
+        not _REGISTERED
+        or RUNTIME.session.phase != SESSION_INACTIVE
+        or RUNTIME.workspace_setup_task is not None
+        or _loaded_align_workspace_window() is None
+    ):
+        return False
+    if not bpy.app.timers.is_registered(_reconnect_loaded_align_session):
+        bpy.app.timers.register(_reconnect_loaded_align_session, first_interval=0.0)
+    return True
+
+
+def _cancel_loaded_align_session_reconnect() -> None:
+    """파일 교체나 애드온 해제 전에 대기 중인 저장 세션 재연결을 취소합니다."""
+
+    if bpy.app.timers.is_registered(_reconnect_loaded_align_session):
+        bpy.app.timers.unregister(_reconnect_loaded_align_session)
 
 
 def _append_handler_once(handler_list, callback) -> None:
@@ -280,6 +369,7 @@ def _subscribe_workspace_changes() -> None:
 @persistent
 def _on_load_pre(_unused) -> None:
     """파일 교체 전에 draw handler와 만료 예정 포인터 및 모달 상태를 정리합니다."""
+    _cancel_loaded_align_session_reconnect()
     clear_session_for_file_load()
     cancel_active_import_job()
     stop_marker_modal_timer()
@@ -324,6 +414,7 @@ def _on_load_post(_unused) -> None:
     invalidate_registry()
     request_redraw()
     schedule_project_restore_if_available()
+    _schedule_loaded_align_session_reconnect()
     _LOGGER.info("event=file_load_post_runtime_initialized")
 
 
@@ -361,6 +452,7 @@ def register() -> None:
     except Exception:
         _REGISTERED = False
         _cancel_runtime_initialization()
+        _cancel_loaded_align_session_reconnect()
         _cleanup_pending_legacy_data()
         remove_draw_handlers()
         _remove_view_menu_if_present()
@@ -399,6 +491,7 @@ def unregister() -> None:
     _REGISTERED = False
     _LOGGER.info("event=addon_unregister_started")
     _cancel_runtime_initialization()
+    _cancel_loaded_align_session_reconnect()
     cancel_project_restore_for_file_load()
     _cleanup_pending_legacy_data()
     cancel_active_import_job()

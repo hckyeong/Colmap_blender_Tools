@@ -1,0 +1,74 @@
+{
+  "protocol_version": "cccore-native-v3",
+  "cccore": {
+    "repository": "https://github.com/CloudCompare/CCCoreLib.git",
+    "commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432",
+    "license": "LGPL-2.0-or-later",
+    "original_registration_normalized_sha256": "dfbc07ef31c7256c3361e156b7558ec727f23487184cabd2105899c9a2fb72cf",
+    "patched_registration_sha256": "329eef87ce8160ff07b0e2f91f38f164951f0511294bf870b3fd0b33b6623dae",
+    "patch_id": "bounded-scale-v1",
+    "patch_file": "patches/bounded_scale_consistency.patch",
+    "patch_sha256": "66eb7b07c45d111530c3c0639eb0bcf57db2b262c7bf330a695b1e3c6fec042a",
+    "concurrency_patch": {
+      "patch_id": "multithread-state-race-v1",
+      "patch_file": "patches/multithread_state_race.patch",
+      "patch_sha256": "6c4d52fad0721d676761893ddb0eb558a57edf4636bd0d32695ab8bbfc584eb8",
+      "files": [
+        {
+          "path": "CMakeLists.txt",
+          "original_normalized_sha256": "96a39725ef0f486a785829a6e736c84683eabdbd309b788e19b33f28e5d593e9",
+          "patched_sha256": "0dec383b0c7c12af414bb8faba02f5cd0bdc1d34b353dd06b5004711ac6204ab"
+        },
+        {
+          "path": "include/DgmOctree.h",
+          "original_normalized_sha256": "e22fbb2f00f965863d92f50658df9ad6e8acdffc8a1dc8ae086cc7919c6f335d",
+          "patched_sha256": "c31678e8f42d387fd17974b5a7129d9e3ba912101de35e12c187a062cc609117"
+        },
+        {
+          "path": "src/DgmOctree.cpp",
+          "original_normalized_sha256": "520dcd3f0705de3a188bf3850f02bd10515f642a37bff9d58f5b768ba037cb50",
+          "patched_sha256": "7077f4ccd9d4c768568ca7d57775ff3503592b3afcd27d827f9def9f70a8c137"
+        },
+        {
+          "path": "src/DistanceComputationTools.cpp",
+          "original_normalized_sha256": "6d1bf3774fff53a981a7f8a19f47a37a98963b42d3e81bf4b3587e5c424963bb",
+          "patched_sha256": "1fe77038451dfed19dcd3a772d95519c6e729b6c80c817e949487a1c566af7dc"
+        }
+      ]
+    }
+  },
+  "nanoflann": {
+    "repository": "https://github.com/jlblancoc/nanoflann.git",
+    "commit": "9a653cb243db6a09c94f833b28732b62f033e2b5",
+    "version": "1.7.1",
+    "license": "BSD-2-Clause"
+  },
+  "json": {
+    "repository": "https://github.com/nlohmann/json.git",
+    "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+    "version": "3.11.3",
+    "license": "MIT",
+    "header_url": "https://raw.githubusercontent.com/nlohmann/json/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03/single_include/nlohmann/json.hpp",
+    "header_sha256": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6",
+    "license_url": "https://raw.githubusercontent.com/nlohmann/json/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03/LICENSE.MIT",
+    "license_sha256": "86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14"
+  },
+  "tbb": {
+    "repository": "https://github.com/uxlfoundation/oneTBB.git",
+    "version": "2022.0.0",
+    "license": "Apache-2.0",
+    "archive_name": "oneapi-tbb-2022.0.0-win.zip",
+    "archive_url": "https://github.com/uxlfoundation/oneTBB/releases/download/v2022.0.0/oneapi-tbb-2022.0.0-win.zip",
+    "archive_sha256": "660f3555de26bee8cd4daef1105d5d9e93e695b2fcfa9c57db3aa38c6afe5675",
+    "archive_root": "oneapi-tbb-2022.0.0",
+    "cmake_dir": "lib/cmake/tbb",
+    "runtime_file": "redist/intel64/vc14/tbb12.dll",
+    "runtime_sha256": "6269822eb10b9de2e63812fd52b96c4d93d5ad53835760192f5c892e37d8e52d",
+    "license_source": "LICENSE.txt",
+    "license_file": "licenses/oneTBB-Apache-2.0.txt",
+    "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "third_party_source": "third-party-programs.txt",
+    "third_party_file": "licenses/oneTBB-third-party-programs.txt",
+    "third_party_sha256": "1634857eb058dce5278c57a832b8974190785145f4be9acdbdb511f3a0c4091c"
+  }
+}

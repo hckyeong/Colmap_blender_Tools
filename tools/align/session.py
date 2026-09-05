@@ -28,6 +28,7 @@ from .constants import (
 )
 from .status import set_workspace_status_text
 from .state import RUNTIME
+from .axis_settings import AXIS_SETTINGS_COMMAND, axis_edit_active_block_reason
 from .constants import LAYER_TRANSFORM_COMMAND_COMMIT
 from .viewport.registry import invalidate_registry, refresh_registry
 from .viewport.renderer import request_redraw
@@ -287,6 +288,7 @@ def request_session_exit(window: Any) -> bool:
     from .operators.marker_alignment import discard_marker_preview_for_lifecycle
     from .alignment.layer_transform import cancel_layer_transform
 
+    cancel_axis_edit_for_lifecycle()
     discard_marker_preview_for_lifecycle()
     cancel_layer_transform(RUNTIME, message="세션 종료로 데이터 레이어 변환을 취소했습니다.")
     session.phase = SESSION_EXITING
@@ -304,7 +306,7 @@ def request_session_exit(window: Any) -> bool:
 
 
 def _restore_committed_session_snapshot(snapshot: Any, kind: str) -> None:
-    """공용 확정 명령의 종류에 따라 마커·Data Layers·레이어 변환 snapshot을 원자 복원합니다."""
+    """공용 확정 명령의 종류에 따라 마커·데이터 레이어·정렬·축 스냅샷을 원자 복원합니다."""
     from .alignment.icp_runtime import (
         icp_commit_command_kind,
         restore_icp_commit_snapshot,
@@ -312,6 +314,11 @@ def _restore_committed_session_snapshot(snapshot: Any, kind: str) -> None:
 
     if kind == icp_commit_command_kind():
         restore_icp_commit_snapshot(RUNTIME, snapshot)
+        return
+    if kind == AXIS_SETTINGS_COMMAND:
+        from .axis_settings import restore_axis_edit_snapshot
+
+        restore_axis_edit_snapshot(RUNTIME, snapshot)
         return
     if kind == MODEL_COMMAND_TOGGLE_LAYER_GROUP:
         RUNTIME.model_catalog.restore_group_snapshot(snapshot)
@@ -334,7 +341,7 @@ def _sync_after_committed_restore(kind: str) -> None:
 
     if kind == MODEL_COMMAND_TOGGLE_LAYER_GROUP:
         RUNTIME.model_catalog.message = RUNTIME.undo_journal.last_action
-    elif kind == LAYER_TRANSFORM_COMMAND_COMMIT:
+    elif kind in {LAYER_TRANSFORM_COMMAND_COMMIT, AXIS_SETTINGS_COMMAND}:
         RUNTIME.model_catalog.message = RUNTIME.undo_journal.last_action
     elif kind == icp_commit_command_kind():
         RUNTIME.model_catalog.message = RUNTIME.undo_journal.last_action
@@ -376,9 +383,29 @@ def _marker_preview_blocks_history(*, redo: bool = False) -> bool:
     return True
 
 
+def cancel_axis_edit_for_lifecycle() -> None:
+    """세션·파일 수명이 끝나면 축 미리보기와 팝업 참조를 함께 폐기합니다."""
+    from .axis_settings import cancel_axis_edit
+    from .operators.axis_settings import clear_axis_edit_dialogs
+
+    cancel_axis_edit(RUNTIME)
+    clear_axis_edit_dialogs()
+
+
+def _axis_edit_blocks_history() -> bool:
+    """축 팝업에서 다른 확정 이력이 실행되어 편집 기준이 바뀌는 것을 막습니다."""
+    reason = axis_edit_active_block_reason(RUNTIME)
+    if reason is None:
+        return False
+    RUNTIME.model_catalog.message = reason
+    set_workspace_status_text(session_align_workspace(), reason)
+    request_redraw()
+    return True
+
+
 def undo_session_state() -> bool:
     """열린 드래프트를 우선하고 없으면 공용 확정 세션 명령을 되돌립니다."""
-    if _marker_preview_blocks_history():
+    if _axis_edit_blocks_history() or _marker_preview_blocks_history():
         return False
     journal = RUNTIME.undo_journal
     if journal.scope_active:
@@ -395,7 +422,7 @@ def undo_session_state() -> bool:
 
 def redo_session_state() -> bool:
     """열린 드래프트를 우선하고 없으면 공용 확정 세션 Redo 명령을 복원합니다."""
-    if _marker_preview_blocks_history(redo=True):
+    if _axis_edit_blocks_history() or _marker_preview_blocks_history(redo=True):
         return False
     journal = RUNTIME.undo_journal
     if journal.scope_active:
@@ -554,6 +581,7 @@ def clear_session_for_file_load() -> None:
     from .operators.session_guard import stop_input_guard_timer
     from .alignment.layer_transform import cancel_layer_transform
 
+    cancel_axis_edit_for_lifecycle()
     discard_marker_preview_for_lifecycle()
     cancel_layer_transform(RUNTIME, message="파일 교체로 데이터 레이어 변환을 취소했습니다.")
     stop_input_guard_timer()
@@ -576,6 +604,7 @@ def restore_session_for_unregister() -> None:
     from .operators.session_guard import stop_input_guard_timer
     from .alignment.layer_transform import cancel_layer_transform
 
+    cancel_axis_edit_for_lifecycle()
     discard_marker_preview_for_lifecycle()
     cancel_layer_transform(RUNTIME, message="애드온 해제로 데이터 레이어 변환을 취소했습니다.")
     stop_input_guard_timer()

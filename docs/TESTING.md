@@ -113,11 +113,25 @@ python -m unittest discover -s tests/projection_paint/core -p "test_*.py"
   --python ".\tests\align\blender\test_obj_export.py"
 ```
 
-첫 검사는 `vt` 1~3성분, 양수·음수 UV 인덱스, UV seam, 부분 UV 면 집합, `mtllib`·`usemtl`·`map_Kd`, 재질별 face-corner 텍스처 배치, 잘못된 입력 거부와 Runtime 불변 배열을 확인합니다. 두 번째 검사는 `모델표시이름.obj`·`모델표시이름.mtl`·`원본이미지명`의 단일 폴더 출력, 모델·텍스처 파일명 충돌 거부, 동일 원본 텍스처 공유, Windows 260자 경로 제한 사전 진단, UV 증분 기록, Reflection 정점·UV Corner 동시 반전, Report Schema 3, 원본 이미지 바이트 복사·SHA-256, 부분 Coverage와 Blender 5.2 기본 OBJ Importer의 실제 UV Layer·이미지 재질 재생성을 확인합니다.
+첫 검사는 `vt` 1~3성분, 양수·음수 UV 인덱스, UV seam, 부분 UV 면 집합, `mtllib`·`usemtl`·`map_Kd`, 재질별 face-corner 텍스처 배치, 기존 600,000면 경계를 넘는 전체 가져오기, 잘못된 입력 거부와 Runtime 불변 배열을 확인합니다. 두 번째 검사는 `모델표시이름.obj`·`모델표시이름.mtl`·`원본이미지명`의 단일 폴더 출력, 모델·텍스처 파일명 충돌 거부, 동일 원본 텍스처 공유, Windows 260자 경로 제한 사전 진단, UV 증분 기록, Reflection 정점·UV Corner 동시 반전, Report Schema 3, 원본 이미지 바이트 복사·SHA-256, 부분 Coverage와 Blender 5.2 기본 OBJ Importer의 실제 UV Layer·이미지 재질 재생성을 확인합니다.
 
 백그라운드 Blender는 GPU 컨텍스트를 초기화하지 않으므로 Align 텍스처 셰이더는 실제 GUI 프로세스에서 같은 `test_mesh_extension.py`를 실행해 추가 검증합니다. 이 검사는 유효한 PNG를 생성하고 GPU Texture, 재질별 TRIS 배치와 자원 해제를 확인합니다.
 
 격리 설치본 검사는 같은 UV Fixture를 설치 ZIP 내부 Reader·Writer로 왕복한 뒤 Blender Mesh의 face-corner UV seam까지 추가로 확인합니다.
+
+## Align OBJ 내장 원본·프록시 회귀
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env --python-exit-code 1 `
+  --python ".\tests\align\blender\test_embedded_obj.py"
+
+& "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe" --background --factory-startup `
+  --python-use-system-env --python-exit-code 1 `
+  --python ".\tests\align\blender\test_companion_persistence.py"
+```
+
+첫 검사는 Native Import 축과 Identity Object Matrix, Triangle·Quad·오목 N-gon의 원본 Polygon·Loop UV·재질, 비연결 Fake User Mesh, 삼각형 프록시, `.blend` 재열기와 외부 OBJ 없는 복원, 구버전 전후 SHA 검증, 실패·취소·레이어 삭제·새 프로젝트 수명주기, 부속 Material·Image 정리, custom Undo·Redo 불변성을 확인합니다. 두 번째 검사는 COLMAP 연결 OBJ가 별도 내장 UUID를 가지고 외부 OBJ 없이 저장·복원되는지 확인합니다.
 
 ## Workspace Seed 검증
 
@@ -156,7 +170,7 @@ python -m unittest discover -s tests/projection_paint/core -p "test_*.py"
   --python ".\tests\blender_gui\test_camera_marker_handoff.py"
 ```
 
-Factory GUI 검사는 세 Seed의 독립 Workspace·Screen Pointer, CREATING → READY 전환, 역순 공식 삭제와 두 ID의 완전 제거를 확인합니다. 실행 순서 검사는 Align N 패널에 수동 종료 버튼이 없는 상태에서 Align → Modifier → Projection Paint → Align 전환과 Modifier → Align 전환, 기존 COLMAP Workspace 탭 및 일반 Blender Workspace 탭을 직접 선택한 수동 전환, 이전 세션의 자동 종료 완료 대기, 사용자가 선택한 일반 Workspace 유지, 세 도구의 READY Workspace 유지·재사용, Source 복귀, FAILED Workspace 부재와 사용자 Screen 보존을 확인합니다. 특히 일반 Workspace에서 기존 READY Align Workspace 탭을 다시 선택하는 즉시 N 패널 표시가 유지되고, 세션 재연결이 끝난 뒤 입력 가능 상태로 돌아오는지도 검사합니다. Blender 파일 로드와 동일하게 Workspace Message Bus 소유 구독을 지운 뒤 `load_post` 복구를 실행하고 Modifier → Align 탭 직접 전환이 다시 감지되는지도 검증합니다. Camera Marker 교대 검사는 Modifier와 Projection Paint가 같은 Frame 1에 실제 Camera를 Import하고 서로 전환한 뒤 활성 도구 Marker만 존재하는지, 일반 Workspace에서 두 Marker가 모두 제거되는지와 Manifest·Object·사용자 Marker 보존을 확인합니다. Projection Paint Background 검사는 준비 중 이탈한 `CREATING` Workspace는 삭제하고 정상 종료한 `READY` Workspace는 보존하는 상태별 계약도 확인합니다.
+Factory GUI 검사는 세 Seed의 독립 Workspace·Screen Pointer, CREATING → READY 전환, 역순 공식 삭제와 두 ID의 완전 제거를 확인합니다. 실행 순서 검사는 Align N 패널에 수동 종료 버튼이 없는 상태에서 Align → Modifier → Projection Paint → Align 전환과 Modifier → Align 전환, 기존 COLMAP Workspace 탭 및 일반 Blender Workspace 탭을 직접 선택한 수동 전환, 이전 세션의 자동 종료 완료 대기, 사용자가 선택한 일반 Workspace 유지, 세 도구의 READY Workspace 유지·재사용, Source 복귀, FAILED Workspace 부재와 사용자 Screen 보존을 확인합니다. 특히 일반 Workspace에서 기존 READY Align Workspace 탭을 다시 선택하는 즉시 N 패널 표시가 유지되고, 세션 재연결이 끝난 뒤 입력 가능 상태로 돌아오는지도 검사합니다. Blender 파일 로드와 동일하게 Workspace Message Bus 소유 구독을 지운 뒤 `load_post` 복구를 실행하고 Modifier → Align 탭 직접 전환이 다시 감지되는지도 검증합니다. 격리환경의 `python test_env/manage.py verify --gui`는 활성 Align Workspace에서 Blend를 저장하고 UI를 포함해 같은 파일을 다시 연 뒤, 다른 Workspace로 이동하지 않아도 저장된 Workspace가 런타임 `ACTIVE` 세션에 자동 연결되는지 추가로 확인합니다. Camera Marker 교대 검사는 Modifier와 Projection Paint가 같은 Frame 1에 실제 Camera를 Import하고 서로 전환한 뒤 활성 도구 Marker만 존재하는지, 일반 Workspace에서 두 Marker가 모두 제거되는지와 Manifest·Object·사용자 Marker 보존을 확인합니다. Projection Paint Background 검사는 준비 중 이탈한 `CREATING` Workspace는 삭제하고 정상 종료한 `READY` Workspace는 보존하는 상태별 계약도 확인합니다.
 
 Blender 5.2는 Append Workspace 공식 삭제 시 `ID user decrement error: SRLayout` 내부 진단을 출력하지만 삭제 결과와 Workspace·Screen ID 제거는 정상입니다. 사용자 수 조작 우회는 사용하지 않습니다.
 
@@ -508,3 +522,44 @@ $process.WaitForExit()
 현재 사용자 설정과 설치본을 건드리지 않도록 `.artifacts` 아래에 임시 Blender 사용자 설정과 로컬 Repository를 생성합니다. Build ZIP을 설치·활성화해 공통 메뉴, 세 진입 Operator, Scene 속성과 세 Workspace Seed 내부 계약을 검사합니다. 이어 설치된 `tools/align/runtime/python/python.exe`로 합성 GICP를 실행하고 고정 버전을 확인한 뒤 임시 영역을 제거합니다. `-WorkspaceGui`는 같은 격리 설치본으로 전체 Workspace 실행 순서와 실제 Camera Marker 교대 GUI 회귀까지 실행합니다.
 
 이 검사는 Native Runtime의 패키징·이동성·최소 연산과 Workspace 배포 자원을 확인하는 자동 Smoke Test입니다. 사용자 보유 실데이터의 Align·Projection Paint 전체 GUI 회귀, 대형 점군 성능, 취소·종료와 Native 장애 격리 검증은 별도의 최종 승인 범위입니다.
+
+
+## CCCoreLib 독립 Align 실험 검증
+
+이 절은 `codex/align-test-env`에 적용한다. 위 통합 기본 배포의 Small GICP 지침은 main 통합 전까지 별도로 유지한다.
+
+```powershell
+& 'E:\DEV\DEV_RND\colmap_align_test_env\runtime\python\python.exe' -X utf8 `
+  'E:\DEV\DEV_RND\colmap_align_test_env\source\test_env\manage.py' verify --gui
+```
+
+실험 관리자는 소스와 CC 런타임이 바뀌면 스테이징 빌드·환경 검사·설치를 수행한다. 설치본의 네 조합 실제 CC 정렬·승인·Undo/Redo, 기존 Align 회귀, 스키마 1~8 복원과 GUI 작업공간을 검사한다. 결과는 실험 루트의 `outputs/verification-report.json`, `outputs/installed-cccore-alignment.json`에 보존한다.
+
+CC 계산 자체는 `tests/align/native/test_cccore_worker.py`와 `tests/align/test_icp_cccore_solver.py`로 따로 검사한다.
+
+```powershell
+$env:COLMAP_CCCORE_WORKER = 'E:\DEV\DEV_RND\colmap_align_test_env\runtime\cccore\colmap_cccore_worker.exe'
+$env:CCCORE_NATIVE_WORKER = $env:COLMAP_CCCORE_WORKER
+& 'E:\DEV\DEV_RND\colmap_align_test_env\runtime\python\python.exe' -X utf8 -I .\tests\align\native\test_cccore_worker.py
+& 'E:\DEV\DEV_RND\colmap_align_test_env\runtime\python\python.exe' -X utf8 -I .\tests\align\test_icp_cccore_solver.py
+```
+네이티브 검사에는 1스레드와 멀티스레드 결과 동등성, 네 형상 조합의 6·5·5·8 논리 연산 순서, Align당 단일 프로세스, SESSION geometry 1회 적재·COMMAND geometry 해제, 배율 상하한·역방향, 순번·경로·부분 JSON 오류, 취소·terminal 경계·충돌, 자식 프로세스 회수와 Windows 파일 공유 충돌 재현을 포함한다. 코어 준비 스크립트는 고정 원문과 패치를 검증하고 `cccore-native-v3` 실제 네이티브 회귀를 실행한다. 역방향 표면은 원본 이동 메시와 inverse query를 사용하며 정확 후보는 bit-exact 평가 키로만 재사용한다. 공개 API 옥트리·메시 교차 격자 캐시는 안전한 후보가 7.25% 느리고 완전 키 반복도 없어 채택하지 않았으며 결과의 build/cache 계수로 0회 적중을 명시한다.
+
+솔버 검사는 각 실제 명령의 `roundtrip_seconds`와 `protocol_overhead_seconds` 공식, 물리 명령 합계, 왕복 대비 보조 비율과 전체 solver `elapsed_seconds` 대비 `protocol_overhead_fraction_of_total_alignment`를 재계산한다. 정확 캐시 논리 항목은 원본 물리 측정값과 같아야 하지만 합계에는 물리 명령 한 번만 포함한다. Blender runtime과 schema 8 persistence 검사는 같은 값을 중첩·최상위 감사 필드에서 보존하고 변조된 합계·비율을 거부한다.
+
+oneTBB 설정 UI와 Blender 실행 계약은 팩토리 시작 프로세스에서 따로 검사한다.
+
+```powershell
+& 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' --background --factory-startup `
+  --python-use-system-env --python-exit-code 1 --python '.\tests\align\blender\test_icp_cccore_ui.py'
+
+& 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' --background --factory-startup `
+  --python-use-system-env --python-exit-code 1 --python '.\tests\align\blender\test_icp_cccore_runtime.py'
+
+& 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' --background --factory-startup `
+  --python-use-system-env --python-exit-code 1 --python '.\tests\align\blender\test_icp_cccore_persistence.py'
+```
+
+실데이터 비교는 기존 보존본의 확정 C를 공통 초기값으로 사용한다. Small GICP 점군 입력과 CC 표면 입력의 결과를 같은 독립 표면 표본으로 평가한다. 이는 엔진과 입력 형상을 함께 바꾼 사용자 흐름의 비교이며, 같은 형상에서 두 알고리즘만 비교한 결과와 구분한다. 실제 COLMAP 내보내기·재로드와 카메라 투영 관계를 검사하며 RC 자체 재구성은 별도 실측 항목이다.
+
+단일 세션 성능 판정은 warmup과 측정 3회를 분리하고 aligned 자동·1스레드 및 같은 perturbation의 v2/v3 오정렬을 비교한다. 전체 시간 1.25배, Working Set +15%, Paging 없음, 취소 2초와 프로토콜 오버헤드 1%를 각각 판정한다. 2026-09-05 최종 run05에서 aligned 자동 평균 `5.9969730초`, 1스레드 `10.2432664초`로 자동이 `1.708073배` 빨랔다. 동일 오정렬은 v2 평균 `502.1496997초` 대비 v3 평균 `106.0332545초`로 `4.735776배` 빠르고 시간을 `78.8841%` 줄여 시간 기준을 통과했다. 최종 행렬·delta 최대 차이는 0이고 품질·후보는 같으며 RMS 차이 `3.7746634e-9`는 기존 float 코어 허용오차 안이다. aligned·오정렬 Working Set 증가는 각각 2.8513%·3.4366%로 통과했다. 전체 solver 대비 프로토콜 오버헤드는 aligned 자동 3.3668~5.0927%, 1스레드 1.2896~2.2335%, 오정렬 0.2675~0.2977%이며 전체 최대 5.092686%로 1% 기준을 실패했다. Paging은 미계측이다. 판정할 수 없거나 실패한 완료 기준을 그대로 남겨 통합 상태는 `EXPERIMENT_ONLY`로 유지한다. 최종 worker `45aed37a17f23ca2ea8f1edd2aa32603fd3a286a734b6fdc201d7b1db55b63c9`와 solver 41/41·native 35/35·Blender UI 9/9·runtime 7/7·persistence 9/9 결과, 원본 SHA-256·크기·mtime은 `outputs/untitled_session_v3_final_20260905_run05`에 보존한다.

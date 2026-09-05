@@ -44,6 +44,7 @@ from ..constants import (
 )
 from ..geometry_access import is_triangle_mesh_model
 from ..logging_utils import get_logger
+from ..mesh_io.embedded_obj_store import extract_embedded_obj_export_geometry
 from ..mesh_io.obj_reader import ObjReader
 from ..mesh_io.obj_writer import (
     IncrementalObjWriter,
@@ -53,8 +54,8 @@ from ..mesh_io.obj_writer import (
     build_obj_export_report,
     canonical_obj_filename,
     compose_project_world_matrix,
-    transformed_face_texcoord_indices,
-    transformed_faces,
+    transformed_polygon_corners,
+    transformed_polygon_texcoord_indices,
     transformed_vertices,
     validate_obj_material_links,
     validate_windows_output_path,
@@ -103,6 +104,7 @@ class ObjExportResult:
     vertex_count: int
     texture_coordinate_count: int
     face_count: int
+    cleanup_warning: str = ""
 
 
 def _ordered_obj_records(runtime: Any = RUNTIME) -> tuple[Any, ...]:
@@ -121,7 +123,7 @@ def _ordered_obj_records(runtime: Any = RUNTIME) -> tuple[Any, ...]:
 
 
 def build_obj_export_snapshots(runtime: Any = RUNTIME) -> tuple[ObjExportModelSnapshot, ...]:
-    """현재 A 그룹의 확정 메시 형상·UV·재질·텍스처와 변환을 snapshot으로 고정합니다."""
+    """현재 A 그룹의 내장 원본 Polygon 또는 구버전 Triangle 형상을 snapshot으로 고정합니다."""
 
     repository = runtime.model_repository
     snapshots: list[ObjExportModelSnapshot] = []
@@ -138,13 +140,54 @@ def build_obj_export_snapshots(runtime: Any = RUNTIME) -> tuple[ObjExportModelSn
             ) from error
         metadata = repository.source_metadata.get(record.model_id)
         source_fingerprint = str(getattr(metadata, "source_fingerprint", "") or "").strip()
-        vertices = np.asarray(getattr(model, "vertices_float64"), dtype=np.float64)
         triangles = np.asarray(getattr(model, "triangles_uint32"), dtype=np.uint32)
-        texcoords = np.asarray(getattr(model, "texcoords_float64"), dtype=np.float64)
-        component_counts = np.asarray(
-            getattr(model, "texcoord_component_counts_uint8"),
-            dtype=np.uint8,
-        )
+        embedded_uuid = str(getattr(model, "embedded_asset_uuid", "") or "").strip()
+        if not embedded_uuid and (runtime is RUNTIME or metadata is not None):
+            raise RuntimeError(
+                f"현재 프로젝트의 OBJ 모델에는 내장 Mesh 식별자가 필요합니다: {record.display_name}"
+            )
+        # 비전역 Runtime에서 Source metadata가 없는 직접 생성 legacy fixture만 Triangle 경로를 사용합니다.
+        embedded_geometry = None
+        if embedded_uuid:
+            embedded_geometry = extract_embedded_obj_export_geometry(
+                embedded_uuid,
+                expected_model_id=str(record.model_id),
+                expected_revision=int(getattr(model, "geometry_revision", 0)),
+            )
+            expected_schema = int(getattr(model, "embedded_asset_schema_version", 0))
+            expected_polygon_count = int(getattr(model, "original_polygon_count", 0))
+            if embedded_geometry.schema_version != expected_schema:
+                raise RuntimeError(
+                    f"내장 OBJ schema가 Runtime과 다릅니다: {record.display_name}"
+                )
+            if embedded_geometry.polygon_count != expected_polygon_count:
+                raise RuntimeError(
+                    f"내장 OBJ Polygon 수가 Runtime과 다릅니다: {record.display_name}"
+                )
+            vertices = embedded_geometry.vertices_float64
+            texcoords = embedded_geometry.texcoords_float64
+            component_counts = embedded_geometry.texcoord_component_counts_uint8
+            materials = embedded_geometry.materials
+            face_count = embedded_geometry.polygon_count
+            polygon_starts = embedded_geometry.polygon_loop_starts_uint32
+            polygon_totals = embedded_geometry.polygon_loop_totals_uint32
+            loop_vertices = embedded_geometry.loop_vertex_indices_uint32
+            loop_texcoords = embedded_geometry.loop_texcoord_indices_int32
+            polygon_materials = embedded_geometry.polygon_material_indices_int32
+        else:
+            vertices = np.asarray(getattr(model, "vertices_float64"), dtype=np.float64)
+            texcoords = np.asarray(getattr(model, "texcoords_float64"), dtype=np.float64)
+            component_counts = np.asarray(
+                getattr(model, "texcoord_component_counts_uint8"),
+                dtype=np.uint8,
+            )
+            materials = tuple(getattr(model, "materials"))
+            face_count = int(triangles.shape[0])
+            polygon_starts = np.empty((0,), dtype=np.uint32)
+            polygon_totals = np.empty((0,), dtype=np.uint32)
+            loop_vertices = np.empty((0,), dtype=np.uint32)
+            loop_texcoords = np.empty((0,), dtype=np.int32)
+            polygon_materials = np.empty((0,), dtype=np.int32)
         face_texcoords = np.asarray(
             getattr(model, "triangle_texcoord_indices_int32"),
             dtype=np.int32,
@@ -166,7 +209,7 @@ def build_obj_export_snapshots(runtime: Any = RUNTIME) -> tuple[ObjExportModelSn
                 load_order=int(record.load_order),
                 geometry_revision=int(getattr(model, "geometry_revision", 0)),
                 vertex_count=int(vertices.shape[0]),
-                face_count=int(triangles.shape[0]),
+                face_count=face_count,
                 source_fingerprint=source_fingerprint,
                 display_fingerprint=str(display.fingerprint),
                 alignment_fingerprint=str(alignment.fingerprint),
@@ -176,8 +219,21 @@ def build_obj_export_snapshots(runtime: Any = RUNTIME) -> tuple[ObjExportModelSn
                 texcoords_float64=texcoords,
                 texcoord_component_counts_uint8=component_counts,
                 triangle_texcoord_indices_int32=face_texcoords,
-                materials=tuple(getattr(model, "materials")),
+                materials=materials,
                 triangle_material_indices_int32=face_materials,
+                polygon_loop_starts_uint32=polygon_starts,
+                polygon_loop_totals_uint32=polygon_totals,
+                loop_vertex_indices_uint32=loop_vertices,
+                loop_texcoord_indices_int32=loop_texcoords,
+                polygon_material_indices_int32=polygon_materials,
+                embedded_asset_uuid=(embedded_geometry.asset_uuid if embedded_geometry else ""),
+                embedded_asset_schema_version=(
+                    embedded_geometry.schema_version if embedded_geometry else 0
+                ),
+                embedded_data_name_hint=(
+                    embedded_geometry.data_name_hint if embedded_geometry else ""
+                ),
+                polygon_topology_explicit=embedded_geometry is not None,
             )
         )
     if not snapshots:
@@ -205,6 +261,9 @@ def obj_export_snapshot_fingerprint(snapshots: tuple[ObjExportModelSnapshot, ...
             snapshot.source_fingerprint,
             snapshot.display_fingerprint,
             snapshot.alignment_fingerprint,
+            snapshot.embedded_asset_uuid,
+            snapshot.embedded_asset_schema_version,
+            snapshot.embedded_data_name_hint,
         ):
             digest.update(str(value).encode("utf-8"))
             digest.update(b"\0")
@@ -215,13 +274,28 @@ def obj_export_snapshot_fingerprint(snapshots: tuple[ObjExportModelSnapshot, ...
             ).tobytes()
         )
         digest.update(b"\0")
+        for array, dtype in (
+            (snapshot.vertices_float64, np.dtype("<f8")),
+            (snapshot.texcoords_float64, np.dtype("<f8")),
+            (snapshot.texcoord_component_counts_uint8, np.dtype("u1")),
+        ):
+            digest.update(np.ascontiguousarray(array, dtype=dtype).tobytes())
+            digest.update(b"\0")
         digest.update(
             np.ascontiguousarray(
-                snapshot.triangle_material_indices_int32,
+                snapshot.polygon_material_indices_int32,
                 dtype=np.dtype("<i4"),
             ).tobytes()
         )
         digest.update(b"\0")
+        for array, dtype in (
+            (snapshot.polygon_loop_starts_uint32, np.dtype("<u4")),
+            (snapshot.polygon_loop_totals_uint32, np.dtype("<u4")),
+            (snapshot.loop_vertex_indices_uint32, np.dtype("<u4")),
+            (snapshot.loop_texcoord_indices_int32, np.dtype("<i4")),
+        ):
+            digest.update(np.ascontiguousarray(array, dtype=dtype).tobytes())
+            digest.update(b"\0")
         for material in snapshot.materials:
             digest.update(material.name.encode("utf-8"))
             digest.update(np.asarray(material.diffuse_color, dtype=np.dtype("<f8")).tobytes())
@@ -416,6 +490,7 @@ class ObjExportJob:
         )
         self.status = "RUNNING"
         self.error_message = ""
+        self.warning_message = ""
         self.cancel_requested = False
         self.model_index = 0
         self.vertex_offset = 0
@@ -625,7 +700,7 @@ class ObjExportJob:
         self._update_progress(self.stage)
 
     def _write_face_chunk(self) -> None:
-        """현재 모델의 다음 삼각면 chunk를 기록하고 완료 시 재질 단계로 전환합니다."""
+        """현재 모델의 다음 Polygon chunk를 기록하고 완료 시 재질 단계로 전환합니다."""
 
         snapshot = self._current_snapshot()
         stop = min(snapshot.face_count, self.face_offset + _OBJ_EXPORT_FACE_CHUNK_SIZE)
@@ -742,7 +817,10 @@ class ObjExportJob:
         """생성 MTL과 복사 텍스처가 준비된 현재 OBJ의 증분 reader를 엽니다."""
 
         snapshot = self._current_snapshot()
-        self.reader = ObjReader(self.candidate_root / snapshot.output_filename)
+        self.reader = ObjReader(
+            self.candidate_root / snapshot.output_filename,
+            preserve_polygons=True,
+        )
         self.stage = OBJ_EXPORT_STAGE_VALIDATING
 
     def _read_validation_obj(self, remaining_seconds: float) -> None:
@@ -759,9 +837,9 @@ class ObjExportJob:
         if (
             self.parsed.vertex_count != snapshot.vertex_count
             or self.parsed.texture_coordinate_count != snapshot.texture_coordinate_count
-            or self.parsed.triangle_count != snapshot.face_count
+            or self.parsed.polygon_count != snapshot.face_count
         ):
-            raise RuntimeError("OBJ 출력 정점·UV·삼각면 수가 snapshot과 다릅니다.")
+            raise RuntimeError("OBJ 출력 정점·UV·Polygon 수가 snapshot과 다릅니다.")
         validate_obj_material_links(self.parsed, snapshot, self.candidate_root)
         self.validation_vertex_offset = 0
         self.validation_texture_coordinate_offset = 0
@@ -811,32 +889,47 @@ class ObjExportJob:
             self.stage = "VALIDATE_FACES"
 
     def _validate_face_chunk(self) -> None:
-        """왕복 파싱 face를 기대 연결과 chunk 단위로 비교합니다."""
+        """왕복 파싱 Polygon Corner·UV·재질을 chunk 단위로 비교합니다."""
 
         snapshot = self._current_snapshot()
         stop = min(
             snapshot.face_count,
             self.validation_face_offset + _OBJ_EXPORT_VALIDATION_CHUNK_SIZE,
         )
-        expected = transformed_faces(snapshot, self.validation_face_offset, stop) - 1
-        actual = self.parsed.triangles_uint32[self.validation_face_offset:stop]
-        if not np.array_equal(actual.astype(np.uint64, copy=False), expected):
-            raise RuntimeError("OBJ 출력 face 연결 또는 winding이 snapshot과 다릅니다.")
-        expected_texcoords = transformed_face_texcoord_indices(
+        expected = transformed_polygon_corners(
             snapshot,
             self.validation_face_offset,
             stop,
         )
-        actual_texcoords = self.parsed.triangle_texcoord_indices_int32[
-            self.validation_face_offset:stop
-        ]
-        if not np.array_equal(actual_texcoords, expected_texcoords):
-            raise RuntimeError("OBJ 출력 face UV 연결 또는 winding이 snapshot과 다릅니다.")
-        if not np.array_equal(
-            self.parsed.triangle_material_indices_int32[self.validation_face_offset:stop],
-            snapshot.triangle_material_indices_int32[self.validation_face_offset:stop],
+        expected_texcoords = transformed_polygon_texcoord_indices(
+            snapshot,
+            self.validation_face_offset,
+            stop,
+        )
+        for relative_index, (expected_vertices, expected_uv) in enumerate(
+            zip(expected, expected_texcoords, strict=True)
         ):
-            raise RuntimeError("OBJ 출력 face 재질 연결이 snapshot과 다릅니다.")
+            polygon_index = self.validation_face_offset + relative_index
+            loop_start = int(self.parsed.polygon_loop_starts_uint32[polygon_index])
+            loop_total = int(self.parsed.polygon_loop_totals_uint32[polygon_index])
+            actual_vertices = self.parsed.loop_vertex_indices_uint32[
+                loop_start : loop_start + loop_total
+            ]
+            actual_uv = self.parsed.loop_texcoord_indices_int32[
+                loop_start : loop_start + loop_total
+            ]
+            if loop_total != expected_vertices.shape[0] or not np.array_equal(
+                actual_vertices,
+                expected_vertices - 1,
+            ):
+                raise RuntimeError("OBJ 출력 Polygon Corner 연결 또는 winding이 snapshot과 다릅니다.")
+            if loop_total != expected_uv.shape[0] or not np.array_equal(actual_uv, expected_uv):
+                raise RuntimeError("OBJ 출력 Polygon UV 연결 또는 winding이 snapshot과 다릅니다.")
+        if not np.array_equal(
+            self.parsed.polygon_material_indices_int32[self.validation_face_offset:stop],
+            snapshot.polygon_material_indices_int32[self.validation_face_offset:stop],
+        ):
+            raise RuntimeError("OBJ 출력 Polygon 재질 연결이 snapshot과 다릅니다.")
         self.validation_face_offset = stop
         if stop >= snapshot.face_count:
             path = self.candidate_root / snapshot.output_filename
@@ -856,10 +949,10 @@ class ObjExportJob:
         snapshot = self._current_snapshot()
         self.validations[snapshot.model_id] = ObjRoundTripValidation(
             vertex_count=self.parsed.vertex_count,
-            face_count=self.parsed.triangle_count,
+            face_count=self.parsed.polygon_count,
             texture_coordinate_count=self.parsed.texture_coordinate_count,
-            textured_face_count=self.parsed.textured_face_count,
-            uv_coverage=(self.parsed.textured_face_count / self.parsed.triangle_count),
+            textured_face_count=self.parsed.textured_polygon_count,
+            uv_coverage=(self.parsed.textured_polygon_count / self.parsed.polygon_count),
             bounds_min=tuple(float(value) for value in self.parsed.bounds_min),
             bounds_max=tuple(float(value) for value in self.parsed.bounds_max),
             output_sha256=self.hash_digest.hexdigest(),
@@ -966,12 +1059,24 @@ class ObjExportJob:
                 self.backup_root.replace(self.output_root)
             raise
         if backup_created:
-            _remove_job_directory(
-                self.backup_root,
-                self.parent,
-                OBJ_EXPORT_PREVIOUS_OUTPUT_PREFIX,
-                self.job_id,
-            )
+            try:
+                _remove_job_directory(
+                    self.backup_root,
+                    self.parent,
+                    OBJ_EXPORT_PREVIOUS_OUTPUT_PREFIX,
+                    self.job_id,
+                )
+            except Exception as cleanup_error:
+                self.warning_message = (
+                    "OBJ 내보내기는 완료됐지만 이전 출력 백업을 정리하지 못했습니다. "
+                    f"후속 정리 경로: {self.backup_root}. 원인: {cleanup_error}"
+                )
+                _LOGGER.warning(
+                    "event=obj_export_backup_cleanup_pending job_id=%s backup=%s reason=%s",
+                    self.job_id,
+                    self.backup_root,
+                    cleanup_error,
+                )
         self.status = "COMPLETED"
         self.stage = OBJ_EXPORT_STAGE_COMPLETED
         self._update_progress(self.stage)
@@ -982,6 +1087,7 @@ class ObjExportJob:
             vertex_count=self.total_vertex_count,
             texture_coordinate_count=self.total_texture_coordinate_count,
             face_count=self.total_face_count,
+            cleanup_warning=self.warning_message,
         )
 
 
@@ -1005,6 +1111,12 @@ def is_obj_export_input_locked() -> bool:
 
 def obj_export_start_block_reason() -> str | None:
     """OBJ Export 시작 전에 가장 먼저 만족하지 못한 조건을 설명합니다."""
+
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(RUNTIME)
+    if axis_reason is not None:
+        return axis_reason
 
     restore_reason = restore_input_block_reason()
     if restore_reason is not None:
@@ -1054,7 +1166,7 @@ def obj_export_status_entries() -> tuple[str, ...]:
             f"{int(progress.total_texture_coordinate_count):,}"
         )
         entries.append(
-            f"삼각면 · {int(progress.written_face_count):,} / {int(progress.total_face_count):,}"
+            f"Polygon · {int(progress.written_face_count):,} / {int(progress.total_face_count):,}"
         )
     if state.last_error:
         entries.append(f"오류 · {state.last_error}")
@@ -1122,10 +1234,10 @@ def _poll_obj_export_timer() -> float | None:
                 state.last_success_report_path = str(result.report_path)
                 state.last_vertex_count = result.vertex_count
                 state.last_face_count = result.face_count
-                set_workspace_status_text(
-                    session_align_workspace(),
-                    f"OBJ 내보내기를 완료했습니다: {result.output_root}",
-                )
+                status_text = f"OBJ 내보내기를 완료했습니다: {result.output_root}"
+                if result.cleanup_warning:
+                    status_text = f"{status_text} · {result.cleanup_warning}"
+                set_workspace_status_text(session_align_workspace(), status_text)
         except Exception as error:
             try:
                 job.cleanup_candidate()

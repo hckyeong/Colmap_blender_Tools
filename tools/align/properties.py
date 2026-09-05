@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from .viewport.display_sampling import DEFAULT_DISPLAY_POINT_LIMIT
 _EXTERNAL_RIGID_BACKENDS = frozenset(
     {"OPEN3D_GICP", "SMALL_GICP", "OPEN3D_ROBUST_POINT_TO_PLANE"}
 )
+_CC_MAX_CPU_THREADS = 1024
 from .distribution_profile import (
     default_icp_backend,
     icp_backend_enum_items,
@@ -141,32 +143,41 @@ def _on_icp_solver_backend_changed(self, _context) -> None:
 
 
 class COLMAPALIGN_AP_preferences(bpy.types.AddonPreferences):
-    """Full 개발 빌드에서만 선택형 외부 ICP 실행 경로를 보관합니다."""
+    """개발 프로필의 명시적 실행 경로와 CC 환경 검사를 제공합니다."""
 
     bl_idname = __package__.split(".tools.", 1)[0]
 
+    cc_cpu_thread_limit: IntProperty(
+        name="CPU 스레드",
+        description="CC 정렬 작업의 최대 CPU 스레드 수입니다. 0은 자동, 1은 단일 스레드, 2 이상은 최대값입니다.",
+        default=0,
+        min=0,
+        max=_CC_MAX_CPU_THREADS,
+    )
+
     if includes_optional_backends():
         open3d_python_path: StringProperty(
-            name="외부 ICP Python",
-            description="선택형 외부 ICP 라이브러리가 설치된 CPython 3.12 x64 실행 파일입니다.",
+            name="정렬 Python 실행 파일",
+            description="개발 환경에서 CC 계산 조정기를 실행할 CPython 3.12 x64 경로입니다. 비워 두면 전용 런타임을 사용합니다.",
             subtype="FILE_PATH",
         )
 
     def draw(self, _context) -> None:
-        """배포 프로필에 맞는 Small GICP 실행 경로와 환경 검사를 표시합니다."""
+        """배포 프로필에 맞는 CC 전용 실행 경로와 실제 엔진 검사를 표시합니다."""
 
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
         if includes_optional_backends():
             layout.prop(self, "open3d_python_path")
-            # Open3D backend 환경 검사는 구현 보존 상태로 UI에서 비활성화합니다.
-            layout.label(text="선택형 외부 ICP 환경은 사용자가 명시적으로 설정합니다.")
+            layout.label(text="경로를 비워 두면 애드온의 전용 정렬 환경을 사용합니다.")
         else:
-            layout.label(text="Small GICP 실행 환경이 애드온에 포함되어 있습니다.", icon="PACKAGE")
+            layout.label(text="CC 정렬 실행 환경이 애드온에 포함되어 있습니다.", icon="PACKAGE")
+        layout.prop(self, "cc_cpu_thread_limit")
+        layout.label(text=cc_cpu_thread_summary(_context))
         layout.operator(
-            "colmap_align.validate_small_gicp_environment",
-            text="small_gicp 환경 검사",
+            "colmap_align.validate_cccore_environment",
+            text="CC 정렬 환경 검사",
             icon="CHECKMARK",
         )
 
@@ -183,20 +194,68 @@ def addon_preferences(context: Any | None = None) -> Any | None:
     return getattr(addon, "preferences", None) if addon is not None else None
 
 
+def cc_cpu_thread_counts(
+    configured_limit: int,
+    detected_thread_count: int | None = None,
+) -> tuple[int, int, int]:
+    """감지 수와 자동 상한 및 현재 설정을 해석한 작업 상한을 반환합니다."""
+    if isinstance(configured_limit, bool) or not isinstance(configured_limit, int):
+        raise ValueError("CC CPU 스레드 설정은 정수여야 합니다.")
+    if not 0 <= configured_limit <= _CC_MAX_CPU_THREADS:
+        raise ValueError(f"CC CPU 스레드 설정은 0 이상 {_CC_MAX_CPU_THREADS} 이하여야 합니다.")
+    detected_value = os.cpu_count() if detected_thread_count is None else detected_thread_count
+    if isinstance(detected_value, bool) or not isinstance(detected_value, int) or detected_value < 1:
+        detected_value = 1
+    detected = max(1, detected_value)
+    automatic = min(_CC_MAX_CPU_THREADS, max(1, detected - 1))
+    selected = automatic if configured_limit == 0 else max(1, min(configured_limit, detected, _CC_MAX_CPU_THREADS))
+    return detected, automatic, selected
+
+
+def configured_cc_cpu_thread_limit(context: Any | None = None) -> int:
+    """현재 Add-on Preferences 값을 감지 논리 프로세서 수로 제한해 반환합니다."""
+    preferences = addon_preferences(context)
+    configured = getattr(preferences, "cc_cpu_thread_limit", 0) if preferences is not None else 0
+    return cc_cpu_thread_counts(int(configured))[2]
+
+
+def cc_cpu_thread_summary(context: Any | None = None) -> str:
+    """환경설정에 표시할 감지 수와 다음 작업의 고정 상한 설명을 반환합니다."""
+    preferences = addon_preferences(context)
+    configured = int(getattr(preferences, "cc_cpu_thread_limit", 0)) if preferences is not None else 0
+    detected, automatic, selected = cc_cpu_thread_counts(configured)
+    mode = "자동" if configured == 0 else "수동"
+    return f"감지 {detected}개 · {mode} {selected}개 · 다음 작업부터 적용"
+
+
 def bundled_small_gicp_python_path() -> str:
     """설치된 애드온 내부 Small GICP CPython 실행 파일의 상대 경로를 반환합니다."""
 
     return str(Path(__file__).resolve().parent / "runtime" / "python" / "python.exe")
 
 
+def bundled_cccore_python_path() -> str:
+    """설치 패키지 또는 명시된 실험 소스의 전용 Python 실행 파일만 찾습니다."""
+    align_root = Path(__file__).resolve().parent
+    bundled = align_root / "runtime" / "python" / "python.exe"
+    if bundled.is_file():
+        return str(bundled)
+    source_root = align_root.parent.parent
+    if (source_root / "test_env" / "manage.py").is_file():
+        development = source_root.parent / "runtime" / "python" / "python.exe"
+        if development.is_file():
+            return str(development)
+    return ""
+
+
 def configured_icp_python_path(context: Any | None = None) -> str:
-    """Small GICP 배포판은 내장 경로를, Full 빌드는 설정한 외부 경로를 반환합니다."""
-
-    if not includes_optional_backends():
-        return bundled_small_gicp_python_path()
-
-    preferences = addon_preferences(context)
-    return str(getattr(preferences, "open3d_python_path", "")).strip()
+    """개발 프로필의 명시적 경로를 우선하고 그 외에는 CC 전용 런타임을 반환합니다."""
+    if includes_optional_backends():
+        preferences = addon_preferences(context)
+        configured = str(getattr(preferences, "open3d_python_path", "")).strip()
+        if configured:
+            return configured
+    return bundled_cccore_python_path()
 
 
 class COLMAPALIGN_PG_settings(bpy.types.PropertyGroup):
@@ -221,6 +280,11 @@ class COLMAPALIGN_PG_settings(bpy.types.PropertyGroup):
         description="다음 COLMAP 파일 탐색기를 열 때 사용할 마지막 선택 경로입니다.",
         subtype="DIR_PATH",
         options={"HIDDEN"},
+    )
+    import_companion_obj: BoolProperty(
+        name="OBJ 함께 불러오기",
+        description="다음 COLMAP 가져오기에서 루트 OBJ를 함께 연결할지 결정합니다",
+        default=True,
     )
     import_input_format: EnumProperty(
         name="Input Format",
@@ -320,7 +384,7 @@ class COLMAPALIGN_PG_settings(bpy.types.PropertyGroup):
     )
     marker_use_uniform_scale: BoolProperty(
         name="Marker Refine Scale",
-        description="3점 이상 마커 행렬만으로 제한 없는 균일 스케일을 계산해 마커 정렬에 적용합니다",
+        description="3점 이상 마커로 초기 정렬의 균일 스케일을 계산합니다. 자동 CC 정렬의 초기값 대비 최대 ±10% 배율 보정과는 별도입니다",
         default=True,
     )
     icp_preset: EnumProperty(
@@ -335,7 +399,7 @@ class COLMAPALIGN_PG_settings(bpy.types.PropertyGroup):
     )
     icp_solver_backend: EnumProperty(
         name="ICP Backend",
-        description="마커 미리보기 또는 현재 P 위치에서 실행할 ICP backend입니다.",
+        description="마커 미리보기 또는 현재 P 위치에서 시작할 정렬 엔진의 내부 식별자입니다.",
         items=icp_backend_enum_items(),
         default=default_icp_backend(),
         update=_on_icp_solver_backend_changed,

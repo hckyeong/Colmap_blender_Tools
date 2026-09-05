@@ -8,6 +8,8 @@ import unicodedata
 
 import bpy
 
+from ..alignment.icp_geometry import geometry_mode_summary
+from ..axis_settings import axis_edit_active_block_reason, axis_edit_block_reason
 from ..constants import (
     CONTROL_PANEL_CATEGORY,
     ICP_ALIGNMENT_PHASE_CANCEL_PENDING,
@@ -53,6 +55,7 @@ from ..project_persistence.runtime import (
 )
 from ..session import is_align_workspace_for_window, is_session_active_for_window
 from ..state import RUNTIME
+from ..viewport.point_data import surface_model_data_for_id
 from ..viewport.registry import role_for_area
 from .import_status import import_status_view
 
@@ -225,6 +228,7 @@ _SCALE_REFINE_STATUS_LABELS = {
     "REJECTED": "거부",
 }
 _ICP_BACKEND_LABELS = {
+    "CCCORELIB": "CC 정밀 정렬",
     "CUSTOM_HYBRID": "기존 Hybrid",
     "OPEN3D_GICP": "Open3D GICP",
     "SMALL_GICP": "small_gicp GICP",
@@ -306,6 +310,9 @@ def _icp_progress_entries() -> tuple[str, ...]:
     progress = getattr(state, "progress", None)
     if progress is None:
         return ("ICP · 입력 준비 중",)
+    if str(getattr(progress, "backend_id", "")).strip().upper() == "CCCORELIB":
+        message = str(getattr(progress, "message", "") or "").strip()
+        return (message or "CC 정렬 · 계산 중",)
     stage = str(getattr(progress, "stage", "")).strip()
     level_name = str(getattr(progress, "level_name", "")).strip()
     iteration = _nonnegative_count(getattr(progress, "iteration", 0)) or 0
@@ -381,12 +388,66 @@ def _icp_progress_entries() -> tuple[str, ...]:
     return (entries[-1] if entries else "ICP · 계산 중",)
 
 
+def _cccore_metric_entries(label: str, metrics) -> tuple[str, ...]:
+    """CC의 독립 거리 평가와 잔차 분포를 기존 평면 지표와 구분해 표시합니다."""
+    if not isinstance(metrics, Mapping):
+        return ()
+    distance_parts = []
+    distribution_parts = []
+    for key, name in (("rms", "거리 RMS"), ("trimmed_rms_90", "가까운 90% RMS")):
+        value = _finite_metric(metrics.get(key), precision=5)
+        if value:
+            distance_parts.append(f"{name} {value}")
+    for key, name in (("median", "중앙값"), ("p95", "95백분위 거리")):
+        value = _finite_metric(metrics.get(key), precision=5)
+        if value:
+            distribution_parts.append(f"{name} {value}")
+    count = _nonnegative_count(metrics.get("count"))
+    if count is not None:
+        distribution_parts.append(f"평가점 {count:,}개")
+    entries = []
+    if distance_parts:
+        entries.append(f"{label} · " + " · ".join(distance_parts))
+    if distribution_parts:
+        entries.append(f"{label} 분포 · " + " · ".join(distribution_parts))
+    return tuple(entries)
+
+
+def _cccore_result_entries(result, state) -> tuple[str, ...]:
+    """CC 결과의 거리 평가·추가 배율·사용자 검토 사유만 상태 로그에 표시합니다."""
+    metadata = getattr(result, "metadata", {})
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    quality = getattr(result, "quality", {})
+    quality = quality if isinstance(quality, Mapping) else {}
+    status = str(quality.get("status", metadata.get("quality", ""))).strip().upper()
+    entries = ["정렬 엔진 · CC 정밀 정렬", f"상태 · {_ICP_QUALITY_LABELS.get(status, '결과 확인 필요')}"]
+    seed = getattr(getattr(state, "input_data", None), "seed", None)
+    baseline_label = "마커 초기값" if bool(getattr(seed, "uses_marker_preview", False)) else "초기 위치"
+    baseline = metadata.get("baseline_metrics")
+    candidate = metadata.get("best_candidate_metrics")
+    entries.extend(_cccore_metric_entries(baseline_label, baseline))
+    entries.extend(_cccore_metric_entries("최선 결과", candidate))
+    if isinstance(baseline, Mapping) and isinstance(candidate, Mapping):
+        improvement = _improvement_percent(baseline.get("trimmed_rms_90"), candidate.get("trimmed_rms_90"))
+        if improvement:
+            entries.append(f"가까운 90% 거리 RMS 개선 · {improvement}")
+    scale = _finite_metric_value(getattr(getattr(result, "icp_delta", None), "uniform_scale", None))
+    if scale is not None and scale > 0:
+        entries.append(f"추가 균일 스케일 · ×{scale:.7g} ({(scale - 1.0) * 100.0:+.2f}%)")
+    reasons = metadata.get("review_reasons", quality.get("reasons", ()))
+    if isinstance(reasons, (tuple, list)):
+        entries.extend(f"검토 · {reason}" for reason in reasons if isinstance(reason, str) and reason.strip())
+    return tuple(entries)
+
+
 def _icp_result_entries() -> tuple[str, ...]:
-    """완료 후보의 raw·분포 가중 RMS와 잔차 분포를 구분해 반환합니다."""
+    """완료 엔진에 맞는 CC 거리 또는 기존 평가 항목을 구분해 반환합니다."""
     state = getattr(RUNTIME, "icp_alignment", None)
     result = getattr(state, "result", None)
     if result is None:
         return ("ICP 결과를 확인하는 중입니다.",)
+    if str(getattr(result, "solver_backend", "")).strip().upper() == "CCCORELIB":
+        return _cccore_result_entries(result, state)
     quality = getattr(result, "quality", {})
     if not isinstance(quality, Mapping):
         quality = {}
@@ -763,6 +824,78 @@ class COLMAPALIGN_PT_main(bpy.types.Panel):
             )
 
 
+def _draw_data_layer_row(layout, model, catalog, *, importing: bool, selection_locked: bool) -> None:
+    """클릭 대상 ID와 내장 OBJ 면 수를 각 데이터셋 한 행에 표시합니다."""
+    is_active = model.registration_status == MODEL_STATUS_REGISTERED
+    is_selected = model.model_id in catalog.selected_model_ids
+    is_colmap = getattr(model, "geometry_kind", "COLMAP_POINT_CLOUD") == "COLMAP_POINT_CLOUD"
+    surface_model = surface_model_data_for_id(model.model_id)
+    embedded_status = ""
+    if bool(getattr(surface_model, "embedded_asset_uuid", "")):
+        embedded_status = (
+            f" · OBJ 내장됨 · 원본 면 {int(surface_model.original_polygon_count):,}"
+            f" / 삼각면 {int(surface_model.proxy_triangle_count):,}"
+        )
+    row = layout.row(align=True)
+    row.enabled = not importing
+    name_row = row.row(align=True)
+    name_row.enabled = not selection_locked
+    name_row.active = is_active
+    operator = name_row.operator(
+        "colmap_align.select_data_layer",
+        text=f"{model.display_name} · {'COLMAP' if is_colmap else 'OBJ'}{embedded_status}",
+        icon="PINNED" if is_active else "BLANK1",
+        emboss=is_selected,
+        depress=is_selected,
+    )
+    operator.model_id = model.model_id
+    points_row = row.row(align=True)
+    points_row.enabled = is_colmap
+    points = points_row.operator(
+        "colmap_align.toggle_data_layer_geometry",
+        text="",
+        icon="POINTCLOUD_DATA",
+        depress=is_colmap and model.show_points,
+    )
+    points.model_id = model.model_id
+    points.geometry_kind = "COLMAP_POINT_CLOUD"
+    mesh_row = row.row(align=True)
+    mesh_row.enabled = surface_model is not None
+    mesh = mesh_row.operator(
+        "colmap_align.toggle_data_layer_geometry",
+        text="",
+        icon="MESH_DATA",
+        depress=mesh_row.enabled and model.show_surface,
+    )
+    mesh.model_id = model.model_id
+    mesh.geometry_kind = "TRIANGLE_MESH"
+    axes_row = row.row(align=True)
+    axes_row.enabled = axis_edit_block_reason(RUNTIME, model.model_id) is None
+    axes = axes_row.operator("colmap_align.edit_geometry_axes", text="", icon="PREFERENCES")
+    axes.model_id = model.model_id
+    visibility = row.operator(
+        "colmap_align.toggle_data_layer_visibility",
+        text="",
+        icon="HIDE_OFF" if model.is_visible else "HIDE_ON",
+        emboss=False,
+    )
+    visibility.model_id = model.model_id
+
+
+def _draw_marker_target_visibility(layout, catalog) -> None:
+    """역할별 형상 고정·충돌과 숨겨진 P 대상만 마커 영역에 안내합니다."""
+    state = RUNTIME.marker_selection
+    message = state.geometry_status_message()
+    if message:
+        layout.label(text=message, icon="ERROR" if state.geometry_conflict_message() else "INFO")
+    reason = state.draft_geometry_rejection_message() if state.has_draft else None
+    if reason and reason != message:
+        layout.label(text=reason, icon="ERROR")
+    moving = catalog.selected_inactive_model
+    if moving is not None and not moving.is_visible:
+        layout.label(text=f"{moving.display_name}: 마커를 지정하려면 레이어를 표시하십시오.", icon="INFO")
+
+
 class COLMAPALIGN_PT_data_layers(bpy.types.Panel):
     """Runtime 카탈로그를 단순 Data Layers 목록으로 표시합니다."""
 
@@ -780,7 +913,7 @@ class COLMAPALIGN_PT_data_layers(bpy.types.Panel):
         return _moving_panel_poll(context)
 
     def draw(self, context):
-        """가져오기 동작·진행 상태와 Runtime 카탈로그 행을 분리해 그립니다."""
+        """데이터셋마다 한 행에 선택·점군·메시·축 설정·전체 표시를 그립니다."""
         layout = self.layout
         _set_session_layout_enabled(layout, context)
         if _draw_project_restore(layout):
@@ -792,13 +925,16 @@ class COLMAPALIGN_PT_data_layers(bpy.types.Panel):
         merge_locked = is_merge_export_input_locked()
         obj_locked = is_obj_export_input_locked()
         export_locked = merge_locked or obj_locked
+        axes_locked = axis_edit_active_block_reason(RUNTIME) is not None
         if job is None:
             button_text = "COLMAP 모델 불러오기" if not catalog.models else "COLMAP 모델 추가"
             import_row = layout.row()
-            import_row.enabled = not preview_active and not icp_locked and not export_locked
+            import_row.enabled = not preview_active and not icp_locked and not export_locked and not axes_locked
             import_row.operator("colmap_align.import_model", text=button_text, icon="IMPORT")
             import_row.operator("colmap_align.import_obj", text="OBJ 추가", icon="MESH_DATA")
-            if icp_locked:
+            if axes_locked:
+                layout.label(text="축 설정을 적용하거나 취소한 뒤 레이어를 변경하십시오.", icon="LOCKED")
+            elif icp_locked:
                 layout.label(text="ICP 실행 또는 결과 미리보기 중에는 가져오기와 레이어 변경이 잠깁니다.", icon="LOCKED")
             elif preview_active:
                 layout.label(text="마커 미리보기 중에는 가져오기와 레이어 변경이 잠깁니다.", icon="LOCKED")
@@ -833,34 +969,14 @@ class COLMAPALIGN_PT_data_layers(bpy.types.Panel):
             source_column.label(text=f"표시 축: {status.axis_text}")
             layout.operator("colmap_align.cancel_import_model", text="가져오기 취소", icon="CANCEL")
         for model in (*catalog.active_models(), *catalog.inactive_models()):
-            is_active = model.registration_status == MODEL_STATUS_REGISTERED
-            # Data Layers는 A/P를 나누지 않은 공통 다중 선택과 마지막 활성 행을 함께 표시합니다.
-            is_selected = model.model_id in catalog.selected_model_ids
-            row = layout.row(align=True)
-            row.enabled = job is None and not preview_active and not icp_locked and not export_locked
-            # 파일명과 짧은 형상 종류를 하나의 선택 버튼에 표시해 별도 종류 열을 없앱니다.
-            name_row = row.row(align=True)
-            name_row.active = is_active
-            geometry_label = (
-                "OBJ"
-                if getattr(model, "geometry_kind", "COLMAP_POINT_CLOUD") == "TRIANGLE_MESH"
-                else "COLMAP"
+            _draw_data_layer_row(
+                layout,
+                model,
+                catalog,
+                importing=job is not None,
+                selection_locked=preview_active or icp_locked or export_locked or axes_locked,
             )
-            operator = name_row.operator(
-                "colmap_align.select_data_layer",
-                text=f"{model.display_name} · {geometry_label}",
-                icon=("PINNED" if is_active else "BLANK1"),
-                emboss=is_selected,
-                depress=is_selected,
-            )
-            operator.model_id = model.model_id
-            visibility = row.operator(
-                "colmap_align.toggle_data_layer_visibility",
-                text="",
-                icon="HIDE_OFF" if model.is_visible else "HIDE_ON",
-                emboss=False,
-            )
-            visibility.model_id = model.model_id
+
 
 
 class COLMAPALIGN_PT_viewport(bpy.types.Panel):
@@ -918,7 +1034,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         return _moving_panel_poll(context)
 
     def draw(self, context):
-        """마커 편집 UI와 marker preview 전환·수치 요약을 함께 그립니다."""
+        """현재 대상의 숨김 점군 안내와 마커 편집·미리보기·수치 요약을 그립니다."""
         layout = self.layout
         _configure_layout(layout)
         _set_session_layout_enabled(layout, context)
@@ -934,12 +1050,14 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         merge_locked = is_merge_export_input_locked()
         obj_locked = is_obj_export_input_locked()
         export_locked = merge_locked or obj_locked
+        _draw_marker_target_visibility(layout, catalog)
         editing_layout = layout.column()
         editing_layout.enabled = (
             not RUNTIME.import_in_progress
             and not preview_active
             and not icp_locked
             and not export_locked
+            and axis_edit_active_block_reason(RUNTIME) is None
         )
         pair_list = marker_pair_list(context.window_manager)
         if pair_list is not None:
@@ -1050,7 +1168,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
 
         if preview_active or direct_align_ready:
             preview_box.label(
-                text=f"기준: A 그룹 전체 {len(catalog.active_models())}개 · 이동: P 레이어 1개",
+                text=geometry_mode_summary(RUNTIME) + " · 숨긴 A 포함",
                 icon="OUTLINER_OB_GROUP_INSTANCE",
             )
 
@@ -1073,7 +1191,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         if direct_align_ready and not preview_active:
             status_start_reason = align_reason or (
                 f"자동 정렬 · A 그룹 전체 {len(catalog.active_models())}개 기준 · "
-                "Small GICP 정밀 후 Refine 정밀을 실행합니다."
+                "CC 강체 정렬 후 초기값 대비 최대 ±10% 배율 보정을 실행합니다."
             )
             status_direct_align_ready = False
         log_entries = wrapped_marker_align_status_entries(

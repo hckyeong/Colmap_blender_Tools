@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -227,11 +229,15 @@ def _mesh_source(label: str):
 
 
 def test_schema_v3_roundtrip_preserves_surface_positions() -> None:
-    """schema v3 canonical JSON roundtrip이 면 ID와 Source Local 선택 좌표를 손실 없이 보존하는지 확인합니다."""
+    """기존 v3 면 마커를 현재 저장 형식으로 왕복해 면 ID와 원본 선택 좌표를 보존하는지 확인합니다."""
 
-    from tools.align.constants import MARKER_POINT_KIND_MESH_SURFACE
+    from tools.align.constants import MARKER_POINT_KIND_MESH_SURFACE, PROJECT_PERSISTENCE_SCHEMA_VERSION
     from tools.align.display_axes import identity_display_transform
-    from tools.align.project_persistence.codec import decode_project_state, encode_project_state
+    from tools.align.project_persistence.codec import (
+        _snapshot_mapping,
+        decode_project_state,
+        payload_fingerprint_for_snapshot,
+    )
     from tools.align.project_persistence.runtime import _restored_marker_snapshot
     from tools.align.project_persistence.types import (
         ProjectCatalogSnapshot,
@@ -291,8 +297,16 @@ def test_schema_v3_roundtrip_preserves_surface_positions() -> None:
             ),
         ),
     )
-    restored = decode_project_state(encode_project_state(snapshot))
-    assert restored.schema_version == 3
+    stored = replace(snapshot, payload_fingerprint=payload_fingerprint_for_snapshot(snapshot))
+    legacy_payload = json.dumps(
+        _snapshot_mapping(stored, include_fingerprint=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    restored = decode_project_state(legacy_payload)
+    assert restored.schema_version == PROJECT_PERSISTENCE_SCHEMA_VERSION
     pair = restored.markers.completed_pairs[0]
     assert pair.reference.local_position == (0.3, 0.2, 0.0)
     assert pair.moving.local_position == (0.2, 0.3, 0.0)

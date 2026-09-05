@@ -1,4 +1,4 @@
-"""원본 OBJ를 줄 단위로 읽어 삼각형 정점·face-corner UV 배열로 확정합니다."""
+"""원본 OBJ를 줄 단위로 읽어 삼각형 프록시와 선택적 Polygon 배열로 확정합니다."""
 
 from __future__ import annotations
 
@@ -9,14 +9,22 @@ from typing import Callable, TextIO
 
 import numpy as np
 
-from ..constants import OBJ_MAX_TEXTURE_COORDINATES, OBJ_MAX_TRIANGLE_FACES
 from .types import MeshImportProgress
 from .obj_materials import ObjMaterialError, resolve_obj_materials, split_obj_arguments
 from .validation import MeshValidationError, validate_obj_limits, validate_triangle_mesh
 
 
 class ObjReaderError(MeshValidationError):
-    """OBJ 문법·파일 읽기·삼각면 제한 오류를 나타냅니다."""
+    """OBJ 문법·파일 읽기·선택적 호출 제한 오류를 나타냅니다."""
+
+
+def _normalize_max_faces(value: int | None) -> int | None:
+    """기본 무제한 또는 호출자가 지정한 양의 삼각면 제한을 정규화합니다."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or int(value) < 1:
+        raise ObjReaderError("OBJ 삼각면 호출 제한은 1개 이상이어야 합니다.")
+    return int(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +41,11 @@ class ObjParseResult:
     registration_vertex_indices: np.ndarray
     bounds_min: np.ndarray
     bounds_max: np.ndarray
+    polygon_loop_starts_uint32: np.ndarray
+    polygon_loop_totals_uint32: np.ndarray
+    loop_vertex_indices_uint32: np.ndarray
+    loop_texcoord_indices_int32: np.ndarray
+    polygon_material_indices_int32: np.ndarray
 
     @property
     def vertex_count(self) -> int:
@@ -43,6 +56,30 @@ class ObjParseResult:
     def triangle_count(self) -> int:
         """파싱된 유효 삼각면 개수를 반환합니다."""
         return int(self.triangles_uint32.shape[0])
+
+    @property
+    def polygon_count(self) -> int:
+        """파싱된 원본 Polygon 개수를 반환합니다."""
+
+        return int(self.polygon_loop_starts_uint32.shape[0])
+
+    @property
+    def textured_polygon_count(self) -> int:
+        """모든 Corner에 UV가 연결된 원본 Polygon 개수를 반환합니다."""
+
+        if self.polygon_count == 0:
+            return 0
+        count = 0
+        for start, total in zip(
+            self.polygon_loop_starts_uint32,
+            self.polygon_loop_totals_uint32,
+            strict=True,
+        ):
+            begin = int(start)
+            end = begin + int(total)
+            if np.all(self.loop_texcoord_indices_int32[begin:end] >= 0):
+                count += 1
+        return count
 
     @property
     def texture_coordinate_count(self) -> int:
@@ -80,6 +117,17 @@ class _ObjMaterialParseState:
     library_references: list[str]
     face_material_names: list[str | None]
     current_material_name: str | None = None
+
+
+@dataclass(slots=True)
+class _ObjPolygonParseState:
+    """가변 Corner Polygon의 Loop 범위와 정점·UV·재질 연결을 누적합니다."""
+
+    loop_starts: list[int]
+    loop_totals: list[int]
+    loop_vertex_indices: list[int]
+    loop_texcoord_indices: list[int]
+    material_names: list[str | None]
 
 
 def _parse_float(token: str, label: str) -> float:
@@ -169,9 +217,12 @@ def _parse_line(
     texcoord_component_counts: list[int],
     triangle_texcoords: list[tuple[int, int, int]],
     material_state: _ObjMaterialParseState,
-    max_faces: int,
+    max_faces: int | None,
+    geometry_only: bool = False,
+    preserve_polygons: bool = False,
+    polygon_state: _ObjPolygonParseState | None = None,
 ) -> None:
-    """OBJ 한 줄에서 원본 정점·UV 또는 삼각면 하나를 누적합니다."""
+    """OBJ 한 줄을 삼각형 프록시와 선택적 가변 Corner Polygon으로 누적합니다."""
     stripped = raw_line.split("#", 1)[0].strip()
     if not stripped:
         return
@@ -184,14 +235,12 @@ def _parse_line(
             raise ObjReaderError("OBJ 정점 수가 uint32 인덱스 범위를 초과했습니다.")
         vertices.append(tuple(_parse_float(token, "정점") for token in fields[1:4]))
         return
+    if geometry_only and record != "f":
+        return
     if record == "vt":
         component_count = len(fields) - 1
         if component_count < 1 or component_count > 3:
             raise ObjReaderError(f"OBJ UV 레코드는 1~3개 성분이어야 합니다 (line {line_count}).")
-        if len(texcoords) >= OBJ_MAX_TEXTURE_COORDINATES:
-            raise ObjReaderError(
-                f"OBJ UV 좌표 수가 {OBJ_MAX_TEXTURE_COORDINATES:,}개 제한을 초과했습니다."
-            )
         values = [_parse_float(token, "UV") for token in fields[1:]]
         values.extend((0.0,) * (3 - component_count))
         texcoords.append((values[0], values[1], values[2]))
@@ -217,27 +266,47 @@ def _parse_line(
     if record != "f":
         # vn, o, g, s 등은 현재 형상·UV·diffuse 재질 계약에 영향을 주지 않습니다.
         return
-    if len(fields) != 4:
+    corner_count = len(fields) - 1
+    if corner_count < 3 or (not preserve_polygons and corner_count != 3):
         raise ObjReaderError(
             f"OBJ face는 삼각형 정점 세 개만 지원합니다 (line {line_count})."
+            if not preserve_polygons
+            else f"OBJ Polygon은 Corner가 세 개 이상이어야 합니다 (line {line_count})."
         )
-    if len(triangles) >= max_faces:
-        raise ObjReaderError("OBJ 삼각면 수가 600,000개 제한을 초과했습니다.")
+    added_triangle_count = corner_count - 2
+    if max_faces is not None and len(triangles) + added_triangle_count > max_faces:
+        raise ObjReaderError(
+            f"OBJ 삼각면 수가 {max_faces:,}개 호출 제한을 초과했습니다."
+        )
     corners = tuple(
-        _face_corner_indices(token, len(vertices), len(texcoords))
-        for token in fields[1:4]
+        (_face_index(token, len(vertices)), -1)
+        if geometry_only
+        else _face_corner_indices(token, len(vertices), len(texcoords))
+        for token in fields[1:]
     )
     indices = tuple(corner[0] for corner in corners)
     uv_indices = tuple(corner[1] for corner in corners)
-    if len(set(indices)) != 3:
+    if len(set(indices)) != corner_count:
         raise ObjReaderError(f"OBJ face가 같은 정점 인덱스를 반복합니다 (line {line_count}).")
     if any(index >= 0 for index in uv_indices) and not all(index >= 0 for index in uv_indices):
         raise ObjReaderError(
-            f"OBJ 한 face의 세 꼭짓점은 모두 UV가 있거나 모두 없어야 합니다 (line {line_count})."
+            f"OBJ 한 face의 모든 Corner는 모두 UV가 있거나 모두 없어야 합니다 (line {line_count})."
         )
-    triangles.append(indices)
-    triangle_texcoords.append(uv_indices)
-    material_state.face_material_names.append(material_state.current_material_name)
+    if preserve_polygons:
+        if polygon_state is None:
+            raise ObjReaderError("OBJ Polygon 누적 상태가 준비되지 않았습니다.")
+        polygon_state.loop_starts.append(len(polygon_state.loop_vertex_indices))
+        polygon_state.loop_totals.append(corner_count)
+        polygon_state.loop_vertex_indices.extend(indices)
+        polygon_state.loop_texcoord_indices.extend(uv_indices)
+        polygon_state.material_names.append(material_state.current_material_name)
+    for corner_index in range(1, corner_count - 1):
+        triangle = (indices[0], indices[corner_index], indices[corner_index + 1])
+        triangle_uv = (uv_indices[0], uv_indices[corner_index], uv_indices[corner_index + 1])
+        triangles.append(triangle)
+        if not geometry_only:
+            triangle_texcoords.append(triangle_uv)
+            material_state.face_material_names.append(material_state.current_material_name)
 
 
 def _finalize(
@@ -248,8 +317,11 @@ def _finalize(
     triangle_texcoords: list[tuple[int, int, int]],
     source_path: Path,
     material_state: _ObjMaterialParseState,
+    geometry_only: bool = False,
+    preserve_polygons: bool = False,
+    polygon_state: _ObjPolygonParseState | None = None,
 ) -> ObjParseResult:
-    """누적 형상·UV·재질을 불변 배열로 확정하고 등록 정점을 계산합니다."""
+    """프록시와 Polygon 배열을 확정하고 형상 전용 읽기에서는 재질 접근을 생략합니다."""
     vertex_array, triangle_array = validate_triangle_mesh(vertices, triangles)
     validate_obj_limits(vertex_count=vertex_array.shape[0], triangle_count=triangle_array.shape[0])
     registration = np.unique(triangle_array.reshape(-1)).astype(np.uint32, copy=False)
@@ -263,17 +335,58 @@ def _finalize(
     component_count_array = np.ascontiguousarray(
         np.asarray(texcoord_component_counts, dtype=np.uint8).reshape((-1,))
     )
-    triangle_texcoord_array = np.ascontiguousarray(
-        np.asarray(triangle_texcoords, dtype=np.int32).reshape((-1, 3))
+    triangle_texcoord_array = (
+        np.full(triangle_array.shape, -1, dtype=np.int32)
+        if geometry_only
+        else np.ascontiguousarray(
+            np.asarray(triangle_texcoords, dtype=np.int32).reshape((-1, 3))
+        )
     )
     texcoord_array.setflags(write=False)
     component_count_array.setflags(write=False)
     triangle_texcoord_array.setflags(write=False)
-    materials, triangle_material_indices = resolve_obj_materials(
-        source_path,
-        material_state.library_references,
-        material_state.face_material_names,
-    )
+    if geometry_only:
+        materials = ()
+        triangle_material_indices = np.full((triangle_array.shape[0],), -1, dtype=np.int32)
+        triangle_material_indices.setflags(write=False)
+    else:
+        materials, triangle_material_indices = resolve_obj_materials(
+            source_path,
+            material_state.library_references,
+            material_state.face_material_names,
+        )
+    if preserve_polygons:
+        if polygon_state is None:
+            raise ObjReaderError("OBJ Polygon 확정 상태가 준비되지 않았습니다.")
+        polygon_starts = np.ascontiguousarray(polygon_state.loop_starts, dtype=np.uint32)
+        polygon_totals = np.ascontiguousarray(polygon_state.loop_totals, dtype=np.uint32)
+        loop_vertices = np.ascontiguousarray(polygon_state.loop_vertex_indices, dtype=np.uint32)
+        loop_texcoords = np.ascontiguousarray(polygon_state.loop_texcoord_indices, dtype=np.int32)
+        if geometry_only:
+            polygon_material_indices = np.full((polygon_starts.shape[0],), -1, dtype=np.int32)
+        else:
+            material_lookup = {material.name: index for index, material in enumerate(materials)}
+            polygon_material_indices = np.asarray(
+                [
+                    -1 if name is None else material_lookup[name]
+                    for name in polygon_state.material_names
+                ],
+                dtype=np.int32,
+            )
+    else:
+        polygon_starts = np.arange(triangle_array.shape[0], dtype=np.uint32) * 3
+        polygon_totals = np.full((triangle_array.shape[0],), 3, dtype=np.uint32)
+        loop_vertices = np.ascontiguousarray(triangle_array.reshape((-1,)), dtype=np.uint32)
+        loop_texcoords = np.ascontiguousarray(triangle_texcoord_array.reshape((-1,)), dtype=np.int32)
+        polygon_material_indices = np.ascontiguousarray(triangle_material_indices, dtype=np.int32)
+    for array in (
+        polygon_starts,
+        polygon_totals,
+        loop_vertices,
+        loop_texcoords,
+        polygon_material_indices,
+    ):
+        array.setflags(write=False)
     return ObjParseResult(
         vertices_float64=vertex_array,
         triangles_uint32=triangle_array,
@@ -285,6 +398,11 @@ def _finalize(
         registration_vertex_indices=registration,
         bounds_min=bounds_min,
         bounds_max=bounds_max,
+        polygon_loop_starts_uint32=polygon_starts,
+        polygon_loop_totals_uint32=polygon_totals,
+        loop_vertex_indices_uint32=loop_vertices,
+        loop_texcoord_indices_int32=loop_texcoords,
+        polygon_material_indices_int32=polygon_material_indices,
     )
 
 
@@ -299,23 +417,24 @@ def _iter_lines(path: Path) -> TextIO:
 def read_obj(
     path: str | Path,
     *,
-    max_faces: int = OBJ_MAX_TRIANGLE_FACES,
+    max_faces: int | None = None,
     cancel_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[MeshImportProgress], None] | None = None,
+    geometry_only: bool = False,
+    preserve_polygons: bool = False,
 ) -> ObjParseResult:
-    """삼각형 OBJ를 줄 단위로 읽고 600,000면 이내 형상·UV 배열을 반환합니다."""
+    """OBJ를 읽고 기본 삼각형 API 또는 검증용 Polygon 배열을 반환합니다."""
     source_path = Path(path).expanduser()
     if source_path.suffix.casefold() != ".obj":
         raise ObjReaderError("OBJ 파일 확장자가 아닙니다.")
-    if int(max_faces) != OBJ_MAX_TRIANGLE_FACES:
-        # 1차 정책은 호출자가 임의로 완화하지 못하도록 고정합니다.
-        max_faces = OBJ_MAX_TRIANGLE_FACES
+    normalized_max_faces = _normalize_max_faces(max_faces)
     vertices: list[tuple[float, float, float]] = []
     triangles: list[tuple[int, int, int]] = []
     texcoords: list[tuple[float, float, float]] = []
     texcoord_component_counts: list[int] = []
     triangle_texcoords: list[tuple[int, int, int]] = []
     material_state = _ObjMaterialParseState([], [])
+    polygon_state = _ObjPolygonParseState([], [], [], [], []) if preserve_polygons else None
     line_count = 0
     stream = _iter_lines(source_path)
     try:
@@ -332,7 +451,10 @@ def read_obj(
                 texcoord_component_counts,
                 triangle_texcoords,
                 material_state,
-                int(max_faces),
+                normalized_max_faces,
+                geometry_only=geometry_only,
+                preserve_polygons=preserve_polygons,
+                polygon_state=polygon_state,
             )
             if progress_callback is not None and (line_count == 1 or line_count % 2048 == 0):
                 progress_callback(
@@ -342,7 +464,7 @@ def read_obj(
                         vertex_count=len(vertices),
                         texture_coordinate_count=len(texcoords),
                         triangle_count=len(triangles),
-                        message="OBJ 형상과 UV를 읽는 중",
+                        message="OBJ 형상을 읽는 중" if geometry_only else "OBJ 형상과 UV를 읽는 중",
                     )
                 )
     except UnicodeError as error:
@@ -358,6 +480,9 @@ def read_obj(
             triangle_texcoords,
             source_path,
             material_state,
+            geometry_only=geometry_only,
+            preserve_polygons=preserve_polygons,
+            polygon_state=polygon_state,
         )
     except (MeshValidationError, ObjMaterialError) as error:
         raise ObjReaderError(str(error)) from error
@@ -370,7 +495,7 @@ def read_obj(
                 texture_coordinate_count=result.texture_coordinate_count,
                 triangle_count=result.triangle_count,
                 fraction=1.0,
-                message="OBJ 형상과 UV 읽기 완료",
+                message="OBJ 형상 읽기 완료" if geometry_only else "OBJ 형상과 UV 읽기 완료",
             )
         )
     return result
@@ -382,10 +507,19 @@ parse_obj = read_obj
 class ObjReader:
     """TIMER 호출부가 OBJ 형상·UV read를 진행 상태와 함께 구동하도록 감싼 reader입니다."""
 
-    def __init__(self, path: str | Path, *, max_faces: int = OBJ_MAX_TRIANGLE_FACES) -> None:
-        """OBJ 경로와 하드 면·UV 제한을 저장하고 아직 읽지 않은 상태로 초기화합니다."""
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_faces: int | None = None,
+        geometry_only: bool = False,
+        preserve_polygons: bool = False,
+    ) -> None:
+        """OBJ 경로·읽기 모드·호출 제한을 저장하고 증분 읽기를 초기화합니다."""
         self.path = Path(path).expanduser()
-        self.max_faces = OBJ_MAX_TRIANGLE_FACES if int(max_faces) != OBJ_MAX_TRIANGLE_FACES else int(max_faces)
+        self.geometry_only = geometry_only
+        self.preserve_polygons = bool(preserve_polygons)
+        self.max_faces = _normalize_max_faces(max_faces)
         self.progress = MeshImportProgress(stage="FILE_CHECK")
         self.result: ObjParseResult | None = None
         self.error: Exception | None = None
@@ -398,6 +532,9 @@ class ObjReader:
         self._texcoord_component_counts: list[int] = []
         self._triangle_texcoords: list[tuple[int, int, int]] = []
         self._material_state = _ObjMaterialParseState([], [])
+        self._polygon_state = (
+            _ObjPolygonParseState([], [], [], [], []) if self.preserve_polygons else None
+        )
         self._line_count = 0
         try:
             self._total_bytes = max(1, int(self.path.stat().st_size))
@@ -429,7 +566,7 @@ class ObjReader:
         return min(1.0, completed_bytes / self._total_bytes)
 
     def _complete(self) -> None:
-        """누적 목록을 불변 배열로 확정하고 스트림·임시 목록을 해제합니다."""
+        """읽기 모드에 맞춰 불변 배열을 확정하고 스트림·임시 목록을 해제합니다."""
         self.result = _finalize(
             self._vertices,
             self._triangles,
@@ -438,6 +575,9 @@ class ObjReader:
             self._triangle_texcoords,
             self.path,
             self._material_state,
+            geometry_only=self.geometry_only,
+            preserve_polygons=self.preserve_polygons,
+            polygon_state=self._polygon_state,
         )
         self._vertices = []
         self._triangles = []
@@ -445,6 +585,7 @@ class ObjReader:
         self._texcoord_component_counts = []
         self._triangle_texcoords = []
         self._material_state = _ObjMaterialParseState([], [])
+        self._polygon_state = None
         self.done = True
         self._close_stream()
         self.progress = MeshImportProgress(
@@ -454,11 +595,11 @@ class ObjReader:
             texture_coordinate_count=self.result.texture_coordinate_count,
             triangle_count=self.result.triangle_count,
             fraction=1.0,
-            message="OBJ 형상과 UV 읽기 완료",
+            message="OBJ 형상 읽기 완료" if self.geometry_only else "OBJ 형상과 UV 읽기 완료",
         )
 
     def step(self, time_budget_seconds: float = 0.025) -> MeshImportProgress:
-        """한 TIMER tick에서 OBJ 읽기를 실행하고 완료·실패 상태를 갱신합니다."""
+        """한 TIMER에서 형상 전용 여부에 맞게 OBJ를 읽고 완료·실패 상태를 갱신합니다."""
         if self.done or self.cancelled:
             return self.progress
         try:
@@ -485,6 +626,9 @@ class ObjReader:
                     self._triangle_texcoords,
                     self._material_state,
                     self.max_faces,
+                    geometry_only=self.geometry_only,
+                    preserve_polygons=self.preserve_polygons,
+                    polygon_state=self._polygon_state,
                 )
                 if processed_this_step % 256 == 0 and perf_counter() - started_at >= budget:
                     self.progress = MeshImportProgress(
@@ -494,7 +638,7 @@ class ObjReader:
                         texture_coordinate_count=len(self._texcoords),
                         triangle_count=len(self._triangles),
                         fraction=self._fraction(),
-                        message="OBJ 형상과 UV를 읽는 중",
+                        message="OBJ 형상을 읽는 중" if self.geometry_only else "OBJ 형상과 UV를 읽는 중",
                     )
                     break
         except UnicodeError as error:
@@ -534,6 +678,7 @@ class ObjReader:
             self._texcoord_component_counts = []
             self._triangle_texcoords = []
             self._material_state = _ObjMaterialParseState([], [])
+            self._polygon_state = None
             self.progress = MeshImportProgress(stage="CANCELLED", message="OBJ 가져오기가 취소되었습니다.")
 
     @property

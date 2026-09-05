@@ -11,6 +11,8 @@ from mathutils import Vector
 
 from ..constants import (
     DRAFT_MODE_EDIT,
+    MARKER_GEOMETRY_SOURCE_MAIN,
+    MARKER_GEOMETRY_SOURCE_COMPANION,
     ICP_ALIGNMENT_PHASE_CANCEL_PENDING,
     ICP_ALIGNMENT_PHASE_PREPARING,
     ICP_ALIGNMENT_PHASE_PREVIEW,
@@ -20,9 +22,10 @@ from ..constants import (
     marker_pair_color,
 )
 from ..logging_utils import get_logger
+from ..marker_geometry import normalize_marker_geometry_source
 from ..state import RUNTIME
 from .picking import marker_source_model_ids
-from .point_data import effective_position_for_model_id
+from .point_data import effective_position_for_model_id, marker_geometry_is_visible
 
 
 _LOGGER = get_logger("viewport.labels")
@@ -68,7 +71,7 @@ def _project(region, region_3d, position: tuple[float, float, float]):
 
 
 def _marker_labels(role: str):
-    """현재 보이는 모델의 확정·드래프트 라벨만 중복 없이 반환합니다."""
+    """마커가 속한 형상이 보이는 확정·드래프트 라벨과 출처를 중복 없이 반환합니다."""
     state = RUNTIME.marker_selection
     labels = []
     visible_model_ids = set(marker_source_model_ids(role))
@@ -79,7 +82,11 @@ def _marker_labels(role: str):
         if pair.pair_id == suppressed_pair_id:
             continue
         point = pair.reference if role == ROLE_REFERENCE else pair.moving
-        if point.model_id and point.model_id not in visible_model_ids:
+        geometry_source = getattr(point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN)
+        if point.model_id and (
+            point.model_id not in visible_model_ids
+            or not marker_geometry_is_visible(point.model_id, geometry_source)
+        ):
             continue
         labels.append(
             (
@@ -88,12 +95,17 @@ def _marker_labels(role: str):
                 pair.pair_id,
                 pair.pair_id == state.active_pair_id,
                 point.model_id,
+                geometry_source,
             )
         )
     if draft is not None:
         point = draft.reference if role == ROLE_REFERENCE else draft.moving
         if point is not None:
-            if point.model_id and point.model_id not in visible_model_ids:
+            geometry_source = getattr(point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN)
+            if point.model_id and (
+                point.model_id not in visible_model_ids
+                or not marker_geometry_is_visible(point.model_id, geometry_source)
+            ):
                 return labels
             # 생성·편집 드래프트는 이전 UIList 선택과 무관하게 현재 후보를 강조합니다.
             labels.append(
@@ -103,6 +115,7 @@ def _marker_labels(role: str):
                     draft.pair_id,
                     True,
                     point.model_id,
+                    geometry_source,
                 )
             )
     return labels
@@ -113,9 +126,16 @@ def _marker_label_color(pair_id: int) -> tuple[float, float, float, float]:
     return marker_pair_color(pair_id)
 
 
-def _display_label_position(model_id: str, source_position):
-    """원본 마커 좌표를 점·원 마커와 같은 현재 Project World 좌표로 변환합니다."""
-    return effective_position_for_model_id(model_id, source_position)
+def _display_label_position(
+    model_id: str,
+    source_position,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
+):
+    """마커 출처의 축과 소유 모델의 공통 정렬을 적용해 원 마커와 같은 위치를 반환합니다."""
+    source = normalize_marker_geometry_source(geometry_source)
+    return effective_position_for_model_id(
+        model_id, source_position, companion=source == MARKER_GEOMETRY_SOURCE_COMPANION,
+    )
 
 
 def _log_display_transform_error_once(model_id: str, error: Exception) -> None:
@@ -207,7 +227,7 @@ def _icp_preview_summary(role: str) -> str:
 
 
 def draw_viewport_labels(role: str) -> None:
-    """현재 레이어, Marker Align, 드래프트 안내와 마커 번호를 화면에 그립니다."""
+    """레이어·정렬·입력 안내와 선택한 형상 축에 맞춘 마커 번호를 화면에 그립니다."""
     context = bpy.context
     region = context.region
     space = context.space_data
@@ -241,9 +261,9 @@ def draw_viewport_labels(role: str) -> None:
     if guide:
         draw_text(guide, 18.0, 24.0, 14.0, (1.0, 0.82, 0.22, 1.0))
 
-    for label, source_position, pair_id, is_active, model_id in _marker_labels(role):
+    for label, source_position, pair_id, is_active, model_id, geometry_source in _marker_labels(role):
         try:
-            position = _display_label_position(model_id, source_position)
+            position = _display_label_position(model_id, source_position, geometry_source)
         except Exception as error:
             _log_display_transform_error_once(model_id, error)
             continue

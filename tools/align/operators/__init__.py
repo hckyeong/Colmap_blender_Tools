@@ -1,5 +1,6 @@
 """COLMAP Align 1차 기술검증 오퍼레이터 모음입니다."""
 
+from .axis_settings import CLASSES as AXIS_SETTINGS_CLASSES
 from .export_model import CLASSES as EXPORT_MODEL_CLASSES
 from .export_obj import CLASSES as EXPORT_OBJ_CLASSES
 from .import_model import CLASSES as IMPORT_MODEL_CLASSES
@@ -16,6 +17,7 @@ from .workspace import CLASSES as WORKSPACE_CLASSES
 CLASSES = (
     WORKSPACE_CLASSES
     + MODEL_GROUP_CLASSES
+    + AXIS_SETTINGS_CLASSES
     + IMPORT_MODEL_CLASSES
     + IMPORT_MESH_CLASSES
     + LAYER_TRANSFORM_CLASSES

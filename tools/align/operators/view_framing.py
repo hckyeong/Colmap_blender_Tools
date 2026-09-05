@@ -50,7 +50,7 @@ def _set_frame_status(window: Any, role: str, message: str) -> None:
 
 
 def frame_visible_role_under_mouse(context: Any, event: Any) -> bool:
-    """마우스 아래 실제 A/P WINDOW만 찾아 해당 역할의 표시 집합을 맞춥니다."""
+    """마우스 아래 A/P 뷰에서 켜진 점군·표면 경계를 맞추고 전부 숨김을 정상 처리합니다."""
     window = getattr(context, "window", None)
     if window is None or not is_session_active_for_window(window):
         return False
@@ -78,10 +78,10 @@ def frame_visible_role_under_mouse(context: Any, event: Any) -> bool:
         _set_frame_status(
             window,
             role,
-            f"{role_label} 뷰에 화면 맞춤할 보이는 레이어가 없습니다.",
+            f"{role_label} 뷰에 화면 맞춤할 보이는 점군이나 표면이 없습니다.",
         )
     else:
-        _set_frame_status(window, role, f"{role_label} 그룹의 보이는 레이어 전체를 맞췄습니다.")
+        _set_frame_status(window, role, f"{role_label} 그룹의 보이는 점군과 표면 전체를 맞췄습니다.")
     return True
 
 

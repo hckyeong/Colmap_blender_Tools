@@ -15,11 +15,16 @@ from ..constants import (
     MARKER_ALIGNMENT_PHASE_PREVIEW,
     MARKER_ALIGNMENT_POSITION_TOLERANCE,
     MARKER_POINT_KIND_COLMAP,
+    MARKER_GEOMETRY_SOURCE_MAIN,
+    MARKER_GEOMETRY_SOURCE_COMPANION,
+    ROLE_REFERENCE,
+    ROLE_MOVING,
     MARKER_POINT_KIND_MESH_SURFACE,
     MARKER_POINT_KIND_MESH_VERTEX,
     MODEL_STATUS_REGISTERED,
 )
 from ..logging_utils import get_logger
+from ..marker_geometry import normalize_marker_geometry_source, resolve_marker_geometry
 from ..geometry_access import (
     geometry_kind_for_model,
     source_position_for_registration_id,
@@ -148,9 +153,17 @@ def _source_position_for_point(
 
 
 def _validate_saved_source_position(selected_point: Any, model: Any) -> np.ndarray:
-    """마커 Source Local 좌표가 현재 COLMAP 점·OBJ 정점·삼각면과 일치하는지 검증합니다."""
+    """선택한 형상 슬롯의 마커 종류와 실제 원본 점·정점·삼각면 좌표를 검증합니다."""
 
     point_kind = str(getattr(selected_point, "point_kind", MARKER_POINT_KIND_COLMAP)).strip().upper()
+    try:
+        geometry_source = normalize_marker_geometry_source(
+            getattr(selected_point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN),
+        )
+    except ValueError as error:
+        raise MarkerInputError(str(error)) from error
+    if geometry_source == MARKER_GEOMETRY_SOURCE_COMPANION and point_kind != MARKER_POINT_KIND_MESH_SURFACE:
+        raise MarkerInputError("연결 메시 마커는 원본 삼각면 위치만 사용할 수 있습니다.")
     point3d_id = getattr(selected_point, "point3d_id", None)
     source_point_id = getattr(selected_point, "source_point_id", None)
     if point_kind in {MARKER_POINT_KIND_MESH_VERTEX, MARKER_POINT_KIND_MESH_SURFACE}:
@@ -189,6 +202,19 @@ def _validate_saved_source_position(selected_point: Any, model: Any) -> np.ndarr
             "마커를 다시 지정하십시오."
         )
     return source_position
+
+
+
+def _geometry_for_selected_point(repository: Any, selected_point: Any):
+    """선택한 마커의 실제 원본과 축을 조회하며 누락을 정렬 입력 오류로 변환합니다."""
+    try:
+        return resolve_marker_geometry(
+            repository,
+            str(getattr(selected_point, "model_id", "")),
+            getattr(selected_point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN),
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise MarkerInputError(str(error)) from error
 
 
 def _project_source_position(
@@ -274,7 +300,7 @@ def _marker_signature(
     repository: Any,
     reference_model_ids: tuple[str, ...],
 ) -> tuple[str, tuple[tuple[str, int], ...]]:
-    """마커와 A 그룹 전체의 상태를 포함한 결정적 stale 검사용 signature를 만듭니다."""
+    """마커 슬롯·형상 리비전·원본 지문·선택 축·소유 정렬의 변경을 감지합니다."""
 
     model_ids = {moving_model_id, *reference_model_ids}
     for pair in pairs:
@@ -284,7 +310,7 @@ def _marker_signature(
         raise MarkerInputError("마커에 소유 모델 ID가 없는 점이 있습니다.")
 
     digest = hashlib.blake2b(digest_size=20)
-    digest.update(b"marker-alignment-v1\0")
+    digest.update(b"marker-alignment-v2\0")
     digest.update(moving_model_id.encode("utf-8"))
     digest.update(b"\0")
     for pair in pairs:
@@ -302,8 +328,20 @@ def _marker_signature(
             )
             if local_position.shape != (3,) or not np.isfinite(local_position).all():
                 raise MarkerInputError("마커 signature에 사용할 Source Local 좌표가 올바르지 않습니다.")
+            geometry = _geometry_for_selected_point(repository, selected_point)
+            geometry_revision = int(getattr(geometry.model_data, "geometry_revision", -1))
+            if geometry_revision < 0:
+                raise MarkerInputError("마커 형상의 리비전이 올바르지 않습니다.")
             digest.update(model_id.encode("utf-8"))
             digest.update(b"\0")
+            for value in (
+                geometry.geometry_source,
+                str(geometry_revision),
+                geometry.source_fingerprint,
+                geometry.display_transform.fingerprint,
+            ):
+                digest.update(value.encode("utf-8"))
+                digest.update(b"\0")
             digest.update(point_kind.encode("ascii"))
             digest.update(b"\0")
             digest.update(str(point_id).encode("ascii"))
@@ -368,7 +406,13 @@ def _current_alignment_signature(
 
 
 def create_marker_alignment_input(runtime: Any) -> MarkerAlignmentInput:
-    """현재 A/P 마커와 Repository snapshot을 immutable Project World solver 입력으로 만듭니다."""
+    """역할별 종류를 검증하고 각 마커의 선택 형상 축·소유 정렬로 계산 입력을 만듭니다."""
+
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(runtime)
+    if axis_reason is not None:
+        raise MarkerInputError(axis_reason)
 
     if not bool(getattr(runtime, "session_active", False)):
         raise MarkerInputError("활성 COLMAP Align 세션에서만 마커 정렬을 시작할 수 있습니다.")
@@ -380,6 +424,10 @@ def create_marker_alignment_input(runtime: Any) -> MarkerAlignmentInput:
         raise MarkerInputError("마커 선택 상태가 없습니다.")
     if bool(getattr(selection, "has_draft", False)):
         raise MarkerInputError("마커 생성 또는 편집을 확정하거나 취소한 뒤 정렬하십시오.")
+    conflict_resolver = getattr(selection, "geometry_conflict_message", None)
+    conflict = conflict_resolver() if callable(conflict_resolver) else None
+    if conflict:
+        raise MarkerInputError(str(conflict))
     raw_pairs = getattr(selection, "completed_pairs", ())
     pairs = tuple(sorted(tuple(raw_pairs), key=lambda pair: int(getattr(pair, "pair_id", 0))))
     if len(pairs) < 3:
@@ -392,9 +440,12 @@ def create_marker_alignment_input(runtime: Any) -> MarkerAlignmentInput:
     if moving_model_id not in repository.models:
         raise MarkerInputError("선택한 P 데이터 레이어가 COLMAP 저장소에 없습니다.")
     reference_model_ids = _active_reference_model_ids(runtime)
-    moving_model = repository.models[moving_model_id]
     moving_alignment = _alignment_for_model(repository, moving_model_id)
-    moving_display_transform = _display_transform_for_model(repository, moving_model_id)
+    role_kind_resolver = getattr(selection, "role_geometry_kind", None)
+    role_kinds = {
+        role: (role_kind_resolver(role) if callable(role_kind_resolver) else None)
+        for role in (ROLE_REFERENCE, ROLE_MOVING)
+    }
 
     reference_positions: list[np.ndarray] = []
     moving_positions: list[np.ndarray] = []
@@ -407,22 +458,26 @@ def create_marker_alignment_input(runtime: Any) -> MarkerAlignmentInput:
             raise MarkerInputError("A 마커가 현재 A 그룹 모델을 참조하지 않습니다.")
         if pair_moving_model_id != moving_model_id:
             raise MarkerInputError("모든 P 마커는 현재 선택한 이동 P 모델을 참조해야 합니다.")
-        reference_model = repository.models.get(reference_model_id)
-        if reference_model is None:
-            raise MarkerInputError("A 마커가 참조하는 COLMAP 모델이 없습니다.")
-        reference_source = _validate_saved_source_position(reference_point, reference_model)
-        moving_source = _validate_saved_source_position(moving_point, moving_model)
+        reference_geometry = _geometry_for_selected_point(repository, reference_point)
+        moving_geometry = _geometry_for_selected_point(repository, moving_point)
+        for role, geometry in ((ROLE_REFERENCE, reference_geometry), (ROLE_MOVING, moving_geometry)):
+            kind = geometry_kind_for_model(geometry.model_data)
+            if role_kinds[role] is not None and role_kinds[role] != kind:
+                raise MarkerInputError("같은 역할의 마커는 점군 또는 메시 한 종류만 사용할 수 있습니다.")
+            role_kinds[role] = kind
+        reference_source = _validate_saved_source_position(reference_point, reference_geometry.model_data)
+        moving_source = _validate_saved_source_position(moving_point, moving_geometry.model_data)
         reference_positions.append(
             _project_source_position(
                 _alignment_for_model(repository, reference_model_id),
-                _display_transform_for_model(repository, reference_model_id),
+                reference_geometry.display_transform,
                 reference_source,
             )
         )
         moving_positions.append(
             _project_source_position(
                 moving_alignment,
-                moving_display_transform,
+                moving_geometry.display_transform,
                 moving_source,
             )
         )
@@ -604,7 +659,7 @@ def create_icp_seed(runtime: Any) -> IcpAlignmentSeed:
 
 
 def _build_icp_seed_from_preview(runtime: Any) -> IcpAlignmentSeed:
-    """등록된 backend가 사용할 최신 marker preview의 immutable seed를 내부에서 조립합니다."""
+    """최신 마커 미리보기와 당시 형상 종속성을 후속 계산의 불변 초기값에 보관합니다."""
 
     preview_state = _preview_state_for_runtime(runtime)
     result = preview_state.result
@@ -622,6 +677,14 @@ def _build_icp_seed_from_preview(runtime: Any) -> IcpAlignmentSeed:
         model_revision_snapshot=result.source_revision_snapshot,
         marker_signature=result.marker_signature,
         initialization_mode="MARKER_PREVIEW",
+        marker_geometry_dependencies=tuple(sorted({
+            (
+                point.model_id,
+                normalize_marker_geometry_source(getattr(point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN)),
+            )
+            for pair in runtime.marker_selection.completed_pairs
+            for point in (pair.reference, pair.moving)
+        })),
     )
     _LOGGER.info(
         "event=marker_alignment_icp_handoff_started moving_model_id=%s marker_count=%s",
@@ -633,6 +696,12 @@ def _build_icp_seed_from_preview(runtime: Any) -> IcpAlignmentSeed:
 
 def _build_icp_seed_from_current_alignment(runtime: Any) -> IcpAlignmentSeed:
     """선택된 P와 A 그룹 전체를 사용하는 직접 ICP seed를 만듭니다."""
+
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(runtime)
+    if axis_reason is not None:
+        raise MarkerInputError(axis_reason)
 
     if not bool(getattr(runtime, "session_active", False)):
         raise MarkerInputError("활성 COLMAP Align 세션에서만 직접 Align을 시작할 수 있습니다.")

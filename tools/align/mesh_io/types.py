@@ -9,11 +9,7 @@ from typing import TypeAlias
 import numpy as np
 import numpy.typing as npt
 
-from ..constants import (
-    GEOMETRY_KIND_TRIANGLE_MESH,
-    OBJ_MAX_TEXTURE_COORDINATES,
-    OBJ_MAX_TRIANGLE_FACES,
-)
+from ..constants import GEOMETRY_KIND_TRIANGLE_MESH
 
 
 Float64Array: TypeAlias = npt.NDArray[np.float64]
@@ -84,7 +80,7 @@ class ObjMaterialData:
 
 @dataclass(frozen=True, slots=True)
 class TriangleMeshModelData:
-    """원본 OBJ 정점·삼각면·face-corner UV와 정렬·표시용 인덱스를 불변 보관합니다."""
+    """내장 OBJ에서 파생한 삼각형 프록시와 원본 Polygon 매핑을 불변 보관합니다."""
 
     model_id: str
     display_name: str
@@ -109,6 +105,16 @@ class TriangleMeshModelData:
     triangle_material_indices_int32: Int32Array = field(
         default_factory=lambda: np.empty((0,), dtype=np.int32)
     )
+    triangle_polygon_indices_uint32: UInt32Array = field(
+        default_factory=lambda: np.empty((0,), dtype=np.uint32)
+    )
+    triangle_loop_indices_uint32: UInt32Array = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.uint32)
+    )
+    embedded_asset_uuid: str = ""
+    embedded_asset_schema_version: int = 0
+    embedded_data_name_hint: str = ""
+    original_polygon_count: int = 0
 
     def __post_init__(self) -> None:
         """메시 형상·UV 배열의 dtype·인덱스 범위·경계를 검증하고 읽기 전용으로 고정합니다."""
@@ -122,8 +128,8 @@ class TriangleMeshModelData:
         if vertices.shape[0] == 0:
             raise ValueError("OBJ 정점이 비어 있습니다.")
         triangles = _freeze_array(self.triangles_uint32, np.uint32, (None, 3), "OBJ 삼각면")
-        if triangles.shape[0] < 1 or triangles.shape[0] > OBJ_MAX_TRIANGLE_FACES:
-            raise ValueError("OBJ 삼각면 수는 1개 이상 600,000개 이하여야 합니다.")
+        if triangles.shape[0] < 1:
+            raise ValueError("OBJ 삼각면은 1개 이상이어야 합니다.")
         if np.any(triangles >= vertices.shape[0]):
             raise ValueError("OBJ 삼각면의 정점 인덱스가 범위를 벗어났습니다.")
         if np.any(triangles[:, 0] == triangles[:, 1]) or np.any(triangles[:, 1] == triangles[:, 2]) or np.any(triangles[:, 0] == triangles[:, 2]):
@@ -149,8 +155,6 @@ class TriangleMeshModelData:
         if isinstance(self.geometry_revision, bool) or int(self.geometry_revision) < 0:
             raise ValueError("geometry revision은 음수일 수 없습니다.")
         texcoords = _freeze_array(self.texcoords_float64, np.float64, (None, 3), "OBJ UV 좌표")
-        if texcoords.shape[0] > OBJ_MAX_TEXTURE_COORDINATES:
-            raise ValueError("OBJ UV 좌표 수가 허용 범위를 초과했습니다.")
         component_counts = _freeze_array(
             self.texcoord_component_counts_uint8,
             np.uint8,
@@ -201,6 +205,43 @@ class TriangleMeshModelData:
         )
         if np.any(face_materials < -1) or np.any(face_materials >= len(materials)):
             raise ValueError("OBJ 면 재질 인덱스가 재질 배열 범위를 벗어났습니다.")
+        raw_triangle_polygons = np.ascontiguousarray(
+            self.triangle_polygon_indices_uint32,
+            dtype=np.uint32,
+        )
+        if raw_triangle_polygons.shape == (0,):
+            raw_triangle_polygons = np.arange(triangles.shape[0], dtype=np.uint32)
+        triangle_polygons = _freeze_array(
+            raw_triangle_polygons,
+            np.uint32,
+            (triangles.shape[0],),
+            "원본 Polygon 매핑",
+        )
+        raw_triangle_loops = np.ascontiguousarray(
+            self.triangle_loop_indices_uint32,
+            dtype=np.uint32,
+        )
+        if raw_triangle_loops.shape == (0, 3):
+            raw_triangle_loops = np.arange(triangles.size, dtype=np.uint32).reshape((-1, 3))
+        triangle_loops = _freeze_array(
+            raw_triangle_loops,
+            np.uint32,
+            (triangles.shape[0], 3),
+            "원본 Loop 매핑",
+        )
+        embedded_uuid = str(self.embedded_asset_uuid).strip().replace("-", "").casefold()
+        embedded_schema = int(self.embedded_asset_schema_version)
+        data_name_hint = str(self.embedded_data_name_hint).strip()
+        original_polygon_count = int(self.original_polygon_count or triangles.shape[0])
+        if embedded_uuid:
+            if len(embedded_uuid) != 32 or any(value not in "0123456789abcdef" for value in embedded_uuid):
+                raise ValueError("내장 OBJ asset UUID가 올바르지 않습니다.")
+            if embedded_schema < 1 or not data_name_hint:
+                raise ValueError("내장 OBJ schema 또는 Data Block 이름 힌트가 비어 있습니다.")
+        elif embedded_schema != 0 or data_name_hint:
+            raise ValueError("내장 OBJ 참조 필드가 서로 일치하지 않습니다.")
+        if original_polygon_count < 1 or np.any(triangle_polygons >= original_polygon_count):
+            raise ValueError("원본 OBJ Polygon 개수 또는 프록시 매핑이 올바르지 않습니다.")
         object.__setattr__(self, "model_id", model_id)
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "source_path", Path(self.source_path))
@@ -216,6 +257,12 @@ class TriangleMeshModelData:
         object.__setattr__(self, "triangle_texcoord_indices_int32", face_texcoords)
         object.__setattr__(self, "materials", materials)
         object.__setattr__(self, "triangle_material_indices_int32", face_materials)
+        object.__setattr__(self, "triangle_polygon_indices_uint32", triangle_polygons)
+        object.__setattr__(self, "triangle_loop_indices_uint32", triangle_loops)
+        object.__setattr__(self, "embedded_asset_uuid", embedded_uuid)
+        object.__setattr__(self, "embedded_asset_schema_version", embedded_schema)
+        object.__setattr__(self, "embedded_data_name_hint", data_name_hint)
+        object.__setattr__(self, "original_polygon_count", original_polygon_count)
 
     @property
     def geometry_kind(self) -> str:
@@ -239,8 +286,20 @@ class TriangleMeshModelData:
 
     @property
     def face_count(self) -> int:
-        """OBJ 원본 삼각면 개수를 반환합니다."""
+        """정렬 프록시 삼각면 개수를 반환합니다."""
         return int(self.triangles_uint32.shape[0])
+
+    @property
+    def proxy_triangle_count(self) -> int:
+        """표시·피킹·정렬에 사용하는 삼각형 프록시 개수를 반환합니다."""
+
+        return self.face_count
+
+    @property
+    def is_embedded_obj(self) -> bool:
+        """모델이 `.blend` 내부 OBJ Mesh를 원본 권위로 가지는지 반환합니다."""
+
+        return bool(self.embedded_asset_uuid)
 
     @property
     def vertex_count(self) -> int:

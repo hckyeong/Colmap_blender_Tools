@@ -123,8 +123,8 @@ has_complete_texture_coordinates: bool
 
 ### 5.3 메모리 제한
 
-- `OBJ_MAX_TEXTURE_COORDINATES = OBJ_MAX_TRIANGLE_FACES * 3`을 새 하드 제한으로 둔다.
-- 최대 600,000 Face 기준 UV Corner는 최대 1,800,000개다.
+- 초기 구현은 최대 600,000 Face와 1,800,000개 UV 좌표를 하드 제한으로 사용했다.
+- 2026-09-04 변경부터 Face와 UV 좌표의 인위적인 개수 상한을 제거하고 파일 전체를 읽는다.
 - UV 좌표, 성분 수, Face UV 인덱스는 NumPy 연속 배열로 확정한 뒤 Python 누적 목록을 즉시 해제한다.
 - Display Sampling과 ICP 입력에는 UV 배열을 복사하지 않는다.
 
@@ -335,7 +335,7 @@ GPU Renderer, Marker Picking, ICP Solver, Small GICP Worker와 공용 Workspace 
 - UV Seam 왕복 유지
 - UV 없는 OBJ의 기존 `f v v v` 호환
 - Partial UV Face 집합 보존
-- 600,000 Face와 최대 UV Corner의 증분 처리
+- 기존 600,000 Face 경계를 넘는 형상과 UV의 증분 처리
 - 취소·실패·덮어쓰기 원자성
 - Report Schema 2의 UV Count와 Coverage
 

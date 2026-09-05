@@ -16,6 +16,8 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix, Vector
 
 from ..constants import (
+    GEOMETRY_KIND_COLMAP_POINT_CLOUD,
+    GEOMETRY_KIND_TRIANGLE_MESH,
     ICP_ALIGNMENT_PHASE_CANCEL_PENDING,
     ICP_ALIGNMENT_PHASE_PREPARING,
     ICP_ALIGNMENT_PHASE_PREVIEW,
@@ -32,9 +34,15 @@ from ..alignment import effective_alignment_for_model, transform_positions
 from ..geometry_access import geometry_kind_for_model, is_triangle_mesh_model
 from ..logging_utils import get_logger
 from ..state import RUNTIME
+from ..constants import MARKER_GEOMETRY_SOURCE_MAIN, MARKER_GEOMETRY_SOURCE_COMPANION
+from ..marker_geometry import normalize_marker_geometry_source
 from .labels import clear_display_transform_errors, draw_viewport_labels
 from .picking import marker_source_model_ids
 from .point_data import (
+    companion_mesh_data_for_id,
+    model_geometry_is_visible,
+    marker_geometry_is_visible,
+    surface_model_data_for_id,
     effective_model_matrix_for_id,
     effective_position_for_model_id,
     model_data_for_id,
@@ -50,7 +58,6 @@ _MESH_TEXTURE_SHADER: Any | None = None
 _MESH_TEXTURE_RESOURCES: dict[Path, "_SharedTextureResource"] = {}
 _DISPLAY_TRANSFORM_ERROR_MODEL_IDS: set[str] = set()
 _MESH_NORMAL_FACE_CHUNK_SIZE = 131_072
-_PREVIEW_GHOST_OPACITY = 0.35
 _PREVIEW_REFERENCE_TRIANGLE_FACE_COLOR = (0.08, 0.78, 0.86, 0.22)
 _PREVIEW_REFERENCE_TRIANGLE_EDGE_COLOR = (0.08, 0.78, 0.86, 0.78)
 _PREVIEW_MOVING_TRIANGLE_FACE_COLOR = (1.0, 0.42, 0.08, 0.22)
@@ -167,13 +174,14 @@ def _display_indices_fingerprint(model_data: Any) -> str:
     return digest.hexdigest()
 
 
-def _batch_key(model_data: Any) -> tuple[str, int, int, str]:
-    """모델·형상·표시 샘플 리비전과 인덱스 fingerprint로 GPU 배치 키를 만듭니다."""
+def _batch_key(model_data: Any) -> tuple[str, int, int, str, str]:
+    """소유 모델·형상 종류·리비전·샘플로 점군과 메시 정점 배치를 구분합니다."""
     return (
         str(getattr(model_data, "model_id")),
         _geometry_revision(model_data),
         _lod_revision(model_data),
         _display_indices_fingerprint(model_data),
+        geometry_kind_for_model(model_data),
     )
 
 
@@ -200,10 +208,24 @@ def _cached_model_id(cache_key: Any) -> str | None:
     return None
 
 
+def _cached_geometry_kind(cache_key: Any) -> str:
+    """기존 점군 키와 새 형상별 키를 구분해 같은 소유 ID의 캐시를 보존합니다."""
+    if isinstance(cache_key, tuple) and len(cache_key) >= 5:
+        if cache_key[2] == "TRIS" or cache_key[-1] == GEOMETRY_KIND_TRIANGLE_MESH:
+            return GEOMETRY_KIND_TRIANGLE_MESH
+    return GEOMETRY_KIND_COLMAP_POINT_CLOUD
+
+
 def _prepared_batch_for_model(model_id: str) -> Any | None:
-    """draw callback에서 표시 샘플 hash를 다시 계산하지 않고 모델 배치를 반환합니다."""
+    """해시 재계산 없이 소유 모델의 점 배치만 찾아 연결 표면 캐시와 구분합니다."""
+    model = model_data_for_id(model_id)
+    kind = geometry_kind_for_model(model) if model is not None else GEOMETRY_KIND_COLMAP_POINT_CLOUD
     for cache_key, batch in RUNTIME.gpu_batches.items():
-        if _cached_model_id(cache_key) == str(model_id):
+        if (
+            _cached_model_id(cache_key) == str(model_id)
+            and _cached_geometry_kind(cache_key) == kind
+            and not isinstance(batch, _MeshSurfaceBatch)
+        ):
             return batch
     return None
 
@@ -367,7 +389,7 @@ def _find_loaded_image_for_path(path: Path) -> Any | None:
 
 
 def _acquire_texture_resource(model_id: str, path: Path) -> _SharedTextureResource:
-    """원본 이미지 경로의 공유 Image·GPUTexture를 준비하고 모델 사용권을 추가합니다."""
+    """공유 이미지·GPU 텍스처를 준비하고 실패하면 새로 읽은 이미지도 정리합니다."""
 
     normalized = path.resolve(strict=False)
     cached = _MESH_TEXTURE_RESOURCES.get(normalized)
@@ -376,9 +398,18 @@ def _acquire_texture_resource(model_id: str, path: Path) -> _SharedTextureResour
         return cached
     existing = _find_loaded_image_for_path(normalized)
     image = existing or bpy.data.images.load(str(normalized), check_existing=True)
+    try:
+        texture = gpu.texture.from_image(image)
+    except Exception:
+        if existing is None:
+            try:
+                bpy.data.images.remove(image)
+            except (ReferenceError, RuntimeError, ValueError):
+                pass
+        raise
     resource = _SharedTextureResource(
         image=image,
-        texture=gpu.texture.from_image(image),
+        texture=texture,
         owned_image=existing is None,
         model_ids={str(model_id)},
     )
@@ -387,7 +418,7 @@ def _acquire_texture_resource(model_id: str, path: Path) -> _SharedTextureResour
 
 
 def _release_texture_resources_for_model(model_id: str) -> None:
-    """모델이 사용한 공유 텍스처를 반납하고 마지막 소유 이미지 데이터만 제거합니다."""
+    """모델의 공유 텍스처를 반납하고 유효한 마지막 소유 이미지만 제거합니다."""
 
     normalized_model_id = str(model_id)
     for path, resource in tuple(_MESH_TEXTURE_RESOURCES.items()):
@@ -395,9 +426,10 @@ def _release_texture_resources_for_model(model_id: str) -> None:
         if resource.model_ids:
             continue
         _MESH_TEXTURE_RESOURCES.pop(path, None)
-        if resource.owned_image and getattr(resource.image, "users", 0) == 0:
+        if resource.owned_image:
             try:
-                bpy.data.images.remove(resource.image)
+                if getattr(resource.image, "users", 0) == 0:
+                    bpy.data.images.remove(resource.image)
             except (ReferenceError, RuntimeError, ValueError):
                 pass
 
@@ -431,7 +463,7 @@ def _batch_vertex_data(model_data: Any) -> tuple[np.ndarray, np.ndarray, int, in
 
 
 def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) -> Any:
-    """지정 모델의 표시 샘플 배치를 원자적으로 준비하고 이전 캐시를 교체합니다."""
+    """지정 형상의 GPU 배치를 준비하고 같은 소유 모델의 다른 형상 캐시는 보존합니다."""
     data = model_data if model_data is not None else model_data_for_id(model_id)
     if data is None:
         raise KeyError(f"GPU 배치를 만들 모델을 찾을 수 없습니다: {model_id}")
@@ -445,7 +477,8 @@ def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) ->
     ):
         return cached_batch
 
-    _release_texture_resources_for_model(model_id)
+    if is_triangle_mesh_model(data):
+        _release_texture_resources_for_model(model_id)
 
     try:
         positions, colors, source_count, display_count = _batch_vertex_data(data)
@@ -465,7 +498,11 @@ def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) ->
     stale_keys = tuple(
         key
         for key in RUNTIME.gpu_batches
-        if _cached_model_id(key) == str(model_id) and key != cache_key
+        if (
+            _cached_model_id(key) == str(model_id)
+            and _cached_geometry_kind(key) == geometry_kind_for_model(data)
+            and key != cache_key
+        )
     )
     for stale_key in stale_keys:
         RUNTIME.gpu_batches.pop(stale_key, None)
@@ -545,21 +582,65 @@ def discard_gpu_batch_for_model(model_id: str) -> None:
     _release_texture_resources_for_model(model_id)
 
 
+def prepare_restored_gpu_batches(runtime: Any = RUNTIME) -> None:
+    """복원 형상의 GPU·텍스처를 격리 준비하고 모두 성공한 경우에만 기존 자원을 교체합니다."""
+    global _MESH_TEXTURE_RESOURCES
+    if runtime is not RUNTIME:
+        raise ValueError("GPU 복원은 현재 렌더러 런타임에서만 확정할 수 있습니다.")
+    previous_batches = runtime.gpu_batches
+    previous_resources = _MESH_TEXTURE_RESOURCES
+    runtime.gpu_batches = {}
+    _MESH_TEXTURE_RESOURCES = {}
+    try:
+        repository = runtime.model_repository
+        for model_id, model in repository.models.items():
+            prepare_gpu_batch_for_model(model_id, model)
+            companion = companion_mesh_data_for_id(model_id)
+            if companion is not None:
+                prepare_gpu_batch_for_model(model_id, companion)
+    except Exception:
+        try:
+            _release_all_texture_resources()
+        finally:
+            runtime.gpu_batches = previous_batches
+            _MESH_TEXTURE_RESOURCES = previous_resources
+        raise
+    prepared_resources = _MESH_TEXTURE_RESOURCES
+    for path, prepared in prepared_resources.items():
+        previous = previous_resources.get(path)
+        if previous is not None and prepared.image is previous.image:
+            # 재사용한 Blender 이미지의 소유권은 새 캐시로 넘겨 기존 정리에서 삭제되지 않게 합니다.
+            prepared.owned_image = previous.owned_image
+            previous.owned_image = False
+    _MESH_TEXTURE_RESOURCES = previous_resources
+    _release_all_texture_resources()
+    previous_resources.update(prepared_resources)
+
+
 def ensure_gpu_batches() -> None:
-    """데이터 변경 경계에서 모든 실제 모델의 GPU POINTS 배치를 동기화합니다."""
+    """데이터 변경 경계에서 점군·독립 메시·연결 표면 캐시를 함께 동기화합니다."""
     models = runtime_models()
+    geometries = list(models.items())
+    geometries.extend(
+        (model_id, companion)
+        for model_id in models
+        if (companion := companion_mesh_data_for_id(model_id)) is not None
+    )
     expected_keys = {
         key
-        for model_data in models.values()
+        for _model_id, model_data in geometries
         for key in (
             (_batch_key(model_data), _mesh_batch_key(model_data))
             if is_triangle_mesh_model(model_data)
             else (_batch_key(model_data),)
         )
     }
-    for model_id, model_data in models.items():
+    for model_id, model_data in geometries:
         cache_key = _batch_key(model_data)
-        if cache_key in RUNTIME.gpu_batches:
+        if cache_key in RUNTIME.gpu_batches and (
+            not is_triangle_mesh_model(model_data)
+            or _mesh_batch_key(model_data) in RUNTIME.gpu_batches
+        ):
             continue
         try:
             prepare_gpu_batch_for_model(model_id, model_data)
@@ -656,17 +737,32 @@ def _model_view_projection_matrix(base_matrix: Any, model_id: str) -> Matrix:
     return base_matrix @ model_matrix
 
 
-def _mesh_draw_matrices(projection_matrix: Any, view_matrix: Any, model_id: str) -> tuple[Matrix, Matrix]:
-    """메시 위치용 MVP와 법선용 역전치 ModelView 행렬을 함께 만듭니다."""
-    model_matrix = Matrix(effective_model_matrix_for_id(model_id).tolist())
+def _mesh_draw_matrices(
+    projection_matrix: Any,
+    view_matrix: Any,
+    model_id: str,
+    *,
+    companion: bool = False,
+) -> tuple[Matrix, Matrix]:
+    """독립·연결 메시의 해당 축으로 위치 MVP와 법선용 역전치 행렬을 만듭니다."""
+    model_matrix = Matrix(
+        effective_model_matrix_for_id(model_id, companion=companion).tolist(),
+    )
     model_view_matrix = view_matrix @ model_matrix
     normal_matrix = model_view_matrix.to_3x3().inverted_safe().transposed()
     return projection_matrix @ model_view_matrix, normal_matrix
 
 
-def _display_marker_position(model_id: str, source_position: Any) -> np.ndarray:
-    """원본 마커 좌표를 점군과 같은 현재 Project World 좌표로 변환합니다."""
-    return effective_position_for_model_id(model_id, source_position)
+def _display_marker_position(
+    model_id: str,
+    source_position: Any,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
+) -> np.ndarray:
+    """마커가 속한 형상 축과 소유 모델의 공통 정렬로 표시 좌표를 계산합니다."""
+    source = normalize_marker_geometry_source(geometry_source)
+    return effective_position_for_model_id(
+        model_id, source_position, companion=source == MARKER_GEOMETRY_SOURCE_COMPANION,
+    )
 
 
 def _log_display_transform_error_once(model_id: str, error: Exception) -> None:
@@ -684,7 +780,7 @@ def _log_display_transform_error_once(model_id: str, error: Exception) -> None:
 
 
 def _marker_entries(role: str):
-    """현재 보이는 모델의 확정·드래프트 마커만 중복 없이 반환합니다."""
+    """마커가 속한 형상이 보이는 확정·드래프트 마커만 중복 없이 반환합니다."""
     state = RUNTIME.marker_selection
     entries = []
     visible_model_ids = set(marker_source_model_ids(role))
@@ -694,7 +790,11 @@ def _marker_entries(role: str):
         if pair.pair_id == suppressed_pair_id:
             continue
         point = pair.reference if role == ROLE_REFERENCE else pair.moving
-        if point.model_id and point.model_id not in visible_model_ids:
+        geometry_source = getattr(point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN)
+        if point.model_id and (
+            point.model_id not in visible_model_ids
+            or not marker_geometry_is_visible(point.model_id, geometry_source)
+        ):
             continue
         entries.append(
             (
@@ -702,15 +802,20 @@ def _marker_entries(role: str):
                 pair.pair_id,
                 pair.pair_id == state.active_pair_id,
                 point.model_id,
+                geometry_source,
             )
         )
     if draft is not None:
         point = draft.reference if role == ROLE_REFERENCE else draft.moving
         if point is not None:
-            if point.model_id and point.model_id not in visible_model_ids:
+            geometry_source = getattr(point, "geometry_source", MARKER_GEOMETRY_SOURCE_MAIN)
+            if point.model_id and (
+                point.model_id not in visible_model_ids
+                or not marker_geometry_is_visible(point.model_id, geometry_source)
+            ):
                 return entries
             # 생성·편집 드래프트는 이전 UIList 선택과 무관하게 현재 후보를 강조합니다.
-            entries.append((point.local_position, draft.pair_id, True, point.model_id))
+            entries.append((point.local_position, draft.pair_id, True, point.model_id, geometry_source))
     return entries
 
 
@@ -731,7 +836,7 @@ def _draw_model_meshes(
     depth_write: bool = True,
     depth_test: str | None = None,
 ) -> None:
-    """삼각형 메시를 COLMAP Color 상태에 따라 역할 색상 또는 UV 텍스처로 그립니다."""
+    """독립·연결 표면을 형상별 축과 공통 소유 모델 정렬·역할 색상으로 그립니다."""
     solid_shader = _mesh_shader()
     texture_shader = _mesh_texture_shader()
     previous_depth_test = gpu.state.depth_test_get()
@@ -745,8 +850,12 @@ def _draw_model_meshes(
         mesh_color = _identifier_color(role)
         use_texture = bool(bpy.context.scene.colmap_align_settings.use_colmap_rgb)
         for model_id in model_ids:
-            model_data = model_data_for_id(model_id)
-            if model_data is None or not is_triangle_mesh_model(model_data):
+            model_data = surface_model_data_for_id(model_id)
+            if (
+                not model_geometry_is_visible(model_id, GEOMETRY_KIND_TRIANGLE_MESH)
+                or model_data is None
+                or not is_triangle_mesh_model(model_data)
+            ):
                 continue
             mesh_key = _mesh_batch_key(model_data)
             surface_batch = RUNTIME.gpu_batches.get(mesh_key)
@@ -757,6 +866,7 @@ def _draw_model_meshes(
                     projection_matrix,
                     view_matrix,
                     model_id,
+                    companion=model_data is not model_data_for_id(model_id),
                 )
             except Exception as error:
                 _log_display_transform_error_once(model_id, error)
@@ -794,7 +904,7 @@ def _draw_model_point_clouds(
     depth_test: str | None = None,
     use_colmap_rgb: bool | None = None,
 ) -> None:
-    """지정 모델 GPU 배치를 역할 색상·투명도·깊이 정책으로 그립니다."""
+    """표시 중인 점군 또는 독립 메시 정점 배치를 역할·투명도·깊이 정책으로 그립니다."""
     settings = bpy.context.scene.colmap_align_settings
     shader = _point_shader()
     previous_depth_test = gpu.state.depth_test_get()
@@ -815,6 +925,10 @@ def _draw_model_point_clouds(
         shader.uniform_float("opacity", float(opacity))
         gpu.state.point_size_set(settings.point_size)
         for model_id in model_ids:
+            model = model_data_for_id(model_id)
+            kind = geometry_kind_for_model(model) if model is not None else GEOMETRY_KIND_COLMAP_POINT_CLOUD
+            if not model_geometry_is_visible(model_id, kind):
+                continue
             batch = _prepared_batch_for_model(model_id)
             if batch is None:
                 continue
@@ -850,15 +964,18 @@ def _marker_preview_triangle_result():
 
 
 def _is_icp_viewport_preview_active() -> bool:
-    """ICP 실행·결과 중 양쪽 뷰에 상대 모델 Ghost를 추가할지 반환합니다."""
+    """ICP 실행·결과 중 양쪽 뷰에 상대 모델을 함께 표시할지 반환합니다."""
     icp_state = getattr(RUNTIME, "icp_alignment", None)
     return str(getattr(icp_state, "phase", "")) in _ICP_VIEWPORT_PREVIEW_PHASES
 
 
 def point_cloud_draw_passes_for_role(role: str) -> tuple[PointCloudDrawPass, ...]:
-    """일반·미리보기 Area 역할에 맞는 점군 합성 제출 순서를 반환합니다."""
+    """마커 입력 중 역할별 형상을 고정하고 일반 선택·미리보기 제출 순서를 반환합니다."""
     if role not in {ROLE_REFERENCE, ROLE_MOVING}:
         return ()
+
+    if RUNTIME.marker_selection.has_draft:
+        return (PointCloudDrawPass(model_ids=marker_source_model_ids(role), role=role),)
 
     catalog = RUNTIME.model_catalog
     selected_reference_ids = multiselection_model_ids_for_role(ROLE_REFERENCE)
@@ -892,35 +1009,29 @@ def point_cloud_draw_passes_for_role(role: str) -> tuple[PointCloudDrawPass, ...
     )
     marker_preview_result = _marker_preview_result()
     if role == ROLE_REFERENCE and _is_icp_viewport_preview_active():
-        # ICP 중 A 뷰에서도 P의 마지막 안정 또는 결과 transform을 Ghost로 함께 표시합니다.
+        # ICP 중 A 뷰에서도 P를 일반 불투명 렌더링으로 함께 표시합니다.
         return (
             own_pass,
             PointCloudDrawPass(
                 model_ids=render_model_ids_for_role(ROLE_MOVING),
                 role=ROLE_MOVING,
-                opacity=_PREVIEW_GHOST_OPACITY,
-                depth_write=False,
-                depth_test="NONE",
             ),
         )
     if role != ROLE_MOVING or marker_preview_result is None:
         return (own_pass,)
 
-    # P 뷰에서만 A Ghost를 마지막에 합성해 정렬된 겹침도 식별 가능하게 합니다.
+    # P 뷰에서는 A도 일반 불투명 렌더링으로 함께 표시합니다.
     return (
         own_pass,
         PointCloudDrawPass(
             model_ids=render_model_ids_for_role(ROLE_REFERENCE),
             role=ROLE_REFERENCE,
-            opacity=_PREVIEW_GHOST_OPACITY,
-            depth_write=False,
-            depth_test="NONE",
         ),
     )
 
 
 def _draw_point_clouds(role: str) -> None:
-    """현재 Area의 점군과 marker 입력 중인 메시 정점 overlay를 제출합니다."""
+    """표시 토글을 반영해 점군과 마커 입력 중인 독립 메시 정점을 제출합니다."""
     marker_model_ids = set(marker_source_model_ids(role)) if RUNTIME.marker_selection.has_draft else set()
     for draw_pass in point_cloud_draw_passes_for_role(role):
         model_ids = tuple(
@@ -928,6 +1039,7 @@ def _draw_point_clouds(role: str) -> None:
             for model_id in draw_pass.model_ids
             if (
                 (model := model_data_for_id(model_id)) is not None
+                and model_geometry_is_visible(model_id, geometry_kind_for_model(model))
                 and (
                     not is_triangle_mesh_model(model)
                     or model_id in marker_model_ids
@@ -947,44 +1059,21 @@ def _draw_point_clouds(role: str) -> None:
 
 
 def _draw_meshes(role: str) -> None:
-    """현재 Area 역할의 메시 본체와 preview Ghost를 점군과 같은 순서로 그립니다."""
-    if role not in {ROLE_REFERENCE, ROLE_MOVING}:
-        return
-    own_ids = tuple(
-        model_id
-        for model_id in render_model_ids_for_role(role)
-        if (model := model_data_for_id(model_id)) is not None and is_triangle_mesh_model(model)
-    )
-    if own_ids:
-        _draw_model_meshes(own_ids, role)
-    marker_preview_result = _marker_preview_result()
-    if role == ROLE_REFERENCE and _is_icp_viewport_preview_active():
-        ghost_ids = tuple(
+    """양쪽 뷰와 미리보기에서 보이는 표면을 점군과 동일한 역할·변환 순서로 제출합니다."""
+    for draw_pass in point_cloud_draw_passes_for_role(role):
+        model_ids = tuple(
             model_id
-            for model_id in render_model_ids_for_role(ROLE_MOVING)
-            if (model := model_data_for_id(model_id)) is not None and is_triangle_mesh_model(model)
+            for model_id in draw_pass.model_ids
+            if model_geometry_is_visible(model_id, GEOMETRY_KIND_TRIANGLE_MESH)
+            and surface_model_data_for_id(model_id) is not None
         )
-        if ghost_ids:
+        if model_ids:
             _draw_model_meshes(
-                ghost_ids,
-                ROLE_MOVING,
-                opacity=_PREVIEW_GHOST_OPACITY,
-                depth_write=False,
-                depth_test="NONE",
-            )
-    elif role == ROLE_MOVING and marker_preview_result is not None:
-        ghost_ids = tuple(
-            model_id
-            for model_id in render_model_ids_for_role(ROLE_REFERENCE)
-            if (model := model_data_for_id(model_id)) is not None and is_triangle_mesh_model(model)
-        )
-        if ghost_ids:
-            _draw_model_meshes(
-                ghost_ids,
-                ROLE_REFERENCE,
-                opacity=_PREVIEW_GHOST_OPACITY,
-                depth_write=False,
-                depth_test="NONE",
+                model_ids,
+                draw_pass.role,
+                opacity=draw_pass.opacity,
+                depth_write=draw_pass.depth_write,
+                depth_test=draw_pass.depth_test,
             )
 
 
@@ -1123,11 +1212,11 @@ def _marker_circle_layers(pair_id: int, is_active: bool):
 
 
 def _draw_markers(role: str) -> None:
-    """같은 쌍 색상으로 원·외곽선을 그리고 활성 쌍만 굵게 강조합니다."""
+    """형상별 표시 좌표에 같은 쌍의 원·외곽선을 그리고 활성 쌍을 강조합니다."""
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-    for source_position, pair_id, is_active, model_id in _marker_entries(role):
+    for source_position, pair_id, is_active, model_id, geometry_source in _marker_entries(role):
         try:
-            position = _display_marker_position(model_id, source_position)
+            position = _display_marker_position(model_id, source_position, geometry_source)
         except Exception as error:
             _log_display_transform_error_once(model_id, error)
             continue

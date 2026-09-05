@@ -8,6 +8,7 @@ import math
 from ..alignment.types import AlignmentProvenanceRecord
 from ..constants import (
     GEOMETRY_KIND_COLMAP_POINT_CLOUD,
+    MARKER_GEOMETRY_SOURCE_MAIN,
     MARKER_POINT_KIND_COLMAP,
 )
 
@@ -31,6 +32,7 @@ class ProjectSourceSnapshot:
     path_absolute: str = ""
     path_relative: str = ""
     display_vertex_limit: int = 0
+    selected_root_relative: str = ""
 
     def __post_init__(self) -> None:
         """v1 COLMAP 필드를 유지하면서 v2 source 종류·경로 별칭을 정규화합니다."""
@@ -53,6 +55,20 @@ class ProjectSourceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectCompanionSourceSnapshot:
+    """COLMAP 소유 연결 OBJ의 출처와 내장 Mesh 식별자를 보관합니다."""
+
+    path_absolute: str
+    path_relative: str
+    source_fingerprint: str
+    geometry_only: bool = True
+    embedded_obj_asset_uuid: str = ""
+    embedded_obj_schema_version: int = 0
+    embedded_obj_data_name_hint: str = ""
+    embedded_obj_geometry_revision: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectCatalogSnapshot:
     """Data Layers의 확정 그룹·표시·감사 상태를 보관합니다."""
 
@@ -60,6 +76,19 @@ class ProjectCatalogSnapshot:
     is_anchor: bool
     is_visible: bool
     alignment_provenance: AlignmentProvenanceRecord | None
+    show_points: bool = True
+    show_surface: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectAxesSnapshot:
+    """최초 가져오기 정보와 분리한 확정 표시 축과 도 단위 XYZ 회전을 보관합니다."""
+
+    preset_id: str
+    axis_forward: str
+    axis_up: str
+    rotation_xyz_degrees: tuple[float, float, float]
+    display_transform_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +101,28 @@ class ProjectModelSnapshot:
     source: ProjectSourceSnapshot
     catalog: ProjectCatalogSnapshot
     alignment_matrix_float64: tuple[tuple[float, float, float, float], ...]
+    companion_source: ProjectCompanionSourceSnapshot | None = None
+    current_axes: ProjectAxesSnapshot | None = None
+    companion_axes: ProjectAxesSnapshot | None = None
+    embedded_obj_asset_uuid: str = ""
+    embedded_obj_schema_version: int = 0
+    embedded_obj_data_name_hint: str = ""
+    embedded_obj_geometry_revision: int = 0
+
+    @property
+    def has_embedded_obj(self) -> bool:
+        """주 형상이 내장 OBJ UUID를 가지는지 반환합니다."""
+
+        return bool(str(self.embedded_obj_asset_uuid).strip())
+
+    @property
+    def has_embedded_companion_obj(self) -> bool:
+        """연결 형상이 별도 내장 OBJ UUID를 가지는지 반환합니다."""
+
+        return bool(
+            self.companion_source is not None
+            and str(self.companion_source.embedded_obj_asset_uuid).strip()
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +135,10 @@ class ProjectMarkerPointSnapshot:
     point_kind: str = MARKER_POINT_KIND_COLMAP
     source_point_id: int | None = None
     local_position: tuple[float, float, float] | None = None
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN
 
     def __post_init__(self) -> None:
-        """v1/v2 점 ID와 v3 면 위치를 호환 가능한 마커 참조로 정규화합니다."""
+        """기존 점·면 참조와 v6 형상 출처를 원본 좌표를 유지한 채 정규화합니다."""
         source_id = self.point3d_id if self.source_point_id is None else self.source_point_id
         local_position = self.local_position
         if local_position is not None:
@@ -97,6 +149,7 @@ class ProjectMarkerPointSnapshot:
         object.__setattr__(self, "point3d_id", int(source_id))
         object.__setattr__(self, "point_kind", str(self.point_kind).strip().upper() or MARKER_POINT_KIND_COLMAP)
         object.__setattr__(self, "local_position", local_position)
+        object.__setattr__(self, "geometry_source", str(self.geometry_source).strip().upper())
 
 
 @dataclass(frozen=True, slots=True)

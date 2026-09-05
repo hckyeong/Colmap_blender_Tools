@@ -77,6 +77,15 @@ def _complete(directory: Path, source_format: SourceFormat, stems: tuple[str, ..
     return all(_file_path(directory, stem, source_format).is_file() for stem in stems)
 
 
+def _has_sparse_model_files(directory: Path) -> bool:
+    """선택 폴더에 COLMAP 파일이 있으면 다른 모델로 대체할 수 없도록 식별합니다."""
+    return any(
+        _file_path(directory, stem, source_format).is_file()
+        for source_format in ("binary", "text")
+        for stem in (*REQUIRED_STEMS, *MODERN_EXTRA_STEMS)
+    )
+
+
 def _resolve_layout_format(directory: Path, input_format: InputFormat) -> SourceFormat:
     """완전한 3파일 집합에서 요청 형식을 선택하고 AUTO에서는 BIN을 우선합니다."""
     candidates: list[SourceFormat] = []
@@ -269,7 +278,7 @@ def discover_sparse_model_with_dataset_root(
     path: str | Path,
     input_format: str = "AUTO",
 ) -> tuple[Path, SparseModelLayout]:
-    """선택한 하위 폴더에서 가장 가까운 표준 Dataset Root와 sparse model을 찾습니다."""
+    """명시 모델의 형식·파일 오류를 보존하고 모델이 없는 선택 폴더에서만 재탐색합니다."""
     selected_path = _normalize_source_path(path)
     requested_format = _normalize_input_format(input_format)
     LOGGER.info(
@@ -278,6 +287,28 @@ def discover_sparse_model_with_dataset_root(
         selected_path,
         requested_format,
     )
+    # 직접 고른 모델은 잘못된 형식·확장 파일 구성도 상위 모델로 대체하지 않습니다.
+    try:
+        direct_format = _resolve_layout_format(selected_path, requested_format)
+        direct_rigs, direct_frames = _resolve_modern_files(selected_path, direct_format)
+    except ColmapDiscoveryError:
+        if _has_sparse_model_files(selected_path):
+            raise
+        direct_format = None
+    if direct_format is not None:
+        direct_layout = SparseModelLayout(
+            source_path=selected_path,
+            selected_format=direct_format,
+            cameras_path=_file_path(selected_path, "cameras", direct_format),
+            images_path=_file_path(selected_path, "images", direct_format),
+            points3d_path=_file_path(selected_path, "points3D", direct_format),
+            rigs_path=direct_rigs,
+            frames_path=direct_frames,
+        )
+        for candidate_root in selected_path.parents:
+            if _matches_standard_dataset_root(candidate_root, selected_path, selected_path):
+                return candidate_root, direct_layout
+        return selected_path, direct_layout
     for candidate_root in (selected_path, *selected_path.parents):
         try:
             layout = _create_standard_dataset_layout(candidate_root, requested_format)
@@ -349,3 +380,25 @@ def discover_sparse_model(
         layout.layout_kind,
     )
     return layout
+
+
+def standard_sparse_model_paths(path: str | Path, input_format: str = "AUTO") -> tuple[Path, ...]:
+    """데이터셋의 sparse 직하 유효 모델 경로를 반환해 연결 모호성을 검사합니다."""
+    dataset_root = _normalize_source_path(path)
+    requested_format = _normalize_input_format(input_format)
+    sparse = dataset_root / "sparse"
+    if not sparse.is_dir() or sparse.is_symlink():
+        return ()
+    if hasattr(os.path, "isjunction") and os.path.isjunction(sparse):
+        return ()
+    models = []
+    for directory in _directories_to_depth_two(sparse):
+        if directory != sparse and directory.parent != sparse:
+            continue
+        try:
+            selected_format = _resolve_layout_format(directory, requested_format)
+            _resolve_modern_files(directory, selected_format)
+        except ColmapDiscoveryError:
+            continue
+        models.append(directory)
+    return tuple(models)

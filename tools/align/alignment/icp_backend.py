@@ -1377,22 +1377,33 @@ def read_job_progress(handle: IcpJobHandle) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     payload = read_json_file(path)
+    if handle.backend_id == IcpSolverBackend.CCCORELIB.value:
+        from .icp_cccore_runtime import validate_cccore_payload
+        validate_cccore_payload(payload, handle)
+        return payload
     _validate_worker_payload_identity(payload, handle, "진행률")
     return payload
 
 
 def read_job_error(handle: IcpJobHandle) -> dict[str, Any] | None:
-    """worker가 남긴 구조화 오류가 있을 때만 읽어 반환합니다."""
+    """구조화 오류를 읽고 CC 오류의 작업·입력 식별자를 검증합니다."""
 
     path = handle.files.error_path
     if not path.is_file():
         return None
-    return read_json_file(path)
+    payload = read_json_file(path)
+    if handle.backend_id == IcpSolverBackend.CCCORELIB.value:
+        from .icp_cccore_runtime import validate_cccore_payload
+        validate_cccore_payload(payload, handle)
+    return payload
 
 
 def read_job_result(handle: IcpJobHandle) -> tuple[dict[str, Any], dict[str, np.ndarray]] | None:
     """메타데이터와 배열 결과가 모두 기록된 경우에만 함께 읽습니다."""
 
+    if handle.backend_id == IcpSolverBackend.CCCORELIB.value:
+        from .icp_cccore_runtime import read_cccore_result
+        return read_cccore_result(handle)
     if not handle.files.result_path.is_file() or not handle.files.result_array_path.is_file():
         return None
     metadata = read_json_file(handle.files.result_path)

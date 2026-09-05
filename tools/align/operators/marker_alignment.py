@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import bpy
 
@@ -30,7 +30,7 @@ from ..constants import (
     ICP_ALIGNMENT_PHASE_RUNNING,
 )
 from ..project_persistence.runtime import restore_input_block_reason
-from ..properties import configured_icp_python_path, sync_marker_pair_list
+from ..properties import cc_cpu_thread_counts, configured_icp_python_path, sync_marker_pair_list
 from ..session import is_session_active_for_window, session_align_workspace
 from ..state import RUNTIME
 from ..status import set_workspace_status_text
@@ -45,7 +45,7 @@ from .workspace import (
 
 _ICP_POLL_INTERVAL_SECONDS = 0.1
 _AUTOMATIC_ICP_PRESET = "PRECISE"
-_AUTOMATIC_ICP_BACKEND = "SMALL_GICP"
+_AUTOMATIC_ICP_BACKEND = "CCCORELIB"
 
 
 def _icp_state() -> Any | None:
@@ -166,7 +166,13 @@ def _export_input_block_reason() -> str | None:
 
 
 def marker_preview_start_block_reason() -> str | None:
-    """미리보기 시작 전 UI가 즉시 알 수 있는 차단 사유를 반환합니다."""
+    """역할 종류 충돌을 포함해 마커 미리보기 시작을 막는 사유를 반환합니다."""
+
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(RUNTIME)
+    if axis_reason is not None:
+        return axis_reason
     restore_reason = restore_input_block_reason()
     if restore_reason is not None:
         return restore_reason
@@ -184,13 +190,22 @@ def marker_preview_start_block_reason() -> str | None:
     selected = RUNTIME.model_catalog.selected_inactive_model
     if selected is None or not selected.is_visible:
         return "정렬할 표시 상태의 P 데이터 레이어를 선택하십시오."
+    conflict = RUNTIME.marker_selection.geometry_conflict_message()
+    if conflict is not None:
+        return conflict
     if len(RUNTIME.marker_selection.completed_pairs) < 3:
         return "마커 정렬에는 완성된 A/P 대응쌍이 최소 3개 필요합니다."
     return None
 
 
 def direct_align_start_block_reason() -> str | None:
-    """마커 없이 A 하나 이상과 P 하나로 Align을 시작할 수 없는 이유를 반환합니다."""
+    """직접 정렬의 A/P 선택과 역할별 입력 형상을 함께 검사합니다."""
+
+    from ..axis_settings import axis_edit_active_block_reason
+
+    axis_reason = axis_edit_active_block_reason(RUNTIME)
+    if axis_reason is not None:
+        return axis_reason
 
     restore_reason = restore_input_block_reason()
     if restore_reason is not None:
@@ -220,15 +235,17 @@ def direct_align_start_block_reason() -> str | None:
         return "정렬할 P 레이어를 하나 선택하십시오."
     if not selected.is_visible:
         return "정렬할 표시 상태의 P 데이터 레이어를 선택하십시오."
-    return None
+    from ..alignment.icp_geometry import geometry_selection_block_reason
+    return geometry_selection_block_reason(RUNTIME)
 
 
 def align_start_block_reason(context: bpy.types.Context) -> str | None:
-    """고정 자동 정렬의 초기값 계약에 맞는 Align 차단 사유를 반환합니다."""
+    """마커 미리보기 여부와 관계없이 자동 CC 정렬의 형상 선택을 검사합니다."""
+    from ..alignment.icp_geometry import geometry_selection_block_reason
 
-    if is_marker_preview_active():
-        return None
     del context
+    if is_marker_preview_active():
+        return geometry_selection_block_reason(RUNTIME)
     return direct_align_start_block_reason()
 
 
@@ -352,11 +369,11 @@ class COLMAPALIGN_OT_toggle_marker_preview(bpy.types.Operator):
 
 
 class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
-    """마커 미리보기 또는 현재 P 위치에서 정밀 Small GICP·Refine을 시작합니다."""
+    """마커 미리보기 또는 현재 P 위치에서 선택 형상의 정밀 CC 정렬을 시작합니다."""
 
     bl_idname = "colmap_align.align_marker_preview"
     bl_label = "Align"
-    bl_description = "마커 미리보기 또는 현재 P 위치에서 Small GICP 정밀 후 Refine 정밀을 자동 실행합니다"
+    bl_description = "마커 미리보기 또는 현재 P 위치에서 CC 강체 정렬과 초기값 대비 최대 ±10% 배율 보정을 자동 실행합니다"
     bl_options = {"INTERNAL"}
 
     @classmethod
@@ -372,7 +389,7 @@ class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
         )
 
     def execute(self, context):
-        """고정된 정밀 Small GICP·Refine 파이프라인을 시작하고 polling을 등록합니다."""
+        """선택 형상의 CC 강체 정렬과 배율 보정을 시작하고 진행 확인을 등록합니다."""
         uses_marker_preview = is_marker_preview_active()
         start_reason = align_start_block_reason(context)
         if start_reason is not None:
@@ -402,7 +419,7 @@ class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
         _report_status(
             self,
             {"INFO"},
-            "자동 2단계 정렬 · Small GICP 정밀 → Refine 정밀 · A 그룹 전체 "
+            "자동 CC 정렬 · 강체 정렬 → 최대 ±10% 배율 보정 · A 그룹 전체 "
             f"{len(RUNTIME.model_catalog.active_models())}개 기준으로 "
             f"{'마커 미리보기' if uses_marker_preview else '현재 P 위치'} 초기값 정렬을 시작했습니다.",
         )
@@ -446,6 +463,45 @@ class COLMAPALIGN_OT_validate_open3d_environment(bpy.types.Operator):
         self.report(
             {"INFO"},
             f"Open3D 환경 확인 완료 · Python {python_version} · Open3D {open3d_version}",
+        )
+        return {"FINISHED"}
+
+
+class COLMAPALIGN_OT_validate_cccore_environment(bpy.types.Operator):
+    """전용 Python과 CC 네이티브 엔진의 실제 최소 계산을 검사합니다."""
+
+    bl_idname = "colmap_align.validate_cccore_environment"
+    bl_label = "CC 정렬 환경 검사"
+    bl_description = "애드온 전용 Python과 CC 엔진을 실행해 정렬 환경을 확인합니다"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, _context):
+        """정렬이 실행 중이 아닐 때만 독립 환경 검사를 허용합니다."""
+        return not is_icp_running()
+
+    def execute(self, context):
+        """설정된 전용 런타임으로 검사하고 성공 또는 실제 오류를 보고합니다."""
+        from ..alignment.icp_cccore_runtime import validate_cccore_environment
+
+        try:
+            environment = validate_cccore_environment(configured_icp_python_path(context))
+        except (RuntimeError, ValueError, OSError) as error:
+            _report_status(self, {"WARNING"}, str(error))
+            return {"CANCELLED"}
+        version = str(environment.get("worker_python_version", "")).strip()
+        native = environment.get("native_environment")
+        if not isinstance(native, Mapping):
+            _report_status(self, {"WARNING"}, "CC 정렬 환경에 병렬 실행 정보가 없습니다.")
+            return {"CANCELLED"}
+        hardware = int(native["hardware_thread_count"])
+        _detected, automatic, _selected = cc_cpu_thread_counts(0, hardware)
+        actual = int(native["effective_max_threads"])
+        suffix = f" · Python {version}" if version else ""
+        _report_status(
+            self,
+            {"INFO"},
+            f"CC 정렬 환경 확인 완료 · oneTBB 병렬 · 실제 {actual}스레드 · 자동 {automatic}스레드{suffix}",
         )
         return {"FINISHED"}
 
@@ -588,6 +644,7 @@ CLASSES = (
     COLMAPALIGN_OT_align_marker_preview,
     # Open3D backend 환경 검사 operator는 구현 보존 상태로 등록하지 않습니다.
     # COLMAPALIGN_OT_validate_open3d_environment,
+    COLMAPALIGN_OT_validate_cccore_environment,
     COLMAPALIGN_OT_validate_small_gicp_environment,
     COLMAPALIGN_OT_cancel_icp,
     COLMAPALIGN_OT_discard_icp_preview,

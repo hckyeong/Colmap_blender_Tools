@@ -46,13 +46,22 @@ from .constants import (
     PROJECT_RESTORE_PHASE_IDLE,
     ROLE_MOVING,
     ROLE_REFERENCE,
+    MARKER_GEOMETRY_SOURCE_MAIN,
+    MARKER_GEOMETRY_SOURCE_COMPANION,
+    MARKER_GEOMETRY_SOURCES,
     MARKER_POINT_KIND_COLMAP,
     MARKER_POINT_KIND_MESH_SURFACE,
     MARKER_POINT_KINDS,
     SESSION_ENTERING,
     SESSION_INACTIVE,
 )
+from .axis_settings_state import AxisSettingsRuntimeState
 from .model_repository import ColmapModelRepository
+from .marker_capture import (
+    create_marker_capture_snapshot,
+    marker_capture_validation_message,
+    marker_geometry_kind_label,
+)
 from .undo import UndoJournal
 
 
@@ -77,13 +86,23 @@ class ModelCatalogRecord:
     is_visible: bool = True
     alignment_provenance: AlignmentProvenanceRecord | None = None
     geometry_kind: str = GEOMETRY_KIND_COLMAP_POINT_CLOUD
+    show_points: bool = True
+    show_surface: bool = False
 
     def __post_init__(self) -> None:
-        """카탈로그 형상 종류를 두 지원 값으로 정규화합니다."""
+        """형상 종류와 점군·메시 중 하나만 선택하는 표시 상태를 정규화합니다."""
         geometry_kind = str(self.geometry_kind).strip().upper()
         if geometry_kind not in {GEOMETRY_KIND_COLMAP_POINT_CLOUD, GEOMETRY_KIND_TRIANGLE_MESH}:
             raise ValueError("Data Layer geometry kind가 올바르지 않습니다.")
         object.__setattr__(self, "geometry_kind", geometry_kind)
+        points = bool(self.show_points)
+        surface = bool(self.show_surface)
+        if geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH:
+            points, surface = False, True
+        elif points == surface:
+            points, surface = True, False
+        object.__setattr__(self, "show_points", points)
+        object.__setattr__(self, "show_surface", surface)
 
 
 @dataclass
@@ -851,6 +870,40 @@ class ModelCatalogState:
         self.message = f"{record.display_name} 레이어를 {state_text} 상태로 변경했습니다."
         return True
 
+    def set_geometry_visibility(
+        self,
+        model_id: str,
+        *,
+        show_points: bool | None = None,
+        show_surface: bool | None = None,
+    ) -> bool:
+        """정렬과 선택을 유지하며 점군 또는 메시 하나를 표시 형상으로 선택합니다."""
+        record = self.models.get(model_id)
+        if record is None:
+            self.message = "표시 상태를 변경할 데이터 레이어를 찾을 수 없습니다."
+            return False
+        if show_points is not None and show_surface is not None:
+            if bool(show_points) == bool(show_surface):
+                self.message = "점군 또는 메시 하나를 선택하십시오. 숨기기는 눈 버튼을 사용하십시오."
+                return False
+            points = bool(show_points)
+        elif show_points is not None:
+            points = bool(show_points)
+        elif show_surface is not None:
+            points = not bool(show_surface)
+        else:
+            return True
+        if record.geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH and points:
+            self.message = "독립 메시 레이어에서는 메시 표시를 사용하십시오."
+            return False
+        updated = replace(record, show_points=points, show_surface=not points)
+        self.models[model_id] = updated
+        self.message = (
+            f"{record.display_name}의 {'점군' if points else '메시'} 표시를 선택했습니다."
+            if updated != record else ""
+        )
+        return True
+
     def toggle_model_visibility(self, model_id: str) -> bool:
         """지정 레이어의 현재 GPU 표시 상태를 반전합니다."""
         record = self.models.get(model_id)
@@ -901,14 +954,19 @@ class ModelCatalogState:
     def restore_group_snapshot(self, snapshot: ModelCatalogSnapshot) -> None:
         """그룹 Undo를 복원하되 이후 변경한 독립 표시 토글은 현재 값으로 보존합니다."""
         current_visibility = {
-            model_id: record.is_visible
+            model_id: (record.is_visible, record.show_points, record.show_surface)
             for model_id, record in self.models.items()
         }
         self.restore_snapshot(snapshot)
-        for model_id, is_visible in current_visibility.items():
+        for model_id, visibility in current_visibility.items():
             record = self.models.get(model_id)
-            if record is not None and record.is_visible != is_visible:
-                self.models[model_id] = replace(record, is_visible=is_visible)
+            if record is not None:
+                self.models[model_id] = replace(
+                    record,
+                    is_visible=visibility[0],
+                    show_points=visibility[1],
+                    show_surface=visibility[2],
+                )
         self._validate_invariants()
 
     def _validate_invariants(self) -> None:
@@ -999,12 +1057,19 @@ class SelectedPoint:
     model_id: str = ""
     point_kind: str = MARKER_POINT_KIND_COLMAP
     source_point_id: int | None = None
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN
 
     def __post_init__(self) -> None:
-        """기존 point3d_id와 점·면 source ID 및 Source Local 좌표를 정규화합니다."""
+        """기존 점 ID와 주 형상·연결 메시 출처 및 원본 좌표를 정규화합니다."""
         point_kind = str(self.point_kind).strip().upper()
         if point_kind not in MARKER_POINT_KINDS:
             raise ValueError("마커 point kind가 올바르지 않습니다.")
+        geometry_source = str(self.geometry_source).strip().upper()
+        if geometry_source not in MARKER_GEOMETRY_SOURCES:
+            raise ValueError("마커 형상 출처가 올바르지 않습니다.")
+        if geometry_source == MARKER_GEOMETRY_SOURCE_COMPANION and point_kind != MARKER_POINT_KIND_MESH_SURFACE:
+            raise ValueError("연결 메시에는 표면 마커만 지정할 수 있습니다.")
+        object.__setattr__(self, "geometry_source", geometry_source)
         source_id = self.source_point_id if self.source_point_id is not None else self.point3d_id
         if source_id is None:
             raise ValueError("마커 원본 점 ID가 비어 있습니다.")
@@ -1054,6 +1119,9 @@ class MarkerDraft:
     reference: SelectedPoint | None
     moving: SelectedPoint | None
     baseline_snapshot: MarkerCommittedSnapshot
+    capture_snapshot: Any = None
+    reference_geometry_kind: str | None = None
+    moving_geometry_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1066,6 +1134,7 @@ class MarkerSelectionSnapshot:
     completed_pairs: tuple[MarkerPair, ...]
     draft: MarkerDraft | None
     message: str
+    capture_runtime: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -1078,6 +1147,7 @@ class MarkerSelectionState:
     completed_pairs: list[MarkerPair] = field(default_factory=list)
     draft: MarkerDraft | None = None
     message: str = ""
+    _capture_runtime: Any = field(default=None, repr=False, compare=False)
 
     @property
     def has_draft(self) -> bool:
@@ -1091,8 +1161,91 @@ class MarkerSelectionState:
             return None
         return self.get_pair(self.active_pair_id)
 
+    def role_geometry_kind(self, role: str) -> str | None:
+        """확정 마커 전체에서 지정 역할의 일관된 형상 종류만 유도합니다."""
+        kinds = self._committed_role_geometry_kinds(role)
+        return next(iter(kinds)) if len(kinds) == 1 else None
+
+    def _committed_role_geometry_kinds(self, role: str) -> frozenset[str]:
+        """한 역할의 확정 마커가 참조하는 형상 종류 집합을 반환합니다."""
+        if role not in _VALID_ROLES:
+            return frozenset()
+        return frozenset(
+            self._point_geometry_kind(pair.reference if role == ROLE_REFERENCE else pair.moving)
+            for pair in self.completed_pairs
+        )
+
+    @staticmethod
+    def _point_geometry_kind(point: SelectedPoint) -> str:
+        """점군 마커와 메시 정점·표면 마커를 역할별 형상 종류로 변환합니다."""
+        return GEOMETRY_KIND_COLMAP_POINT_CLOUD if point.point_kind == MARKER_POINT_KIND_COLMAP else GEOMETRY_KIND_TRIANGLE_MESH
+
+    def geometry_conflict_message(self) -> str | None:
+        """구버전 확정 마커의 역할별 종류 혼합을 보존하면서 충돌을 안내합니다."""
+        roles = [label for role, label in ((ROLE_REFERENCE, "A"), (ROLE_MOVING, "P"))
+                 if len(self._committed_role_geometry_kinds(role)) > 1]
+        if roles:
+            return f"{'/'.join(roles)} 마커에 점군과 메시가 혼합되어 있습니다. 충돌하는 쌍을 삭제하거나 마커를 초기화하십시오."
+        return None
+
+    def _draft_role_geometry_kind(self, role: str) -> str | None:
+        """확정 기준을 우선하고 없으면 현재 드래프트의 잠정 종류를 반환합니다."""
+        committed = self.role_geometry_kind(role)
+        if committed is not None or self.draft is None:
+            return committed
+        return self.draft.reference_geometry_kind if role == ROLE_REFERENCE else self.draft.moving_geometry_kind
+
+    def geometry_status_message(self) -> str:
+        """현재 A/P의 확정 또는 잠정 종류 고정을 짧게 안내합니다."""
+        conflict = self.geometry_conflict_message()
+        if conflict is not None:
+            return conflict
+        values = []
+        for role, label in ((ROLE_REFERENCE, "A"), (ROLE_MOVING, "P")):
+            kind = self._draft_role_geometry_kind(role)
+            values.append(f"{label}: {marker_geometry_kind_label(kind)}" + (" 고정" if kind else ""))
+        return " · ".join(values) if self.has_draft or self.completed_pairs else ""
+
+    def draft_geometry_rejection_message(self) -> str | None:
+        """현재 입력의 역할 종류와 표시·원본·축·정렬 기준 유효성을 검사합니다."""
+        conflict = self.geometry_conflict_message()
+        if conflict is not None:
+            return conflict
+        draft = self.draft
+        if draft is None:
+            return None
+        if draft.capture_snapshot is not None:
+            if self._capture_runtime is None:
+                return "마커 입력 기준이 만료되었습니다. 취소한 뒤 다시 시작하십시오."
+            reason = marker_capture_validation_message(self._capture_runtime, draft.capture_snapshot)
+            if reason is not None:
+                return reason
+        for role, point in ((ROLE_REFERENCE, draft.reference), (ROLE_MOVING, draft.moving)):
+            if point is None:
+                continue
+            kind = self._draft_role_geometry_kind(role)
+            if kind is not None and self._point_geometry_kind(point) != kind:
+                label = "A" if role == ROLE_REFERENCE else "P"
+                return f"{label} 마커는 {marker_geometry_kind_label(kind)}로 고정되어 있습니다."
+        return None
+
+    def _capture_for_begin(self, runtime: Any):
+        """입력 시작 전 확정 종류와 보이는 후보를 검증하고 임시 기준을 만듭니다."""
+        conflict = self.geometry_conflict_message()
+        if conflict is not None:
+            raise ValueError(conflict)
+        return create_marker_capture_snapshot(runtime) if runtime is not None else None
+
+    def _initial_draft_geometry_kind(self, role: str, capture_snapshot: Any) -> str | None:
+        """확정 기준이 없고 보이는 후보 종류가 하나이면 잠정 종류를 정합니다."""
+        committed = self.role_geometry_kind(role)
+        if committed is not None or capture_snapshot is None:
+            return committed
+        kinds = capture_snapshot.role_geometry_kinds(role)
+        return next(iter(kinds)) if len(kinds) == 1 else None
+
     def snapshot(self) -> MarkerSelectionSnapshot:
-        """현재 마커 상태를 세션 Undo용 불변 스냅샷으로 복사합니다."""
+        """마커와 임시 입력 검증 참조를 복사해 실패 복구와 드래프트 Undo를 보장합니다."""
         return MarkerSelectionSnapshot(
             phase=self.phase,
             next_pair_id=self.next_pair_id,
@@ -1100,10 +1253,11 @@ class MarkerSelectionState:
             completed_pairs=tuple(self.completed_pairs),
             draft=self.draft,
             message=self.message,
+            capture_runtime=self._capture_runtime,
         )
 
     def restore_snapshot(self, snapshot: MarkerSelectionSnapshot) -> None:
-        """검증된 스냅샷을 한 번에 복원해 Undo 경계를 보장합니다."""
+        """마커와 임시 입력 검증 참조를 함께 복원해 Undo 경계를 보장합니다."""
         if not isinstance(snapshot, MarkerSelectionSnapshot):
             raise TypeError("마커 Undo 스냅샷 형식이 올바르지 않습니다.")
         self.phase = snapshot.phase
@@ -1111,14 +1265,21 @@ class MarkerSelectionState:
         self.active_pair_id = snapshot.active_pair_id
         self.completed_pairs = list(snapshot.completed_pairs)
         self.draft = snapshot.draft
+        self._capture_runtime = snapshot.capture_runtime if snapshot.draft is not None else None
         self.message = snapshot.message
 
-    def begin_create_draft(self) -> bool:
-        """양방향 A/P 입력을 받을 새 마커 쌍 드래프트를 시작합니다."""
+    def begin_create_draft(self, *, runtime: Any = None) -> bool:
+        """역할별 종류와 표시 기준을 검증하고 새 마커 쌍 입력을 시작합니다."""
         if self.has_draft:
             self.message = "이미 편집 중인 마커 쌍이 있습니다. 먼저 확정하거나 취소하십시오."
             return False
+        try:
+            capture = self._capture_for_begin(runtime)
+        except (ValueError, RuntimeError) as error:
+            self.message = str(error)
+            return False
         baseline = self._committed_snapshot()
+        self._capture_runtime = runtime
         self.phase = PHASE_CAPTURING
         self.draft = MarkerDraft(
             mode=DRAFT_MODE_CREATE,
@@ -1127,12 +1288,15 @@ class MarkerSelectionState:
             reference=None,
             moving=None,
             baseline_snapshot=baseline,
+            capture_snapshot=capture,
+            reference_geometry_kind=self._initial_draft_geometry_kind(ROLE_REFERENCE, capture),
+            moving_geometry_kind=self._initial_draft_geometry_kind(ROLE_MOVING, capture),
         )
         self.message = f"A{self.next_pair_id} 또는 P{self.next_pair_id} 점을 선택하십시오."
         return True
 
-    def begin_edit_draft(self, pair_id: int) -> bool:
-        """선택한 확정 쌍의 A/P 후보를 유지한 통합 편집 드래프트를 시작합니다."""
+    def begin_edit_draft(self, pair_id: int, *, runtime: Any = None) -> bool:
+        """확정 역할 종류를 유지하고 현재 표시 기준에서 선택한 쌍을 편집합니다."""
         if self.has_draft:
             self.message = "이미 편집 중인 마커 쌍이 있습니다."
             return False
@@ -1140,7 +1304,13 @@ class MarkerSelectionState:
         if pair is None:
             self.message = "편집할 마커 쌍을 찾을 수 없습니다."
             return False
+        try:
+            capture = self._capture_for_begin(runtime)
+        except (ValueError, RuntimeError) as error:
+            self.message = str(error)
+            return False
         baseline = self._committed_snapshot()
+        self._capture_runtime = runtime
         self.phase = PHASE_CAPTURING
         self.active_pair_id = pair.pair_id
         self.draft = MarkerDraft(
@@ -1150,6 +1320,9 @@ class MarkerSelectionState:
             reference=pair.reference,
             moving=pair.moving,
             baseline_snapshot=baseline,
+            capture_snapshot=capture,
+            reference_geometry_kind=self._initial_draft_geometry_kind(ROLE_REFERENCE, capture),
+            moving_geometry_kind=self._initial_draft_geometry_kind(ROLE_MOVING, capture),
         )
         self.message = f"A{pair.pair_id} 또는 P{pair.pair_id} 점을 다시 선택해 마커 쌍을 편집하십시오."
         return True
@@ -1163,8 +1336,9 @@ class MarkerSelectionState:
         model_id: str | None = None,
         point_kind: str = MARKER_POINT_KIND_COLMAP,
         source_point_id: int | None = None,
+        geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
     ) -> bool:
-        """모델 소유권을 보존해 드래프트 후보를 바꾸고 중복 선택을 거부합니다."""
+        """원본 출처와 역할별 종류·입력 기준을 검증한 뒤 드래프트 후보를 바꿉니다."""
         rejection_message = self._draft_pick_rejection_message(
             role,
             point3d_id,
@@ -1172,6 +1346,7 @@ class MarkerSelectionState:
             model_id=model_id,
             point_kind=point_kind,
             source_point_id=source_point_id,
+            geometry_source=geometry_source,
         )
         if rejection_message is not None:
             if rejection_message != "이미 선택한 점입니다.":
@@ -1187,16 +1362,19 @@ class MarkerSelectionState:
             model_id=str(model_id or ""),
             point_kind=point_kind,
             source_point_id=source_point_id if source_point_id is not None else point3d_id,
+            geometry_source=geometry_source,
         )
         if role == ROLE_REFERENCE:
             self.draft = replace(
                 draft,
                 reference=selected,
+                reference_geometry_kind=self._draft_role_geometry_kind(role) or self._point_geometry_kind(selected),
             )
         else:
             self.draft = replace(
                 draft,
                 moving=selected,
+                moving_geometry_kind=self._draft_role_geometry_kind(role) or self._point_geometry_kind(selected),
             )
         self.message = self._draft_status_message(self.draft)
         return True
@@ -1210,8 +1388,9 @@ class MarkerSelectionState:
         model_id: str | None = None,
         point_kind: str = MARKER_POINT_KIND_COLMAP,
         source_point_id: int | None = None,
+        geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
     ) -> bool:
-        """모델을 포함한 점 후보가 드래프트를 바꾸는지 상태 변경 없이 확인합니다."""
+        """출처·역할 종류·입력 기준을 포함해 후보가 유효한지 상태 변경 없이 검사합니다."""
         return self._draft_pick_rejection_message(
             role,
             point3d_id,
@@ -1219,10 +1398,11 @@ class MarkerSelectionState:
             model_id=model_id,
             point_kind=point_kind,
             source_point_id=source_point_id,
+            geometry_source=geometry_source,
         ) is None
 
     def can_confirm_draft(self) -> bool:
-        """신규 후보 완성 또는 기존 쌍의 실제 변경 여부를 상태 변경 없이 확인합니다."""
+        """입력 기준이 유효한 상태에서 후보 완성 또는 기존 쌍의 실제 변경을 검사합니다."""
         draft = self.draft
         if (
             not self.has_draft
@@ -1230,6 +1410,8 @@ class MarkerSelectionState:
             or draft.reference is None
             or draft.moving is None
         ):
+            return False
+        if self.draft_geometry_rejection_message() is not None:
             return False
         if draft.mode == DRAFT_MODE_CREATE:
             return True
@@ -1246,8 +1428,12 @@ class MarkerSelectionState:
         )
 
     def commit_draft(self) -> MarkerPair | None:
-        """준비된 드래프트를 하나의 확정 마커 쌍으로 반영합니다."""
+        """역할 종류와 입력 지문을 다시 검사하고 준비된 드래프트를 확정합니다."""
         draft = self.draft
+        reason = self.draft_geometry_rejection_message()
+        if reason is not None:
+            self.message = reason
+            return None
         if not self.can_confirm_draft() or draft is None:
             if draft is not None and draft.mode == DRAFT_MODE_EDIT:
                 self.message = "A 또는 P 점을 실제로 변경한 뒤 쌍 지정을 누르십시오."
@@ -1275,6 +1461,7 @@ class MarkerSelectionState:
             message = f"A{pair.pair_id} ↔ P{pair.pair_id} 대응쌍을 편집했습니다."
         self.phase = PHASE_IDLE
         self.draft = None
+        self._capture_runtime = None
         self.active_pair_id = pair.pair_id
         self.message = message
         return pair
@@ -1287,6 +1474,7 @@ class MarkerSelectionState:
         self._restore_committed_snapshot(draft.baseline_snapshot)
         self.phase = PHASE_IDLE
         self.draft = None
+        self._capture_runtime = None
         self.message = "마커 쌍 입력을 취소했습니다."
         return True
 
@@ -1368,17 +1556,19 @@ class MarkerSelectionState:
         exclude_pair_id: int | None = None,
         point_kind: str = MARKER_POINT_KIND_COLMAP,
         position: tuple[float, float, float] | None = None,
+        geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
     ) -> bool:
-        """다른 쌍이 같은 모델의 원본 점 또는 같은 면 위치를 쓰는지 확인합니다."""
+        """다른 쌍이 같은 모델·출처의 원본 점 또는 같은 면 위치를 쓰는지 확인합니다."""
         if role not in _VALID_ROLES:
             return False
         normalized_model_id = str(model_id or "")
+        geometry_source = str(geometry_source).strip().upper()
         for pair in self.completed_pairs:
             if pair.pair_id == exclude_pair_id:
                 continue
             point = pair.reference if role == ROLE_REFERENCE else pair.moving
             stored_id = point.source_point_id if point.source_point_id is not None else point.point3d_id
-            if point.point_kind != point_kind or stored_id != point3d_id:
+            if point.geometry_source != geometry_source or point.point_kind != point_kind or stored_id != point3d_id:
                 continue
             if point_kind == MARKER_POINT_KIND_MESH_SURFACE and position is not None:
                 candidate_position = tuple(float(value) for value in position)
@@ -1406,6 +1596,7 @@ class MarkerSelectionState:
         self.active_pair_id = None
         self.completed_pairs.clear()
         self.draft = None
+        self._capture_runtime = None
         self.message = ""
 
     def _committed_snapshot(self) -> MarkerCommittedSnapshot:
@@ -1454,30 +1645,44 @@ class MarkerSelectionState:
         model_id: str | None = None,
         point_kind: str = MARKER_POINT_KIND_COLMAP,
         source_point_id: int | None = None,
+        geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
     ) -> str | None:
-        """모델 소유권을 포함한 점 선택의 거부 이유를 상태 변경 없이 반환합니다."""
+        """출처·역할 종류·입력 지문·중복을 검사해 선택 거부 이유를 반환합니다."""
         draft = self.draft
         if not self.has_draft or draft is None:
             return "먼저 마커 쌍 추가 또는 편집을 시작하십시오."
         if role not in _VALID_ROLES:
             return "마커 역할이 올바르지 않습니다."
+        reason = self.draft_geometry_rejection_message()
+        if reason is not None:
+            return reason
+        try:
+            selected = SelectedPoint(
+                model_role=role, point3d_id=int(point3d_id),
+                local_position=tuple(float(value) for value in position),
+                model_id=str(model_id or ""), point_kind=point_kind,
+                source_point_id=source_point_id if source_point_id is not None else point3d_id,
+                geometry_source=geometry_source,
+            )
+        except (TypeError, ValueError) as error:
+            return str(error)
+        kind = self._point_geometry_kind(selected)
+        required_kind = self._draft_role_geometry_kind(role)
+        if required_kind is not None and kind != required_kind:
+            label = "A" if role == ROLE_REFERENCE else "P"
+            return f"{label} 마커는 {marker_geometry_kind_label(required_kind)}로 고정되어 있습니다. 같은 종류의 형상을 선택하십시오."
+        if draft.capture_snapshot is not None and not any(
+            item.role == role and item.model_id == selected.model_id
+            and item.geometry_source == selected.geometry_source and item.geometry_kind == kind
+            for item in draft.capture_snapshot.geometries
+        ):
+            return "입력 시작 때 표시한 대상 형상에서 마커를 선택하십시오."
         if self.is_point_used(
-            role,
-            int(source_point_id if source_point_id is not None else point3d_id),
-            model_id=model_id,
-            exclude_pair_id=draft.source_pair_id,
-            point_kind=point_kind,
-            position=position,
+            role, selected.source_point_id, model_id=model_id,
+            exclude_pair_id=draft.source_pair_id, point_kind=selected.point_kind,
+            position=position, geometry_source=selected.geometry_source,
         ):
             return "이미 다른 마커 쌍에 사용한 점입니다."
-        selected = SelectedPoint(
-            model_role=role,
-            point3d_id=int(point3d_id),
-            local_position=tuple(float(value) for value in position),
-            model_id=str(model_id or ""),
-            point_kind=point_kind,
-            source_point_id=source_point_id if source_point_id is not None else point3d_id,
-        )
         current = draft.reference if role == ROLE_REFERENCE else draft.moving
         if current == selected:
             return "이미 선택한 점입니다."
@@ -1618,7 +1823,7 @@ class ViewportRegistryState:
 
 @dataclass
 class ProjectRestoreRuntimeState:
-    """대형 COLMAP 배열 없이 자동 복원 진행·오류·재연결 후보만 보관합니다."""
+    """자동 복원 진행·오류·재연결 후보와 확정 전 격리 런타임을 보관합니다."""
 
     phase: str = PROJECT_RESTORE_PHASE_IDLE
     generation: int = 0
@@ -1629,6 +1834,8 @@ class ProjectRestoreRuntimeState:
     last_error: str = ""
     last_message: str = ""
     relink_paths: dict[str, str] = field(default_factory=dict)
+    staging_runtime: Any | None = None
+    created_embedded_assets: dict[str, str] = field(default_factory=dict)
 
     def clear(self, *, keep_project_uuid: bool = False) -> None:
         """파일 교체·등록 해제 뒤 stale 복원 입력을 비우고 유휴 상태로 되돌립니다."""
@@ -1642,6 +1849,8 @@ class ProjectRestoreRuntimeState:
         self.last_error = ""
         self.last_message = ""
         self.relink_paths.clear()
+        self.created_embedded_assets.clear()
+        self.staging_runtime = None
 
 
 @dataclass
@@ -1658,6 +1867,7 @@ class RuntimeState:
     layer_transform: LayerTransformRuntimeState = field(
         default_factory=LayerTransformRuntimeState
     )
+    axis_settings: AxisSettingsRuntimeState = field(default_factory=AxisSettingsRuntimeState)
     icp_alignment: IcpAlignmentRuntimeState = field(default_factory=IcpAlignmentRuntimeState)
     merge_export: MergeExportRuntimeState = field(default_factory=MergeExportRuntimeState)
     obj_export: ObjExportRuntimeState = field(default_factory=ObjExportRuntimeState)
@@ -1752,10 +1962,11 @@ class RuntimeState:
         self.obj_export_timer = None
 
     def clear_transient(self, keep_markers: bool = False) -> None:
-        """파일 교체에 취약한 GPU·면 피킹·창·Undo·카탈로그 참조를 안전하게 비웁니다."""
+        """파일 교체에 취약한 축 미리보기·GPU·창·Undo·카탈로그 참조를 비웁니다."""
         from .alignment.icp_runtime import invalidate_icp
         from .viewport.picking import clear_mesh_surface_pick_cache
 
+        self.axis_settings.clear()
         invalidate_icp(self, "세션 상태를 초기화했습니다.")
         self.layer_transform.clear(message="세션 상태를 초기화했습니다.")
         if self.icp_timer is not None:

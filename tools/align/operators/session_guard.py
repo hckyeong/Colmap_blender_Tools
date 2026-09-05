@@ -317,6 +317,9 @@ class COLMAPALIGN_OT_session_input_guard(bpy.types.Operator):
                     "마커 정렬 미리보기를 취소하고 이전 P 시점으로 복원했습니다.",
                 )
                 return {"RUNNING_MODAL"}
+        # 속성 팝업이 활성일 때 입력·취소·필드 Undo는 Blender 팝업이 처리합니다.
+        if RUNTIME.axis_settings.is_active:
+            return {"PASS_THROUGH"}
         action = route_session_input(event)
         if action is None:
             return {"PASS_THROUGH"}

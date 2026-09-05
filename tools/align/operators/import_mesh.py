@@ -1,4 +1,4 @@
-"""삼각형 OBJ 파일 선택과 TIMER 기반 MeshImportJob 실행을 제공합니다."""
+"""원본 토폴로지 OBJ 파일 선택과 TIMER 기반 MeshImportJob 실행을 제공합니다."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 import bpy
 from bpy.props import EnumProperty, StringProperty
 
+from ..axis_settings import axis_edit_active_block_reason
 from ..constants import OBJ_DISPLAY_VERTEX_LIMIT
 from ..display_axes import (
     AXIS_ITEMS,
@@ -51,11 +52,11 @@ def _axis_pair(operator: Any) -> tuple[str, str]:
 
 
 class COLMAPALIGN_OT_import_obj(bpy.types.Operator):
-    """파일 탐색기에서 삼각형 OBJ와 표시 축을 선택합니다."""
+    """파일 탐색기에서 원본 토폴로지 OBJ와 표시 축을 선택합니다."""
 
     bl_idname = "colmap_align.import_obj"
     bl_label = "OBJ 메시 추가"
-    bl_description = "삼각형 OBJ(최대 600,000면)를 Data Layer로 추가합니다"
+    bl_description = "OBJ 원본 토폴로지를 내장하고 정렬용 삼각형 프록시를 추가합니다"
     bl_options = {"REGISTER"}
 
     filepath: StringProperty(name="OBJ 파일", subtype="FILE_PATH", options={"SKIP_SAVE"})
@@ -71,6 +72,7 @@ class COLMAPALIGN_OT_import_obj(bpy.types.Operator):
         return bool(
             window is not None
             and is_session_active_for_window(window)
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not RUNTIME.import_in_progress
             and not RUNTIME.modal_active
             and not bool(getattr(RUNTIME.merge_export, "is_running", False))
@@ -92,16 +94,20 @@ class COLMAPALIGN_OT_import_obj(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def draw(self, _context: bpy.types.Context) -> None:
-        """파일 탐색기 옵션에 Display Axis와 삼각면 하드 제한 안내를 그립니다."""
+        """파일 탐색기 옵션에 Display Axis와 비파괴 내장 안내를 그립니다."""
         self.layout.prop(self, "axis_preset")
         if axes_for_preset(self.axis_preset) is None:
             self.layout.prop(self, "axis_forward")
             self.layout.prop(self, "axis_up")
-        self.layout.label(text="삼각면 최대 600,000개, 자동 리메시 없음", icon="INFO")
+        self.layout.label(text="Triangle·Quad·N-gon 원본 내장, 자동 리메시 없음", icon="INFO")
         self.layout.label(text=f"마커 정점 표시 상한 {OBJ_DISPLAY_VERTEX_LIMIT:,}개", icon="INFO")
 
     def execute(self, context: bpy.types.Context):
-        """선택한 OBJ와 축 snapshot을 내부 TIMER 작업으로 전달합니다."""
+        """축 편집 잠금을 확인하고 OBJ·축 스냅샷을 내부 TIMER 작업으로 전달합니다."""
+        reason = axis_edit_active_block_reason(RUNTIME)
+        if reason is not None:
+            _report_status(self, {"WARNING"}, reason)
+            return {"CANCELLED"}
         if restore_input_block_reason() is not None:
             _report_status(self, {"WARNING"}, restore_input_block_reason() or "복원 중입니다.")
             return {"CANCELLED"}
@@ -151,6 +157,7 @@ class COLMAPALIGN_OT_import_obj_job(bpy.types.Operator):
         return bool(
             window is not None
             and is_session_active_for_window(window)
+            and axis_edit_active_block_reason(RUNTIME) is None
             and not RUNTIME.import_in_progress
             and not bool(getattr(RUNTIME.merge_export, "is_running", False))
             and not bool(getattr(RUNTIME.obj_export, "is_running", False))
@@ -184,7 +191,11 @@ class COLMAPALIGN_OT_import_obj_job(bpy.types.Operator):
         return result
 
     def _start(self, context: bpy.types.Context) -> set[str]:
-        """MeshImportJob을 생성하고 Blender TIMER·진행 막대를 등록합니다."""
+        """축 편집 잠금을 확인하고 OBJ TIMER·진행 막대를 등록합니다."""
+        reason = axis_edit_active_block_reason(RUNTIME)
+        if reason is not None:
+            _report_status(self, {"WARNING"}, reason)
+            return {"CANCELLED"}
         try:
             job = create_mesh_import_job(
                 self.source_path,

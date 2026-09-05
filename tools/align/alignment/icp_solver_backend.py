@@ -19,6 +19,7 @@ from ..constants import (
 class IcpSolverBackend(str, Enum):
     """사용자가 명시적으로 선택하는 ICP 수치 backend입니다."""
 
+    CCCORELIB = "CCCORELIB"
     CUSTOM_HYBRID = ICP_BACKEND_ID_CUSTOM_HYBRID
     OPEN3D_GICP = ICP_BACKEND_ID_OPEN3D_GICP
     SMALL_GICP = ICP_BACKEND_ID_SMALL_GICP
@@ -26,6 +27,7 @@ class IcpSolverBackend(str, Enum):
 
 
 _BACKEND_ALGORITHM_VERSIONS = {
+    IcpSolverBackend.CCCORELIB: "cccore-icp-v3",
     IcpSolverBackend.CUSTOM_HYBRID: ICP_BACKEND_ALGORITHM_VERSION_CUSTOM_HYBRID,
     IcpSolverBackend.OPEN3D_GICP: ICP_BACKEND_ALGORITHM_VERSION_OPEN3D_GICP,
     IcpSolverBackend.SMALL_GICP: ICP_BACKEND_ALGORITHM_VERSION_SMALL_GICP,
