@@ -1,5 +1,13 @@
 # 통합 구현 현황
 
+## 0.3.37 실험 Align 정식 승격
+
+실험 `e9082f7`의 CC v3·OBJ 내장·레이어 축/형상·표면 마커·저장 자동 재연결을 정식 `colmap_tools`로 이관했습니다. 기본 ZIP에 전용 Python·CC·oneTBB를 포함하고 Root 환경설정의 CPU 상한을 연결했습니다. Modifier·Projection Painting 및 공용 작업공간 생명주기는 유지했습니다.
+
+정식 설치본의 네 가지 CC 입력 조합과 저장·재연결·세 도구 GUI 교대, Align 소스 35종·네이티브 35개·솔버 41개를 검증했습니다. 실데이터 평균은 정렬 6.141806초, 오정렬 102.505927초이며 기존 v3 대비 최종 행렬·거리 지표 차이는 0입니다. 페이징 및 기존 1% 프로토콜 목표 미달의 채택 결정은 [승격 기록](ALIGN_CC_MAIN_RELEASE_NOTE.md)에 남겼습니다.
+
+Production ZIP은 `build/colmap_tools-0.3.37.zip`, 크기는 47,943,982바이트, SHA-256은 `41905a6350b6ca4fe61698c57117be8815db73a6afa0f2055f2f77aac07ab32b`입니다.
+
 ## 0.3.36 Align 진입 Object Mode 자동 전환
 
 - Align 진입 시 Edit·Sculpt·Texture Paint를 포함한 비 Object Mode를 Blender 기본 Object Mode로 자동 전환합니다.

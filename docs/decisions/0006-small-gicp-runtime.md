@@ -1,6 +1,6 @@
 # ADR-0006: Small GICP Native Runtime 배포와 Process 격리
 
-- 상태: 채택
+- 상태: 기본 엔진·배포 프로필 결정은 [ADR-0011](0011-cccore-production-runtime.md)로 대체. 프로세스 격리와 명시적 SmallGicp 비교 빌드는 유지.
 - 결정일: 2026-08-27
 
 ## 배경

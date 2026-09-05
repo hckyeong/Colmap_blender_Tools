@@ -26,3 +26,5 @@ Root `__init__.py`는 `shell.lifecycle`만 호출합니다. Root Shell은 도구
 `tools/modifier/core/edit_delta.py`, `edit_journal.py`, `domain_persistence.py`는 Blender와 분리된 편집 Delta·전용 Undo/Redo Journal·저장 Codec을 소유합니다. `tools/modifier/blender/modifier_runtime_domain.py`는 Domain Registry와 Scene의 일시 연결만 관리하고, `modifier_project_store.py`와 `modifier_persistence_handlers.py`는 Active/Staging Text 저장 경계를 담당합니다. Modifier Scene 요소와 Timeline은 Domain 결과에서 재생성 가능한 파생 표시입니다.
 
 `tools/modifier/blender/camera_review_authority.py`는 Modifier Camera 쓰기 권한의 공통 검증 경계입니다. Timeline과 Viewport는 서로를 참조하지 않고 이 권한 경계만 사용해 현재 Window·Workspace·Scene Marker 사용권이 일치할 때만 Scene Camera를 변경합니다.
+
+0.3.37의 Align 기본 정렬은 CC v3입니다. `shell/preferences.py`의 Root 환경설정 한 곳에서 CPU 상한을 저장하고 Align의 스레드 해석 함수를 사용합니다. 패키지의 `tools/align/runtime/python/`은 외부 Python 조정자, `tools/align/runtime/cccore/`는 네이티브 세션 워커·DLL·라이선스·재빌드 원문을 담습니다. 한 Align 작업의 순차 네이티브 명령이 같은 프로세스와 형상 캐시를 재사용하며 Blender 안에는 CC DLL을 적재하지 않습니다. 개발 캐시 `.cccore-runtime/`과 검증기·결과는 배포 ZIP에서 제외합니다.

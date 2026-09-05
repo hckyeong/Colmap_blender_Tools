@@ -2,6 +2,42 @@
 
 모든 명령은 Repository Root에서 실행합니다.
 
+## Align CC 정식 배포와 재연결 검증
+
+```powershell
+.\build_tools\build_extension.ps1
+.\build_tools\test_align_source.ps1
+.\build_tools\test_installed_extension.ps1 -WorkspaceGui -ReportDirectory "$PWD\build\verification"
+```
+
+기본 `CCCoreLib` ZIP은 전용 Python·NumPy와 CC v3·oneTBB를 포함합니다. 빌드는 Architecture·Coexistence·Modifier Core·Projection Core와 통합 등록 검사, 스테이징 실제 CC 정렬, ZIP 필수 파일·해시·개발 경로 누출 검사를 수행합니다. 검증된 실행 환경을 재사용할 때에는 `-CcCorePythonPath`와 `-CcCoreRuntimePath`를 지정합니다. `SmallGicp`는 희소 점군 비교 전용이며 `Full`은 CC 기본 실행 환경에 개발용 선택형 소스를 추가합니다.
+
+설치 검사는 임시 Blender 사용자 설정에 ZIP을 설치하고 네 가지 입력 조합의 실제 정렬, 승인·Undo/Redo, 설정, OBJ 토폴로지와 면 코너 UV를 확인합니다. `-WorkspaceGui`는 세 도구 작업공간·카메라 마커 교대와 다음 세 가지 새 프로세스 검사를 추가합니다.
+
+1. COLMAP·연결 쿼드 OBJ 두 레이어, 마커쌍, 확정 행렬과 CPU 설정을 생성하고 저장합니다.
+2. Align 작업공간에서 저장한 파일로 새 Blender를 시작해 탭 전환 없이 활성 세션·내장 메시·UV·행렬·마커·CPU 설정을 확인합니다.
+3. 일반 작업공간에서 저장한 파일은 데이터만 복원하고 작업공간을 유지하는지 확인합니다.
+
+`verification-report.json`에는 설치 ZIP의 SHA-256과 완료 영역을 기록하고, `session-reconnect/`에는 각 프로세스의 결과를 남깁니다. 기존 사용자 Blender 설정·원본 파일을 변경하지 않습니다.
+
+정식 네이티브 실행 환경을 소스에서 다시 준비하려면 Visual Studio 2022 C++ 도구가 설치된 PowerShell에서 다음을 실행합니다.
+
+```powershell
+python .\build_tools\cccore_distribution.py prepare-python
+.\build_tools\prepare_cccore_runtime.ps1 -EnvironmentRoot "$PWD\.cccore-runtime" -RuntimePath "$PWD\.cccore-runtime\cccore"
+& .\.cccore-runtime\python\python.exe -X utf8 .\tests\align\native\test_cccore_worker.py --report "$PWD\build\native-tests.json"
+$env:COLMAP_CCCORE_WORKER = "$PWD\.cccore-runtime\cccore\colmap_cccore_worker.exe"
+& .\.cccore-runtime\python\python.exe -X utf8 .\tests\align\test_icp_cccore_solver.py
+```
+
+이전 v3 실데이터 결과와 같은 입력·행렬·스레드로 정식 설치본을 비교하는 명령:
+
+```powershell
+.\build_tools\benchmark_installed_cccore.ps1 -BaselineRoot '<이전 v3 결과 루트>' -InputBlend '<동일 입력 blend>' -ReportDirectory '<새 결과 폴더>'
+```
+
+각 상태에서 워밍업 1회와 측정 3회를 서로 다른 Blender 프로세스로 실행합니다. 기존 입력 SHA-256·형상 지문·파라미터·최종 행렬·거리 지표·메시 적재 횟수를 대조하고, Windows PDH로 시스템 전체의 페이지 디스크 입출력·페이지 파일 점유·가용 메모리·CPU 부하를 수집합니다. 일반 페이지 폴트나 작업집합만으로 페이징 여부를 판단하지 않으며, 디스크 읽기를 특정 워커의 스왑 읽기로 단정하지 않습니다.
+
 ## Projection Paint 가시 Layer Texture Export 회귀
 
 ```powershell

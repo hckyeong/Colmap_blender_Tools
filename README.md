@@ -31,8 +31,22 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 .\build_tools\build_extension.ps1
 ```
 
-기본 빌드는 Align의 검증된 `small_gicp` Native Runtime을 Build Staging에만 포함하는 `SmallGicp` Production 프로필입니다. 생성한 ZIP의 격리 설치와 설치본 합성 GICP 검증은 다음 명령으로 실행합니다.
+0.3.37부터 기본 빌드는 `CCCoreLib` 프로필입니다. 전용 CPython 3.12.10·NumPy 1.26.4와 CC v3·oneTBB 실행 환경을 ZIP에 포함하므로 별도 Python 설치 없이 정렬할 수 있습니다. 실행 환경은 Git에서 제외한 `.cccore-runtime/`에 준비하고 빌드 스테이징에 복사합니다. 처음 네이티브 실행 환경을 준비할 때에는 Visual Studio 2022 C++ 빌드 도구와 네트워크가 필요합니다.
+
+`-CcCorePythonPath`와 `-CcCoreRuntimePath`로 검증된 실행 환경을 지정할 수도 있습니다. 고정 버전·바이너리·라이선스·재빌드 원문 해시와 실제 정렬 검사를 통과한 입력만 사용합니다.
+
+생성한 ZIP의 격리 설치, 실제 네 가지 CC 입력 조합, 저장·자동 재연결 및 세 도구 공존 검증:
 
 ```powershell
-.\build_tools\test_installed_extension.ps1
+.\build_tools\test_installed_extension.ps1 -WorkspaceGui
 ```
+
+기존 명시적 `-AlignProfile SmallGicp`는 희소 점군 비교용으로 유지합니다. `-AlignProfile Full`은 CC 실행 환경과 선택형 엔진 소스를 포함하며, 구엔진 비교에 필요한 별도 Python 경로를 환경설정에서 지정합니다. 기본 CC ZIP에는 Small GICP·Open3D 실행 패키지를 포함하지 않습니다.
+
+## Align 0.3.37
+
+레이어의 점군·표면 아이콘에서 고른 형상으로 정렬하며, 각 데이터의 축은 레이어 설정에서 바꿀 수 있습니다. 연결 OBJ와 독립 OBJ의 원본 면·UV는 Blender Mesh로 내장하고, 정렬에는 삼각형 프록시를 사용합니다. OBJ 내보내기는 내장 원본에 확정 행렬을 적용하므로 쿼드/N곤을 보존합니다. COLMAP 원본은 기존 외부 파일 참조 방식을 유지합니다.
+
+3점 마커 정렬 후 CC 정밀 정렬을 실행하거나 현재 위치에서 직접 정렬할 수 있습니다. CC는 강체 정렬 뒤 초기값 대비 최대 ±10% 균일 배율 보정을 수행합니다. 환경설정의 **CPU 스레드**는 0 자동, 1 단일, 2 이상 수동 상한이며 다음 작업부터 적용됩니다.
+
+Align 작업공간에서 저장한 `.blend`를 다시 열면 데이터 복원 후 세션이 자동 연결됩니다. 일반 작업공간에서 저장한 파일은 해당 작업공간을 유지합니다. 변경·검증 범위는 [0.3.37 승격 기록](docs/migration/ALIGN_CC_MAIN_RELEASE_NOTE.md)을 참조하십시오.

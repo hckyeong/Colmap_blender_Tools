@@ -100,8 +100,8 @@ def _assert_alignment_runtime(module) -> None:
     if profile.DISTRIBUTION_PROFILE == "SMALL_GICP":
         _assert_small_gicp_runtime(module)
         return
-    if profile.DISTRIBUTION_PROFILE != "CCCORELIB":
-        raise AssertionError("설치본 검사는 실행 환경을 포함한 CC 또는 Small GICP 배포를 요구합니다.")
+    if profile.DISTRIBUTION_PROFILE not in {"CCCORELIB", "FULL"}:
+        raise AssertionError("설치본 검사는 실행 환경을 포함한 CCCoreLib·Full·SmallGicp 배포를 요구합니다.")
     properties = import_module(f"{MODULE_NAME}.tools.align.properties")
     preferences = bpy.context.preferences.addons[MODULE_NAME].preferences
     if properties.addon_preferences() != preferences:

@@ -4,6 +4,8 @@
 
 ## 현행 문서
 
+- [Align CC 정식 승격 0.3.37 기록](migration/ALIGN_CC_MAIN_RELEASE_NOTE.md)
+- [ADR-0011: CC 정식 배포와 v3 채택](decisions/0011-cccore-production-runtime.md)
 - [Align main 마이그레이션 계획서](COLMAP_Align_main_마이그레이션_계획서.md)
 - [Align main 승격 검토](COLMAP_Align_main_승격_검토.md)
 - [독립 도구 통합 계획서](COLMAP_Tools_독립도구_통합_계획서.md)
