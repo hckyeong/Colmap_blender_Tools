@@ -14,8 +14,8 @@ import tempfile
 import time
 import unittest
 
-ENVIRONMENT = Path(__file__).resolve().parents[4]
-WORKER = Path(os.environ.get("COLMAP_CCCORE_WORKER", str(ENVIRONMENT / "runtime/cccore/colmap_cccore_worker.exe")))
+ENVIRONMENT = Path(__file__).resolve().parents[3] / ".cccore-runtime"
+WORKER = Path(os.environ.get("COLMAP_CCCORE_WORKER", str(ENVIRONMENT / "cccore/colmap_cccore_worker.exe")))
 BASE = [(-1,-1,-1),(2,0,0),(0,3,0),(0,0,4),(1,2,1),(-2,1,3),(3,-1,2),(2,3,-2)]
 
 

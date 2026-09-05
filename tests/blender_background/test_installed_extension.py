@@ -94,6 +94,35 @@ def _assert_manifest_version(module) -> None:
         )
 
 
+def _assert_alignment_runtime(module) -> None:
+    """현재 설치 프로필의 실제 엔진과 정식 CPU 설정 연결을 검증합니다."""
+    profile = import_module(f"{MODULE_NAME}.tools.align.distribution_profile")
+    if profile.DISTRIBUTION_PROFILE == "SMALL_GICP":
+        _assert_small_gicp_runtime(module)
+        return
+    if profile.DISTRIBUTION_PROFILE != "CCCORELIB":
+        raise AssertionError("설치본 검사는 실행 환경을 포함한 CC 또는 Small GICP 배포를 요구합니다.")
+    properties = import_module(f"{MODULE_NAME}.tools.align.properties")
+    preferences = bpy.context.preferences.addons[MODULE_NAME].preferences
+    if properties.addon_preferences() != preferences:
+        raise AssertionError("Align이 정식 Root 환경설정에 연결되지 않았습니다.")
+    original = preferences.cc_cpu_thread_limit
+    try:
+        for requested in (0, 1, 4):
+            preferences.cc_cpu_thread_limit = requested
+            assert properties.configured_cc_cpu_thread_limit() == properties.cc_cpu_thread_counts(requested)[2]
+        preferences.cc_cpu_thread_limit = 1
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "align"))
+        from installed_cccore_checks import check_cccore_alignment
+        output = os.environ.get("COLMAP_TOOLS_TEST_OUTPUT", "")
+        with TemporaryDirectory() as temporary:
+            report = check_cccore_alignment(MODULE_NAME, Path(output or temporary))
+        assert report["passed"] and len(report["cases"]) == 4
+        assert _operator_is_registered("colmap_align.validate_cccore_environment")
+    finally:
+        preferences.cc_cpu_thread_limit = original
+
+
 def _assert_small_gicp_runtime(module) -> None:
     """설치된 내장 CPython으로 고정 버전과 합성 Small GICP 연산을 검증합니다."""
 
@@ -254,7 +283,7 @@ def _assert_workspace_seeds(module) -> None:
 
 
 def _assert_obj_uv_roundtrip() -> None:
-    """설치본 Import·Align·Export와 Blender 재수입에서 UV·diffuse 텍스처를 검증합니다."""
+    """Blender의 면 코너 UV 표현과 텍스처가 정식 Import·Align·Export 뒤 보존되는지 검증합니다."""
 
     mesh_io = import_module(f"{MODULE_NAME}.tools.align.mesh_io")
     obj_writer = import_module(f"{MODULE_NAME}.tools.align.mesh_io.obj_writer")
@@ -324,8 +353,13 @@ def _assert_obj_uv_roundtrip() -> None:
         output_path = root / snapshot.output_filename
         validation = obj_writer.write_obj_incremental(output_path, snapshot)
         parsed = mesh_io.read_obj(output_path)
-        if validation.texture_coordinate_count != 4 or validation.textured_face_count != 2:
+        if validation.texture_coordinate_count != len(snapshot.texcoords_float64) or validation.textured_face_count != 2:
             raise AssertionError("설치본 OBJ UV 왕복 count가 다릅니다.")
+        # Blender는 OBJ UV 테이블을 면 코너별 2D UV로 저장하므로 실제 코너 값을 정답과 비교합니다.
+        expected_corners = np.asarray((((0.25, 0.0), (1.0, 0.5), (0.1, 0.2)),
+                                       ((0.9, 0.8), (0.1, 0.2), (1.0, 0.5))))
+        actual_corners = parsed.texcoords_float64[parsed.triangle_texcoord_indices_int32, :2]
+        np.testing.assert_allclose(actual_corners, expected_corners, atol=1e-7, rtol=0.0)
         if validation.material_count != 1 or validation.diffuse_texture_count != 1:
             raise AssertionError("설치본 OBJ 재질·텍스처 왕복 count가 다릅니다.")
         copied_texture = root / snapshot.texture_assets[0].output_relative_path
@@ -377,7 +411,8 @@ def main() -> int:
     try:
         _loaded, enabled = addon_utils.check(MODULE_NAME)
         if not enabled:
-            module = addon_utils.enable(MODULE_NAME, default_set=False, persistent=False)
+            # 격리 프로필의 실제 설정 항목까지 생성해 Root Preferences 연결을 검증합니다.
+            module = addon_utils.enable(MODULE_NAME, default_set=True, persistent=False)
             if module is None:
                 raise AssertionError("설치한 COLMAP Tools Extension을 활성화하지 못했습니다.")
         module = import_module(MODULE_NAME)
@@ -435,7 +470,7 @@ def main() -> int:
         if len(_projection_paint_multiselect_block_keymap_items()) != 3:
             raise AssertionError("설치본 Projection Paint 입력 차단 키맵이 정확히 세 개가 아닙니다.")
         _assert_workspace_seeds(module)
-        _assert_small_gicp_runtime(module)
+        _assert_alignment_runtime(module)
         _assert_obj_uv_roundtrip()
         addon_utils.disable(MODULE_NAME, default_set=False)
         if hasattr(bpy.types, "COLMAP_MT_tools"):

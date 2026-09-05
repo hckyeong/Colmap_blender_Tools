@@ -30,19 +30,42 @@ def _selected_runtime():
 
 
 def test_defaults_and_legacy_profiles() -> None:
-    """새 기본 엔진은 CC이고 정식 프로필은 CC 하나만 노출하는지 확인합니다."""
+    """정식·개발 기본은 CC이고 명시적 구엔진 비교 프로필만 Small GICP인지 확인합니다."""
     from tools.align import distribution_profile
     from tools.align.alignment.icp_solver_backend import backend_algorithm_version
 
     assert backend_algorithm_version("CCCORELIB") == "cccore-icp-v3"
     for profile in ("CCCORELIB", "SMALL_GICP", "FULL"):
         with patch.object(distribution_profile, "DISTRIBUTION_PROFILE", profile):
-            assert distribution_profile.default_icp_backend() == "CCCORELIB"
+            expected = "SMALL_GICP" if profile == "SMALL_GICP" else "CCCORELIB"
+            assert distribution_profile.default_icp_backend() == expected
             items = tuple(item[0] for item in distribution_profile.icp_backend_enum_items())
             if profile != "FULL":
-                assert items == ("CCCORELIB",)
+                assert items == (expected,)
             else:
                 assert "CCCORELIB" in items and "SMALL_GICP" in items
+
+
+def test_explicit_small_gicp_profile_rejects_surface_input() -> None:
+    """비교판은 점군을 구엔진으로 전달하고 표면 입력을 다른 데이터로 바꾸지 않고 차단합니다."""
+    from tools.align.operators import marker_alignment
+    from test_icp_cccore_geometry import _surface
+
+    runtime = _selected_runtime()
+    with patch.object(marker_alignment, "RUNTIME", runtime), \
+         patch.object(marker_alignment, "_AUTOMATIC_ICP_BACKEND", "SMALL_GICP"), \
+         patch.object(marker_alignment, "restore_input_block_reason", return_value=None), \
+         patch.object(marker_alignment, "begin_icp_job") as begin, \
+         patch.object(marker_alignment, "_register_icp_poll_timer"), \
+         patch.object(marker_alignment, "request_redraw"), \
+         patch.object(marker_alignment, "_report_status") as report, \
+         patch.object(marker_alignment, "configured_icp_python_path", return_value="비교/python.exe"):
+        assert marker_alignment.direct_align_start_block_reason() is None
+        assert marker_alignment.COLMAPALIGN_OT_align_marker_preview.execute(SimpleNamespace(), SimpleNamespace()) == {"FINISHED"}
+        assert begin.call_args.kwargs["solver_backend"] == "SMALL_GICP"
+        assert "Small GICP" in report.call_args.args[2] and "CC 강체" not in report.call_args.args[2]
+        _surface(runtime, "이동")
+        assert "희소 점군만" in marker_alignment.align_start_block_reason(SimpleNamespace())
 
 
 def test_rna_defaults_and_scale_descriptions() -> None:

@@ -22,8 +22,10 @@ def _paths() -> None:
 
 
 def _python() -> str:
-    """실험의 독립 CPython 실행 파일을 명시적으로 선택합니다."""
-    return str(Path(__file__).resolve().parents[4] / "runtime/python/python.exe")
+    """현재 작업트리에서 준비한 전용 CC Python 실행 파일을 선택합니다."""
+    from tools.align.properties import bundled_cccore_python_path
+
+    return bundled_cccore_python_path()
 
 
 def _begin(runtime):

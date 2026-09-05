@@ -23,7 +23,7 @@ import icp_cccore_contract as contract
 import icp_cccore_solver as solver
 import icp_cccore_worker as worker
 
-MANAGE_MODULE_PATH = Path(__file__).resolve().parents[2] / "test_env" / "manage.py"
+MANAGE_MODULE_PATH = Path(__file__).resolve().parents[2] / "build_tools" / "cccore_distribution.py"
 MANAGE_MODULE_SPEC = importlib.util.spec_from_file_location("cccore_test_env_manage", MANAGE_MODULE_PATH)
 if MANAGE_MODULE_SPEC is None or MANAGE_MODULE_SPEC.loader is None:
     raise RuntimeError("CC 패키징 계약 모듈을 불러오지 못했습니다.")

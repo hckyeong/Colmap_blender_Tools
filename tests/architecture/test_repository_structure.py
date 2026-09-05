@@ -229,10 +229,12 @@ class RepositoryStructureTests(unittest.TestCase):
         ]
         self.assertEqual([], violations)
 
-    def test_small_gicp_runtime_is_supplied_only_by_build_staging(self) -> None:
-        """대용량 Native Runtime은 Source가 아니라 검증된 Build Staging에만 포함해야 합니다."""
+    def test_cccore_runtime_is_supplied_only_by_build_staging(self) -> None:
+        """정식 CC 런타임과 구엔진 비교 프로필은 검증된 스테이징에서만 공급합니다."""
 
         self.assertFalse((ROOT / "tools" / "align" / "runtime").exists())
+        self.assertTrue((ROOT / "build_tools" / "prepare_cccore_runtime.ps1").is_file())
+        self.assertTrue((ROOT / "build_tools" / "cccore_distribution.py").is_file())
         self.assertTrue((ROOT / "build_tools" / "prepare_small_gicp_runtime.ps1").is_file())
         requirements = (
             ROOT / "build_tools" / "small_gicp_backend_requirements.txt"
@@ -243,7 +245,9 @@ class RepositoryStructureTests(unittest.TestCase):
             encoding="utf-8"
         )
         for contract in (
-            'AlignProfile = "SmallGicp"',
+            'AlignProfile = "CCCoreLib"',
+            "Add-CcCoreEmbeddedRuntime",
+            "tools/align/runtime/cccore/colmap_cccore_worker.exe",
             "Resolve-SmallGicpRuntimeSource",
             "Add-SmallGicpEmbeddedRuntime",
             "Test-SmallGicpRuntime",
