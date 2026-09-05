@@ -87,12 +87,15 @@ class CcCoreRuntimeParameters:
 
 
 def bundled_cccore_worker_path() -> str:
-    """설치 패키지 또는 명시된 실험 소스의 CC 실행 파일을 찾습니다."""
+    """설치 패키지와 정식 소스 캐시 및 기존 실험 소스의 CC 실행 파일을 찾습니다."""
     align_root = Path(__file__).resolve().parents[1]
     bundled = align_root / "runtime" / "cccore" / "colmap_cccore_worker.exe"
     if bundled.is_file():
         return str(bundled)
     source_root = align_root.parent.parent
+    development = source_root / ".cccore-runtime" / "cccore" / "colmap_cccore_worker.exe"
+    if (source_root / "build_tools" / "cccore_distribution.py").is_file() and development.is_file():
+        return str(development)
     if (source_root / "test_env" / "manage.py").is_file():
         development = source_root.parent / "runtime" / "cccore" / "colmap_cccore_worker.exe"
         if development.is_file():
@@ -105,7 +108,7 @@ def validate_cccore_environment(python_binary_path: str, native_worker_path: str
     python = Path(python_binary_path).expanduser()
     native = Path(native_worker_path or bundled_cccore_worker_path())
     if not python.is_file() or not native.is_file():
-        raise IcpBackendError("CC 정렬 실행 환경을 찾지 못했습니다. 실험 애드온을 다시 빌드하십시오.")
+        raise IcpBackendError("CC 정렬 실행 환경을 찾지 못했습니다. CC 실행 환경이 포함된 애드온을 설치하십시오.")
     worker = Path(__file__).with_name("icp_cccore_worker.py")
     try:
         checked = subprocess.run(

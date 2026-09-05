@@ -21,7 +21,7 @@ def includes_optional_backends() -> bool:
 
 
 def icp_backend_enum_items() -> tuple[tuple[str, str, str], ...]:
-    """정식 배포에는 CC 엔진만 노출하고 개발 프로필의 구형 식별자를 보존합니다."""
+    """배포에 포함된 엔진을 노출하고 개발 프로필의 비교용 식별자를 보존합니다."""
 
     cccore = ("CCCORELIB", "CC 정밀 정렬", "선택한 점군 또는 메시로 강체 정렬과 최대 ±10% 배율 보정을 실행합니다.")
     small_gicp = (
@@ -29,6 +29,8 @@ def icp_backend_enum_items() -> tuple[tuple[str, str, str], ...]:
         "small_gicp GICP",
         "전체 희소점으로 small_gicp GICP를 실행합니다.",
     )
+    if DISTRIBUTION_PROFILE == SMALL_GICP_PROFILE:
+        return (small_gicp,)
     if not includes_optional_backends():
         return (cccore,)
     return (
@@ -46,9 +48,9 @@ def icp_backend_enum_items() -> tuple[tuple[str, str, str], ...]:
 
 
 def default_icp_backend() -> str:
-    """기존 파일의 저장값과 무관하게 새 정렬의 기본 CC 엔진을 반환합니다."""
+    """명시적 구엔진 비교 프로필 외에는 CC를 새 정렬의 기본값으로 반환합니다."""
 
-    return "CCCORELIB"
+    return "SMALL_GICP" if DISTRIBUTION_PROFILE == SMALL_GICP_PROFILE else "CCCORELIB"
 
 
 __all__ = (

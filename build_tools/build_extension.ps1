@@ -3,10 +3,12 @@ param(
     [string]$BlenderPath = "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe",
     [string]$PythonPath = "python",
     [string]$OutputDirectory = "",
-    [ValidateSet("SmallGicp", "Full")]
-    [string]$AlignProfile = "SmallGicp",
+    [ValidateSet("CCCoreLib", "SmallGicp", "Full")]
+    [string]$AlignProfile = "CCCoreLib",
     [string]$SmallGicpRuntimePath = "",
-    [string]$SmallGicpPackagePython = ""
+    [string]$SmallGicpPackagePython = "",
+    [string]$CcCoreRuntimePath = "",
+    [string]$CcCorePythonPath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -93,7 +95,11 @@ function Set-StagedBuildProfile {
         [string]$ProfileName
     )
 
-    $profileValue = if ($ProfileName -eq "SmallGicp") { "SMALL_GICP" } else { "FULL" }
+    $profileValue = switch ($ProfileName) {
+        "CCCoreLib" { "CCCORELIB" }
+        "SmallGicp" { "SMALL_GICP" }
+        default { "FULL" }
+    }
     $profileSource = "`"`"`"빌드가 포함한 선택형 backend 범위를 고정합니다.`"`"`"`n`nDISTRIBUTION_PROFILE = `"$profileValue`"`n"
     [System.IO.File]::WriteAllText(
         (Join-Path $PackagePath "_build_profile.py"),
@@ -257,6 +263,37 @@ function Add-SmallGicpEmbeddedRuntime {
         -WorkerPath (Join-Path $AlignPackagePath "alignment\icp_small_gicp_worker.py")
 }
 
+function Add-CcCoreEmbeddedRuntime {
+    <# 고정 CC 런타임을 준비하고 복사한 스테이징에서 실제 최소 정렬을 검사합니다. #>
+    param([string]$ProjectRoot, [string]$AlignPackagePath)
+
+    $helper = Join-Path $PSScriptRoot "cccore_distribution.py"
+    $cacheRoot = Join-Path $ProjectRoot ".cccore-runtime"
+    $pythonSource = if ($CcCorePythonPath) { [IO.Path]::GetFullPath($CcCorePythonPath) } else { Join-Path $cacheRoot "python" }
+    $nativeSource = if ($CcCoreRuntimePath) { [IO.Path]::GetFullPath($CcCoreRuntimePath) } else { Join-Path $cacheRoot "cccore" }
+    if (!$CcCorePythonPath -and !(Test-Path -LiteralPath (Join-Path $pythonSource "python.exe"))) {
+        & $PythonPath -X utf8 $helper prepare-python
+        if ($LASTEXITCODE -ne 0) { throw "정식 CC Python 준비에 실패했습니다." }
+    }
+    if (!$CcCoreRuntimePath -and !(Test-Path -LiteralPath (Join-Path $nativeSource "colmap_cccore_worker.exe"))) {
+        & (Join-Path $PSScriptRoot "prepare_cccore_runtime.ps1") -EnvironmentRoot $cacheRoot -RuntimePath $nativeSource
+        if ($LASTEXITCODE -ne 0) { throw "정식 CC 네이티브 런타임 준비에 실패했습니다." }
+    }
+    $runtime = Join-Path $AlignPackagePath "runtime"
+    & $PythonPath -X utf8 $helper stage --python-source $pythonSource --native-source $nativeSource --destination $runtime
+    if ($LASTEXITCODE -ne 0) { throw "정식 CC 실행 환경의 스테이징 검증에 실패했습니다." }
+    $nativeWorker = Join-Path $runtime "cccore\colmap_cccore_worker.exe"
+    $result = & (Join-Path $runtime "python\python.exe") -I (Join-Path $AlignPackagePath "alignment\icp_cccore_worker.py") --check-environment --native-worker $nativeWorker
+    if ($LASTEXITCODE -ne 0) { throw "스테이징 CC 정렬 환경 검사가 실패했습니다." }
+    $environment = $result | ConvertFrom-Json
+    if (!$environment.ok -or $environment.backend_id -ne "CCCORELIB" -or
+        $environment.algorithm_version -ne "cccore-icp-v3" -or $environment.job_protocol_version -ne "cccore-job-v3" -or
+        $environment.native_environment.self_test -ne "passed") {
+        throw "스테이징 CC 엔진 또는 최소 정렬 결과가 배포 계약과 다릅니다."
+    }
+    Write-Host "CCCoreLib 스테이징 실제 정렬 검사 통과"
+}
+
 function Test-BuiltArchive {
     <# ZIP의 통합 Runtime Source와 Align 프로필별 포함·제외 계약을 검증합니다. #>
     param(
@@ -284,8 +321,6 @@ function Test-BuiltArchive {
             "tools/align/_build_profile.py",
             "tools/align/registration.py",
             "tools/align/alignment/icp_external_contract.py",
-            "tools/align/alignment/icp_small_gicp_solver.py",
-            "tools/align/alignment/icp_small_gicp_worker.py",
             "tools/align/resources/workspaces/colmap_align_seed_5_2.blend",
             "tools/modifier/blender/lifecycle.py",
             "tools/modifier/blender/dataset_adapter.py",
@@ -314,11 +349,40 @@ function Test-BuiltArchive {
             $profileReader.Dispose()
         }
 
-        if ($ProfileName -eq "SmallGicp") {
+        if ($ProfileName -in @("CCCoreLib", "Full")) {
+            $expectedProfile = if ($ProfileName -eq "Full") { "FULL" } else { "CCCORELIB" }
+            if ($profileSource -notmatch ('DISTRIBUTION_PROFILE\s*=\s*"' + $expectedProfile + '"')) {
+                throw "CC ZIP의 배포 프로필이 요청과 다릅니다: $expectedProfile"
+            }
+            foreach ($required in @(
+                "tools/align/alignment/icp_cccore_solver.py",
+                "tools/align/alignment/icp_cccore_worker.py",
+                "tools/align/runtime/python/python.exe",
+                "tools/align/runtime/python/runtime_manifest.json",
+                "tools/align/runtime/cccore/colmap_cccore_worker.exe",
+                "tools/align/runtime/cccore/CCCoreLib.dll",
+                "tools/align/runtime/cccore/tbb12.dll",
+                "tools/align/runtime/cccore/runtime_manifest.json",
+                "tools/align/runtime/cccore/cccore_rebuild_sources.zip",
+                "tools/align/runtime/cccore/licenses/CCCoreLib-LGPL-2.0.txt",
+                "tools/align/runtime/cccore/licenses/oneTBB-Apache-2.0.txt"
+            )) {
+                if ($entryNames -notcontains $required) { throw "정식 CC ZIP에 필수 파일이 없습니다: $required" }
+            }
+            foreach ($entry in $entryNames) {
+                if (($ProfileName -eq "CCCoreLib" -and $entry -match 'tools/align/(optional_backends/|alignment/icp_(small_gicp|open3d|solver\.py|worker\.py))') -or
+                    $entry -match 'tools/align/runtime/python/.*small_gicp') {
+                    throw "정식 CC ZIP에 제외한 구엔진이 포함되었습니다: $entry"
+                }
+            }
+        }
+        elseif ($ProfileName -eq "SmallGicp") {
             if ($profileSource -notmatch 'DISTRIBUTION_PROFILE\s*=\s*"SMALL_GICP"') {
                 throw "SmallGicp ZIP의 Align 배포 프로필이 SMALL_GICP가 아닙니다."
             }
             foreach ($required in @(
+                "tools/align/alignment/icp_small_gicp_solver.py",
+                "tools/align/alignment/icp_small_gicp_worker.py",
                 "tools/align/runtime/python/python.exe",
                 "tools/align/runtime/python/python312.dll",
                 "tools/align/runtime/python/python312._pth",
@@ -366,16 +430,8 @@ function Test-BuiltArchive {
                 throw "SmallGicp ZIP의 Runtime Manifest가 배포 계약과 다릅니다."
             }
         }
-        else {
-            if ($profileSource -notmatch 'DISTRIBUTION_PROFILE\s*=\s*"FULL"') {
-                throw "Full ZIP의 Align 배포 프로필이 FULL이 아닙니다."
-            }
-            if ($entryNames | Where-Object { $_.StartsWith("tools/align/runtime/", [System.StringComparison]::OrdinalIgnoreCase) }) {
-                throw "Full 개발 ZIP에는 Small GICP 내장 런타임을 포함하지 않습니다."
-            }
-        }
 
-        $forbiddenPattern = "^(tests|docs|build_tools|COLMAP_Align|COLMAP_Modifier|COLMAP_Projection_Paint)(/|$)"
+        $forbiddenPattern = "^(test_env|tests|docs|build_tools|COLMAP_Align|COLMAP_Modifier|COLMAP_Projection_Paint)(/|$)"
         $unexpectedEntries = @($entryNames | Where-Object { $_ -match $forbiddenPattern })
         if ($unexpectedEntries.Count -gt 0) {
             throw "Extension ZIP에 비배포 항목이 포함되었습니다: $($unexpectedEntries -join ', ')"
@@ -411,7 +467,8 @@ $testSuites = @(
     [pscustomobject]@{ Name = "Projection Core"; Path = "tests\projection_paint\core" }
 )
 foreach ($suite in $testSuites) {
-    & $PythonPath -m unittest discover -s (Join-Path $projectRoot $suite.Path) -p "test_*.py"
+    # 내장 Python도 검증할 소스 루트를 명시적으로 탐색하며 실행 환경의 격리 설정은 바꾸지 않습니다.
+    & $PythonPath -X utf8 -c "import sys,unittest; sys.path.insert(0,sys.argv[1]); suite=unittest.TestLoader().discover(sys.argv[2], pattern='test_*.py'); result=unittest.TextTestRunner(verbosity=1).run(suite); sys.exit(not result.wasSuccessful())" $projectRoot (Join-Path $projectRoot $suite.Path)
     if ($LASTEXITCODE -ne 0) {
         throw "$($suite.Name) 테스트에 실패했습니다."
     }
@@ -438,7 +495,16 @@ try {
     $alignPackagePath = Join-Path $stagingRoot "tools\align"
     Set-StagedBuildProfile -PackagePath $alignPackagePath -ProfileName $AlignProfile
 
-    if ($AlignProfile -eq "SmallGicp") {
+    if ($AlignProfile -in @("CCCoreLib", "Full")) {
+        if ($AlignProfile -eq "CCCoreLib") {
+            Remove-SmallGicpExcludedBackends -PackagePath $alignPackagePath
+            foreach ($name in @("icp_small_gicp_solver.py", "icp_small_gicp_worker.py")) {
+                Remove-Item -LiteralPath (Join-Path $alignPackagePath "alignment\$name") -Force
+            }
+        }
+        Add-CcCoreEmbeddedRuntime -ProjectRoot $projectRoot -AlignPackagePath $alignPackagePath
+    }
+    elseif ($AlignProfile -eq "SmallGicp") {
         Remove-SmallGicpExcludedBackends -PackagePath $alignPackagePath
         $runtimeSource = Resolve-SmallGicpRuntimeSource `
             -ProjectRoot $projectRoot `
@@ -452,11 +518,11 @@ try {
     Remove-StagedPythonCaches -StagingRoot $stagingRoot
 
     # 검증된 Staging만 Blender Extension Builder에 전달합니다.
-    & $BlenderPath --background --command extension validate $stagingRoot
+    & $BlenderPath --background --factory-startup --command extension validate $stagingRoot
     if ($LASTEXITCODE -ne 0) {
         throw "COLMAP Tools Extension Staging 검증에 실패했습니다."
     }
-    & $BlenderPath --background --command extension build --source-dir $stagingRoot --output-dir $temporaryOutput
+    & $BlenderPath --background --factory-startup --command extension build --source-dir $stagingRoot --output-dir $temporaryOutput
     if ($LASTEXITCODE -ne 0) {
         throw "COLMAP Tools Extension 빌드에 실패했습니다."
     }
@@ -468,6 +534,8 @@ try {
         throw "생성된 COLMAP Tools Extension ZIP를 찾을 수 없습니다."
     }
     Test-BuiltArchive -ArchivePath $package.FullName -ProfileName $AlignProfile
+    & $PythonPath -X utf8 (Join-Path $PSScriptRoot "cccore_distribution.py") validate-archive $package.FullName
+    if ($LASTEXITCODE -ne 0) { throw "배포 ZIP의 경로 또는 CC 파일 무결성 검사에 실패했습니다." }
 
     New-Item -ItemType Directory -Path $buildOutput -Force | Out-Null
     $finalPackage = Join-Path $buildOutput $package.Name

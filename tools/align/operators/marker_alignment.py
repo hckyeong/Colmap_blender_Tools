@@ -30,6 +30,7 @@ from ..constants import (
     ICP_ALIGNMENT_PHASE_RUNNING,
 )
 from ..project_persistence.runtime import restore_input_block_reason
+from ..distribution_profile import default_icp_backend
 from ..properties import cc_cpu_thread_counts, configured_icp_python_path, sync_marker_pair_list
 from ..session import is_session_active_for_window, session_align_workspace
 from ..state import RUNTIME
@@ -45,7 +46,28 @@ from .workspace import (
 
 _ICP_POLL_INTERVAL_SECONDS = 0.1
 _AUTOMATIC_ICP_PRESET = "PRECISE"
-_AUTOMATIC_ICP_BACKEND = "CCCORELIB"
+_AUTOMATIC_ICP_BACKEND = default_icp_backend()
+
+
+def automatic_alignment_description() -> str:
+    """설치 프로필에서 실제 실행하는 엔진과 계산 범위를 설명합니다."""
+    if _AUTOMATIC_ICP_BACKEND == "SMALL_GICP":
+        return "Small GICP 희소 점군 정렬과 균일 배율 보정을 실행합니다."
+    return "CC 강체 정렬 후 초기값 대비 최대 ±10% 배율 보정을 실행합니다."
+
+
+def _automatic_geometry_block_reason() -> str | None:
+    """현재 형상 계약과 명시적 Small GICP 비교판의 점군 입력 제한을 검사합니다."""
+    from ..alignment.icp_geometry import geometry_selection_block_reason
+
+    reason = geometry_selection_block_reason(RUNTIME)
+    if reason is not None or _AUTOMATIC_ICP_BACKEND != "SMALL_GICP":
+        return reason
+    catalog = RUNTIME.model_catalog
+    records = (*catalog.active_models(), catalog.selected_alignment_moving_model)
+    if any(record.show_surface for record in records):
+        return "Small GICP 비교판은 희소 점군만 정렬합니다. 모든 A/P 레이어에서 점군을 선택하십시오."
+    return None
 
 
 def _icp_state() -> Any | None:
@@ -235,17 +257,15 @@ def direct_align_start_block_reason() -> str | None:
         return "정렬할 P 레이어를 하나 선택하십시오."
     if not selected.is_visible:
         return "정렬할 표시 상태의 P 데이터 레이어를 선택하십시오."
-    from ..alignment.icp_geometry import geometry_selection_block_reason
-    return geometry_selection_block_reason(RUNTIME)
+    return _automatic_geometry_block_reason()
 
 
 def align_start_block_reason(context: bpy.types.Context) -> str | None:
-    """마커 미리보기 여부와 관계없이 자동 CC 정렬의 형상 선택을 검사합니다."""
-    from ..alignment.icp_geometry import geometry_selection_block_reason
+    """마커 미리보기 여부와 관계없이 배포 엔진의 형상 선택을 검사합니다."""
 
     del context
     if is_marker_preview_active():
-        return geometry_selection_block_reason(RUNTIME)
+        return _automatic_geometry_block_reason()
     return direct_align_start_block_reason()
 
 
@@ -369,11 +389,11 @@ class COLMAPALIGN_OT_toggle_marker_preview(bpy.types.Operator):
 
 
 class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
-    """마커 미리보기 또는 현재 P 위치에서 선택 형상의 정밀 CC 정렬을 시작합니다."""
+    """마커 미리보기 또는 현재 P 위치에서 배포 엔진의 정밀 정렬을 시작합니다."""
 
     bl_idname = "colmap_align.align_marker_preview"
     bl_label = "Align"
-    bl_description = "마커 미리보기 또는 현재 P 위치에서 CC 강체 정렬과 초기값 대비 최대 ±10% 배율 보정을 자동 실행합니다"
+    bl_description = "마커 미리보기 또는 현재 P 위치에서 " + automatic_alignment_description()
     bl_options = {"INTERNAL"}
 
     @classmethod
@@ -389,7 +409,7 @@ class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
         )
 
     def execute(self, context):
-        """선택 형상의 CC 강체 정렬과 배율 보정을 시작하고 진행 확인을 등록합니다."""
+        """배포 엔진의 정렬과 배율 보정을 시작하고 진행 확인을 등록합니다."""
         uses_marker_preview = is_marker_preview_active()
         start_reason = align_start_block_reason(context)
         if start_reason is not None:
@@ -419,7 +439,7 @@ class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
         _report_status(
             self,
             {"INFO"},
-            "자동 CC 정렬 · 강체 정렬 → 최대 ±10% 배율 보정 · A 그룹 전체 "
+            f"{automatic_alignment_description()} A 그룹 전체 "
             f"{len(RUNTIME.model_catalog.active_models())}개 기준으로 "
             f"{'마커 미리보기' if uses_marker_preview else '현재 P 위치'} 초기값 정렬을 시작했습니다.",
         )

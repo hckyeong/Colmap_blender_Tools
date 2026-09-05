@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import bpy
-from bpy.props import StringProperty
+from bpy.props import IntProperty, StringProperty
 
 
 def root_package_name() -> str:
@@ -13,9 +13,15 @@ def root_package_name() -> str:
 
 
 class COLMAPTOOLS_AP_preferences(bpy.types.AddonPreferences):
-    """도구 독립 설정과 Align 선택형 외부 ICP 경로를 보관합니다."""
+    """도구 독립 설정과 Align CPU 상한·개발 실행 경로를 보관합니다."""
 
     bl_idname = root_package_name()
+
+    cc_cpu_thread_limit: IntProperty(
+        name="CPU 스레드",
+        description="CC 정렬의 최대 CPU 스레드 수입니다. 0은 자동, 1은 단일 스레드입니다",
+        default=0, min=0, max=1024,
+    )
 
     open3d_python_path: StringProperty(
         name="외부 ICP Python",
@@ -24,14 +30,26 @@ class COLMAPTOOLS_AP_preferences(bpy.types.AddonPreferences):
     )
 
     def draw(self, _context) -> None:
-        """통합 Extension의 공통 설정을 도구별 섹션으로 표시합니다."""
+        """정식 배포 프로필에 맞는 Align 실행 환경과 CPU 설정을 표시합니다."""
+
+        from ..tools.align.distribution_profile import (
+            DISTRIBUTION_PROFILE, SMALL_GICP_PROFILE, includes_optional_backends,
+        )
+        from ..tools.align.properties import cc_cpu_thread_summary
 
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
         align_box = layout.box()
         align_box.label(text="COLMAP Align", icon="ORIENTATION_GLOBAL")
-        align_box.prop(self, "open3d_python_path")
+        if includes_optional_backends():
+            align_box.prop(self, "open3d_python_path")
+        if DISTRIBUTION_PROFILE != SMALL_GICP_PROFILE:
+            align_box.prop(self, "cc_cpu_thread_limit")
+            align_box.label(text=cc_cpu_thread_summary(_context))
+            align_box.operator("colmap_align.validate_cccore_environment", text="CC 정렬 환경 검사", icon="CHECKMARK")
+        else:
+            align_box.label(text="Small GICP 비교용 실행 환경이 포함되어 있습니다.")
 
 
 CLASSES = (COLMAPTOOLS_AP_preferences,)

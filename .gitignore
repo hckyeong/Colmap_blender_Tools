@@ -11,6 +11,7 @@ __pycache__/
 /.small-gicp-runtime/
 /.small-gicp-runtime-cache/
 /.small-gicp-runtime-build/
+/.cccore-runtime/
 *.zip
 .codex_*
 

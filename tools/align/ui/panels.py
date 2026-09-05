@@ -19,6 +19,7 @@ from ..constants import (
 )
 from ..operators.marker_alignment import (
     align_start_block_reason,
+    automatic_alignment_description,
     direct_align_start_block_reason,
     icp_phase,
     is_icp_input_locked,
@@ -1191,7 +1192,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         if direct_align_ready and not preview_active:
             status_start_reason = align_reason or (
                 f"자동 정렬 · A 그룹 전체 {len(catalog.active_models())}개 기준 · "
-                "CC 강체 정렬 후 초기값 대비 최대 ±10% 배율 보정을 실행합니다."
+                f"{automatic_alignment_description()}"
             )
             status_direct_align_ready = False
         log_entries = wrapped_marker_align_status_entries(

@@ -235,12 +235,15 @@ def bundled_small_gicp_python_path() -> str:
 
 
 def bundled_cccore_python_path() -> str:
-    """설치 패키지 또는 명시된 실험 소스의 전용 Python 실행 파일만 찾습니다."""
+    """설치 패키지와 정식 소스 캐시 및 기존 실험 소스의 전용 Python을 찾습니다."""
     align_root = Path(__file__).resolve().parent
     bundled = align_root / "runtime" / "python" / "python.exe"
     if bundled.is_file():
         return str(bundled)
     source_root = align_root.parent.parent
+    development = source_root / ".cccore-runtime" / "python" / "python.exe"
+    if (source_root / "build_tools" / "cccore_distribution.py").is_file() and development.is_file():
+        return str(development)
     if (source_root / "test_env" / "manage.py").is_file():
         development = source_root.parent / "runtime" / "python" / "python.exe"
         if development.is_file():
@@ -249,7 +252,11 @@ def bundled_cccore_python_path() -> str:
 
 
 def configured_icp_python_path(context: Any | None = None) -> str:
-    """개발 프로필의 명시적 경로를 우선하고 그 외에는 CC 전용 런타임을 반환합니다."""
+    """개발 명시 경로를 우선하고 실제 배포 엔진의 전용 런타임을 반환합니다."""
+    from .distribution_profile import DISTRIBUTION_PROFILE, SMALL_GICP_PROFILE
+
+    if DISTRIBUTION_PROFILE == SMALL_GICP_PROFILE:
+        return bundled_small_gicp_python_path()
     if includes_optional_backends():
         preferences = addon_preferences(context)
         configured = str(getattr(preferences, "open3d_python_path", "")).strip()
