@@ -2,6 +2,15 @@
 
 모든 명령은 Repository Root에서 실행합니다.
 
+## Align 파일 로드 시 내보내기 상태 회귀
+
+```powershell
+& 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' --background --factory-startup `
+  --python-exit-code 1 --python '.\tests\align\blender\test_merge_export_runtime.py'
+```
+
+내보내기 작업이 없는 유휴·사전 검사 완료·완료·실패·취소 상태를 정리한 뒤 오류가 남지 않는지 확인합니다. 실제 작업의 정리 호출·타이머 해제·중단 사유 보존과 기존 내보내기 실패 진단, 세션의 파일 교체 경로도 검사합니다. 이 스크립트는 `test_align_source.ps1`의 필수 목록에도 포함됩니다.
+
 ## Align CC 정식 배포와 재연결 검증
 
 ```powershell

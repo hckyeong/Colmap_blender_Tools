@@ -197,6 +197,97 @@ def test_poll_exception_invalidates_worker_and_preserves_original_error() -> Non
         RUNTIME.clear_merge_export_timer()
 
 
+def test_inactive_lifecycle_cleanup_clears_export_status() -> None:
+    """실행 중인 작업이 없으면 파일 교체 안내를 새 내보내기 오류로 남기지 않습니다."""
+
+    from tools.align.constants import (
+        MERGE_EXPORT_PHASE_CANCELLED,
+        MERGE_EXPORT_PHASE_COMPLETED,
+        MERGE_EXPORT_PHASE_FAILED,
+        MERGE_EXPORT_PHASE_IDLE,
+        MERGE_EXPORT_PHASE_PREFLIGHT_READY,
+    )
+    from tools.align.operators.export_model import (
+        invalidate_merge_export_for_lifecycle,
+        merge_export_status_entries,
+    )
+    from tools.align.state import RUNTIME
+
+    state = RUNTIME.merge_export
+    try:
+        for phase in (
+            MERGE_EXPORT_PHASE_IDLE,
+            MERGE_EXPORT_PHASE_PREFLIGHT_READY,
+            MERGE_EXPORT_PHASE_COMPLETED,
+            MERGE_EXPORT_PHASE_FAILED,
+            MERGE_EXPORT_PHASE_CANCELLED,
+        ):
+            state.clear()
+            state.phase = phase
+            if phase == MERGE_EXPORT_PHASE_FAILED:
+                state.last_error = "이전 파일의 내보내기 오류"
+            invalidate_merge_export_for_lifecycle("새 Blender 파일을 불러와 구조 통합 작업을 정리했습니다.")
+            assert state.phase == MERGE_EXPORT_PHASE_IDLE
+            assert state.last_error == "", (phase, state.last_error)
+            assert merge_export_status_entries() == ("상태 · IDLE",)
+            assert state.job is None
+    finally:
+        state.clear()
+
+
+def test_active_lifecycle_cleanup_stops_job_and_preserves_reason() -> None:
+    """진행 중인 작업은 정리한 뒤 타이머를 해제하고 중단 사유를 유지합니다."""
+
+    from unittest.mock import Mock
+
+    import bpy
+
+    from tools.align.constants import MERGE_EXPORT_PHASE_EXPORT_RUNNING, MERGE_EXPORT_PHASE_IDLE
+    from tools.align.operators.export_model import (
+        _poll_merge_export_job_timer,
+        _register_merge_export_poll_timer,
+        invalidate_merge_export_for_lifecycle,
+        stop_merge_export_poll_timer_for_lifecycle,
+    )
+    from tools.align.state import RUNTIME
+
+    state = RUNTIME.merge_export
+    state.clear()
+    backend = Mock()
+    job = object()
+    reason = "새 Blender 파일을 불러와 구조 통합 작업을 정리했습니다."
+    state.backend = backend
+    state.job = job
+    state.phase = MERGE_EXPORT_PHASE_EXPORT_RUNNING
+    try:
+        _register_merge_export_poll_timer()
+        assert bpy.app.timers.is_registered(_poll_merge_export_job_timer)
+        invalidate_merge_export_for_lifecycle(reason)
+        backend.invalidate.assert_called_once_with(job)
+        assert state.phase == MERGE_EXPORT_PHASE_IDLE
+        assert state.last_error == reason
+        assert state.backend is None and state.job is None
+        assert RUNTIME.merge_export_timer is None
+        assert not bpy.app.timers.is_registered(_poll_merge_export_job_timer)
+    finally:
+        stop_merge_export_poll_timer_for_lifecycle()
+        state.clear()
+
+
+def test_file_load_without_export_has_no_export_error() -> None:
+    """내보내기를 시작하지 않은 세션의 파일 교체가 오류 없는 대기 상태로 끝납니다."""
+
+    from tools.align.session import clear_session_for_file_load
+    from tools.align.state import RUNTIME
+
+    RUNTIME.merge_export.clear()
+    RUNTIME.obj_export.clear()
+    clear_session_for_file_load()
+    assert RUNTIME.merge_export.last_error == "", RUNTIME.merge_export.last_error
+    assert RUNTIME.obj_export.last_error == "", RUNTIME.obj_export.last_error
+    assert not RUNTIME.merge_export.is_running
+
+
 def run_all() -> None:
     """Blender background runner가 호출할 구조 통합 Runtime 검증 묶음을 실행합니다."""
 
@@ -207,6 +298,9 @@ def run_all() -> None:
     test_runtime_state_marks_only_worker_phases_as_input_locked()
     test_point2d_offset_overflow_explains_cause_impact_and_remedy()
     test_poll_exception_invalidates_worker_and_preserves_original_error()
+    test_inactive_lifecycle_cleanup_clears_export_status()
+    test_active_lifecycle_cleanup_stops_job_and_preserves_reason()
+    test_file_load_without_export_has_no_export_error()
     print("test_merge_export_runtime: 통과")
 
 

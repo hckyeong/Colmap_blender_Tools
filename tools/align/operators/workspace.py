@@ -298,7 +298,7 @@ def _ensure_dedicated_workspace(
     context: Any,
     source_workspace: Any,
 ) -> tuple[bpy.types.WorkSpace, Any]:
-    """현재 Window를 검증된 Align Seed Workspace로 전환하거나 READY 공간을 재사용합니다."""
+    """Align Seed의 UI 설정을 보존해 새 공간으로 전환하거나 기존 READY 공간을 재사용합니다."""
     window_manager = context.window_manager
     target_window = context.window
     if target_window is None:
@@ -330,6 +330,7 @@ def _ensure_dedicated_workspace(
             target_window,
             ALIGN_WORKSPACE_SPEC,
             source_workspace,
+            preserve_seed_ui=True,
         )
     except WorkspaceFactoryError as error:
         raise WorkspaceConfigurationError(str(error)) from error

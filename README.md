@@ -43,7 +43,19 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 
 기존 명시적 `-AlignProfile SmallGicp`는 희소 점군 비교용으로 유지합니다. `-AlignProfile Full`은 CC 실행 환경과 선택형 엔진 소스를 포함하며, 구엔진 비교에 필요한 별도 Python 경로를 환경설정에서 지정합니다. 기본 CC ZIP에는 Small GICP·Open3D 실행 패키지를 포함하지 않습니다.
 
-## Align 0.3.37
+## Align 0.3.40
+
+새 Align 작업공간에서는 왼쪽 A 뷰의 N 패널은 닫고 오른쪽 P 뷰의 정렬 패널만 엽니다. 이후 사용자가 왼쪽 패널을 직접 열면 재진입해도 그 상태를 유지합니다. [변경 기록](docs/migration/ALIGN_REFERENCE_SIDEBAR_DEFAULT_RELEASE_NOTE.md)
+
+### 0.3.39 기본 폭
+
+새 Align 작업공간의 N 패널을 요청한 기본 폭으로 엽니다. 기본 폭은 화면 배율 적용 전 370이며, 현재 환경에서는 약 478픽셀입니다. 기존 `.blend`에 저장된 폭과 사용자가 조절한 폭은 유지합니다. [변경 기록](docs/migration/ALIGN_SIDEBAR_DEFAULT_WIDTH_RELEASE_NOTE.md)
+
+### 0.3.38 오류 수정
+
+내보내기를 실행하지 않은 상태에서 `.blend`를 열 때 `COLMAP Export 오류`가 표시되던 문제를 수정했습니다. 실행 중인 작업이 없으면 이전 내보내기 상태를 비우고, 실제 작업을 중단한 경우에만 중단 사유를 남깁니다. [변경 기록](docs/migration/ALIGN_EXPORT_IDLE_LOAD_RELEASE_NOTE.md)
+
+### 0.3.37에서 이어지는 기능
 
 레이어의 점군·표면 아이콘에서 고른 형상으로 정렬하며, 각 데이터의 축은 레이어 설정에서 바꿀 수 있습니다. 연결 OBJ와 독립 OBJ의 원본 면·UV는 Blender Mesh로 내장하고, 정렬에는 삼각형 프록시를 사용합니다. OBJ 내보내기는 내장 원본에 확정 행렬을 적용하므로 쿼드/N곤을 보존합니다. COLMAP 원본은 기존 외부 파일 참조 방식을 유지합니다.
 

@@ -259,8 +259,10 @@ def append_seed_workspace(
     window: Any,
     spec: WorkspaceSeedSpec,
     source_workspace: Any,
+    *,
+    preserve_seed_ui: bool = False,
 ) -> Any:
-    """검증된 Seed Workspace 하나를 Append하고 CREATING 소유 상태로 전환합니다."""
+    """검증된 Seed를 선택적으로 UI 설정까지 보존해 Append하고 CREATING 소유 상태로 전환합니다."""
 
     blender = _require_blender()
     if window is None or pointer(window) == 0:
@@ -277,13 +279,18 @@ def append_seed_workspace(
     before_pointers = {pointer(workspace) for workspace in blender.data.workspaces}
     appended_workspace = None
     try:
-        with context.temp_override(window=window):
-            result = blender.ops.workspace.append_activate(
-                idname=spec.seed_workspace_name,
-                filepath=str(seed_path),
-            )
-        if "FINISHED" not in result:
-            raise WorkspaceFactoryError(f"Workspace Seed Append가 완료되지 않았습니다: {result}")
+        if preserve_seed_ui:
+            # append_activate는 영역 폭을 기본값으로 초기화하므로 저장된 UI가 필요하면 Library로 읽습니다.
+            with blender.data.libraries.load(str(seed_path), link=False) as (_data_from, data_to):
+                data_to.workspaces = [spec.seed_workspace_name]
+        else:
+            with context.temp_override(window=window):
+                result = blender.ops.workspace.append_activate(
+                    idname=spec.seed_workspace_name,
+                    filepath=str(seed_path),
+                )
+            if "FINISHED" not in result:
+                raise WorkspaceFactoryError(f"Workspace Seed Append가 완료되지 않았습니다: {result}")
         appended = [
             workspace
             for workspace in blender.data.workspaces

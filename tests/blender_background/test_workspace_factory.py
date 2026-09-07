@@ -105,7 +105,7 @@ def _finish_gui_test(succeeded: bool) -> None:
 
 
 def _run_gui_factory_test() -> float | None:
-    """이벤트 Tick별로 세 Seed Append, READY 전환과 역순 삭제를 검증합니다."""
+    """세 Seed의 생성·삭제와 소유권, Align Seed의 기본 패널 닫힘을 검증합니다."""
 
     global _GUI_PHASE, _GUI_SPEC_INDEX, _GUI_DELETE_INDEX
     try:
@@ -116,7 +116,10 @@ def _run_gui_factory_test() -> float | None:
         if _GUI_PHASE == "APPEND":
             spec = SPECS[_GUI_SPEC_INDEX]
             source_workspace = window.workspace
-            workspace = append_seed_workspace(context, window, spec, source_workspace)
+            workspace = append_seed_workspace(
+                context, window, spec, source_workspace,
+                preserve_seed_ui=spec.tool_id == "align",
+            )
             if workspace.get(WORKSPACE_STATE_KEY) != STATE_CREATING:
                 raise AssertionError("Append 직후 Workspace 상태가 CREATING이 아닙니다.")
             if source_workspace_from_metadata(workspace) is not source_workspace:
@@ -130,6 +133,10 @@ def _run_gui_factory_test() -> float | None:
                 raise AssertionError("다음 Tick에 Append Workspace가 활성화되지 않았습니다.")
             if not screen_matches_workspace(window.screen, workspace):
                 raise AssertionError("활성 Screen의 Workspace UUID 연결이 올바르지 않습니다.")
+            if spec.tool_id == "align":
+                area = next(area for area in window.screen.areas if area.type == "VIEW_3D")
+                if area.spaces.active.show_region_ui:
+                    raise AssertionError("Align Seed의 패널이 기본 닫힘 상태가 아닙니다.")
             mark_workspace_ready(workspace, window.screen, spec)
             if not workspace_matches_spec(workspace, spec):
                 raise AssertionError("READY Workspace가 최종 명세와 일치하지 않습니다.")

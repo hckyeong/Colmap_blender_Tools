@@ -16,7 +16,7 @@ $scripts = @(
     "test_colmap_io.py", "test_mesh_extension.py", "test_embedded_obj.py", "test_marker_sim3.py",
     "test_icp_direct_align.py", "test_icp_cccore_geometry.py", "test_icp_cccore_ui.py",
     "test_icp_cccore_runtime.py", "test_icp_cccore_persistence.py",
-    "test_merge_export_transforms.py", "test_merge_export_writer.py",
+    "test_merge_export_transforms.py", "test_merge_export_writer.py", "test_merge_export_runtime.py",
     "test_project_persistence_codec.py", "test_project_persistence_store.py",
     "test_companion_obj_reader.py", "test_companion_import.py",
     "test_companion_display.py", "test_companion_persistence.py",

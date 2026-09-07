@@ -742,7 +742,7 @@ def _start_merge_export_job(
 
 
 def invalidate_merge_export_for_lifecycle(reason: str) -> None:
-    """load·unregister 전에 worker와 후보 출력만 정리하고 상태를 비웁니다."""
+    """파일 교체·등록 해제 때 작업을 정리하고 실제 작업이 있을 때만 중단 사유를 남깁니다."""
 
     state = _merge_export_state()
     backend = getattr(state, "backend", None)
@@ -750,7 +750,7 @@ def invalidate_merge_export_for_lifecycle(reason: str) -> None:
     if backend is not None and job is not None:
         backend.invalidate(job)
     stop_merge_export_poll_timer_for_lifecycle()
-    state.clear(error_message=reason)
+    state.clear(error_message=reason if job is not None else "")
     request_redraw()
 
 

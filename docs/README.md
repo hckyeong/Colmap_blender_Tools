@@ -4,6 +4,9 @@
 
 ## 현행 문서
 
+- [Align 왼쪽 N 패널 기본 닫힘 0.3.40](migration/ALIGN_REFERENCE_SIDEBAR_DEFAULT_RELEASE_NOTE.md)
+- [Align N 패널 기본 폭 0.3.39](migration/ALIGN_SIDEBAR_DEFAULT_WIDTH_RELEASE_NOTE.md)
+- [Align 유휴 내보내기 파일 로드 오류 수정 0.3.38](migration/ALIGN_EXPORT_IDLE_LOAD_RELEASE_NOTE.md)
 - [Align CC 정식 승격 0.3.37 기록](migration/ALIGN_CC_MAIN_RELEASE_NOTE.md)
 - [ADR-0011: CC 정식 배포와 v3 채택](decisions/0011-cccore-production-runtime.md)
 - [Align main 마이그레이션 계획서](COLMAP_Align_main_마이그레이션_계획서.md)
