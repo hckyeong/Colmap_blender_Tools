@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$EnvironmentRoot = "",
-    [string]$RuntimePath = ""
+    [string]$RuntimePath = "",
+    [string]$PythonPath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -154,12 +155,19 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 허용 파일과 배포 파일 해시를 빠짐없이 연결하는지 검사합니다. #>
+    <# Manifest가 패치 식별자·최종 원문·허용 파일과 배포 해시를 빠짐없이 연결하는지 검사합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.protocol_version -ne $Lock.protocol_version -or $manifest.tbb_version -ne $Lock.tbb.version) {
         throw "Runtime Manifest의 프로토콜 또는 oneTBB 버전이 잠금 정보와 다릅니다."
+    }
+    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)"
+    if ($manifest.core_patch -ne $expectedCorePatch -or $manifest.self_test.core_patch -ne $expectedCorePatch -or
+        $manifest.registration_safety_patch -ne $Lock.cccore.registration_safety_patch.id -or
+        $manifest.registration_safety_patch_sha256 -ne $Lock.cccore.registration_safety_patch.sha256 -or
+        $manifest.patched_registration_sha256 -ne $Lock.cccore.registration_safety_patch.patched_sha256) {
+        throw "Runtime Manifest의 등록 안전 패치 또는 최종 원문 해시가 잠금 정보와 다릅니다."
     }
     $manifestFiles = @($manifest.runtime_files | ForEach-Object { [string]$_ } | Sort-Object)
     if (@(Compare-Object -ReferenceObject @($ExpectedRuntimeFiles | Sort-Object) -DifferenceObject $manifestFiles).Count -ne 0) {
@@ -217,15 +225,30 @@ foreach ($changedFile in $changedFiles) {
 if ((& git -C $CoreSource ls-files --others --exclude-standard)) { throw "CCCoreLib 캐시에 추적되지 않은 파일이 있습니다." }
 $PatchFile = Join-Path $NativeSource $Lock.cccore.patch_file
 Assert-Hash $PatchFile $Lock.cccore.patch_sha256
+$RegistrationSafetyPatch = $Lock.cccore.registration_safety_patch
+$RegistrationSafetyPatchFile = Join-Path $NativeSource $RegistrationSafetyPatch.file
+Assert-Hash $RegistrationSafetyPatchFile $RegistrationSafetyPatch.sha256
+if ($RegistrationSafetyPatch.original_sha256 -ne $Lock.cccore.patched_registration_sha256) {
+    throw "등록 안전 패치의 입력 해시가 기존 배율 패치의 결과와 다릅니다."
+}
 $RegistrationSource = Join-Path $CoreSource "src\RegistrationTools.cpp"
 $registrationHash = Get-NormalizedSha256 $RegistrationSource
+if ($registrationHash -notin @($Lock.cccore.original_registration_normalized_sha256,
+    $RegistrationSafetyPatch.original_sha256, $RegistrationSafetyPatch.patched_sha256)) {
+    throw "등록 원문이 원본·배율 패치 후·안전 패치 후의 검증 가능한 상태가 아닙니다."
+}
+$normalized = [IO.File]::ReadAllText($RegistrationSource).Replace("`r`n", "`n")
+[IO.File]::WriteAllText($RegistrationSource, $normalized, [Text.UTF8Encoding]::new($false))
 if ($registrationHash -eq $Lock.cccore.original_registration_normalized_sha256) {
-    $normalized = [IO.File]::ReadAllText($RegistrationSource).Replace("`r`n", "`n")
-    [IO.File]::WriteAllText($RegistrationSource, $normalized, [Text.UTF8Encoding]::new($false))
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $PatchFile)
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $PatchFile)
+    Assert-Hash $RegistrationSource $RegistrationSafetyPatch.original_sha256
 }
-Assert-Hash $RegistrationSource $Lock.cccore.patched_registration_sha256
+if ((Get-NormalizedSha256 $RegistrationSource) -eq $RegistrationSafetyPatch.original_sha256) {
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $RegistrationSafetyPatchFile)
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $RegistrationSafetyPatchFile)
+}
+Assert-Hash $RegistrationSource $RegistrationSafetyPatch.patched_sha256
 $ConcurrencyPatch = $Lock.cccore.concurrency_patch
 $ConcurrencyPatchFile = Join-Path $NativeSource $ConcurrencyPatch.patch_file
 Assert-Hash $ConcurrencyPatchFile $ConcurrencyPatch.patch_sha256
@@ -270,7 +293,7 @@ $CMake = Join-Path $VisualStudio "Common7\IDE\CommonExtensions\Microsoft\CMake\C
 if (!(Test-Path -LiteralPath $CMake)) { throw "Visual Studio에 포함된 CMake를 찾지 못했습니다." }
 Invoke-Checked $CMake @('-S',$NativeSource,'-B',$BuildPath,'-G','Visual Studio 17 2022','-A','x64',
     "-DCCCORE_SOURCE=$CoreSource","-DJSON_INCLUDE_DIR=$Dependencies","-DTBB_DIR=$TbbCMake","-DCORE_COMMIT=$($Lock.cccore.commit)",
-    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)")
+    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)")
 Invoke-Checked $CMake @('--build',$BuildPath,'--config','Release','--parallel','8')
 foreach ($binary in @('colmap_cccore_worker.exe','CCCoreLib.dll')) {
     Copy-Item -LiteralPath (Join-Path $BuildPath "bin\$binary") -Destination (Join-Path $StagedRuntime $binary) -Force
@@ -314,7 +337,7 @@ Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\native\test_cccore_w
 $SourceArchive = Join-Path $StagedRuntime 'cccore_rebuild_sources.zip'
 Compress-Archive -Path (Join-Path $SourcePackage '*') -DestinationPath $SourceArchive -Force
 $SelfTestResult = ConvertTo-PortableSelfTestResult (Invoke-NativeEnvironmentCheck $StagedRuntime)
-$TestPython = Join-Path $EnvironmentRoot 'runtime\python\python.exe'
+$TestPython = if ($PythonPath) { [IO.Path]::GetFullPath($PythonPath) } else { Join-Path $EnvironmentRoot 'runtime\python\python.exe' }
 if (!(Test-Path -LiteralPath $TestPython)) { throw "네이티브 계약 검사에 사용할 격리 Python이 없습니다." }
 $oldWorker = $env:COLMAP_CCCORE_WORKER
 try {
@@ -339,11 +362,13 @@ $Manifest = [ordered]@{
     protocol_version = $Lock.protocol_version
     platform = 'windows-x64'
     core_commit = $Lock.cccore.commit
-    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)"
+    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)"
     core_patch_sha256 = $Lock.cccore.patch_sha256
     concurrency_patch = $ConcurrencyPatch.patch_id
     concurrency_patch_sha256 = $ConcurrencyPatch.patch_sha256
-    patched_registration_sha256 = $Lock.cccore.patched_registration_sha256
+    registration_safety_patch = $RegistrationSafetyPatch.id
+    registration_safety_patch_sha256 = $RegistrationSafetyPatch.sha256
+    patched_registration_sha256 = $RegistrationSafetyPatch.patched_sha256
     dependencies = $Lock
     build_options = @{ CCCORELIB_SHARED=$true; CCCORELIB_USE_QT_CONCURRENT=$false; CCCORELIB_USE_TBB=$true; CCCORELIB_USE_CGAL=$false; configuration='Release' }
     cmake_version = ((& $CMake --version) | Select-Object -First 1)

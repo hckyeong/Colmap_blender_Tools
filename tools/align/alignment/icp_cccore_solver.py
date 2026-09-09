@@ -18,8 +18,10 @@ import numpy as np
 
 if __package__:
     from . import icp_cccore_contract as contract
+    from . import icp_cccore_overlap as overlap
 else:
     import icp_cccore_contract as contract
+    import icp_cccore_overlap as overlap
 
 ProgressSink = Callable[[Mapping[str, Any]], None] | None
 CancelProbe = Callable[[], bool] | None
@@ -31,7 +33,7 @@ QUALITY_POLICY = {
     "maximum_spatial_bin_relative_increase": 0.25,
     "minimum_spatial_bin_count": 10,
     "trimmed_fraction": 0.9,
-    "selection_metric": "MEAN_DIRECTIONAL_RMS",
+    "selection_metric": "FIXED_OVERLAP_MEAN_DIRECTIONAL_RMS",
     "distance_units": "PROJECT_WORLD",
 }
 
@@ -189,7 +191,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 실행 파일·DLL·Manifest의 고정 v3 배포 지문을 엄격히 검증합니다."""
+    """네이티브 실행 파일·DLL·Manifest의 고정 v4 배포 지문을 엄격히 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -209,6 +211,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "effective_max_threads", "hardware_thread_count", "distance_multithread_support",
         "octree_multithread_support", "coordinate_type", "matrix_scalar_type",
         "binary_sha256", "self_test",
+        "registration_safety_patch", "registration_safety_patch_sha256", "patched_registration_sha256",
     }
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
@@ -216,7 +219,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             f"CC Runtime Manifest의 필수 필드가 없습니다: {', '.join(missing_fields)}"
         )
     if manifest.get("protocol_version") != contract.CC_NATIVE_PROTOCOL_VERSION:
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v3 네이티브 계약이 아닙니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v4 네이티브 계약이 아닙니다.")
     if manifest.get("platform") != "windows-x64":
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 플랫폼이 windows-x64가 아닙니다.")
     if manifest.get("coordinate_type") != "float32" or manifest.get("matrix_scalar_type") != "float64":
@@ -231,6 +234,17 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
     if not isinstance(options, Mapping) or any(options.get(key) is not value for key, value in required_options.items()):
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 CCCoreLib oneTBB 빌드 옵션이 올바르지 않습니다.")
     dependencies = manifest.get("dependencies")
+    core_dependency = dependencies.get("cccore") if isinstance(dependencies, Mapping) else None
+    safety = core_dependency.get("registration_safety_patch") if isinstance(core_dependency, Mapping) else None
+    if (
+        not isinstance(safety, Mapping)
+        or safety.get("id") != "farthest-mesh-correspondence-v1"
+        or manifest["registration_safety_patch"] != safety["id"]
+        or safety["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["registration_safety_patch_sha256"], "메시 대응 안전 패치") != safety.get("sha256")
+        or _manifest_sha256(manifest["patched_registration_sha256"], "최종 등록 원문") != safety.get("patched_sha256")
+    ):
+        raise contract.CcCoreEnvironmentError("CC 메시 먼 점 필터의 대응 면 보존 패치가 검증되지 않았습니다.")
     tbb_dependency = dependencies.get("tbb") if isinstance(dependencies, Mapping) else None
     if not isinstance(tbb_dependency, Mapping) or tbb_dependency.get("version") != contract.CC_TBB_VERSION:
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 oneTBB 고정 의존성이 올바르지 않습니다.")
@@ -247,7 +261,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         or self_test.get("coordinate_type") != "float32"
         or self_test.get("matrix_scalar_type") != "float64"
     ):
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v3 계약과 다릅니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v4 계약과 다릅니다.")
     expected_self_test_libraries = {
         "library_path": "CCCoreLib.dll",
         "tbb_library_path": "tbb12.dll",
@@ -295,6 +309,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "protocol_version", "core_commit", "core_patch", "coordinate_type",
         "matrix_scalar_type", "build_type", "compiler", "architecture", "platform",
         "core_patch_sha256", "concurrency_patch", "concurrency_patch_sha256",
+        "registration_safety_patch", "registration_safety_patch_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",
@@ -704,8 +719,9 @@ class NativeRunner:
         self, operation: str, data: Mapping[str, Any], model: Mapping[str, Any],
         *, adjust_scale: bool = False, reverse: bool = False, stage: str = "PREPARING",
         evaluation_key_sha256: str = "",
+        overlap_ratio: float = 1.0,
     ) -> dict[str, Any]:
-        """단일 세션에 다음 순번 명령을 기록하고 응답·거리 파일을 엄격히 검증합니다."""
+        """실제 후보의 겹침 비율을 단일 세션에 전달하고 응답·거리 파일을 검증합니다."""
         self.check_cancelled()
         self._validate_runtime_unchanged("CC 호출 전에 실행 파일이나 라이브러리 배포 정보가 변경되었습니다.")
         self.start()
@@ -728,8 +744,9 @@ class NativeRunner:
             "adjust_scale": adjust_scale,
             "min_scale": (1.0 / contract.CC_MAX_SCALE if reverse else contract.CC_MIN_SCALE) if adjust_scale else 1.0,
             "max_scale": (1.0 / contract.CC_MIN_SCALE if reverse else contract.CC_MAX_SCALE) if adjust_scale else 1.0,
-            "overlap_ratio": self.parameters["overlap_ratio"],
-            "max_iterations": self.parameters["max_iterations"],
+            "overlap_ratio": overlap_ratio,
+            "filter_out_farthest_points": self.parameters["filter_out_farthest_points"],
+            "max_iterations": self.parameters["scale_refine_max_iterations" if adjust_scale else "max_iterations"],
             "sampling_limit": sampling_limit,
             "max_threads": self.parameters["max_threads"],
         }
@@ -1005,41 +1022,152 @@ def _spatial_bins(points: np.ndarray, distances: np.ndarray, unit: float) -> lis
 
 def prepare_overlap_policy(
     runner: NativeRunner, moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry, reverse: bool,
+    *, marker_initial_rms: float = 0.0,
 ) -> dict[str, Any]:
-    """실제 등록 방향과 원본 형상 규모·점 간격으로 고정 대응 반경을 정합니다."""
+    """초기 위치의 형상 규모·점 간격·마커 잔차로 두 고정 거리 반경을 정합니다."""
     data = reference if reverse else moving
     model = moving if reverse else reference
-    data_diagonal = float(np.linalg.norm(np.ptp(data.positions, axis=0)))
+    data_diagonal = min(float(np.linalg.norm(np.ptp(item.positions, axis=0))) for item in (data, model))
     spacing = 0.0
     spacing_count = 0
     if model.triangles is None:
-        total = model.positions.shape[0]
+        model_positions = np.unique(model.positions, axis=0)
+        total = model_positions.shape[0]
         spacing_count = min(2048, max(1, total // 2))
         indices = np.sort(np.random.default_rng(contract.CC_EVALUATION_SEED + 2).choice(total, spacing_count, replace=False))
         remaining = np.ones(total, dtype=bool)
         remaining[indices] = False
-        data_entry = runner.geometry("spacing-query", model.positions[indices], cache_scope="COMMAND")
-        model_entry = runner.geometry("spacing-model", model.positions[remaining], cache_scope="COMMAND")
+        data_entry = runner.geometry("spacing-query", model_positions[indices], cache_scope="COMMAND")
+        model_entry = runner.geometry("spacing-model", model_positions[remaining], cache_scope="COMMAND")
         distances = runner.call("distance", data_entry, model_entry, stage="PREPARING")["distances"]
         spacing = float(np.median(distances))
-    radius = min(data_diagonal * 0.05, max(data_diagonal * 0.01, spacing * 3.0))
+    parameters = runner.parameters
+    radius = max(
+        data_diagonal * parameters["validation_distance_diagonal_fraction"],
+        spacing * parameters["validation_distance_spacing_factor"],
+        marker_initial_rms * parameters["validation_distance_marker_factor"],
+    )
     if not math.isfinite(radius) or radius <= 0.0:
         raise contract.CcCoreInputError("CC 유효 대응 거리 기준을 계산하지 못했습니다.")
+    if radius > data_diagonal * parameters["validation_distance_max_diagonal_fraction"]:
+        raise contract.CcCoreInputError(
+            "3점 정렬 잔차 또는 점 간격이 겹침 판별 한도를 넘습니다. 초기 정렬과 데이터 밀도를 확인하세요."
+        )
     return {
         **QUALITY_POLICY,
         "primary_direction": "reference_to_moving" if reverse else "moving_to_reference",
         "data_diagonal_normalized": data_diagonal,
         "model_point_spacing_normalized": spacing,
         "point_spacing_probe_count": spacing_count,
+        "marker_initial_rms_normalized": marker_initial_rms,
         "correspondence_radius_normalized": radius,
-        "correspondence_radius_formula": "min(0.05 * data_diagonal, max(0.01 * data_diagonal, 3 * median_model_spacing))",
+        "candidate_radius_normalized": radius * parameters["candidate_distance_factor"],
+        "correspondence_radius_formula": "max(0.01 * min_diagonal, 3 * model_spacing, 2 * marker_initial_rms)",
         "minimum_valid_correspondence_ratio": 0.2,
-        "minimum_pass_correspondence_ratio": runner.parameters["overlap_ratio"] * 0.85,
+        "minimum_pass_correspondence_ratio": 0.9,
+        "minimum_coverage_retention": 0.9,
+        "minimum_candidate_fraction": 0.01,
+        "minimum_original_span_ratio": 0.05,
         "minimum_spatial_span_ratio": 0.25,
         "minimum_covered_spatial_bins": 3,
         "minimum_bin_valid_ratio": 0.2,
-        "policy_basis": "원본 등록 데이터 크기의 1퍼센트를 기본 반경으로 사용하고 점 모델의 실제 간격을 보완하되 5퍼센트로 제한합니다.",
+        "policy_basis": "3점 정렬 후 반경을 고정하고 후보 선별에는 두 배 반경을 사용합니다. 5퍼센트 한도를 넘으면 중단합니다.",
     }
+
+
+def prepare_candidate_samples(
+    runner: NativeRunner, moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry,
+    policy: Mapping[str, Any], reverse: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """원본 대상까지 거리를 재사용하여 등록 표본과 고정 겹침 평가 표본을 분리 확보합니다."""
+    parameters = runner.parameters
+    sampling = {"directions": {}, "optimizer_seed": contract.CC_OPTIMIZER_SEED,
+                "evaluation_seed": contract.CC_EVALUATION_SEED,
+                "candidate_shortage": False, "spatial_distribution_warning": False}
+    registration = None
+    samples = {"moving_to_reference": np.empty((0, 3)), "reference_to_moving": np.empty((0, 3))}
+    directions = []
+    if not reverse:
+        directions.append(("moving_to_reference", moving, reference, "reference-model"))
+    if moving.triangles is not None:
+        directions.append(("reference_to_moving", reference, moving, "moving-model"))
+    for number, (direction, source, target, model_label) in enumerate(directions):
+        runner.check_cancelled()
+        model = runner.geometry(model_label, target.positions, target.triangles)
+
+        def query(points: np.ndarray) -> np.ndarray:
+            """준비 거리 명령을 같은 원본 모델에 보내며 세션의 명령 예산을 지킵니다."""
+            if runner.counter >= contract.CC_MAX_PREPARING_OPERATIONS:
+                raise contract.CcCoreInputError("CC 겹침 후보 거리 조회 예산을 초과했습니다. 초기 정렬을 확인하세요.")
+            data = runner.geometry(f"candidate-query-{runner.counter + 1}", points, cache_scope="COMMAND")
+            return runner.call("distance", data, model, stage="PREPARING")["distances"]
+
+        domain_started = monotonic()
+        domain = overlap.build_overlap_domain(
+            source, (target.positions.min(axis=0), target.positions.max(axis=0)),
+            policy["candidate_radius_normalized"], query,
+            cancel_probe=runner.cancel_probe, batch_size=parameters["candidate_probe_batch_size"],
+            max_subdivision_depth=parameters["candidate_max_depth"],
+            max_candidate_patches=parameters["candidate_max_patch_points"],
+        )
+        domain_seconds = float(monotonic() - domain_started)
+        evaluation_started = monotonic()
+        evaluation = overlap.sample_overlap_domain(
+            domain, parameters["evaluation_sample_count"], contract.CC_EVALUATION_SEED + number,
+            query, radius=policy["correspondence_radius_normalized"], cancel_probe=runner.cancel_probe,
+            max_proposals_factor=parameters["candidate_proposal_limit"],
+        )
+        evaluation_seconds = float(monotonic() - evaluation_started)
+        # 표본 개수가 많아도 원본의 작은 접촉점·선에만 몰린 결과는 사용하지 않습니다.
+        centered = evaluation.positions - np.mean(evaluation.positions, axis=0)
+        original_positions = np.unique(source.positions, axis=0) if source.triangles is None else source.positions
+        original_centered = original_positions - np.mean(original_positions, axis=0)
+        spread = np.sqrt(np.maximum(0.0, np.linalg.eigvalsh(centered.T @ centered / len(centered))))
+        original_spread = np.sqrt(np.maximum(0.0, np.linalg.eigvalsh(
+            original_centered.T @ original_centered / len(original_centered))))
+        span = spread[-2:] / np.maximum(original_spread[-2:], np.finfo(float).tiny)
+        if source.triangles is None:
+            fraction = domain.metadata["candidate_fraction"]
+        else:
+            fraction = domain.metadata["candidate_area_fraction"] * evaluation.metadata["acceptance_fraction"]
+        if fraction < policy["minimum_candidate_fraction"] or np.any(span < policy["minimum_original_span_ratio"]):
+            raise contract.CcCoreInputError("CC 겹침 후보가 원본의 작은 접촉점이나 좁은 선에 집중되어 있습니다.")
+        diagnostics = {
+            "domain": domain.metadata, "evaluation": evaluation.metadata,
+            "evaluation_sample_fingerprint": evaluation.fingerprint,
+            "evaluation_sample_count": len(evaluation.positions),
+            "original_span_ratios": span.tolist(), "estimated_overlap_fraction": fraction,
+            "domain_seconds": domain_seconds, "evaluation_sampling_seconds": evaluation_seconds,
+        }
+        samples[direction] = evaluation.positions
+        if direction == policy["primary_direction"]:
+            count = parameters["mesh_sample_count"] if source.triangles is not None else parameters["point_sample_count"]
+            registration_started = monotonic()
+            chosen = overlap.sample_overlap_domain(
+                domain, count, contract.CC_OPTIMIZER_SEED, query, cancel_probe=runner.cancel_probe,
+                max_proposals_factor=parameters["candidate_proposal_limit"],
+            )
+            registration = chosen.positions
+            diagnostics.update(registration=chosen.metadata, registration_sample_fingerprint=chosen.fingerprint,
+                               registration_sampling_seconds=float(monotonic() - registration_started))
+            sampling["candidate_shortage"] = source.triangles is None and len(registration) < count
+        sampling["directions"][direction] = diagnostics
+    if registration is None:
+        raise contract.CcCoreInputError("CC 등록 방향의 겹침 표본을 확보하지 못했습니다.")
+    sampling["registration_sample_count"] = len(registration)
+    return registration, samples["moving_to_reference"], samples["reference_to_moving"], sampling
+
+
+def registration_overlap_ratio(
+    runner: NativeRunner, data: Mapping[str, Any], model: Mapping[str, Any],
+    policy: Mapping[str, Any], *, stage: str,
+) -> float:
+    """각 등록 직전에 실제 전달 표본에서 가까운 대응 비율을 추정합니다."""
+    distances = runner.call("distance", data, model, stage=stage)["distances"]
+    ratio = float(np.mean(distances <= policy["correspondence_radius_normalized"]))
+    if ratio < 0.1 or np.count_nonzero(distances <= policy["correspondence_radius_normalized"]) < 3:
+        raise contract.CcCoreNumericalError("CC 등록 후보의 가까운 대응 비율이 10퍼센트보다 작거나 대응점이 부족합니다.")
+    return ratio
 
 
 def correspondence_coverage(
@@ -1172,11 +1300,28 @@ def evaluate_candidate(
     moving_samples: np.ndarray, reference_samples: np.ndarray, normalization: Normalization,
     overlap_policy: Mapping[str, Any] | None = None, *, stage: str,
     evaluation_cache: ExactEvaluationCache | None = None,
+    overlap_sample_counts: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """동일 원본 표본의 실제 점·삼각면 거리를 후보마다 독립 계산합니다."""
+    """고정 겹침 표본과 전체 참고 표본을 함께 질의하고 통계는 분리해 계산합니다."""
     directions: dict[str, Any] = {}
     arrays = []
-    coverage = None
+    full_directions: dict[str, Any] = {}
+    full_arrays = []
+    coverages = {}
+
+    def summarize(direction: str, points: np.ndarray, distances: np.ndarray) -> None:
+        """처음 고정한 겹침 표본의 분모를 유지하고 전체 참고 오차를 별도로 기록합니다."""
+        count = len(points) if overlap_sample_counts is None else overlap_sample_counts[direction]
+        selected_points, selected_distances = points[:count], distances[:count]
+        summary = _distance_summary(selected_distances, normalization.unit)
+        summary["spatial_bins"] = _spatial_bins(selected_points, selected_distances, normalization.unit)
+        directions[direction] = summary
+        arrays.append(selected_distances)
+        if overlap_policy is not None:
+            coverages[direction] = correspondence_coverage(selected_points, selected_distances, overlap_policy)
+        full = distances[count:] if overlap_sample_counts is not None else distances
+        full_directions[direction] = _distance_summary(full, normalization.unit)
+        full_arrays.append(full)
     # 기본 평가는 이동→기준이며 메시·메시만 양방향, 메시·점은 역방향입니다.
     if not (moving.triangles is not None and reference.triangles is None):
         query_label = f"{label}-moving-evaluation"
@@ -1211,12 +1356,7 @@ def evaluate_candidate(
                     "moving_to_reference", delta, distances,
                     source_logical_index=source_logical_index, source_sequence=source_sequence,
                 )
-        summary = _distance_summary(distances, normalization.unit)
-        summary["spatial_bins"] = _spatial_bins(moving_samples, distances, normalization.unit)
-        directions["moving_to_reference"] = summary
-        if overlap_policy is not None and overlap_policy["primary_direction"] == "moving_to_reference":
-            coverage = correspondence_coverage(moving_samples, distances, overlap_policy)
-        arrays.append(distances)
+        summarize("moving_to_reference", moving_samples, distances)
     if moving.triangles is not None:
         query_label = f"{label}-reference-inverse-evaluation"
         model_label = "moving-model"
@@ -1252,34 +1392,62 @@ def evaluate_candidate(
                     "reference_to_moving", delta, distances,
                     source_logical_index=source_logical_index, source_sequence=source_sequence,
                 )
-        summary = _distance_summary(distances, normalization.unit)
-        summary["spatial_bins"] = _spatial_bins(reference_samples, distances, normalization.unit)
-        directions["reference_to_moving"] = summary
-        if overlap_policy is not None and overlap_policy["primary_direction"] == "reference_to_moving":
-            coverage = correspondence_coverage(reference_samples, distances, overlap_policy)
-        arrays.append(distances)
+        summarize("reference_to_moving", reference_samples, distances)
     result = _distance_summary(np.concatenate(arrays), normalization.unit)
     result["mean_rms"] = float(np.mean([entry["rms"] for entry in directions.values()]))
     result["mean_rms_normalized"] = float(np.mean([entry["rms_normalized"] for entry in directions.values()]))
     result["directions"] = directions
     result["spatial_bins"] = {name: item["spatial_bins"] for name, item in directions.items()}
-    if coverage is not None:
-        result["correspondence_coverage"] = coverage
+    result["overlap_rms"] = result["rms"]
+    result["overlap_rms_normalized"] = result["rms_normalized"]
+    result["overlap_mean_rms"] = result["mean_rms"]
+    result["overlap_mean_rms_normalized"] = result["mean_rms_normalized"]
+    result["evaluation_sample_count"] = result["count"]
+    result["full_reference_metrics"] = {
+        **_distance_summary(np.concatenate(full_arrays), normalization.unit),
+        "directions": full_directions,
+        "mean_rms": float(np.mean([entry["rms"] for entry in full_directions.values()])),
+        "mean_rms_normalized": float(np.mean([entry["rms_normalized"] for entry in full_directions.values()])),
+    }
+    if overlap_policy is not None:
+        result["correspondence_coverage"] = coverages[overlap_policy["primary_direction"]]
+        result["directional_coverage"] = coverages
     return result
 
 
 def select_candidate(
-    metrics: Mapping[str, Mapping[str, Any]], diagnostics: Mapping[str, Any]
+    metrics: Mapping[str, Mapping[str, Any]], diagnostics: Mapping[str, Any],
+    policy: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, list[str], float, str]:
-    """평균 방향 RMS로 후보를 고르고 꼬리·공간 악화와 배율 경계를 검토 대상으로 표시합니다."""
-    best = min(("baseline", "rigid", "scale_refine"), key=lambda key: metrics[key]["mean_rms_normalized"])
+    """고정 겹침의 대응과 분포를 보존하는 후보 중 방향 RMS가 가장 낮은 결과를 고릅니다."""
     baseline = metrics["baseline"]
+    eligible = ["baseline"]
+    rejected = []
+    for name in ("rigid", "scale_refine"):
+        if policy is not None:
+            safe = True
+            for direction, coverage in metrics[name]["directional_coverage"].items():
+                initial_coverage = baseline["directional_coverage"][direction]
+                if coverage["valid_count"] < initial_coverage["valid_count"] * policy["minimum_coverage_retention"]:
+                    safe = False
+                try:
+                    assess_correspondence_coverage({"correspondence_coverage": coverage}, policy)
+                except contract.CcCoreNumericalError:
+                    safe = False
+            if not safe:
+                rejected.append(name)
+                continue
+        eligible.append(name)
+    best = min(eligible, key=lambda key: metrics[key]["mean_rms_normalized"])
     selected = metrics[best]
     initial_rms = baseline["mean_rms_normalized"]
     final_rms = selected["mean_rms_normalized"]
     tolerance = QUALITY_POLICY["absolute_distance_tolerance_normalized"]
     improvement = (initial_rms - final_rms) / max(initial_rms, np.finfo(np.float64).eps)
-    reasons = []
+    reasons = [
+        f"{'크기 고정' if name == 'rigid' else '배율 보정'} 후보는 초기 겹침 영역의 대응이나 분포를 유지하지 못해 제외했습니다."
+        for name in rejected if metrics[name]["mean_rms_normalized"] < final_rms
+    ]
     if initial_rms - final_rms <= tolerance or improvement < QUALITY_POLICY["minimum_relative_mean_rms_improvement"]:
         reasons.append("독립 평가의 평균 RMS가 충분히 감소하지 않았습니다.")
     if metrics["scale_refine"]["mean_rms_normalized"] > metrics["rigid"]["mean_rms_normalized"] + tolerance:
@@ -1312,7 +1480,7 @@ def solve_cccore_job(
     job_directory: Path | str, native_worker: Path | str,
     progress_sink: ProgressSink = None, cancel_probe: CancelProbe = None,
 ) -> CcCoreSolverResult:
-    """고정 배율 정렬과 ±10퍼센트 배율 보정을 실행하고 독립 평가로 최종 후보를 선택합니다."""
+    """초기 위치에서 겹침 표본을 먼저 확보하고 두 등록 후보를 고정 평가로 비교합니다."""
     root = Path(job_directory).resolve(strict=True)
     manifest = contract.validate_manifest(contract.read_json_object(contract.job_path(root, "manifest.json")), root)
     parameters = contract.resolve_parameters(manifest["parameters"])
@@ -1343,7 +1511,7 @@ def solve_cccore_job(
     def execute_session() -> CcCoreSolverResult:
         """준비부터 결과 메타데이터 확정까지 하나의 네이티브 세션 안에서 실행합니다."""
         runner.start()
-        progress("PREPARING", 0.02, "CC 정렬 입력과 독립 평가 표본을 준비합니다.")
+        progress("PREPARING", 0.02, "현재 초기 정렬에서 겹침 후보와 독립 평가 표본을 준비합니다.")
         runner.check_cancelled()
         moving_world = contract.load_geometry(root, manifest["geometry"]["moving"])
         reference_world = contract.load_geometry(root, manifest["geometry"]["reference"])
@@ -1356,10 +1524,25 @@ def solve_cccore_job(
         )
         mode = contract.GEOMETRY_MODES[(moving.kind, reference.kind)]
         reverse = mode == "MESH_TO_POINT"
-        overlap_policy = prepare_overlap_policy(runner, moving, reference, reverse)
+        marker_initial_rms = manifest.get("marker_initial_rms", 0.0)
+        if isinstance(marker_initial_rms, bool) or not isinstance(marker_initial_rms, (int, float)) or not math.isfinite(marker_initial_rms) or marker_initial_rms < 0:
+            raise contract.CcCoreInputError("CC 초기 마커 잔차가 유한한 비음수 길이가 아닙니다.")
+        overlap_policy = prepare_overlap_policy(
+            runner, moving, reference, reverse, marker_initial_rms=marker_initial_rms / normalization.unit,
+        )
+        data_positions, moving_overlap, reference_overlap, sampling_diagnostics = prepare_candidate_samples(
+            runner, moving, reference, overlap_policy, reverse,
+        )
         seed = contract.CC_EVALUATION_SEED
-        moving_samples = fixed_evaluation_points(moving, parameters["evaluation_sample_count"], seed)
-        reference_samples = fixed_evaluation_points(reference, parameters["evaluation_sample_count"], seed + 1)
+        moving_samples = np.concatenate((moving_overlap, fixed_evaluation_points(
+            moving, parameters["evaluation_sample_count"], seed + 100)))
+        reference_samples = np.concatenate((reference_overlap, fixed_evaluation_points(
+            reference, parameters["evaluation_sample_count"], seed + 101)))
+        overlap_counts = {"moving_to_reference": len(moving_overlap), "reference_to_moving": len(reference_overlap)}
+        for direction, values in sampling_diagnostics["directions"].items():
+            combined = moving_samples if direction == "moving_to_reference" else reference_samples
+            values["full_reference_sample_count"] = len(combined) - overlap_counts[direction]
+        preparing_seconds = float(monotonic() - started)
         evaluation_cache = ExactEvaluationCache({
             "algorithm_version": contract.CC_ALGORITHM_VERSION,
             "native_worker_sha256": runner.native_worker_sha256,
@@ -1372,44 +1555,43 @@ def solve_cccore_job(
             "quality_policy": overlap_policy,
             "optimizer_seed": contract.CC_OPTIMIZER_SEED,
             "evaluation_seed": contract.CC_EVALUATION_SEED,
+            "initial_alignment_4x4": manifest["initial_alignment_4x4"],
+            "sampling_diagnostics": sampling_diagnostics,
         }, moving_samples, reference_samples)
         deltas = {"baseline": np.identity(4, dtype=np.float64)}
         metrics = {}
-        progress("BASELINE", 0.08, "정렬 전 원본 표본의 표면 거리를 평가합니다.")
+        progress("BASELINE", 0.08, "정렬 전 고정 겹침 표본의 거리를 평가합니다.")
         metrics["baseline"] = evaluate_candidate(
             runner, "baseline", deltas["baseline"], moving, reference, moving_samples, reference_samples,
             normalization, overlap_policy, stage="BASELINE", evaluation_cache=evaluation_cache,
+            overlap_sample_counts=overlap_counts,
         )
-        if reverse:
-            data_positions = reference.positions
-            model_geometry = moving
-        else:
-            data_positions = (
-                sample_triangle_surface(
-                    moving.positions, moving.triangles, parameters["mesh_sample_count"],
-                    contract.CC_OPTIMIZER_SEED,
-                ) if moving.triangles is not None else moving.positions
-            )
-            model_geometry = reference
-        data = runner.geometry("registration-data", data_positions, cache_scope="COMMAND")
+        assess_correspondence_coverage(metrics["baseline"], overlap_policy)
+        model_geometry = moving if reverse else reference
+        # 등록 전 거리 조회와 등록이 같은 불변 표본을 사용하므로 세션 동안 유지합니다.
+        data = runner.geometry("registration-data", data_positions)
         model_label = "moving-model" if reverse else "reference-model"
         model = runner.geometry(model_label, model_geometry.positions, model_geometry.triangles)
         progress("RIGID", 0.20, "크기를 고정한 CC 정밀 정렬을 계산합니다.")
-        rigid = runner.call("register", data, model, adjust_scale=False, reverse=reverse, stage="RIGID")
+        rigid_ratio = registration_overlap_ratio(runner, data, model, overlap_policy, stage="RIGID")
+        rigid = runner.call("register", data, model, adjust_scale=False, reverse=reverse, stage="RIGID", overlap_ratio=rigid_ratio)
         rigid_native = rigid["matrix_4x4"]
         deltas["rigid"] = np.linalg.inv(rigid_native) if reverse else rigid_native
-        progress("RIGID_EVALUATION", 0.43, "크기 고정 결과를 원본 표본으로 평가합니다.")
+        progress("RIGID_EVALUATION", 0.43, "크기 고정 결과를 같은 겹침 표본으로 평가합니다.")
         metrics["rigid"] = evaluate_candidate(
             runner, "rigid", deltas["rigid"], moving, reference, moving_samples, reference_samples,
             normalization, overlap_policy, stage="RIGID_EVALUATION", evaluation_cache=evaluation_cache,
+            overlap_sample_counts=overlap_counts,
         )
         # 두 번째 등록은 첫 번째 결과를 좌표에 반영하고 같은 원본 모델을 유지합니다.
         refined_data = runner.geometry(
-            "registration-rigid-data", transform_positions(data_positions, rigid_native), cache_scope="COMMAND",
+            "registration-rigid-data", transform_positions(data_positions, rigid_native),
         )
         progress("SCALE_REFINE", 0.57, "추가 배율 ±10퍼센트 안에서 CC 정렬을 정밀 보정합니다.")
+        refined_ratio = registration_overlap_ratio(runner, refined_data, model, overlap_policy, stage="SCALE_REFINE")
         refined = runner.call(
             "register", refined_data, model, adjust_scale=True, reverse=reverse, stage="SCALE_REFINE",
+            overlap_ratio=refined_ratio,
         )
         refined_native = refined["matrix_4x4"] @ rigid_native
         deltas["scale_refine"] = np.linalg.inv(refined_native) if reverse else refined_native
@@ -1417,16 +1599,17 @@ def solve_cccore_job(
             _matrix, scale = contract.matrix_sim3(deltas[name], f"CC {name} 최종 변화량")
             if not contract.CC_MIN_SCALE - 5.0e-6 <= scale <= contract.CC_MAX_SCALE + 5.0e-6:
                 raise contract.CcCoreNumericalError("CC 이동 모델의 최종 추가 배율이 ±10퍼센트를 벗어났습니다.")
-        progress("REFINE_EVALUATION", 0.78, "배율 보정 결과를 같은 원본 표본으로 평가합니다.")
+        progress("REFINE_EVALUATION", 0.78, "배율 보정 결과를 같은 겹침 표본으로 평가합니다.")
         metrics["scale_refine"] = evaluate_candidate(
             runner, "scale-refine", deltas["scale_refine"], moving, reference, moving_samples,
             reference_samples, normalization, overlap_policy, stage="REFINE_EVALUATION",
             evaluation_cache=evaluation_cache,
+            overlap_sample_counts=overlap_counts,
         )
         runner.check_cancelled()
         runner.close()
         worlds = {key: normalization.world_delta(value) for key, value in deltas.items()}
-        best_name = min(metrics, key=lambda key: metrics[key]["mean_rms_normalized"])
+        best_name = select_candidate(metrics, {"additional_scale": 1.0}, overlap_policy)[0]
         diagnostics = delta_diagnostics(worlds[best_name], normalization)
         diagnostics["rigid_sim3_projection_frobenius"] = rigid["sim3_projection_frobenius"]
         diagnostics["scale_refine_sim3_projection_frobenius"] = refined["sim3_projection_frobenius"]
@@ -1451,7 +1634,7 @@ def solve_cccore_job(
         evaluation_cache_statistics = contract.validate_exact_evaluation_cache_statistics(
             evaluation_cache.statistics(), validated_native_calls,
         )
-        best_name, quality, reasons, improvement, stop_reason = select_candidate(metrics, diagnostics)
+        best_name, quality, reasons, improvement, stop_reason = select_candidate(metrics, diagnostics, overlap_policy)
         coverage_reasons = assess_correspondence_coverage(metrics[best_name], overlap_policy)
         reasons.extend(coverage_reasons)
         if reasons:
@@ -1462,7 +1645,7 @@ def solve_cccore_job(
         progress("FINALIZING", 0.96, "독립 거리 평가와 최종 비파괴 정렬 결과를 확정합니다.")
 
         def stage_metadata(value: Mapping[str, Any], stage_name: str) -> dict[str, Any]:
-            """네이티브 정렬 진단을 독립 평가 지표와 구분해 기록합니다."""
+            """실제 전달 표본과 추정 겹침 비율을 네이티브 정렬 진단에 기록합니다."""
             return {
                 **{key: item for key, item in value.items() if key != "matrix_4x4"},
                 "stage": stage_name, "matrix_4x4": value["matrix_4x4"].tolist(),
@@ -1470,6 +1653,9 @@ def solve_cccore_job(
                 "data_point_count": data["point_count"], "sampling_limit": max(
                     data["point_count"], model["point_count"] if model_geometry.triangles is None else 1
                 ),
+                "estimated_overlap_ratio": rigid_ratio if stage_name == "rigid" else refined_ratio,
+                "filter_out_farthest_points": parameters["filter_out_farthest_points"],
+                "max_iterations": parameters["max_iterations" if stage_name == "rigid" else "scale_refine_max_iterations"],
             }
 
         logical_operations = [dict(item) for item in validated_native_calls]
@@ -1528,6 +1714,9 @@ def solve_cccore_job(
             **session_protocol_statistics,
             "normalization": normalization.to_mapping(),
             "parameters": parameters, "quality_policy": overlap_policy,
+            "marker_initial_rms": marker_initial_rms,
+            "sampling_diagnostics": sampling_diagnostics,
+            "preparing_seconds": preparing_seconds,
             "quality": quality, "user_review_required": quality == "REVIEW", "review_reasons": reasons,
             "baseline_metrics": metrics["baseline"], "best_candidate_metrics": metrics[best_name],
             "candidate_metrics": metrics, "relative_improvement": improvement,

@@ -128,8 +128,11 @@ def native_call_summaries(
     *,
     requested: int = 8,
     effective: int = 6,
+    preparing_count: int = 2,
 ) -> list[dict]:
-    """형상 모드에 맞는 v3 순차 연산·단계·계측 호출 목록을 만듭니다."""
+    """제한된 준비 접두부와 형상별 v4 등록·평가 골격의 계측 목록을 만듭니다."""
+    operations = ("distance",) * preparing_count + contract.CC_NATIVE_OPERATION_SEQUENCES[geometry_mode]
+    stages = ("PREPARING",) * preparing_count + contract.CC_NATIVE_OPERATION_STAGES[geometry_mode]
     timings = {name: 0.0 for name in contract.CC_NATIVE_TIMING_FIELDS}
     counters = {name: 0 for name in contract.CC_NATIVE_COUNTER_FIELDS}
     return [{
@@ -139,10 +142,10 @@ def native_call_summaries(
         "physical_sequence": index,
         "source_sequence": index,
         "source_logical_index": index,
-        "stage": contract.CC_NATIVE_OPERATION_STAGES[geometry_mode][index - 1],
+        "stage": stages[index - 1],
         "execution_source": "native_session",
         "evaluation_key_sha256": "d" * 64 if operation == "distance" and
-        contract.CC_NATIVE_OPERATION_STAGES[geometry_mode][index - 1] != "PREPARING" else "",
+        stages[index - 1] in {"BASELINE", "RIGID_EVALUATION", "REFINE_EVALUATION"} else "",
         "elapsed_seconds": index / 100.0,
         "roundtrip_seconds": index / 100.0 + 0.002,
         "protocol_overhead_seconds": 0.002,
@@ -152,7 +155,7 @@ def native_call_summaries(
         "model_geometry_id": "model",
         "timings": dict(timings),
         **counters,
-    } for index, operation in enumerate(contract.CC_NATIVE_OPERATION_SEQUENCES[geometry_mode], start=1)]
+    } for index, operation in enumerate(operations, start=1)]
 
 
 def physical_native_call_summaries(logical_operations: list[dict]) -> list[dict]:
@@ -175,12 +178,12 @@ def physical_native_call_summaries(logical_operations: list[dict]) -> list[dict]
 
 
 def make_native_runtime(directory: Path) -> tuple[Path, dict]:
-    """엄격한 NativeRunner 시작 검사에 사용할 최소 v3 런타임을 만듭니다."""
+    """등록 안전 패치 식별자를 포함하는 최소 v4 실행 환경을 만듭니다."""
     directory.mkdir(parents=True, exist_ok=True)
     binary_contents = {
-        "colmap_cccore_worker.exe": b"worker-v3",
-        "CCCoreLib.dll": b"cccore-v3",
-        "tbb12.dll": b"tbb-v3",
+        "colmap_cccore_worker.exe": b"worker-v4",
+        "CCCoreLib.dll": b"cccore-v4",
+        "tbb12.dll": b"tbb-v4",
     }
     binary_hashes = {}
     for filename, contents in binary_contents.items():
@@ -188,12 +191,21 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
         path.write_bytes(contents)
         binary_hashes[filename] = solver.file_sha256(path)
     thread_metadata = native_thread_metadata(requested=4, effective=4, hardware=8)
+    safety = {
+        "id": "farthest-mesh-correspondence-v1", "file": "patches/farthest_mesh_correspondence.patch",
+        "sha256": "b" * 64, "original_sha256": "c" * 64, "patched_sha256": "d" * 64,
+    }
+    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"]
     manifest = {
         "protocol_version": contract.CC_NATIVE_PROTOCOL_VERSION,
         "platform": "windows-x64",
         "core_commit": thread_metadata["core_commit"],
         "core_patch": thread_metadata["core_patch"],
-        "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION}},
+        "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
+                         "cccore": {"registration_safety_patch": safety}},
+        "registration_safety_patch": safety["id"],
+        "registration_safety_patch_sha256": safety["sha256"],
+        "patched_registration_sha256": safety["patched_sha256"],
         "build_options": {
             "CCCORELIB_SHARED": True,
             "CCCORELIB_USE_QT_CONCURRENT": False,
@@ -234,11 +246,11 @@ class PureContractTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first, evaluation))
         self.assertTrue(np.all(first[:, 2] == 0.0))
 
-    def test_v3_protocol_and_thread_limit_contract(self) -> None:
-        """v3 식별자와 1..1024 범위의 네이티브 스레드 요청만 허용합니다."""
-        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v3")
-        self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v3")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v3")
+    def test_v4_protocol_and_thread_limit_contract(self) -> None:
+        """v4 식별자와 1..1024 범위의 네이티브 스레드 요청만 허용합니다."""
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v4")
+        self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v4")
         self.assertEqual(contract.resolve_parameters({"cc_max_threads": 1024})["max_threads"], 1024)
         for value in (0, -1, 1025, True, 1.5):
             with self.subTest(value=value), self.assertRaises(contract.CcCoreInputError):
@@ -311,7 +323,7 @@ class PureContractTests(unittest.TestCase):
                     effective_max_threads=6,
                 )
                 self.assertEqual(
-                    tuple(item["operation"] for item in validated),
+                    tuple(item["operation"] for item in validated[2:]),
                     contract.CC_NATIVE_OPERATION_SEQUENCES[geometry_mode],
                 )
                 with self.assertRaisesRegex(contract.CcCoreEnvironmentError, "작업 순서"):
@@ -339,17 +351,19 @@ class PureContractTests(unittest.TestCase):
     def test_logical_and_physical_calls_validate_exact_cache_links(self) -> None:
         """캐시 적중 논리 연산이 앞선 물리 거리 명령의 동일 키만 참조하는지 확인합니다."""
         logical = native_call_summaries("POINT_TO_MESH")
+        baseline_index = next(index for index, item in enumerate(logical) if item["stage"] == "BASELINE")
+        cached_index = next(index for index, item in enumerate(logical) if item["stage"] == "RIGID_EVALUATION")
         evaluation_key = "b" * 64
-        logical[0]["evaluation_key_sha256"] = evaluation_key
-        logical[2].update({
+        logical[baseline_index]["evaluation_key_sha256"] = evaluation_key
+        logical[cached_index].update({
             "physical_sequence": None,
-            "source_sequence": 1,
-            "source_logical_index": 1,
+            "source_sequence": baseline_index + 1,
+            "source_logical_index": baseline_index + 1,
             "execution_source": "exact_evaluation_cache",
             "evaluation_key_sha256": evaluation_key,
             "elapsed_seconds": 0.0,
-            "roundtrip_seconds": logical[0]["roundtrip_seconds"],
-            "protocol_overhead_seconds": logical[0]["protocol_overhead_seconds"],
+            "roundtrip_seconds": logical[baseline_index]["roundtrip_seconds"],
+            "protocol_overhead_seconds": logical[baseline_index]["protocol_overhead_seconds"],
         })
         next_sequence = 1
         for item in logical:
@@ -366,7 +380,7 @@ class PureContractTests(unittest.TestCase):
         physical = physical_native_call_summaries(logical)
         self.assertEqual(len(contract.validate_physical_native_call_summaries(
             physical, validated, requested_max_threads=8, effective_max_threads=6,
-        )), 4)
+        )), len(logical) - 1)
         self.assertEqual(contract.validate_exact_evaluation_cache_statistics(
             {"policy": "BIT_EXACT_MATRIX_AND_EVALUATION_CONTRACT", "entry_count": 2,
              "hit_count": 1, "miss_count": 2},
@@ -375,14 +389,14 @@ class PureContractTests(unittest.TestCase):
         for timing_field in ("roundtrip_seconds", "protocol_overhead_seconds"):
             with self.subTest(timing_field=timing_field):
                 changed = copy.deepcopy(logical)
-                changed[2][timing_field] += 0.001
+                changed[cached_index][timing_field] += 0.001
                 with self.assertRaises(contract.CcCoreEnvironmentError):
                     contract.validate_native_call_summaries(
                         changed, geometry_mode="POINT_TO_MESH",
                         requested_max_threads=8, effective_max_threads=6,
                     )
         changed = copy.deepcopy(logical)
-        changed[2]["evaluation_key_sha256"] = "c" * 64
+        changed[cached_index]["evaluation_key_sha256"] = "c" * 64
         with self.assertRaises(contract.CcCoreEnvironmentError):
             contract.validate_native_call_summaries(
                 changed, geometry_mode="POINT_TO_MESH",
@@ -745,7 +759,7 @@ class PureContractTests(unittest.TestCase):
             self.assertEqual(failure_probe.call_count, 2)
 
     def test_evaluation_distance_requires_exact_cache_key(self) -> None:
-        """후보 평가 거리는 키를 필수로 하고 준비·등록 연산의 잘못된 키도 거부합니다."""
+        """독립 평가만 키를 필수로 하고 준비·겹침 추정·등록의 평가 키를 거부합니다."""
         summaries = native_call_summaries("POINT_TO_POINT")
         validated = contract.validate_native_call_summaries(
             summaries, geometry_mode="POINT_TO_POINT",
@@ -753,24 +767,17 @@ class PureContractTests(unittest.TestCase):
         )
         self.assertTrue(all(
             bool(item["evaluation_key_sha256"])
-            for item in validated if item["operation"] == "distance" and item["stage"] != "PREPARING"
+            for item in validated if item["stage"] in {"BASELINE", "RIGID_EVALUATION", "REFINE_EVALUATION"}
         ))
-        for index in (1, 3, 5):
+        for index, item in enumerate(summaries):
             with self.subTest(index=index):
                 changed = copy.deepcopy(summaries)
-                changed[index]["evaluation_key_sha256"] = ""
+                changed[index]["evaluation_key_sha256"] = "" if item["evaluation_key_sha256"] else "e" * 64
                 with self.assertRaises(contract.CcCoreEnvironmentError):
                     contract.validate_native_call_summaries(
                         changed, geometry_mode="POINT_TO_POINT",
                         requested_max_threads=8, effective_max_threads=6,
                     )
-        changed = copy.deepcopy(summaries)
-        changed[0]["evaluation_key_sha256"] = "e" * 64
-        with self.assertRaises(contract.CcCoreEnvironmentError):
-            contract.validate_native_call_summaries(
-                changed, geometry_mode="POINT_TO_POINT",
-                requested_max_threads=8, effective_max_threads=6,
-            )
 
     def test_native_runner_requires_manifest_dlls_and_matching_binary_hashes(self) -> None:
         """시작 시 Manifest·필수 DLL 누락과 세 필수 바이너리 해시 불일치를 거부합니다."""
@@ -851,7 +858,7 @@ class PureContractTests(unittest.TestCase):
                     runner.call("distance", {"point_count": 1}, {"point_count": 1})
 
     def test_native_runner_requires_manifest_fields(self) -> None:
-        """시작 시 필수 Manifest 필드가 빠진 v3 런타임을 거부합니다."""
+        """시작 시 필수 Manifest 필드가 빠진 v4 런타임을 거부합니다."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable, manifest = make_native_runtime(root / "runtime")
@@ -914,6 +921,43 @@ class PureContractTests(unittest.TestCase):
         self.assertEqual(quality, "REVIEW")
         self.assertTrue(any("상위" in reason for reason in reasons))
         self.assertTrue(any("공간" in reason for reason in reasons))
+
+    def test_candidate_selection_rejects_directional_coverage_collapse(self) -> None:
+        """오차가 작아도 어느 평가 방향에서든 대응 수나 공간 분포를 잃은 후보는 제외합니다."""
+        policy = {
+            "minimum_coverage_retention": 0.9, "minimum_correspondence_count": 30,
+            "minimum_valid_correspondence_ratio": 0.2, "minimum_pass_correspondence_ratio": 0.9,
+            "minimum_covered_spatial_bins": 3, "minimum_spatial_span_ratio": 0.25,
+        }
+        coverage = {
+            "valid_count": 100, "count": 100, "valid_ratio": 1.0,
+            "covered_spatial_bins": 8, "occupied_spatial_bins": 8,
+            "spatial_span_ratios": [1.0, 1.0, 1.0],
+        }
+        for direction in ("moving_to_reference", "reference_to_moving"):
+            for field, value in (("valid_count", 89), ("covered_spatial_bins", 2),
+                                 ("spatial_span_ratios", [1.0, 1.0, 0.1])):
+                metrics = {"baseline": simple_metrics(0.1), "rigid": simple_metrics(0.05),
+                           "scale_refine": simple_metrics(0.001)}
+                for entry in metrics.values():
+                    entry["directions"]["reference_to_moving"] = copy.deepcopy(entry["directions"]["moving_to_reference"])
+                    entry["directional_coverage"] = {name: copy.deepcopy(coverage) for name in entry["directions"]}
+                metrics["scale_refine"]["directional_coverage"][direction][field] = value
+                with self.subTest(direction=direction, field=field):
+                    best, quality, reasons, _, _ = solver.select_candidate(metrics, {"additional_scale": 1.0}, policy)
+                    self.assertEqual((best, quality), ("rigid", "REVIEW"))
+                    self.assertTrue(any("제외" in reason for reason in reasons))
+
+    def test_full_reference_error_does_not_override_overlap_selection(self) -> None:
+        """고정 겹침 오차가 같은 후보의 전체 참고 오차를 바꿔도 선택·승인은 같습니다."""
+        metrics = {"baseline": simple_metrics(0.1), "rigid": simple_metrics(0.05),
+                   "scale_refine": simple_metrics(0.02)}
+        expected = solver.select_candidate(metrics, {"additional_scale": 1.03})
+        metrics["baseline"]["full_reference_metrics"] = simple_metrics(0.0001)
+        metrics["rigid"]["full_reference_metrics"] = simple_metrics(1.0)
+        metrics["scale_refine"]["full_reference_metrics"] = simple_metrics(1000000.0)
+        self.assertEqual(solver.select_candidate(metrics, {"additional_scale": 1.03}), expected)
+        self.assertEqual(expected[:2], ("scale_refine", "PASS"))
 
     def test_file_contract_rejects_traversal_and_wrong_binary_size(self) -> None:
         """경로 이탈과 배열 크기 불일치를 계산 전에 거부하는지 확인합니다."""
@@ -1118,15 +1162,29 @@ class NativeIntegrationTests(unittest.TestCase):
                     np.testing.assert_allclose(new_distances, old_distances, rtol=0.0, atol=2.0e-6)
 
     def test_identity_mesh_job_reuses_exact_candidate_evaluations(self) -> None:
-        """실제 동일 M2M 작업은 항등 후보 네 방향을 캐시하고 물리 명령을 네 번만 실행합니다."""
+        """동일 메시의 항등 후보 네 평가를 캐시하면서 준비·등록 전 거리는 실제 실행합니다."""
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             _manifest, _expected = make_job(directory, "TRIANGLE_MESH", "TRIANGLE_MESH")
             (directory / "reference.bin").write_bytes((directory / "moving.bin").read_bytes())
             result = solver.solve_cccore_job(directory, NATIVE_WORKER)
             np.testing.assert_allclose(result.delta_4x4, np.identity(4), atol=2.0e-6, rtol=0.0)
-            self.assertEqual(len(result.metadata["logical_operations"]), 8)
-            self.assertEqual(result.metadata["physical_native_command_count"], 4)
+            logical = result.metadata["logical_operations"]
+            preparing_count = sum(item["stage"] == "PREPARING" for item in logical)
+            self.assertGreaterEqual(preparing_count, 1)
+            self.assertLessEqual(preparing_count, contract.CC_MAX_PREPARING_OPERATIONS)
+            validated = contract.validate_native_call_summaries(
+                logical, geometry_mode="MESH_TO_MESH",
+                requested_max_threads=result.metadata["requested_max_threads"],
+                effective_max_threads=result.metadata["effective_max_threads"],
+            )
+            self.assertEqual(len(logical), preparing_count + 10)
+            self.assertEqual(result.metadata["physical_native_command_count"], preparing_count + 6)
+            contract.validate_physical_native_call_summaries(
+                result.metadata["physical_native_calls"], validated,
+                requested_max_threads=result.metadata["requested_max_threads"],
+                effective_max_threads=result.metadata["effective_max_threads"],
+            )
             self.assertEqual(result.metadata["exact_evaluation_cache"], {
                 "policy": "BIT_EXACT_MATRIX_AND_EVALUATION_CONTRACT",
                 "entry_count": 2, "hit_count": 4, "miss_count": 2,
@@ -1137,7 +1195,8 @@ class NativeIntegrationTests(unittest.TestCase):
             ]
             self.assertEqual(
                 [(item["index"], item["source_logical_index"], item["source_sequence"]) for item in cached],
-                [(4, 1, 1), (5, 2, 2), (7, 1, 1), (8, 2, 2)],
+                [(preparing_count + index, preparing_count + origin, preparing_count + origin)
+                 for index, origin in ((5, 1), (6, 2), (9, 1), (10, 2))],
             )
             by_logical = {item["logical_index"]: item for item in result.metadata["physical_native_calls"]}
             for item in cached:
@@ -1151,7 +1210,7 @@ class NativeIntegrationTests(unittest.TestCase):
             )
 
     def test_all_four_geometry_combinations(self) -> None:
-        """기본 정밀 표본 수로 네 조합의 배율·방향·단일 합성을 확인합니다."""
+        """네 조합의 정밀도와 유한한 후보 준비·고정 등록 골격·단일 합성을 확인합니다."""
         for moving_kind, reference_kind in contract.GEOMETRY_MODES:
             with self.subTest(moving=moving_kind, reference=reference_kind), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -1185,12 +1244,22 @@ class NativeIntegrationTests(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(
-                    tuple(item["operation"] for item in result["logical_operations"]),
+                    tuple(item["operation"] for item in result["logical_operations"] if item["stage"] != "PREPARING"),
                     contract.CC_NATIVE_OPERATION_SEQUENCES[result["geometry_mode"]],
                 )
                 self.assertEqual(
-                    tuple(item["stage"] for item in result["logical_operations"]),
+                    tuple(item["stage"] for item in result["logical_operations"] if item["stage"] != "PREPARING"),
                     contract.CC_NATIVE_OPERATION_STAGES[result["geometry_mode"]],
+                )
+                validated = contract.validate_native_call_summaries(
+                    result["logical_operations"], geometry_mode=result["geometry_mode"],
+                    requested_max_threads=result["requested_max_threads"],
+                    effective_max_threads=result["effective_max_threads"],
+                )
+                contract.validate_physical_native_call_summaries(
+                    result["physical_native_calls"], validated,
+                    requested_max_threads=result["requested_max_threads"],
+                    effective_max_threads=result["effective_max_threads"],
                 )
                 self.assertEqual(result["session_exit_reason"], "closed")
                 self.assertEqual(result["session_statistics"]["geometry_load_count"], len(result["geometry_statistics"]))
@@ -1340,19 +1409,20 @@ class NativeIntegrationTests(unittest.TestCase):
             )
             self.assertGreater(result.metadata["relative_improvement"], 0.99)
 
-    def test_scale_bounds_are_applied_in_both_registration_directions(self) -> None:
-        """정방향과 역방향 계산 모두 이동 모델의 추가 배율 한도를 지키는지 확인합니다."""
+    def test_initial_scale_gap_without_overlap_is_rejected_in_both_directions(self) -> None:
+        """초기 배율 차이로 실제 겹침을 확보하지 못하면 정·역방향 모두 결과를 만들지 않습니다."""
         for moving_kind, reference_kind in (
             ("COLMAP_POINT_CLOUD", "TRIANGLE_MESH"), ("TRIANGLE_MESH", "COLMAP_POINT_CLOUD"),
         ):
-            for target, bound in ((0.85, 0.9), (1.15, 1.1)):
+            for target in (0.85, 1.15):
                 with self.subTest(mode=(moving_kind, reference_kind), target=target), tempfile.TemporaryDirectory() as temporary:
                     directory = Path(temporary)
                     make_job(directory, moving_kind, reference_kind, scale=target)
-                    result = solver.solve_cccore_job(directory, NATIVE_WORKER)
-                    self.assertAlmostEqual(result.metadata["diagnostics"]["additional_scale"], bound, delta=5.0e-6)
-                    self.assertEqual(result.metadata["quality"], "REVIEW")
-                    self.assertTrue(any("경계" in item for item in result.metadata["review_reasons"]))
+                    expected_error = "겹침 표본" if target == 0.85 else "가까운 대응 비율"
+                    with self.assertRaisesRegex(contract.CcCoreError, expected_error):
+                        solver.solve_cccore_job(directory, NATIVE_WORKER)
+                    self.assertFalse((directory / "result.json").exists())
+                    self.assertFalse((directory / "result.npz").exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows 자식 프로세스 수명 회귀입니다.")
     def test_normal_session_close_response_exit_repeat(self) -> None:

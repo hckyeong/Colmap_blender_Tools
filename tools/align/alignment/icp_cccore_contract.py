@@ -14,36 +14,39 @@ from typing import Any, Mapping
 import numpy as np
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v3"
-CC_JOB_PROTOCOL_VERSION = "cccore-job-v3"
-CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v3"
+CC_ALGORITHM_VERSION = "cccore-icp-v4"
+CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
+CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v4"
 CC_LEGACY_NATIVE_PROTOCOL_VERSION = "cccore-native-v2"
 CC_THREAD_BACKEND = "oneTBB"
 CC_TBB_VERSION = "2022.0.0"
 CC_MAX_THREADS = 1024
+CC_DEFAULT_MAX_ITERATIONS = 200
+CC_DEFAULT_SCALE_REFINE_MAX_ITERATIONS = 1000
+CC_MAX_PREPARING_OPERATIONS = 2048
 CC_NATIVE_OPERATION_SEQUENCES = {
-    "POINT_TO_POINT": ("distance", "distance", "register", "distance", "register", "distance"),
-    "POINT_TO_MESH": ("distance", "register", "distance", "register", "distance"),
-    "MESH_TO_POINT": ("distance", "register", "distance", "register", "distance"),
+    "POINT_TO_POINT": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
+    "POINT_TO_MESH": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
+    "MESH_TO_POINT": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
     "MESH_TO_MESH": (
-        "distance", "distance", "register", "distance",
-        "distance", "register", "distance", "distance",
+        "distance", "distance", "distance", "register", "distance",
+        "distance", "distance", "register", "distance", "distance",
     ),
 }
 CC_NATIVE_OPERATION_STAGES = {
     "POINT_TO_POINT": (
-        "PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION",
-        "SCALE_REFINE", "REFINE_EVALUATION",
+        "BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION",
+        "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION",
     ),
     "POINT_TO_MESH": (
-        "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION",
+        "BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION",
     ),
     "MESH_TO_POINT": (
-        "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION",
+        "BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION",
     ),
     "MESH_TO_MESH": (
-        "BASELINE", "BASELINE", "RIGID", "RIGID_EVALUATION",
-        "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION", "REFINE_EVALUATION",
+        "BASELINE", "BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION",
+        "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION", "REFINE_EVALUATION",
     ),
 }
 CC_NATIVE_TIMING_FIELDS = (
@@ -426,7 +429,7 @@ def validate_native_call_summaries(
     requested_max_threads: int,
     effective_max_threads: int,
 ) -> tuple[dict[str, Any], ...]:
-    """논리 연산 순서를 유지하며 실제 세션 실행과 정확 캐시 적중을 구분해 검증합니다."""
+    """유한한 후보 준비 뒤 고정 등록·평가 순서와 세션·캐시 연결을 검증합니다."""
     if not isinstance(value, list) or not value:
         raise CcCoreEnvironmentError("CC 최종 결과에 논리 연산 요약이 없습니다.")
     expected_keys = {
@@ -440,6 +443,15 @@ def validate_native_call_summaries(
     expected_stages = CC_NATIVE_OPERATION_STAGES.get(geometry_mode)
     if expected_operations is None or expected_stages is None:
         raise CcCoreEnvironmentError("CC 논리 연산 요약의 형상 모드가 올바르지 않습니다.")
+    preparing_count = 0
+    for item in value:
+        if not isinstance(item, Mapping) or item.get("stage") != "PREPARING":
+            break
+        preparing_count += 1
+    if not 1 <= preparing_count <= CC_MAX_PREPARING_OPERATIONS:
+        raise CcCoreEnvironmentError("CC 후보 준비 연산 수가 1~2048 범위를 벗어났습니다.")
+    expected_operations = ("distance",) * preparing_count + expected_operations
+    expected_stages = ("PREPARING",) * preparing_count + expected_stages
     if len(value) != len(expected_operations):
         raise CcCoreEnvironmentError("CC 논리 연산 요약의 작업 순서 또는 수가 형상 모드 계약과 다릅니다.")
     summaries = []
@@ -474,7 +486,9 @@ def validate_native_call_summaries(
             if not isinstance(item.get(name), str) or not item[name].strip():
                 raise CcCoreEnvironmentError(f"CC 논리 연산의 {name} 값이 없습니다.")
         physical_sequence = item.get("physical_sequence")
-        requires_evaluation_key = operation == "distance" and item.get("stage") != "PREPARING"
+        requires_evaluation_key = operation == "distance" and item.get("stage") in {
+            "BASELINE", "RIGID_EVALUATION", "REFINE_EVALUATION",
+        }
         evaluation_key = _validate_evaluation_key_sha256(
             item.get("evaluation_key_sha256"), required=requires_evaluation_key,
         )
@@ -510,7 +524,7 @@ def validate_native_call_summaries(
                 raise CcCoreEnvironmentError("CC 실제 논리 연산의 프로토콜 오버헤드가 왕복·네이티브 시간과 다릅니다.")
             next_physical_sequence += 1
         else:
-            if operation != "distance" or physical_sequence is not None:
+            if not requires_evaluation_key or physical_sequence is not None:
                 raise CcCoreEnvironmentError("CC 정확 평가 캐시는 물리 명령 없는 거리 연산이어야 합니다.")
             if source_logical_index >= expected_index or source_sequence >= next_physical_sequence:
                 raise CcCoreEnvironmentError("CC 정확 평가 캐시가 앞선 물리 거리 명령을 참조하지 않습니다.")
@@ -743,29 +757,46 @@ def identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_parameters(value: Mapping[str, Any]) -> dict[str, Any]:
-    """CC 계산의 명시적 성능 옵션과 고정 배율·표본 정책을 반환합니다."""
+    """후보 우선 표본·자동 겹침 추정 정책과 명시적 성능 옵션을 검증합니다."""
     if not isinstance(value, Mapping):
         raise CcCoreInputError("CC 작업 매개변수는 객체여야 합니다.")
-    overlap = value.get("cc_overlap_ratio", 0.9)
-    if isinstance(overlap, bool) or not isinstance(overlap, (int, float)) or not math.isfinite(overlap):
-        raise CcCoreInputError("CC 겹침 비율은 유한한 실수여야 합니다.")
-    if not 0.1 <= float(overlap) <= 1.0:
-        raise CcCoreInputError("CC 겹침 비율은 0.1 이상 1 이하이어야 합니다.")
+    fixed_policy = {
+        "overlap_mode": "ESTIMATED_ON_CANDIDATES",
+        "filter_out_farthest_points": True,
+        "candidate_probe_batch_size": 8192,
+        "candidate_max_depth": 8,
+        "candidate_max_patch_points": 250000,
+        "candidate_proposal_limit": 20,
+        "validation_distance_diagonal_fraction": 0.01,
+        "validation_distance_spacing_factor": 3.0,
+        "validation_distance_marker_factor": 2.0,
+        "candidate_distance_factor": 2.0,
+        "validation_distance_max_diagonal_fraction": 0.05,
+    }
+    for name, expected in fixed_policy.items():
+        actual = value.get(f"cc_{name}", expected)
+        if type(actual) is not type(expected) or actual != expected:
+            raise CcCoreInputError(f"CC {name} 값이 후보 선별 고정 정책과 다릅니다.")
     values = {
-        "overlap_ratio": float(overlap),
-        "max_iterations": positive_integer(value.get("cc_max_iterations", 100), "CC 최대 반복 수"),
+        **fixed_policy,
+        "max_iterations": positive_integer(value.get("cc_max_iterations", CC_DEFAULT_MAX_ITERATIONS), "CC 최대 반복 수"),
+        "scale_refine_max_iterations": positive_integer(
+            value.get("cc_scale_refine_max_iterations", value.get("cc_max_iterations", CC_DEFAULT_SCALE_REFINE_MAX_ITERATIONS)),
+            "CC 배율 보정 최대 반복 수",
+        ),
         "mesh_sample_count": positive_integer(value.get("cc_mesh_sample_count", 50000), "CC 메시 표본 수"),
+        "point_sample_count": positive_integer(value.get("cc_point_sample_count", 50000), "CC 점군 표본 수"),
         "evaluation_sample_count": positive_integer(value.get("cc_evaluation_sample_count", 30000), "CC 평가 표본 수"),
         "max_threads": positive_integer(value.get("cc_max_threads", 1), "CC 스레드 수"),
         "min_scale": CC_MIN_SCALE,
         "max_scale": CC_MAX_SCALE,
         "optimizer_seed": CC_OPTIMIZER_SEED,
         "evaluation_seed": CC_EVALUATION_SEED,
-        "point_input_policy": "FULL_INPUT",
-        "mesh_sampling_policy": "AREA_WEIGHTED_FIXED_SEED",
-        "automatic_overlap_search": False,
+        "point_input_policy": "OVERLAP_CANDIDATES_SPATIAL_SAMPLE",
+        "mesh_sampling_policy": "OVERLAP_PATCHES_AREA_WEIGHTED_FIXED_SEED",
+        "automatic_overlap_search": True,
     }
-    if values["mesh_sample_count"] < 3 or values["evaluation_sample_count"] < 3:
+    if any(values[name] < 3 for name in ("mesh_sample_count", "point_sample_count", "evaluation_sample_count")):
         raise CcCoreInputError("정렬·평가 표본은 각각 최소 3개이어야 합니다.")
     if values["max_threads"] > CC_MAX_THREADS:
         raise CcCoreInputError(f"CC 스레드 수는 {CC_MAX_THREADS} 이하여야 합니다.")

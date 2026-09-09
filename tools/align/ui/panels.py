@@ -390,12 +390,12 @@ def _icp_progress_entries() -> tuple[str, ...]:
 
 
 def _cccore_metric_entries(label: str, metrics) -> tuple[str, ...]:
-    """CC의 독립 거리 평가와 잔차 분포를 기존 평면 지표와 구분해 표시합니다."""
+    """CC의 독립 겹침 평가와 전체 참고 거리·표본 개수를 구분해 표시합니다."""
     if not isinstance(metrics, Mapping):
         return ()
     distance_parts = []
     distribution_parts = []
-    for key, name in (("rms", "거리 RMS"), ("trimmed_rms_90", "가까운 90% RMS")):
+    for key, name in (("overlap_mean_rms", "겹침 평가 RMS"), ("overlap_rms", "겹침 합산 RMS")):
         value = _finite_metric(metrics.get(key), precision=5)
         if value:
             distance_parts.append(f"{name} {value}")
@@ -403,9 +403,18 @@ def _cccore_metric_entries(label: str, metrics) -> tuple[str, ...]:
         value = _finite_metric(metrics.get(key), precision=5)
         if value:
             distribution_parts.append(f"{name} {value}")
-    count = _nonnegative_count(metrics.get("count"))
+    coverage = metrics.get("correspondence_coverage")
+    count = _nonnegative_count(coverage.get("valid_count")) if isinstance(coverage, Mapping) else None
     if count is not None:
-        distribution_parts.append(f"평가점 {count:,}개")
+        distribution_parts.append(f"주방향 유효 대응 {count:,}개")
+    sample_count = _nonnegative_count(metrics.get("evaluation_sample_count"))
+    if sample_count is not None:
+        distribution_parts.append(f"전체 평가 표본 {sample_count:,}개")
+    full = metrics.get("full_reference_metrics")
+    if isinstance(full, Mapping):
+        full_rms = _finite_metric(full.get("rms"), precision=5)
+        if full_rms:
+            distribution_parts.append(f"전체 참고 RMS {full_rms}")
     entries = []
     if distance_parts:
         entries.append(f"{label} · " + " · ".join(distance_parts))
@@ -415,7 +424,7 @@ def _cccore_metric_entries(label: str, metrics) -> tuple[str, ...]:
 
 
 def _cccore_result_entries(result, state) -> tuple[str, ...]:
-    """CC 결과의 거리 평가·추가 배율·사용자 검토 사유만 상태 로그에 표시합니다."""
+    """CC 결과의 겹침 평가·표본 진단·추가 배율·검토 사유를 상태 로그에 표시합니다."""
     metadata = getattr(result, "metadata", {})
     metadata = metadata if isinstance(metadata, Mapping) else {}
     quality = getattr(result, "quality", {})
@@ -429,9 +438,18 @@ def _cccore_result_entries(result, state) -> tuple[str, ...]:
     entries.extend(_cccore_metric_entries(baseline_label, baseline))
     entries.extend(_cccore_metric_entries("최선 결과", candidate))
     if isinstance(baseline, Mapping) and isinstance(candidate, Mapping):
-        improvement = _improvement_percent(baseline.get("trimmed_rms_90"), candidate.get("trimmed_rms_90"))
+        improvement = _improvement_percent(baseline.get("overlap_mean_rms"), candidate.get("overlap_mean_rms"))
         if improvement:
-            entries.append(f"가까운 90% 거리 RMS 개선 · {improvement}")
+            entries.append(f"겹침 평가 RMS 개선 · {improvement}")
+    sampling = metadata.get("sampling_diagnostics")
+    if isinstance(sampling, Mapping):
+        registration_count = _nonnegative_count(sampling.get("registration_sample_count"))
+        if registration_count is not None:
+            entries.append(f"정합 표본 · {registration_count:,}개")
+        for field in ("candidate_shortage", "spatial_distribution_warning"):
+            if sampling.get(field) is True:
+                entries.append("검토 · " + ("겹침 후보가 목표 표본 수보다 부족합니다." if field == "candidate_shortage"
+                                           else "겹침 후보의 공간 분포를 확인하십시오."))
     scale = _finite_metric_value(getattr(getattr(result, "icp_delta", None), "uniform_scale", None))
     if scale is not None and scale > 0:
         entries.append(f"추가 균일 스케일 · ×{scale:.7g} ({(scale - 1.0) * 100.0:+.2f}%)")

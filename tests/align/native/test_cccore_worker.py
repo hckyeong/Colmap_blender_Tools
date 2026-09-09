@@ -51,13 +51,13 @@ class NativeContractTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def request(self, data=BASE, model=BASE, triangles=None, operation="register", scale=False, lower=.9, upper=1.1, max_threads=4):
-        """고정폭 리틀엔디언 파일과 저수준 요청을 작성합니다."""
+        """기존 단발 등록의 필터 기본값을 유지하는 바이너리와 저수준 요청을 작성합니다."""
         for name, points in (("data", data), ("model", model)):
             (self.root/f"{name}.bin").write_bytes(struct.pack("<"+"d"*(len(points)*3), *(axis for p in points for axis in p)))
         request = {"protocol_version":"cccore-native-v2", "operation":operation,
                    "data":{"positions_file":"data.bin", "point_count":len(data)},
                    "model":{"positions_file":"model.bin", "point_count":len(model)},
-                   "parameters":{"adjust_scale":scale,"min_scale":lower,"max_scale":upper,"overlap_ratio":1,
+                   "parameters":{"adjust_scale":scale,"min_scale":lower,"max_scale":upper,"overlap_ratio":1,"filter_out_farthest_points":False,
                                   "max_iterations":100,"sampling_limit":max(3,len(data),len(model)),"max_threads":max_threads},
                    "output_file":"result.json","progress_file":"progress.json","cancel_file":"cancel.flag","distances_file":"distances.bin"}
         if triangles is not None:
@@ -89,12 +89,12 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def start_session(self, *, max_threads=4):
-        """v3 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
+        """v4 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
         root = self.root / "session-job"
         native = root / "native"
         native.mkdir(parents=True)
         identity = {
-            "protocol_version": "cccore-native-v3",
+            "protocol_version": "cccore-native-v4",
             "session_id": "0123456789abcdef0123456789abcdef",
             "job_id": root.name,
             "input_fingerprint": "fedcba9876543210fedcba9876543210",
@@ -166,7 +166,7 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4):
-        """고정 순번 v3 명령을 제출하고 응답 또는 세션 실패를 기다립니다."""
+        """고정 순번 v4 명령을 제출하고 응답 또는 세션 실패를 기다립니다."""
         command = self.session_command_payload(
             identity, sequence, operation, data=data, model=model, stage=stage, max_threads=max_threads,
         )
@@ -182,7 +182,7 @@ class NativeContractTest(unittest.TestCase):
         self.fail("세션 명령 응답이 제한 시간 안에 생성되지 않았습니다.")
 
     def session_command_payload(self, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4):
-        """오류 계약 검사에도 재사용할 순번별 v3 명령 객체를 만듭니다."""
+        """오류 계약 검사에도 재사용할 순번별 v4 명령 객체를 만듭니다."""
         stem = f"native/command-{sequence:04d}"
         command = {
             **identity, "sequence": sequence, "operation": operation, "stage": stage,
@@ -193,7 +193,7 @@ class NativeContractTest(unittest.TestCase):
                 "data": data, "model": model,
                 "parameters": {
                     "adjust_scale": False, "min_scale": 1.0, "max_scale": 1.0,
-                    "overlap_ratio": 1.0, "max_iterations": 100,
+                    "overlap_ratio": 1.0, "filter_out_farthest_points": True, "max_iterations": 100,
                     "sampling_limit": max(int(data["point_count"]), int(model["point_count"])),
                     "max_threads": max_threads,
                 },
@@ -233,7 +233,7 @@ class NativeContractTest(unittest.TestCase):
         process = subprocess.run([str(WORKER),"--check-environment"],capture_output=True,text=True,encoding="utf-8",timeout=30)
         self.assertEqual(process.returncode,0,process.stdout)
         result=json.loads(process.stdout)
-        self.assertEqual(result["protocol_version"],"cccore-native-v3")
+        self.assertEqual(result["protocol_version"],"cccore-native-v4")
         self.assertEqual(result["self_test"],"passed")
         self.assertTrue(Path(result["library_path"]).is_file())
         self.assertTrue(Path(result["tbb_library_path"]).is_file())
@@ -365,9 +365,11 @@ class NativeContractTest(unittest.TestCase):
                 process.wait()
 
     def test_session_registration_matches_v2_request(self):
-        """v3 세션 등록 행렬이 유지한 v2 단발 기준선과 수치적으로 같은지 확인합니다."""
+        """최원거리점 필터를 같은 값으로 명시한 v4 세션과 v2 단발 등록을 비교합니다."""
         model_points = transform_points(BASE, angle=.02, translation=(.03, -.02, .04))
-        baseline = self.run_request(self.request(model=model_points))
+        baseline_request = self.request(model=model_points)
+        baseline_request["parameters"]["filter_out_farthest_points"] = True
+        baseline = self.run_request(baseline_request)
         root, identity, process, _ = self.start_session()
         try:
             data = self.session_geometry(root, "data", BASE)
@@ -718,6 +720,36 @@ class NativeContractTest(unittest.TestCase):
                 self.assertLess(result["final_rms"],1e-5)
                 self.assertAlmostEqual(result["scale"],scale,delta=2e-5)
 
+    def test_mesh_farthest_filter_preserves_partial_overlap_correspondences(self):
+        """원거리점 제거와 부분 겹침 필터를 함께 거쳐도 일치하는 표면의 항등 변환을 보존합니다."""
+        vertices = [(0, 0, 0), (3, 0, 0), (.3, 2, 0), (.2, .5, 4)]
+        triangles = [(0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)]
+        rng = random.Random(9812)
+        data = []
+        for face in triangles:
+            for _ in range(100):
+                u, v = rng.random(), rng.random()
+                if u + v > 1:
+                    u, v = 1 - u, 1 - v
+                data.append(tuple(vertices[face[0]][axis] * (1 - u - v)
+                                  + vertices[face[1]][axis] * u + vertices[face[2]][axis] * v
+                                  for axis in range(3)))
+        outliers = [(100.0 + index, 120.0 + index, 150.0 + index) for index in range(5)]
+        contaminated = data + outliers
+        for overlap in (.6, .9):
+            for adjust_scale in (False, True):
+                with self.subTest(overlap=overlap, adjust_scale=adjust_scale):
+                    request = self.request(data=contaminated, model=vertices, triangles=triangles, scale=adjust_scale)
+                    request["parameters"].update(overlap_ratio=overlap, filter_out_farthest_points=True)
+                    result = self.run_request(request)
+                    actual = apply_matrix(data, result["matrix_4x4"])
+                    error = math.sqrt(sum(sum((a - b) ** 2 for a, b in zip(p, q))
+                                          for p, q in zip(actual, data)) / len(data))
+                    self.assertLess(error, 5e-5)
+                    self.assertLess(result["final_rms"], 1e-5)
+                    self.assertAlmostEqual(result["scale"], 1.0, delta=2e-5)
+                    self.assertLess(result["final_point_count"], len(contaminated))
+
     def test_pre_cancelled(self):
         """연산 전 취소를 명시적 취소 상태와 종료 코드로 반환합니다."""
         request=self.request()
@@ -744,12 +776,13 @@ class NativeContractTest(unittest.TestCase):
             if process.poll() is None:process.kill();process.wait()
 
     def test_invalid_inputs(self):
-        """비유한 좌표·범위·길이·공선·면 인덱스 오류를 거부합니다."""
+        """좌표·형상·범위 오류와 명시적 최원거리점 필터 계약 위반을 거부합니다."""
         cases=[("nan","INVALID_COORDINATE"),("length","BINARY_LENGTH_MISMATCH"),("scale","INVALID_SCALE_RANGE"),
                ("count","INVALID_COUNT"),("line","DEGENERATE_INPUT"),("sample","SAMPLING_LIMIT_EXCEEDED"),
                ("triangle_index","INVALID_TRIANGLE_INDEX"),("triangle_flat","DEGENERATE_TRIANGLE"),
                ("threads_zero","INVALID_COUNT"),("threads_negative","INVALID_COUNT"),
-               ("threads_boolean","INVALID_COUNT"),("threads_float","INVALID_COUNT")]
+               ("threads_boolean","INVALID_COUNT"),("threads_float","INVALID_COUNT"),
+               ("filter_number","INVALID_PARAMETER")]
         for case,code in cases:
             with self.subTest(case=case):
                 request=self.request()
@@ -765,9 +798,43 @@ class NativeContractTest(unittest.TestCase):
                 if case=="threads_negative":request["parameters"]["max_threads"]=-1
                 if case=="threads_boolean":request["parameters"]["max_threads"]=True
                 if case=="threads_float":request["parameters"]["max_threads"]=1.5
+                if case=="filter_number":request["parameters"]["filter_out_farthest_points"]=1
                 result=self.run_request(request,"error")
                 self.assertEqual(result["code"],code)
                 (self.root/"result.json").unlink(missing_ok=True)
+
+    def test_legacy_request_preserves_omitted_filter(self):
+        """과거 단발 요청은 필터 생략과 세 점 이상인 낮은 겹침 비율을 유지합니다."""
+        request = self.request(data=BASE * 5, model=BASE * 5)
+        request["parameters"]["overlap_ratio"] = 0.09
+        request["parameters"].pop("filter_out_farthest_points")
+        self.run_request(request)
+
+    def test_session_registration_rejects_v4_parameter_violations(self):
+        """새 세션은 필터 생략·숫자 필터·낮은 겹침 비율을 거부합니다."""
+        base_root = self.root
+        for case, code in (("missing", "INVALID_PARAMETER"), ("number", "INVALID_PARAMETER"),
+                           ("overlap", "INVALID_OVERLAP")):
+            self.root = base_root / case
+            root, identity, process, _ = self.start_session()
+            try:
+                data = self.session_geometry(root, "data", BASE)
+                model = self.session_geometry(root, "model", BASE)
+                request = self.session_command_payload(identity, 1, "register", data=data, model=model)
+                if case == "missing":
+                    request["parameters"].pop("filter_out_farthest_points")
+                elif case == "number":
+                    request["parameters"]["filter_out_farthest_points"] = 1
+                else:
+                    request["parameters"]["overlap_ratio"] = 0.09
+                (root / "native/command-0001.request.json").write_text(json.dumps(request), encoding="utf-8")
+                with self.subTest(case=case):
+                    self.assert_failed_session(root, process, code)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                self.root = base_root
 
     def run_with_progress_lock(self, hold_seconds):
         """삭제 공유를 허용하지 않는 읽기 핸들로 Windows 파일 교체 경쟁을 재현합니다."""

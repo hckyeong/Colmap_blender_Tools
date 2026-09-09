@@ -1,5 +1,5 @@
 {
-  "protocol_version": "cccore-native-v3",
+  "protocol_version": "cccore-native-v4",
   "cccore": {
     "repository": "https://github.com/CloudCompare/CCCoreLib.git",
     "commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432",
@@ -9,6 +9,13 @@
     "patch_id": "bounded-scale-v1",
     "patch_file": "patches/bounded_scale_consistency.patch",
     "patch_sha256": "66eb7b07c45d111530c3c0639eb0bcf57db2b262c7bf330a695b1e3c6fec042a",
+    "registration_safety_patch": {
+      "id": "farthest-mesh-correspondence-v1",
+      "file": "patches/farthest_mesh_correspondence.patch",
+      "sha256": "29387943b562fe0225ffbeb653f64c9f2d915d3cff705e24907ff25da680e329",
+      "original_sha256": "329eef87ce8160ff07b0e2f91f38f164951f0511294bf870b3fd0b33b6623dae",
+      "patched_sha256": "b0e06492f3e1082ec5f27edb884e5c52b48385b8e9286d9c8c1f378fa330b08a"
+    },
     "concurrency_patch": {
       "patch_id": "multithread-state-race-v1",
       "patch_file": "patches/multithread_state_race.patch",

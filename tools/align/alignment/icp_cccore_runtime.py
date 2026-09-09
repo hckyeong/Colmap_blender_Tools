@@ -19,11 +19,12 @@ from .icp_backend import (
     read_json_file, read_result_arrays, write_job_manifest,
 )
 from .icp_solver_backend import IcpSolverBackend
+from .icp_cccore_contract import CC_DEFAULT_MAX_ITERATIONS, CC_DEFAULT_SCALE_REFINE_MAX_ITERATIONS
 from .types import Sim3Transform
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v3"
-CC_JOB_PROTOCOL_VERSION = "cccore-job-v3"
+CC_ALGORITHM_VERSION = "cccore-icp-v4"
+CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
 CC_PROGRESS_STAGES = frozenset({
     "PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE",
     "REFINE_EVALUATION", "FINALIZING", "COMPLETED", "FAILED", "CANCELLED",
@@ -58,7 +59,7 @@ class CcCoreRuntimeParameters:
 
     scale_mode: str = "REFINE"
     scale_refine_max_relative_change: float = 0.10
-    scale_refine_max_iterations: int = 100
+    scale_refine_max_iterations: int = CC_DEFAULT_SCALE_REFINE_MAX_ITERATIONS
     cc_max_threads: int = 1
 
     def __post_init__(self) -> None:
@@ -69,10 +70,23 @@ class CcCoreRuntimeParameters:
             raise ValueError("CC CPU 스레드 상한은 1 이상 1024 이하여야 합니다.")
 
     def to_mapping(self) -> dict[str, Any]:
-        """네이티브 계산 조정기에서 소비할 정밀 설정을 반환합니다."""
+        """부분 겹침에서의 수렴 예산과 고정 표본 정책을 계산 조정기에 전달합니다."""
         return {
-            "cc_overlap_ratio": 0.9,
-            "cc_max_iterations": 100,
+            "cc_overlap_mode": "ESTIMATED_ON_CANDIDATES",
+            "cc_point_input_policy": "OVERLAP_CANDIDATES_SPATIAL_SAMPLE",
+            "cc_point_sample_count": 50000,
+            "cc_filter_out_farthest_points": True,
+            "cc_candidate_probe_batch_size": 8192,
+            "cc_candidate_max_depth": 8,
+            "cc_candidate_max_patch_points": 250000,
+            "cc_candidate_proposal_limit": 20,
+            "cc_validation_distance_diagonal_fraction": 0.01,
+            "cc_validation_distance_spacing_factor": 3.0,
+            "cc_validation_distance_marker_factor": 2.0,
+            "cc_candidate_distance_factor": 2.0,
+            "cc_validation_distance_max_diagonal_fraction": 0.05,
+            "cc_max_iterations": CC_DEFAULT_MAX_ITERATIONS,
+            "cc_scale_refine_max_iterations": self.scale_refine_max_iterations,
             "cc_mesh_sample_count": 50000,
             "cc_evaluation_sample_count": 30000,
             "cc_max_threads": self.cc_max_threads,
@@ -222,6 +236,9 @@ def begin_cccore_job(
     files = None
     try:
         seed = create_icp_seed(runtime)
+        marker_initial_rms = 0.0 if seed.marker_result is None else float(seed.marker_result.metrics.rms)
+        if not np.isfinite(marker_initial_rms) or marker_initial_rms < 0.0:
+            raise IcpJobProtocolError("마커 초기 정렬 잔차가 유효한 월드 거리 값이 아닙니다.")
         reference_ids = ir._reference_ids_for_seed(runtime, seed)
         geometry = create_cccore_geometry_snapshot(
             runtime, moving_model_id=seed.moving_model_id,
@@ -255,6 +272,7 @@ def begin_cccore_job(
             "moving_model_id": seed.moving_model_id, "reference_model_ids": list(reference_ids),
             "initial_alignment_4x4": seed.initial_alignment_float64.tolist(),
             "marker_signature": seed.marker_signature,
+            "marker_initial_rms": marker_initial_rms,
             "model_revision_snapshot": _plain(revisions), "model_state_snapshot": _plain(model_state),
             "parameter_fingerprint": parameters.fingerprint, "parameters": parameters.to_mapping(),
             "geometry_mode": geometry.geometry_mode, "reverse_registration": geometry.reverse_registration,
@@ -320,7 +338,7 @@ def read_cccore_result(handle: IcpJobHandle) -> tuple[dict[str, Any], dict[str, 
 
 
 def progress_from_cccore(payload: Mapping[str, Any], *, handle: IcpJobHandle, input_data: Any) -> Any:
-    """CC의 실제 계산 단계와 유효한 진행률만 기존 화면에 전달합니다."""
+    """CC의 실제 계산 단계·반복 상한과 유효한 진행률을 기존 화면에 전달합니다."""
     from . import icp_runtime as ir
 
     validate_cccore_payload(payload, handle)
@@ -339,7 +357,9 @@ def progress_from_cccore(payload: Mapping[str, Any], *, handle: IcpJobHandle, in
     return ir.IcpProgressState(
         stage=stage, level_name=str(payload.get("level_name", stage)),
         iteration=0, progress=float(value), message=str(payload.get("message", "")),
-        stable_alignment=stable, max_iterations=100, level_complete=stage == "COMPLETED",
+        stable_alignment=stable,
+        max_iterations=(CC_DEFAULT_SCALE_REFINE_MAX_ITERATIONS if stage == "SCALE_REFINE" else CC_DEFAULT_MAX_ITERATIONS),
+        level_complete=stage == "COMPLETED",
         backend_id=CC_BACKEND_ID, backend_algorithm_version=CC_ALGORITHM_VERSION,
     )
 
@@ -361,6 +381,98 @@ def current_geometry_matches(runtime: Any, input_data: Any, *, verify_content: b
         initial_alignment_float64=input_data.seed.initial_alignment_float64,
         verify_content=verify_content,
     ) is None
+
+
+def _validate_overlap_result_metadata(metadata: Mapping[str, Any]) -> None:
+    """고정 겹침 평가와 표본 진단의 수치·개수·출처 지문을 승인 전에 검사합니다."""
+    from .icp_cccore_contract import finite_nonnegative_number, nonnegative_integer
+
+    sampling = metadata.get("sampling_diagnostics")
+    if not isinstance(sampling, Mapping):
+        raise IcpJobProtocolError("CC 겹침 표본 진단이 없습니다.")
+    total_registration = nonnegative_integer(sampling.get("registration_sample_count"), "CC 정합 표본 수")
+    if not 3 <= total_registration <= 50000:
+        raise IcpJobProtocolError("CC 정합 표본 수가 지원 범위를 벗어났습니다.")
+    for name in ("optimizer_seed", "evaluation_seed"):
+        nonnegative_integer(sampling.get(name), f"CC 표본 {name}")
+    if sampling["optimizer_seed"] == sampling["evaluation_seed"]:
+        raise IcpJobProtocolError("CC 정합과 독립 평가의 표본 시드가 같습니다.")
+    for name in ("candidate_shortage", "spatial_distribution_warning"):
+        if name in sampling and type(sampling[name]) is not bool:
+            raise IcpJobProtocolError(f"CC 표본 진단의 {name} 값이 논리값이 아닙니다.")
+    directions = sampling.get("directions")
+    if not isinstance(directions, Mapping) or not directions or not set(directions) <= {
+        "moving_to_reference", "reference_to_moving",
+    }:
+        raise IcpJobProtocolError("CC 겹침 평가 방향 진단이 올바르지 않습니다.")
+    expected_directions = {"moving_to_reference", "reference_to_moving"} if metadata.get("geometry_mode") == "MESH_TO_MESH" else {
+        "reference_to_moving" if metadata.get("geometry_mode") == "MESH_TO_POINT" else "moving_to_reference",
+    }
+    if set(directions) != expected_directions:
+        raise IcpJobProtocolError("CC 겹침 평가 방향이 입력 형상 조합과 다릅니다.")
+    evaluation_count = 0
+    registration_count = 0
+    for direction in directions.values():
+        if not isinstance(direction, Mapping):
+            raise IcpJobProtocolError("CC 평가 방향 진단이 객체가 아닙니다.")
+        for name in ("domain", "evaluation"):
+            if not isinstance(direction.get(name), Mapping):
+                raise IcpJobProtocolError(f"CC 표본 진단의 {name} 값이 객체가 아닙니다.")
+        count = nonnegative_integer(direction.get("evaluation_sample_count"), "CC 방향별 평가 표본 수")
+        if not 3 <= count <= 30000:
+            raise IcpJobProtocolError("CC 방향별 독립 평가 표본 수가 지원 범위를 벗어났습니다.")
+        if nonnegative_integer(direction["evaluation"].get("sample_count"), "CC 독립 표본 진단 수") != count:
+            raise IcpJobProtocolError("CC 독립 평가 표본 수가 채집 진단과 다릅니다.")
+        evaluation_count += count
+        nonnegative_integer(direction.get("full_reference_sample_count"), "CC 전체 참고 표본 수")
+        fingerprints = ["evaluation_sample_fingerprint"]
+        if "registration" in direction:
+            if not isinstance(direction["registration"], Mapping):
+                raise IcpJobProtocolError("CC 정합 표본 진단이 객체가 아닙니다.")
+            registration_count += nonnegative_integer(direction["registration"].get("sample_count"), "CC 방향별 정합 표본 수")
+            fingerprints.append("registration_sample_fingerprint")
+        for name in fingerprints:
+            value = direction.get(name)
+            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise IcpJobProtocolError(f"CC 표본의 {name} 지문이 올바르지 않습니다.")
+    if registration_count != sampling["registration_sample_count"]:
+        raise IcpJobProtocolError("CC 정합 표본 합계가 방향별 진단과 다릅니다.")
+    for name in ("baseline_metrics", "best_candidate_metrics"):
+        metric = metadata.get(name)
+        if not isinstance(metric, Mapping):
+            raise IcpJobProtocolError("CC 고정 겹침 평가 통계가 없습니다.")
+        count = nonnegative_integer(metric.get("evaluation_sample_count"), "CC 전체 평가 표본 수")
+        if count != evaluation_count:
+            raise IcpJobProtocolError("CC 평가 표본 수가 고정 방향별 표본과 다릅니다.")
+        metric_directions = metric.get("directions")
+        if not isinstance(metric_directions, Mapping) or set(metric_directions) != expected_directions:
+            raise IcpJobProtocolError("CC 평가 통계의 방향이 독립 표본 방향과 다릅니다.")
+        directional_rms = []
+        for direction_name, summary in metric_directions.items():
+            if not isinstance(summary, Mapping):
+                raise IcpJobProtocolError("CC 방향별 평가 통계가 객체가 아닙니다.")
+            directional_rms.append(finite_nonnegative_number(summary.get("rms"), "CC 방향별 겹침 RMS"))
+            if nonnegative_integer(summary.get("count"), "CC 방향별 평가점 수") != directions[direction_name]["evaluation_sample_count"]:
+                raise IcpJobProtocolError("CC 방향별 평가점 수가 고정 표본과 다릅니다.")
+        overlap_mean = finite_nonnegative_number(metric.get("overlap_mean_rms"), "CC 겹침 평가 RMS")
+        overlap_rms = finite_nonnegative_number(metric.get("overlap_rms"), "CC 겹침 합산 RMS")
+        if not np.isclose(overlap_mean, np.mean(directional_rms), rtol=1e-12, atol=1e-12):
+            raise IcpJobProtocolError("CC 겹침 평가 RMS가 방향별 평균과 다릅니다.")
+        if not np.isclose(overlap_rms, finite_nonnegative_number(metric.get("rms"), "CC 고정 평가 RMS"), rtol=1e-12, atol=1e-12):
+            raise IcpJobProtocolError("CC 겹침 합산 RMS가 고정 평가 통계와 다릅니다.")
+        coverage = metric.get("correspondence_coverage")
+        if not isinstance(coverage, Mapping):
+            raise IcpJobProtocolError("CC 주방향 유효 대응 통계가 없습니다.")
+        coverage_count = nonnegative_integer(coverage.get("count"), "CC 주방향 평가 표본 수")
+        valid_count = nonnegative_integer(coverage.get("valid_count"), "CC 주방향 유효 대응 수")
+        if valid_count > coverage_count or coverage_count > evaluation_count:
+            raise IcpJobProtocolError("CC 주방향 유효 대응 수가 평가 표본 수를 초과했습니다.")
+        full = metric.get("full_reference_metrics")
+        if not isinstance(full, Mapping):
+            raise IcpJobProtocolError("CC 전체 참고 평가 통계가 없습니다.")
+        for field in ("rms", "median", "p95", "trimmed_rms_90", "mean_rms"):
+            finite_nonnegative_number(full.get(field), f"CC 전체 참고 {field}")
+        nonnegative_integer(full.get("count"), "CC 전체 참고 평가점 수")
 
 
 def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], arrays: Mapping[str, np.ndarray]) -> Any:
@@ -398,6 +510,11 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
         finite_nonnegative_number,
     )
     try:
+        _validate_overlap_result_metadata(metadata)
+        marker_rms = finite_nonnegative_number(metadata.get("marker_initial_rms"), "CC 마커 초기 잔차")
+        expected_marker_rms = 0.0 if input_data.seed.marker_result is None else float(input_data.seed.marker_result.metrics.rms)
+        if marker_rms != expected_marker_rms:
+            raise IcpJobProtocolError("CC 결과의 마커 초기 잔차가 작업 입력과 다릅니다.")
         native_identity = validate_native_execution_metadata(
             metadata,
             requested_max_threads=input_data.parameters.cc_max_threads,
@@ -464,7 +581,8 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
     baseline = metadata.get("baseline_metrics")
     if not isinstance(metrics, Mapping) or not isinstance(baseline, Mapping):
         raise IcpJobProtocolError("CC 정렬 전후 평가가 없습니다.")
-    for name in ("rms", "median", "p95", "trimmed_rms_90"):
+    for name in ("rms", "median", "p95", "trimmed_rms_90", "overlap_mean_rms", "overlap_rms",
+                 "overlap_mean_rms_normalized", "overlap_rms_normalized"):
         for evaluation in (metrics, baseline):
             value = evaluation.get(name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
@@ -472,7 +590,7 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
     reasons = metadata.get("review_reasons")
     if not isinstance(reasons, list) or any(not isinstance(reason, str) for reason in reasons):
         raise IcpJobProtocolError("CC 검토 사유가 올바르지 않습니다.")
-    quality = {"status": metadata["quality"], "rmse": float(metrics["trimmed_rms_90"]), "reasons": list(reasons)}
+    quality = {"status": metadata["quality"], "rmse": float(metrics["overlap_mean_rms"]), "reasons": list(reasons)}
     return ir.IcpRuntimeResult(
         moving_model_id=input_data.seed.moving_model_id,
         reference_model_ids=input_data.reference_model_ids,
@@ -484,8 +602,9 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
     )
 
 
-# 승인 기록에 보존하는 v3 감사 필드를 저장·복원 회귀와 공유합니다.
+# 승인 기록에 보존하는 v4 감사 필드를 저장·복원 회귀와 공유합니다.
 CCCORE_PROVENANCE_METADATA_FIELDS = (
+    "sampling_diagnostics", "marker_initial_rms",
     "core_commit", "native_worker_sha256", "native_build_identity", "quality_policy",
     "geometry_mode", "reverse_registration", "normalization", "parameters",
     "diagnostics", "registration_stages", "best_stage", "solver_stop_reason",
@@ -504,13 +623,36 @@ CCCORE_PROVENANCE_METADATA_FIELDS = (
 )
 
 
+def _compact_execution_audit(metadata: dict[str, Any]) -> None:
+    """검증을 마친 반복 준비 기록은 개수·지문으로, 등록·평가 기록은 원문으로 보존합니다."""
+    summary = {"version": 1, "policy": "PREPARATION_SUMMARY", "fields": {}}
+    for name in ("logical_operations", "native_calls", "physical_native_calls", "geometry_statistics"):
+        records = metadata.get(name)
+        if not isinstance(records, list):
+            continue
+        if name == "geometry_statistics":
+            retained = [item for item in records if item.get("cache_scope") == "SESSION"]
+        else:
+            retained = [item for item in records if item.get("stage") != "PREPARING"]
+        encoded = json.dumps(records, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        summary["fields"][name] = {
+            "source_count": len(records), "retained_count": len(retained),
+            "source_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+        metadata[name] = retained
+    # 세션 합계에는 생략된 준비 조회와 일회성 형상도 계속 포함됩니다.
+    metadata["execution_audit_storage"] = summary
+
+
 def cccore_provenance_fields(input_data: Any, result: Any) -> dict[str, Any]:
-    """승인 순간의 CC 버전·설정·형상 출처만 작은 불변 감사 정보로 보존합니다."""
+    """승인 순간의 CC 품질·출처와 요약된 실행 이력을 저장 한도 안에 보존합니다."""
     metadata = {
         name: _plain(result.metadata[name])
         for name in CCCORE_PROVENANCE_METADATA_FIELDS if name in result.metadata
     }
     metadata["geometry_input_fingerprint"] = input_data.snapshot.input_fingerprint
+    _compact_execution_audit(metadata)
     return {
         "solver_geometry_dependencies": input_data.snapshot.geometry_dependencies,
         "engine_metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True,

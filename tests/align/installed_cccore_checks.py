@@ -19,21 +19,21 @@ _GEOMETRY_CASES = (
     ("MESH_TO_MESH", True, True),
 )
 _NATIVE_OPERATION_SEQUENCES = {
-    "POINT_TO_POINT": ("distance", "distance", "register", "distance", "register", "distance"),
-    "POINT_TO_MESH": ("distance", "register", "distance", "register", "distance"),
-    "MESH_TO_POINT": ("distance", "register", "distance", "register", "distance"),
+    "POINT_TO_POINT": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
+    "POINT_TO_MESH": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
+    "MESH_TO_POINT": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
     "MESH_TO_MESH": (
-        "distance", "distance", "register", "distance",
-        "distance", "register", "distance", "distance",
+        "distance", "distance", "distance", "register", "distance",
+        "distance", "distance", "register", "distance", "distance",
     ),
 }
 _NATIVE_OPERATION_STAGES = {
-    "POINT_TO_POINT": ("PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION"),
-    "POINT_TO_MESH": ("BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION"),
-    "MESH_TO_POINT": ("BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION"),
+    "POINT_TO_POINT": ("BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION"),
+    "POINT_TO_MESH": ("BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION"),
+    "MESH_TO_POINT": ("BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION"),
     "MESH_TO_MESH": (
-        "BASELINE", "BASELINE", "RIGID", "RIGID_EVALUATION",
-        "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION", "REFINE_EVALUATION",
+        "BASELINE", "BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION",
+        "RIGID_EVALUATION", "SCALE_REFINE", "SCALE_REFINE", "REFINE_EVALUATION", "REFINE_EVALUATION",
     ),
 }
 _MATRIX_TOLERANCE = 1.5e-3
@@ -186,7 +186,8 @@ def _verified_thread_metadata(
     geometry_mode: str | None = None,
     require_calls: bool = True,
 ) -> dict[str, Any]:
-    """설치본 결과의 oneTBB 값과 논리·물리 호출 연결을 검증해 반환합니다."""
+    """설치본의 안전 패치·oneTBB 값·v4 준비 접두부와 고정 호출 골격을 검증합니다."""
+    assert "farthest-mesh-correspondence-v1" in metadata["core_patch"].split("+")
     assert metadata["thread_backend"] == "oneTBB"
     assert metadata["tbb_version"] == "2022.0.0"
     assert metadata["requested_max_threads"] == expected_requested
@@ -205,8 +206,12 @@ def _verified_thread_metadata(
         assert metadata["physical_native_command_count"] == len(physical_calls)
         assert metadata["physical_native_command_count"] <= len(calls)
         assert geometry_mode in _NATIVE_OPERATION_SEQUENCES
-        assert tuple(call.get("operation") for call in calls) == _NATIVE_OPERATION_SEQUENCES[geometry_mode]
-        assert tuple(call.get("stage") for call in calls) == _NATIVE_OPERATION_STAGES[geometry_mode]
+        preparing_count = sum(call.get("stage") == "PREPARING" for call in calls)
+        assert 1 <= preparing_count <= 2048
+        assert all(call.get("stage") == "PREPARING" and call.get("operation") == "distance"
+                   for call in calls[:preparing_count])
+        assert tuple(call.get("operation") for call in calls[preparing_count:]) == _NATIVE_OPERATION_SEQUENCES[geometry_mode]
+        assert tuple(call.get("stage") for call in calls[preparing_count:]) == _NATIVE_OPERATION_STAGES[geometry_mode]
         assert metadata["session_exit_reason"] == "closed"
         assert metadata["session_statistics"]["geometry_load_count"] == len(metadata["geometry_statistics"])
         assert metadata["session_statistics"]["geometry_cache_hits"] > 0
@@ -265,6 +270,62 @@ def _verified_thread_metadata(
     return result
 
 
+def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, reference_mesh: bool,
+                                native_path: Path) -> dict[str, Any]:
+    """설치본의 표본 목표·실제 후보 수·방향별 고정 평가 분모와 주지표를 검증합니다."""
+    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v4"
+    assert metadata["job_protocol_version"] == "cccore-job-v4"
+    identity = metadata["native_build_identity"]
+    assert identity["protocol_version"] == "cccore-native-v4"
+    assert identity["registration_safety_patch"] == "farthest-mesh-correspondence-v1"
+    runtime_manifest = json.loads(native_path.with_name("runtime_manifest.json").read_text(encoding="utf-8"))
+    safety = runtime_manifest["dependencies"]["cccore"]["registration_safety_patch"]
+    assert safety["id"] == identity["registration_safety_patch"]
+    assert identity["registration_safety_patch_sha256"] == safety["sha256"]
+    assert identity["patched_registration_sha256"] == safety["patched_sha256"]
+    parameters = metadata["parameters"]
+    assert parameters["point_sample_count"] == parameters["mesh_sample_count"] == 50000
+    assert parameters["evaluation_sample_count"] == 30000
+    assert parameters["overlap_mode"] == "ESTIMATED_ON_CANDIDATES"
+    assert parameters["filter_out_farthest_points"] is True
+    assert "overlap_ratio" not in parameters
+    sampling = metadata["sampling_diagnostics"]
+    assert sampling["optimizer_seed"] != sampling["evaluation_seed"]
+    directions = sampling["directions"]
+    expected_directions = ({"moving_to_reference", "reference_to_moving"} if moving_mesh and reference_mesh
+                           else {"reference_to_moving"} if moving_mesh else {"moving_to_reference"})
+    assert set(directions) == expected_directions
+    total_evaluation = 0
+    registration_count = 0
+    for name, direction in directions.items():
+        source_is_mesh = moving_mesh if name == "moving_to_reference" else reference_mesh
+        count = direction["evaluation_sample_count"]
+        assert type(count) is int and direction["evaluation"]["sample_count"] == count
+        assert direction["evaluation"]["requested_sample_count"] == 30000
+        if source_is_mesh:
+            assert count == 30000
+        else:
+            assert 3 <= count <= min(30000, direction["domain"]["candidate_point_count"])
+        total_evaluation += count
+        if "registration" in direction:
+            registration = direction["registration"]
+            assert registration["requested_sample_count"] == 50000
+            expected_count = 50000 if source_is_mesh else min(50000, direction["domain"]["candidate_point_count"])
+            assert registration["sample_count"] == expected_count
+            registration_count += expected_count
+    assert sampling["registration_sample_count"] == registration_count
+    assert all(stage["data_point_count"] == registration_count for stage in metadata["registration_stages"])
+    for metric in metadata["candidate_metrics"].values():
+        assert metric["count"] == metric["evaluation_sample_count"] == total_evaluation
+        for name, direction in directions.items():
+            assert metric["directions"][name]["count"] == direction["evaluation_sample_count"]
+        directional_rms = [summary["rms"] for summary in metric["directions"].values()]
+        assert np.isclose(metric["overlap_mean_rms"], np.mean(directional_rms), rtol=1e-12, atol=1e-12)
+        assert np.isclose(metric["overlap_rms"], metric["rms"], rtol=1e-12, atol=1e-12)
+        assert isinstance(metric["full_reference_metrics"], dict)
+    return sampling
+
+
 def _wait_for_result(runtime_module, runtime, *, timeout_seconds: float = 180.0):
     """실제 작업 파일을 공개 진행 API로 읽고 결과 미리보기까지 기다립니다."""
     deadline = monotonic() + timeout_seconds
@@ -282,7 +343,7 @@ def _wait_for_result(runtime_module, runtime, *, timeout_seconds: float = 180.0)
 
 def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
               moving_mesh: bool, reference_mesh: bool, python_path: Path, native_path: Path) -> dict[str, Any]:
-    """실제 네이티브 정렬 뒤 P 승인과 공개 스냅샷 기반 Undo/Redo를 검증합니다."""
+    """실제 v4 정렬의 고정 표본·겹침 RMS와 기존 정답 행렬·승인·Undo/Redo를 검증합니다."""
     runtime, expected = _runtime_fixture(modules, output_root, mode, moving_mesh, reference_mesh)
     api = modules["runtime"]
     repository = runtime.model_repository
@@ -309,6 +370,7 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
             expected_threads,
             geometry_mode=mode,
         )
+        sampling_metadata = _verified_sampling_metadata(dict(result.metadata), moving_mesh, reference_mesh, native_path)
         np.testing.assert_allclose(actual, expected, atol=_MATRIX_TOLERANCE, rtol=0.0)
         np.testing.assert_array_equal(repository.alignment_transform_for_model_id("moving").matrix_float64, before_p)
         np.testing.assert_array_equal(repository.alignment_transform_for_model_id("reference").matrix_float64, before_a)
@@ -320,23 +382,42 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
         assert native_hash == hashlib.sha256(native_path.read_bytes()).hexdigest()
         quality = result.quality_status
         metrics = dict(result.metadata["best_candidate_metrics"])
+        assert result.quality["rmse"] == metrics["overlap_mean_rms"]
         commit = api.approve_icp_result(runtime)
         provenance = runtime.model_catalog.models["moving"].alignment_provenance
         assert provenance.backend_id == "CCCORELIB"
+        assert provenance.algorithm_version == "cccore-icp-v4"
+        assert provenance.icp_rmse == metrics["overlap_mean_rms"]
         assert runtime.model_catalog.models["moving"].registration_status == "REGISTERED"
         expected_dependencies = tuple(sorted((("moving", "COMPANION" if moving_mesh else "MAIN"),
                                               ("reference", "COMPANION" if reference_mesh else "MAIN"))))
         assert provenance.solver_geometry_dependencies == expected_dependencies
         audit = json.loads(provenance.engine_metadata_json)
+        assert len(provenance.engine_metadata_json.encode("utf-8")) <= 262144
+        trace_summary = audit["execution_audit_storage"]
+        assert trace_summary["version"] == 1
+        for field in ("logical_operations", "native_calls", "physical_native_calls", "geometry_statistics"):
+            records = result.metadata[field]
+            expected_records = [item for item in records if (
+                item.get("cache_scope") == "SESSION" if field == "geometry_statistics"
+                else item.get("stage") != "PREPARING")]
+            assert audit[field] == expected_records
+            full_trace = json.dumps(records, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":"), allow_nan=False).encode("utf-8")
+            assert trace_summary["fields"][field] == {
+                "source_count": len(records), "retained_count": len(expected_records),
+                "source_sha256": hashlib.sha256(full_trace).hexdigest(),
+            }
         for field in (
             "thread_backend", "tbb_version", "requested_max_threads", "effective_max_threads",
             "hardware_thread_count", "distance_multithread_support",
-            "octree_multithread_support", "native_process_count", "logical_operations", "native_calls",
-            "physical_native_calls", "physical_native_command_count", "exact_evaluation_cache",
+            "octree_multithread_support", "native_process_count",
+            "physical_native_command_count", "exact_evaluation_cache",
             "process_startup_seconds", "session_elapsed_seconds", "session_exit_reason",
-            "session_statistics", "geometry_statistics", "session_protocol_statistics",
+            "session_statistics", "session_protocol_statistics",
             "physical_roundtrip_seconds", "protocol_overhead_seconds",
             "protocol_overhead_ratio_of_roundtrip", "protocol_overhead_fraction_of_total_alignment",
+            "sampling_diagnostics", "baseline_metrics", "best_candidate_metrics", "native_build_identity",
         ):
             assert audit[field] == result.metadata[field]
         np.testing.assert_allclose(repository.alignment_transform_for_model_id("moving").matrix_float64, actual, atol=1e-12, rtol=0.0)
@@ -367,6 +448,10 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
             "matrix_tolerance": _MATRIX_TOLERANCE, "reference_unchanged": True, "source_arrays_unchanged": True,
             "approved": True, "undo_redo": True, "geometry_dependencies": [list(item) for item in expected_dependencies],
             "rms": float(metrics["rms"]), "trimmed_rms_90": float(metrics["trimmed_rms_90"]),
+            "overlap_mean_rms": float(metrics["overlap_mean_rms"]),
+            "overlap_rms": float(metrics["overlap_rms"]),
+            "full_reference_rms": float(metrics["full_reference_metrics"]["rms"]),
+            "sampling_diagnostics": sampling_metadata,
             "threading": thread_metadata,
             "elapsed_seconds": monotonic() - started,
         }

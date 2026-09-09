@@ -2,6 +2,18 @@
 
 모든 명령은 Repository Root에서 실행합니다.
 
+## Align 겹침 후보 우선 샘플링 v4
+
+0.3.41의 검사 범위·수치·한계·ZIP 해시는 [릴리스 기록](migration/ALIGN_OVERLAP_SAMPLING_RELEASE_NOTE.md)에 정리합니다.
+
+```powershell
+& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_overlap.py
+& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_v4_contract.py
+& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_partial_overlap.py --threads 4
+```
+
+네이티브 빌드 검사는 메시 먼 점 필터와 부분 겹침 필터를 함께 실행하는 접근 위반 회귀를 포함합니다. 준비 조회는 실제 실행에서 전체 계약을 검증하며, 승인 저장은 반복 준비 기록을 요약하므로 저장된 부분 목록에 전체 실행용 순서 검사를 적용하지 않습니다. 최대 2,048회 준비 조회의 저장 한도와 이전 v1~v3 승인 기록의 복원을 별도로 검사합니다.
+
 ## Align 파일 로드 시 내보내기 상태 회귀
 
 ```powershell
@@ -19,7 +31,7 @@
 .\build_tools\test_installed_extension.ps1 -WorkspaceGui -ReportDirectory "$PWD\build\verification"
 ```
 
-기본 `CCCoreLib` ZIP은 전용 Python·NumPy와 CC v3·oneTBB를 포함합니다. 빌드는 Architecture·Coexistence·Modifier Core·Projection Core와 통합 등록 검사, 스테이징 실제 CC 정렬, ZIP 필수 파일·해시·개발 경로 누출 검사를 수행합니다. 검증된 실행 환경을 재사용할 때에는 `-CcCorePythonPath`와 `-CcCoreRuntimePath`를 지정합니다. `SmallGicp`는 희소 점군 비교 전용이며 `Full`은 CC 기본 실행 환경에 개발용 선택형 소스를 추가합니다.
+기본 `CCCoreLib` ZIP은 전용 Python·NumPy와 CC v4·oneTBB를 포함합니다. 빌드는 Architecture·Coexistence·Modifier Core·Projection Core와 통합 등록 검사, 스테이징 실제 CC 정렬, ZIP 필수 파일·해시·개발 경로 누출 검사를 수행합니다. 검증된 실행 환경을 재사용할 때에는 `-CcCorePythonPath`와 `-CcCoreRuntimePath`를 지정합니다. `SmallGicp`는 희소 점군 비교 전용이며 `Full`은 CC 기본 실행 환경에 개발용 선택형 소스를 추가합니다.
 
 설치 검사는 임시 Blender 사용자 설정에 ZIP을 설치하고 네 가지 입력 조합의 실제 정렬, 승인·Undo/Redo, 설정, OBJ 토폴로지와 면 코너 UV를 확인합니다. `-WorkspaceGui`는 세 도구 작업공간·카메라 마커 교대와 다음 세 가지 새 프로세스 검사를 추가합니다.
 
@@ -33,7 +45,7 @@
 
 ```powershell
 python .\build_tools\cccore_distribution.py prepare-python
-.\build_tools\prepare_cccore_runtime.ps1 -EnvironmentRoot "$PWD\.cccore-runtime" -RuntimePath "$PWD\.cccore-runtime\cccore"
+.\build_tools\prepare_cccore_runtime.ps1 -EnvironmentRoot "$PWD\.cccore-runtime" -RuntimePath "$PWD\.cccore-runtime\cccore" -PythonPath "$PWD\.cccore-runtime\python\python.exe"
 & .\.cccore-runtime\python\python.exe -X utf8 .\tests\align\native\test_cccore_worker.py --report "$PWD\build\native-tests.json"
 $env:COLMAP_CCCORE_WORKER = "$PWD\.cccore-runtime\cccore\colmap_cccore_worker.exe"
 & .\.cccore-runtime\python\python.exe -X utf8 .\tests\align\test_icp_cccore_solver.py

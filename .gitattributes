@@ -1,0 +1,2 @@
+# 네이티브 코어 패치는 잠금 파일의 원문 해시와 같은 줄바꿈으로 보관합니다.
+tools/align/native/cccore_worker/patches/*.patch text eol=lf

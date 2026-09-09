@@ -34,7 +34,7 @@ def test_defaults_and_legacy_profiles() -> None:
     from tools.align import distribution_profile
     from tools.align.alignment.icp_solver_backend import backend_algorithm_version
 
-    assert backend_algorithm_version("CCCORELIB") == "cccore-icp-v3"
+    assert backend_algorithm_version("CCCORELIB") == "cccore-icp-v4"
     for profile in ("CCCORELIB", "SMALL_GICP", "FULL"):
         with patch.object(distribution_profile, "DISTRIBUTION_PROFILE", profile):
             expected = "SMALL_GICP" if profile == "SMALL_GICP" else "CCCORELIB"
@@ -113,7 +113,13 @@ def test_cpu_thread_preferences_auto_manual_and_snapshot() -> None:
     assert properties.cc_cpu_thread_counts(1024, 4096) == (4096, 1024, 1024)
     first = CcCoreRuntimeParameters(cc_max_threads=15)
     changed = CcCoreRuntimeParameters(cc_max_threads=1)
-    assert first.to_mapping()["cc_max_threads"] == 15
+    settings = first.to_mapping()
+    assert settings["cc_max_threads"] == 15
+    assert settings["cc_point_sample_count"] == 50000
+    assert settings["cc_evaluation_sample_count"] == 30000
+    assert settings["cc_overlap_mode"] == "ESTIMATED_ON_CANDIDATES"
+    assert settings["cc_filter_out_farthest_points"] is True
+    assert "cc_overlap_ratio" not in settings
     assert first.fingerprint != changed.fingerprint
     assert first.to_mapping()["cc_max_threads"] == 15
 
@@ -188,6 +194,7 @@ def test_begin_job_freezes_preference_thread_limit() -> None:
         assert input_data.parameters.cc_max_threads == 7
         assert input_data.parameters.to_mapping()["cc_max_threads"] == 7
         assert captured["manifest"]["parameters"]["cc_max_threads"] == 7
+        assert captured["manifest"]["marker_initial_rms"] == 0.0
         assert captured["manifest"]["parameter_fingerprint"] == input_data.parameters.fingerprint
         assert captured["manifest"]["input_fingerprint"] == input_data.input_fingerprint
         changed_parameters = icp_cccore_runtime.CcCoreRuntimeParameters(cc_max_threads=1)
@@ -203,14 +210,42 @@ def test_begin_job_freezes_preference_thread_limit() -> None:
             shutil.rmtree(handle.files.job_directory, ignore_errors=True)
 
 
+
+def test_marker_radius_uses_world_residual_without_evaluation_markers() -> None:
+    """마커 초기화는 월드 잔차만 반경용으로 전달하고 마커 점을 평가 입력에 넣지 않습니다."""
+    from test_icp_runtime import _runtime_with_marker_preview
+    from tools.align.alignment import icp_cccore_runtime
+
+    runtime, marker = _runtime_with_marker_preview(count=64)
+    captured = {}
+
+    def capture_launch(files, manifest, _python_path, _native_path):
+        """초기 마커 잔차와 형상 전용 평가 입력이 담긴 작업 계약을 기록합니다."""
+        captured.update(manifest)
+        return SimpleNamespace(files=files, job_id=manifest["job_id"])
+
+    handle = None
+    try:
+        with patch.object(icp_cccore_runtime, "_launch", side_effect=capture_launch):
+            handle = icp_cccore_runtime.begin_cccore_job(runtime, "사용하지않음/python.exe")
+        assert captured["marker_initial_rms"] == marker.metrics.rms
+        assert captured["marker_initial_rms"] >= 0.0
+        assert "marker_points" not in captured and "marker_evaluation" not in captured
+        assert set(captured["geometry"]) == {"moving", "reference", "input_fingerprint", "provenance"}
+    finally:
+        if handle is not None:
+            shutil.rmtree(handle.files.job_directory, ignore_errors=True)
+
+
 def test_cc_distance_log_and_progress_message() -> None:
     """CC 결과에는 거리 분포·추가 배율·검토 사유가 보이고 실제 진행 문구를 유지합니다."""
     from tools.align.ui import panels
 
-    baseline = {"rms": 0.5, "trimmed_rms_90": 0.4, "median": 0.3, "p95": 0.9, "count": 30000}
-    best = {"rms": 0.2, "trimmed_rms_90": 0.1, "median": 0.05, "p95": 0.4, "count": 30000}
+    baseline = {"overlap_mean_rms": 0.4, "overlap_rms": 0.5, "evaluation_sample_count": 30000, "correspondence_coverage": {"valid_count": 24000}, "full_reference_metrics": {"rms": 2.0}, "rms": 0.5, "trimmed_rms_90": 0.4, "median": 0.3, "p95": 0.9, "count": 30000}
+    best = {"overlap_mean_rms": 0.1, "overlap_rms": 0.2, "evaluation_sample_count": 30000, "correspondence_coverage": {"valid_count": 24000}, "full_reference_metrics": {"rms": 2.5}, "rms": 0.2, "trimmed_rms_90": 0.1, "median": 0.05, "p95": 0.4, "count": 30000}
     result = SimpleNamespace(solver_backend="CCCORELIB", quality={"status": "REVIEW"},
         metadata={"baseline_metrics": baseline, "best_candidate_metrics": best,
+                  "sampling_diagnostics": {"registration_sample_count": 50000, "candidate_shortage": True, "spatial_distribution_warning": True},
                   "review_reasons": ["일부 공간 구간에서 거리 오차가 증가했습니다."]},
         icp_delta=SimpleNamespace(uniform_scale=1.025))
     state = SimpleNamespace(result=result, input_data=SimpleNamespace(seed=SimpleNamespace(uses_marker_preview=True)),
@@ -218,7 +253,10 @@ def test_cc_distance_log_and_progress_message() -> None:
     with patch.object(panels, "RUNTIME", SimpleNamespace(icp_alignment=state)):
         entries = "\n".join(panels._icp_result_entries())
         assert "사용자 확인 필요" in entries and "마커 초기값" in entries
-        assert "거리 RMS 0.5" in entries and "가까운 90% RMS 0.1" in entries
+        assert "겹침 평가 RMS 0.4" in entries and "겹침 합산 RMS 0.2" in entries
+        assert "전체 참고 RMS 2.5" in entries and "평가 표본 30,000개" in entries
+        assert "주방향 유효 대응 24,000개" in entries and "정합 표본 · 50,000개" in entries
+        assert "목표 표본 수보다 부족" in entries and "공간 분포" in entries
         assert "중앙값" in entries and "95백분위 거리" in entries and "30,000개" in entries
         assert "+75.00%" in entries and "×1.025 (+2.50%)" in entries
         assert "검토 · 일부 공간 구간" in entries

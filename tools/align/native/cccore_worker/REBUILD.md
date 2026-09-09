@@ -55,7 +55,7 @@ PowerShell 7에서 다음 명령을 실행합니다. 출력은 지정한 격리 
 
 ## 배포된 원문만으로 재빌드
 
-원문 ZIP을 별도 작업 폴더에 풀고, 해당 폴더에서 실행합니다. ZIP의 코어는 두 최소 패치가 적용된 상태이며 `tbb/`에는 검증된 공식 Windows 패키지가 있습니다. 네트워크 다운로드가 필요하지 않습니다.
+원문 ZIP을 별도 작업 폴더에 풀고, 해당 폴더에서 실행합니다. ZIP의 코어는 기존 두 패치와 등록 안전 패치가 적용된 상태이며 `tbb/`에는 검증된 공식 Windows 패키지가 있습니다. 네트워크 다운로드가 필요하지 않습니다.
 
 ```powershell
 $cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
@@ -64,7 +64,7 @@ Expand-Archive -LiteralPath .\tbb\oneapi-tbb-2022.0.0-win.zip -DestinationPath .
   "-DCCCORE_SOURCE=$PWD\cccore-src" "-DJSON_INCLUDE_DIR=$PWD\json" `
   "-DTBB_DIR=$PWD\tbb\oneapi-tbb-2022.0.0\lib\cmake\tbb" `
   -DCORE_COMMIT=dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 `
-  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1
+  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1
 & $cmake --build .\build --config Release --parallel 8
 Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -Destination .\build\bin\tbb12.dll
 & .\build\bin\colmap_cccore_worker.exe --check-environment
@@ -72,13 +72,28 @@ Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -
 
 `build/bin`에 워커, `CCCoreLib.dll`, `tbb12.dll`이 준비됩니다. 배포 런타임에서 Microsoft C++ 재배포 DLL 네 파일과 oneTBB 라이선스·제삼자 고지를 함께 유지합니다. Windows의 Universal CRT는 운영체제 제공 구성요소를 사용합니다.
 
-준비 스크립트는 매 실행마다 새 빌드·원문·런타임 스테이징을 만들고 허용 파일 목록, v3 Manifest 연결, 자체 검사와 단일 세션·캐시 네이티브 회귀를 모두 확인한 뒤 런타임 디렉터리를 교체합니다. 실패하면 기존 런타임을 유지하거나 교체 직전 백업으로 되돌리므로 이전 파일이 원문 ZIP이나 최종 배포에 섞이지 않습니다.
+준비 스크립트는 매 실행마다 새 빌드·원문·런타임 스테이징을 만들고 허용 파일 목록, v4 Manifest 연결, 자체 검사와 단일 세션·캐시 네이티브 회귀를 모두 확인한 뒤 런타임 디렉터리를 교체합니다. 실패하면 기존 런타임을 유지하거나 교체 직전 백업으로 되돌리므로 이전 파일이 원문 ZIP이나 최종 배포에 섞이지 않습니다.
+
+v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비율을 받으며 `filter_out_farthest_points`를 공개 `Parameters::filterOutFarthestPoints`에 연결합니다. 절대 최대거리 제한을 코어에 추가하지 않으며, 코어 커밋과 두 기존 패치의 원문·적용 결과 해시를 보존하고, 등록 안전 패치의 적용 전후 해시를 별도로 고정합니다. v3 런타임은 v4 배포 검증을 통과할 수 없습니다.
 
 ## 삼각면 거리의 옥트리 단계 선택
 
 독립 거리 API의 삼각면 경로는 `octreeLevel=0`을 자동 보정하지 않아 실데이터 약 3만 점과 6만 5천 면을 단일 셀에서 비교했습니다. 기존 실험의 전체 계산은 약 264초였으며 거리 평가가 대부분을 차지했습니다. 워커는 동일 고정 코어의 `RegistrationTools.cpp`가 사용하는 공개 `DgmOctree::findBestLevelForComparisonWithOctree`로 점군과 메시 꼭짓점의 옥트리 단계 값을 선택합니다. 거리 계산 자체는 공식 `computeCloud2MeshDistances`를 그대로 사용합니다. 임의 고정 단계나 거리 근사는 적용하지 않았습니다.
 
-회귀는 삼각면 내부·외부의 기존 해석적 정답을 유지하고, 64800개 삼각면과 30000개 점의 해석적 거리 및 15초 처리 한도를 검사합니다. 이 변경은 워커의 공개 API 설정이며 코어 원문 수정은 위에 고지한 두 최소 패치뿐입니다.
+회귀는 삼각면 내부·외부의 기존 해석적 정답을 유지하고, 64800개 삼각면과 30000개 점의 해석적 거리 및 15초 처리 한도를 검사합니다. 이 변경은 워커의 공개 API 설정이며 해당 거리 최적화는 코어 원문을 바꾸지 않으며, 등록 안전 수정은 아래 별도 패치로 고지합니다.
+
+## 메시 최원거리점 필터의 대응 식별자 보존
+
+고정 원문의 최원거리점 필터는 메시 최근접점 `CPSetPlain`을 새 점군에 복사하면서 최근접 삼각형 번호를 담은 스칼라 필드를 생성·복사하지 않았습니다. 이어지는 부분 겹침 필터가 그 필드를 읽으면 잘못된 필드 인덱스를 역참조하여 접근 위반으로 종료될 수 있습니다. `farthest-mesh-correspondence-v1`은 같은 파일의 기존 부분 겹침 필터와 동일하게 `enableScalarField()`와 `addPointScalarValue()`로 대응 정보를 보존합니다.
+
+- 패치 원문: `patches/farthest_mesh_correspondence.patch`
+- 적용 전 SHA-256: `329eef87ce8160ff07b0e2f91f38f164951f0511294bf870b3fd0b33b6623dae`
+- 패치 SHA-256: `29387943b562fe0225ffbeb653f64c9f2d915d3cff705e24907ff25da680e329`
+- 최종 등록 원문 SHA-256: `b0e06492f3e1082ec5f27edb884e5c52b48385b8e9286d9c8c1f378fa330b08a`
+
+준비 스크립트는 원본·배율 패치 완료·안전 패치 완료의 세 상태만 수용하여 중복 적용을 막습니다. Manifest와 원문 ZIP은 안전 패치와 최종 등록 원문의 해시를 함께 검증합니다. 기존 두 패치 파일이나 수치 허용오차는 변경하지 않습니다. 회귀에는 메시·최원거리점 필터·겹침 비율 0.6/0.9 조합의 알려진 강체·배율 변환을 포함합니다.
+
+독립 워커는 기존 Windows 오류 모드에 `SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX`를 추가하여 오류 대화상자 반복을 막습니다. 비정상 종료는 기존 종료 코드와 조정자 오류로 계속 보고하며, 대화상자 억제는 원인 수정이나 오류 처리를 대체하지 않습니다.
 
 ## v3 세션·수명·취소 계약
 

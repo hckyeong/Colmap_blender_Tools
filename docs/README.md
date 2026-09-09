@@ -4,6 +4,8 @@
 
 ## 현행 문서
 
+- [Align 겹침 후보 우선 샘플링 0.3.41](migration/ALIGN_OVERLAP_SAMPLING_RELEASE_NOTE.md)
+- [Align CC 겹침 후보 우선 샘플링 계획서](COLMAP_Align_CC_겹침후보_우선샘플링_계획서.md)
 - [Align 왼쪽 N 패널 기본 닫힘 0.3.40](migration/ALIGN_REFERENCE_SIDEBAR_DEFAULT_RELEASE_NOTE.md)
 - [Align N 패널 기본 폭 0.3.39](migration/ALIGN_SIDEBAR_DEFAULT_WIDTH_RELEASE_NOTE.md)
 - [Align 유휴 내보내기 파일 로드 오류 수정 0.3.38](migration/ALIGN_EXPORT_IDLE_LOAD_RELEASE_NOTE.md)

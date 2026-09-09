@@ -22,11 +22,12 @@ def _add_test_paths() -> None:
 
 @contextmanager
 def _project_fixture(*, companions: bool = True):
-    """실험 출력 폴더에서 실제 원본을 읽고 생성한 프로젝트 Text만 정리합니다."""
+    """저장소 안의 임시 출력 폴더에서 실제 원본을 읽고 생성한 프로젝트 Text를 정리합니다."""
     from test_companion_marker_persistence import _origin
     from test_project_restore import _remove_owned_project_texts
 
-    outputs = Path(__file__).resolve().parents[4] / "outputs"
+    outputs = Path(__file__).resolve().parents[3] / ".artifacts" / "cc-persistence"
+    outputs.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="cc-persistence-", dir=outputs) as directory:
         root = Path(directory).resolve()
         assert root.parent == outputs.resolve()
@@ -39,12 +40,17 @@ def _project_fixture(*, companions: bool = True):
 def _v3_engine_metadata(source: str) -> dict:
     """실제 v3 저장 계약의 전체 감사 필드와 논리·물리 호출 연결을 구성합니다."""
     from tools.align.alignment.icp_cccore_contract import (
-        CC_NATIVE_COUNTER_FIELDS, CC_NATIVE_OPERATION_SEQUENCES, CC_NATIVE_OPERATION_STAGES,
+        CC_NATIVE_COUNTER_FIELDS,
         CC_NATIVE_TIMING_FIELDS,
     )
     geometry_mode = "MESH_TO_MESH" if source == "COMPANION" else "POINT_TO_POINT"
-    operations = CC_NATIVE_OPERATION_SEQUENCES[geometry_mode]
-    stages = CC_NATIVE_OPERATION_STAGES[geometry_mode]
+    # 저장 호환 검사는 당시 v3 연산 순서를 새 실행 계약과 독립적으로 보존합니다.
+    if geometry_mode == "MESH_TO_MESH":
+        operations = ("distance", "distance", "register", "distance", "distance", "register", "distance", "distance")
+        stages = ("BASELINE", "BASELINE", "RIGID", "RIGID_EVALUATION", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION", "REFINE_EVALUATION")
+    else:
+        operations = ("distance", "distance", "register", "distance", "register", "distance")
+        stages = ("PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION")
     if geometry_mode == "MESH_TO_MESH":
         native_logical_indexes = (1, 2, 3, 6)
         cache_sources = {4: 1, 5: 2, 7: 1, 8: 2}
@@ -210,7 +216,7 @@ def _v3_engine_metadata(source: str) -> dict:
         **protocol_statistics, "geometry_input_fingerprint": "83" * 32,
     }
     from tools.align.alignment.icp_cccore_runtime import CCCORE_PROVENANCE_METADATA_FIELDS
-    assert set(metadata) == set(CCCORE_PROVENANCE_METADATA_FIELDS)
+    assert set(metadata) == set(CCCORE_PROVENANCE_METADATA_FIELDS) - {"sampling_diagnostics", "marker_initial_rms"}
     return metadata
 
 
@@ -325,14 +331,11 @@ def test_cc_mesh_approval_roundtrip_uses_real_project_snapshot() -> None:
         assert saved["algorithm_version"] == "cccore-icp-v3"
         from tools.align.alignment.icp_cccore_runtime import CCCORE_PROVENANCE_METADATA_FIELDS
         audit = saved["engine_metadata"]
-        assert set(audit) == set(CCCORE_PROVENANCE_METADATA_FIELDS)
+        assert set(audit) == set(CCCORE_PROVENANCE_METADATA_FIELDS) - {"sampling_diagnostics", "marker_initial_rms"}
         assert audit["geometry_mode"] == "MESH_TO_MESH"
         from tools.align.alignment import icp_cccore_contract as contract
-        logical = contract.validate_native_call_summaries(
-            audit["logical_operations"], geometry_mode=audit["geometry_mode"],
-            requested_max_threads=audit["requested_max_threads"],
-            effective_max_threads=audit["effective_max_threads"],
-        )
+        # 이전 승인 기록은 새 계산 프로토콜로 재검증하지 않고 원래 감사 내용을 보존합니다.
+        logical = tuple(audit["logical_operations"])
         assert audit["native_calls"] == audit["logical_operations"]
         contract.validate_exact_evaluation_cache_statistics(audit["exact_evaluation_cache"], logical)
         physical = contract.validate_physical_native_call_summaries(
@@ -383,6 +386,60 @@ def test_cc_v1_v2_provenance_survives_snapshot_encode_decode_and_restore() -> No
             restored_provenance = restored.model_catalog.models["moving"].alignment_provenance
             assert restored_provenance == provenance
             assert restored_provenance.algorithm_version == algorithm_version
+
+
+
+def test_v4_overlap_audit_survives_project_restore() -> None:
+    """최대 준비 조회도 저장 한도를 지키며 겹침 지표·실행 요약을 그대로 복원합니다."""
+    from types import SimpleNamespace
+    from test_companion_persistence import _restore, _write_snapshot
+    from tools.align.alignment.icp_cccore_runtime import cccore_provenance_fields
+    from tools.align.project_persistence import decode_project_state, encode_project_state
+
+    with _project_fixture() as origin:
+        _set_distinct_axes_and_alignment(origin)
+        original = _cc_provenance(origin)
+        metadata = json.loads(original.engine_metadata_json)
+        metadata["marker_initial_rms"] = 0.006
+        metadata["sampling_diagnostics"] = {
+            "registration_sample_count": 50000, "optimizer_seed": 101, "evaluation_seed": 202,
+            "directions": {"moving_to_reference": {"evaluation_sample_count": 30000,
+                "evaluation_sample_fingerprint": "ab" * 32, "registration_sample_fingerprint": "cd" * 32}},
+        }
+        for name in ("baseline_metrics", "best_candidate_metrics"):
+            metadata[name] = {"overlap_mean_rms": 0.0125, "overlap_rms": 0.013,
+                "evaluation_sample_count": 30000, "full_reference_metrics": {"rms": 1.25, "count": 30000}}
+        for name in ("logical_operations", "native_calls", "physical_native_calls"):
+            seed = metadata[name][0]
+            metadata[name] = [dict(seed, stage="PREPARING", index=index + 1) for index in range(2048)] + metadata[name]
+        seed_geometry = metadata["geometry_statistics"][0]
+        metadata["geometry_statistics"] += [dict(seed_geometry, geometry_id=f"query-{index}",
+            cache_scope="COMMAND") for index in range(2048)]
+        source_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+        assert len(source_json.encode("utf-8")) > 262144
+        fields = cccore_provenance_fields(SimpleNamespace(snapshot=SimpleNamespace(
+            input_fingerprint=metadata["geometry_input_fingerprint"],
+            geometry_dependencies=original.solver_geometry_dependencies)), SimpleNamespace(metadata=metadata))
+        assert json.dumps(metadata, ensure_ascii=False, sort_keys=True) == source_json
+        assert len(fields["engine_metadata_json"].encode("utf-8")) < 262144
+        compact = json.loads(fields["engine_metadata_json"])
+        for name in ("baseline_metrics", "best_candidate_metrics", "sampling_diagnostics", "session_statistics"):
+            assert compact[name] == metadata[name]
+        for name in ("logical_operations", "native_calls", "physical_native_calls"):
+            assert compact["execution_audit_storage"]["fields"][name]["source_count"] == len(metadata[name])
+            assert all(item["stage"] != "PREPARING" for item in compact[name])
+        provenance = replace(original, algorithm_version="cccore-icp-v4",
+            **fields)
+        origin.model_catalog.set_alignment_provenance("moving", provenance)
+        origin.model_catalog.promote_model_for_icp_commit("moving")
+        snapshot, _text = _write_snapshot(origin)
+        decoded = decode_project_state(encode_project_state(snapshot))
+        assert decoded.models[1].catalog.alignment_provenance == provenance
+        restored = _restore()
+        _assert_restored_geometry(origin, restored)
+        audit = json.loads(restored.model_catalog.models["moving"].alignment_provenance.engine_metadata_json)
+        assert audit == compact
+        assert restored.icp_alignment.input_data is None and restored.icp_alignment.result is None
 
 
 def test_schema_six_upgrades_to_current_and_preserves_old_engine() -> None:

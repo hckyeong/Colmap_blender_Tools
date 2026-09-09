@@ -31,7 +31,7 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 .\build_tools\build_extension.ps1
 ```
 
-0.3.37부터 기본 빌드는 `CCCoreLib` 프로필입니다. 전용 CPython 3.12.10·NumPy 1.26.4와 CC v3·oneTBB 실행 환경을 ZIP에 포함하므로 별도 Python 설치 없이 정렬할 수 있습니다. 실행 환경은 Git에서 제외한 `.cccore-runtime/`에 준비하고 빌드 스테이징에 복사합니다. 처음 네이티브 실행 환경을 준비할 때에는 Visual Studio 2022 C++ 빌드 도구와 네트워크가 필요합니다.
+0.3.37부터 기본 빌드는 `CCCoreLib` 프로필입니다. 전용 CPython 3.12.10·NumPy 1.26.4와 CC v4·oneTBB 실행 환경을 ZIP에 포함하므로 별도 Python 설치 없이 정렬할 수 있습니다. 실행 환경은 Git에서 제외한 `.cccore-runtime/`에 준비하고 빌드 스테이징에 복사합니다. 처음 네이티브 실행 환경을 준비할 때에는 Visual Studio 2022 C++ 빌드 도구와 네트워크가 필요합니다.
 
 `-CcCorePythonPath`와 `-CcCoreRuntimePath`로 검증된 실행 환경을 지정할 수도 있습니다. 고정 버전·바이너리·라이선스·재빌드 원문 해시와 실제 정렬 검사를 통과한 입력만 사용합니다.
 
@@ -43,7 +43,11 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 
 기존 명시적 `-AlignProfile SmallGicp`는 희소 점군 비교용으로 유지합니다. `-AlignProfile Full`은 CC 실행 환경과 선택형 엔진 소스를 포함하며, 구엔진 비교에 필요한 별도 Python 경로를 환경설정에서 지정합니다. 기본 CC ZIP에는 Small GICP·Open3D 실행 패키지를 포함하지 않습니다.
 
-## Align 0.3.40
+## Align 0.3.41
+
+3점 정렬 또는 현재 위치에서 먼 영역을 먼저 제외하고, 겹침 후보 안에서 메시 표본 50,000개를 확보합니다. 점군은 중복 없이 최대 50,000개를 사용합니다. 결과는 처음 고정한 겹침 평가 표본으로 비교하며, 상태창에서 전체 참고 RMS와 구분합니다. 추가 초기 ICP는 실행하지 않습니다. [변경 기록](docs/migration/ALIGN_OVERLAP_SAMPLING_RELEASE_NOTE.md)
+
+### 0.3.40 왼쪽 패널 기본값
 
 새 Align 작업공간에서는 왼쪽 A 뷰의 N 패널은 닫고 오른쪽 P 뷰의 정렬 패널만 엽니다. 이후 사용자가 왼쪽 패널을 직접 열면 재진입해도 그 상태를 유지합니다. [변경 기록](docs/migration/ALIGN_REFERENCE_SIDEBAR_DEFAULT_RELEASE_NOTE.md)
 

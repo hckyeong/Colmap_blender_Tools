@@ -40,7 +40,7 @@ using Clock = std::chrono::steady_clock;
 using Cloud = CCCoreLib::PointCloud;
 using Transform = CCCoreLib::PointProjectionTools::Transformation;
 constexpr const char* kProtocol = "cccore-native-v2";
-constexpr const char* kSessionProtocol = "cccore-native-v3";
+constexpr const char* kSessionProtocol = "cccore-native-v4";
 constexpr const char* kThreadBackend = "oneTBB";
 constexpr const char* kTbbVersion = TBB_VERSION_PIN;
 
@@ -487,8 +487,8 @@ std::unique_ptr<CCCoreLib::SimpleMesh> loadMesh(
     return mesh;
 }
 
-// 등록 매개변수를 검증해 코어의 공개 설정으로 변환합니다.
-CCCoreLib::ICPRegistrationTools::Parameters parameters(const Json& value, unsigned dataCount, unsigned modelCount, bool mesh, unsigned maxThreads) {
+// 등록 매개변수를 검증하고 과거 단발 요청에만 기존 기본값을 유지합니다.
+CCCoreLib::ICPRegistrationTools::Parameters parameters(const Json& value, unsigned dataCount, unsigned modelCount, bool mesh, unsigned maxThreads, bool legacy = false) {
     CCCoreLib::ICPRegistrationTools::Parameters params;
     require(value.at("adjust_scale").is_boolean(), "INVALID_PARAMETER", "스케일 조정 여부는 논리값이어야 합니다.");
     params.adjustScale = value.at("adjust_scale").get<bool>();
@@ -497,8 +497,8 @@ CCCoreLib::ICPRegistrationTools::Parameters parameters(const Json& value, unsign
     require(params.minScale > 0 && params.minScale <= 1 && params.maxScale >= 1,
             "INVALID_SCALE_RANGE", "추가 변환의 스케일 범위는 양수이고 항등 배율 1을 포함해야 합니다.");
     params.finalOverlapRatio = finiteField(value, "overlap_ratio");
-    require(params.finalOverlapRatio > 0 && params.finalOverlapRatio <= 1 && std::floor(dataCount * params.finalOverlapRatio) >= 3,
-            "INVALID_OVERLAP", "겹침 비율은 0보다 크고 1 이하이며 최소 세 점을 유지해야 합니다.");
+    require((legacy ? params.finalOverlapRatio > 0 : params.finalOverlapRatio >= 0.1) && params.finalOverlapRatio <= 1 && std::floor(dataCount * params.finalOverlapRatio) >= 3,
+            "INVALID_OVERLAP", "겹침 비율은 0.1 이상 1 이하이며 최소 세 점을 유지해야 합니다.");
     params.nbMaxIterations = unsignedField(value, "max_iterations", 1, 100000);
     params.convType = CCCoreLib::ICPRegistrationTools::MAX_ITER_CONVERGENCE;
     params.samplingLimit = unsignedField(value, "sampling_limit", 3, 0x7fffffffu);
@@ -508,7 +508,10 @@ CCCoreLib::ICPRegistrationTools::Parameters parameters(const Json& value, unsign
             "INVALID_PARAMETER", "실제 스레드 수가 요청 상한을 벗어났습니다.");
     params.maxThreadCount = static_cast<int>(maxThreads);
     params.useC2MSignedDistances = false;
-    params.filterOutFarthestPoints = false;
+    require((legacy && !value.contains("filter_out_farthest_points")) ||
+                (value.contains("filter_out_farthest_points") && value.at("filter_out_farthest_points").is_boolean()),
+            "INVALID_PARAMETER", "최원거리점 필터 여부는 명시적인 논리값이어야 합니다.");
+    params.filterOutFarthestPoints = value.value("filter_out_farthest_points", false);
     return params;
 }
 
@@ -598,7 +601,7 @@ Json execute(const Json& request, const fs::path& root, Progress& progress, cons
     result["status"] = "completed";
     result["operation"] = operation;
     if (operation == "register") {
-        auto params = parameters(request.at("parameters"), data->size(), model->size(), bool(mesh), threads.effective);
+        auto params = parameters(request.at("parameters"), data->size(), model->size(), bool(mesh), threads.effective, true);
         Transform transform;
         double rms = -1;
         unsigned count = 0;
@@ -1060,7 +1063,7 @@ std::pair<Json, int> runSession(const fs::path& sessionRequestPath) {
                                    "ready_file", "result_file", "cancel_file", "command_directory"},
                          "세션 시작 요청 필드가 고정 계약과 다릅니다.");
         require(request.at("protocol_version") == kSessionProtocol, "PROTOCOL_MISMATCH",
-                "세션 시작 요청은 v3 네이티브 프로토콜이어야 합니다.");
+                "세션 시작 요청은 v4 네이티브 프로토콜이어야 합니다.");
         identity["session_id"] = safeIdentifier(request, "session_id");
         identity["job_id"] = safeIdentifier(request, "job_id");
         identity["input_fingerprint"] = safeIdentifier(request, "input_fingerprint");
@@ -1208,8 +1211,14 @@ std::pair<Json, int> runSession(const fs::path& sessionRequestPath) {
     }
 }
 
+// 독립 워커에서 기존 오류 모드를 보존하면서 치명적 오류의 대화상자만 억제합니다.
+void configureHeadlessErrorReporting() {
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+}
+
 // Windows 유니코드 인자를 받아 독립 작업과 환경 검사를 실행합니다.
 int wmain(int argc, wchar_t** argv) {
+    configureHeadlessErrorReporting();
     const auto started = Clock::now();
     fs::path output, progressPath;
     Json result;

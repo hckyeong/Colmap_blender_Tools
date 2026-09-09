@@ -2,11 +2,11 @@
 
 이 디렉터리는 Blender 또는 CloudCompare GUI를 불러오지 않는 Windows x64 실행 파일의 소스입니다. 상위 Python 조정자가 공통 좌표 정규화, 결정적 표본화, 강체→유사변환 두 단계와 독립 평가를 담당합니다.
 
-`colmap_cccore_worker.exe --session <JSON 절대경로>`는 Align 작업 하나의 등록·거리 명령을 단일 프로세스에서 순차 처리합니다. 세션의 요청·응답·진행·취소·종료 결과는 작업 폴더의 원자 파일로만 교환하며 표준 입출력 파이프를 사용하지 않습니다. 기존 `--request` v2는 수치 기준선과 호환 검사에만 유지하며 v3 세션과 혼용하지 않습니다. `--check-environment`는 실제로 로드한 공유 DLL 경로와 비대칭 점군 합성 등록 검사를 반환합니다.
+`colmap_cccore_worker.exe --session <JSON 절대경로>`는 Align 작업 하나의 등록·거리 명령을 단일 프로세스에서 순차 처리합니다. 세션의 요청·응답·진행·취소·종료 결과는 작업 폴더의 원자 파일로만 교환하며 표준 입출력 파이프를 사용하지 않습니다. 기존 `--request` v2는 수치 기준선과 호환 검사에만 유지하며 v4 세션과 혼용하지 않습니다. `--check-environment`는 실제로 로드한 공유 DLL 경로와 비대칭 점군 합성 등록 검사를 반환합니다.
 
 ## 파일 계약
 
-- 세션 `protocol_version`: `cccore-native-v3`
+- 세션 `protocol_version`: `cccore-native-v4`
 - 시작 요청은 `session_id`, `job_id`, `input_fingerprint`, `parameters.max_threads`와 고정된 ready·result·cancel·command 경로를 포함합니다.
 - 각 명령은 1부터 단조 증가하는 `sequence`, `operation`, `stage`, 동일한 세션 식별자와 순번별 고정 response·progress·distance 경로를 포함합니다.
 - `operation`: `register`, `distance`, 세션 종료용 `close`
@@ -18,13 +18,15 @@
 - 입력 파일은 선언한 개수와 정확한 길이가 같아야 하며 유한 좌표·인덱스 범위·퇴화 점군과 삼각형을 검사합니다.
 - 입력 좌표를 코어 `PointCoordinateType=float32`로 명시적으로 변환합니다. 정규화 원점과 단위는 상위 조정자의 책임입니다.
 
-등록 `parameters`는 `adjust_scale`, `min_scale`, `max_scale`, `overlap_ratio`, `max_iterations`, `sampling_limit`, `max_threads`를 요구합니다. 추가 배율 범위는 양수이며 항등 배율 1을 포함해야 합니다. 겹침 비율은 `(0,1]`이며 최소 세 점을 남겨야 합니다. 데이터 점과 점 모델은 표본 제한 이하여야 합니다. 메시 모델의 전체 꼭짓점과 면은 유지합니다. 내부의 임의 재표본화는 허용하지 않습니다.
+등록 `parameters`는 `adjust_scale`, `min_scale`, `max_scale`, `overlap_ratio`, `filter_out_farthest_points`, `max_iterations`, `sampling_limit`, `max_threads`를 요구합니다. 추가 배율 범위는 양수이며 항등 배율 1을 포함해야 합니다. 겹침 비율은 `[0.1,1]`이며 최소 세 점을 남겨야 합니다. 데이터 점과 점 모델은 표본 제한 이하여야 합니다. 메시 모델의 전체 꼭짓점과 면은 유지합니다. 내부의 임의 재표본화는 허용하지 않습니다. 상위 조정자는 후보 선별 뒤 50,000점 표본의 유효거리 내부 비율을 계산하여 매 등록에 전달하고, `filter_out_farthest_points=true`로 공개 코어 필터를 켭니다.
+
+상위 조정자의 논리 연산 계약은 `PREPARING` 거리 명령 1~2048회 뒤 기준 평가, `RIGID` 겹침 추정 거리·등록·독립 평가, `SCALE_REFINE` 겹침 추정 거리·등록·독립 평가를 요구합니다. 두 메시의 기준·독립 평가는 양방향입니다. 등록 전 겹침 추정과 준비 거리에는 정확 평가 캐시를 사용하지 않습니다. 모든 명령의 식별자·순번과 지오메트리 적재·수명·집계 검증을 유지합니다.
 
 빌드는 oneTBB `2022.0.0` 정확한 버전을 필수로 켜고 QtConcurrent·CGAL을 끕니다. `max_threads`는 `1..1024`의 정수로 검증하며 Windows 프로세서 그룹 전체의 활성 논리 프로세서 수로 제한합니다. 확정한 같은 상한을 등록, C2C·C2M 거리와 MSVC PPL 병렬 정렬에 적용합니다.
 
 ## 결과와 중단
 
-논리 연산 성공 상태는 `completed`, 정상 세션 종료는 `closed`, 취소는 `cancelled`, 오류는 `error`입니다. 프로세스 종료 코드는 정상 0, 취소 2, 오류 1입니다. v3 계산 결과는 순번별 응답 파일에 기록하고 전체 세션 결과는 `native/session-result.json`에 기록하며 Python은 stdout을 통신이나 결과 경로로 사용하지 않습니다. 호환 기준선인 v2 `--request`만 단발 결과를 stdout에 반환합니다.
+논리 연산 성공 상태는 `completed`, 정상 세션 종료는 `closed`, 취소는 `cancelled`, 오류는 `error`입니다. 프로세스 종료 코드는 정상 0, 취소 2, 오류 1입니다. v4 계산 결과는 순번별 응답 파일에 기록하고 전체 세션 결과는 `native/session-result.json`에 기록하며 Python은 stdout을 통신이나 결과 경로로 사용하지 않습니다. 호환 기준선인 v2 `--request`만 단발 결과를 stdout에 반환합니다.
 
 공통 결과는 세션·작업·입력 식별자, 순번, 코어·패치·스레드 식별자와 실행 시간을 포함합니다. 명령별 `timings`는 binary read, float32 변환·검증, mesh load, octree, mesh grid, kernel, serialization을 구분하고, `operation_statistics`는 geometry load/cache hit와 가속구조 생성 횟수를 기록합니다. close 결과는 세션 누계, 최고 작업 집합, 캐시 추정 크기와 geometry별 적재·캐시 적중 통계를 포함합니다. 등록 `matrix_4x4`는 행 우선 `data→model`, 즉 `p'=sRp+T`이며 거리 파일은 입력 순서의 N개 `float64`입니다.
 
@@ -46,6 +48,8 @@ Python 조정자는 물리 명령 요청 파일을 원자 기록하기 직전부
 
 ## 스케일 경계 수정
 
-채택 원문과 수정 원인은 [재빌드 안내](REBUILD.md)에 기록했습니다. 배율 일관성 수정은 `src/RegistrationTools.cpp`만 바꾸는 `bounded-scale-v1`로 유지합니다. v3 세션은 명령을 순차 실행하며, 별도 `multithread-state-race-v1` 패치는 각 명령 내부 TBB 태스크가 공유하는 옥트리 성공 플래그와 C2M 성공·오류 상태만 원자화합니다. 두 패치는 각각 원문·패치·적용 결과 SHA-256을 잠금 파일로 검증하며, 결과 행렬의 배율을 사후에 잘라 맞추는 보정은 수행하지 않습니다.
+v4의 `farthest-mesh-correspondence-v1`은 최원거리점 제거 뒤에도 메시 최근접점의 삼각형 번호 스칼라 필드를 생성·복사하여 후속 부분 겹침 필터의 잘못된 메모리 접근을 막습니다. 기존 두 패치와 별도 파일·적용 전후 해시로 관리하며, 최종 코어 식별자와 재빌드 원문은 안전 패치를 포함해야 합니다. 독립 워커는 기존 Windows 오류 모드를 보존하면서 치명적 오류 대화상자를 억제하고 실패 종료 코드를 계속 보고합니다.
 
-Windows에서 읽기 핸들이 파일 교체를 잠시 막을 때 시스템 오류 5·32·33에만 20ms 간격, 최대 240ms의 원자 교체 재시도를 수행합니다. 한도를 넘으면 해당 시스템 번호를 `native_code`로 보존한 `OUTPUT_IO_ERROR`를 반환합니다. v3 진행 파일 기록 실패는 명령 응답 또는 `session-result.json`의 오류로 남고, v2 단발 요청은 같은 오류를 stdout 결과에도 반환합니다.
+채택 원문과 수정 원인은 [재빌드 안내](REBUILD.md)에 기록했습니다. 배율 일관성 수정은 `src/RegistrationTools.cpp`만 바꾸는 `bounded-scale-v1`로 유지합니다. v4 세션은 명령을 순차 실행하며, 별도 `multithread-state-race-v1` 패치는 각 명령 내부 TBB 태스크가 공유하는 옥트리 성공 플래그와 C2M 성공·오류 상태만 원자화합니다. 두 패치는 각각 원문·패치·적용 결과 SHA-256을 잠금 파일로 검증하며, 결과 행렬의 배율을 사후에 잘라 맞추는 보정은 수행하지 않습니다.
+
+Windows에서 읽기 핸들이 파일 교체를 잠시 막을 때 시스템 오류 5·32·33에만 20ms 간격, 최대 240ms의 원자 교체 재시도를 수행합니다. 한도를 넘으면 해당 시스템 번호를 `native_code`로 보존한 `OUTPUT_IO_ERROR`를 반환합니다. v4 진행 파일 기록 실패는 명령 응답 또는 `session-result.json`의 오류로 남고, v2 단발 요청은 같은 오류를 stdout 결과에도 반환합니다.

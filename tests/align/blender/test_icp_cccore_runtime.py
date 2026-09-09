@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,12 +52,12 @@ def _finish(runtime, timeout=120):
     return runtime.icp_alignment.result
 
 
-def _direct_runtime():
-    """근접한 실제 점군 A/P와 소유 카탈로그를 구성합니다."""
+def _direct_runtime(count=12000):
+    """반경 정책을 만족하는 밀도의 실제 점군과 알려진 변환의 A/P 카탈로그를 구성합니다."""
     from test_icp_runtime import _model
     from tools.align.display_axes import identity_display_transform
     from tools.align.state import RuntimeState
-    points = np.random.default_rng(763).normal(size=(96, 3))
+    points = np.random.default_rng(763).normal(size=(count, 3))
     angle = np.deg2rad(3.0)
     rotation = np.asarray(((np.cos(angle), -np.sin(angle), 0),
                            (np.sin(angle), np.cos(angle), 0), (0, 0, 1)))
@@ -83,7 +85,7 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
     result = _finish(runtime)
     assert not handle.files.job_directory.exists()
     assert result.solver_backend == "CCCORELIB" and result.metadata["geometry_mode"] == "POINT_TO_POINT"
-    assert result.algorithm_version == "cccore-icp-v3"
+    assert result.algorithm_version == "cccore-icp-v4"
     requested_threads = min(1024, max(1, (os.cpu_count() or 1) - 1))
     assert result.metadata["parameters"]["max_threads"] == requested_threads
     assert result.metadata["requested_max_threads"] == requested_threads
@@ -98,14 +100,12 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
     assert result.metadata["native_process_count"] == 1
     assert result.metadata["native_calls"] == result.metadata["logical_operations"]
     assert result.metadata["physical_native_command_count"] == len(result.metadata["physical_native_calls"])
-    assert result.metadata["physical_native_command_count"] == 6
-    assert result.metadata["exact_evaluation_cache"]["hit_count"] == 0
-    assert tuple(call["operation"] for call in result.metadata["logical_operations"]) == (
-        "distance", "distance", "register", "distance", "register", "distance",
-    )
-    assert tuple(call["stage"] for call in result.metadata["logical_operations"]) == (
-        "PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE", "REFINE_EVALUATION",
-    )
+    operations = result.metadata["logical_operations"]
+    assert sum(item["operation"] == "register" for item in operations) == 2
+    assert any(item["stage"] == "PREPARING" for item in operations)
+    assert result.metadata["parameters"]["point_sample_count"] == 50000
+    assert result.quality["rmse"] == result.metadata["best_candidate_metrics"]["overlap_mean_rms"]
+    assert result.metadata["marker_initial_rms"] == 0.0
     assert result.metadata["session_exit_reason"] == "closed"
     assert result.metadata["session_statistics"]["geometry_load_count"] == len(result.metadata["geometry_statistics"])
     assert result.metadata["session_statistics"]["geometry_cache_hits"] > 0
@@ -132,7 +132,20 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
     assert provenance.solver_geometry_dependencies == (("moving", "MAIN"), ("reference", "MAIN"))
     audit = json.loads(provenance.engine_metadata_json)
     from tools.align.alignment.icp_cccore_runtime import CCCORE_PROVENANCE_METADATA_FIELDS
-    assert set(audit) == set(CCCORE_PROVENANCE_METADATA_FIELDS)
+    assert set(audit) == set(CCCORE_PROVENANCE_METADATA_FIELDS) | {"execution_audit_storage"}
+    assert len(provenance.engine_metadata_json.encode("utf-8")) <= 262144
+    for field in ("logical_operations", "native_calls", "physical_native_calls", "geometry_statistics"):
+        records = result.metadata[field]
+        retained = [item for item in records if (
+            item.get("cache_scope") == "SESSION" if field == "geometry_statistics"
+            else item.get("stage") != "PREPARING")]
+        encoded = json.dumps(records, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        assert audit[field] == retained
+        assert audit["execution_audit_storage"]["fields"][field] == {
+            "source_count": len(records), "retained_count": len(retained),
+            "source_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
     assert audit["geometry_input_fingerprint"] == result.metadata["geometry_input_fingerprint"]
     assert audit["core_commit"] and len(audit["native_worker_sha256"]) == 64
     for field in ("native_build_identity", "geometry_provenance", "baseline_metrics",
@@ -140,10 +153,9 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
                   "thread_backend", "tbb_version", "requested_max_threads",
                   "effective_max_threads", "hardware_thread_count",
                   "distance_multithread_support", "octree_multithread_support", "native_process_count",
-                  "logical_operations", "native_calls", "physical_native_calls",
                   "physical_native_command_count", "exact_evaluation_cache",
                   "process_startup_seconds", "session_elapsed_seconds",
-                  "session_exit_reason", "session_statistics", "geometry_statistics",
+                  "session_exit_reason", "session_statistics",
                   "session_protocol_statistics", "physical_roundtrip_seconds",
                   "protocol_overhead_seconds", "protocol_overhead_ratio_of_roundtrip",
                   "protocol_overhead_fraction_of_total_alignment"):
@@ -162,7 +174,7 @@ def test_marker_initial_transform_is_applied_once() -> None:
     """기존 3점 초기 변환을 두 번 적용하지 않고 버리기로 마커 미리보기를 복원합니다."""
     from test_icp_runtime import _runtime_with_marker_preview
     from tools.align.alignment.icp_runtime import discard_icp_preview
-    runtime, marker = _runtime_with_marker_preview(count=64)
+    runtime, marker = _runtime_with_marker_preview(count=64000)
     expected = marker.preview_alignment.matrix_float64.copy()
     _begin(runtime)
     result = _finish(runtime)
@@ -217,7 +229,7 @@ def test_progress_avoids_rehash_until_completion() -> None:
 
 
 def test_corrupted_native_session_aggregate_is_rejected() -> None:
-    """완료 파일의 상주 캐시 합계를 변조하면 공통 runtime 복원 경계에서 거부합니다."""
+    """완료 파일의 겹침 표본·지표·세션 합계를 변조하면 승인 경계에서 거부합니다."""
     from tools.align.alignment.icp_backend import IcpJobProtocolError
     from tools.align.alignment.icp_cccore_runtime import read_cccore_result, result_from_cccore
     from tools.align.alignment.icp_runtime import invalidate_icp
@@ -229,6 +241,33 @@ def test_corrupted_native_session_aggregate_is_rejected() -> None:
         loaded = read_cccore_result(handle)
         assert loaded is not None
         metadata, arrays = loaded
+        for invalid_scale in (1.2, -1.0):
+            corrupted_arrays = {name: array.copy() for name, array in arrays.items()}
+            corrupted_arrays["final_alignment_4x4"][:3, :3] *= invalid_scale
+            try:
+                result_from_cccore(runtime, runtime.icp_alignment, metadata, corrupted_arrays)
+            except (IcpJobProtocolError, ValueError):
+                pass
+            else:
+                raise AssertionError("스케일 한도 위반 또는 반사 행렬을 runtime이 수용했습니다.")
+        for field, value in (("registration_sample_count", -1), ("evaluation_seed", True)):
+            corrupted = deepcopy(metadata)
+            corrupted["sampling_diagnostics"][field] = value
+            try:
+                result_from_cccore(runtime, runtime.icp_alignment, corrupted, arrays)
+            except IcpJobProtocolError:
+                pass
+            else:
+                raise AssertionError(f"손상된 겹침 진단 {field}를 runtime이 수용했습니다.")
+        for field, value in (("overlap_mean_rms", -1.0), ("evaluation_sample_count", 1)):
+            corrupted = deepcopy(metadata)
+            corrupted["best_candidate_metrics"][field] = value
+            try:
+                result_from_cccore(runtime, runtime.icp_alignment, corrupted, arrays)
+            except IcpJobProtocolError:
+                pass
+            else:
+                raise AssertionError(f"손상된 겹침 평가 {field}를 runtime이 수용했습니다.")
         metadata["session_statistics"]["cache_resident_estimated_bytes"] += 1
         try:
             result_from_cccore(runtime, runtime.icp_alignment, metadata, arrays)
@@ -246,6 +285,25 @@ def test_corrupted_native_session_aggregate_is_rejected() -> None:
             raise AssertionError("손상된 최상위 프로토콜 합계를 runtime이 수용했습니다.")
     finally:
         invalidate_icp(runtime, "손상 결과 회귀 검사 종료")
+
+
+
+def test_sparse_input_is_rejected_without_transform() -> None:
+    """거리 반경 상한을 넘는 극희소 점군을 임의로 완화하지 않고 원본 상태로 거부합니다."""
+    from tools.align.alignment.icp_runtime import poll_icp_job
+
+    runtime, _expected = _direct_runtime(count=96)
+    before = runtime.model_repository.alignment_transform_for_model_id("moving").matrix_float64.copy()
+    handle = _begin(runtime)
+    deadline = monotonic() + 120
+    while runtime.icp_alignment.is_running:
+        poll_icp_job(runtime)
+        assert monotonic() < deadline, "희소 입력 검사 시간 제한을 넘었습니다."
+        sleep(0.02)
+    assert not runtime.icp_alignment.has_preview
+    assert "겹침 판별 한도" in runtime.icp_alignment.last_error
+    assert not handle.is_running
+    np.testing.assert_array_equal(runtime.model_repository.alignment_transform_for_model_id("moving").matrix_float64, before)
 
 
 def test_actual_job_cancel_preserves_model() -> None:
@@ -266,14 +324,14 @@ def test_actual_job_cancel_preserves_model() -> None:
 
 
 def test_legacy_provenance_without_cc_fields_roundtrip() -> None:
-    """스키마 8에서 이전 Small GICP와 CCCoreLib v1·v2 감사 기록을 그대로 복원합니다."""
+    """스키마 8에서 이전 Small GICP와 CCCoreLib v1·v2·v3 감사 기록을 그대로 복원합니다."""
     from tools.align.alignment.types import AlignmentProvenanceRecord
     from tools.align.project_persistence.codec import _decode_provenance
     original = AlignmentProvenanceRecord(model_id="old", method="ICP", backend_id="SMALL_GICP",
                                          algorithm_version="small-gicp-v6", icp_status="PASS", icp_rmse=0.25)
     decoded = _decode_provenance(original.to_mapping(), "old", 6)
     assert decoded == original and not decoded.engine_metadata_json and not decoded.solver_geometry_dependencies
-    for version in ("cccore-icp-v1", "cccore-icp-v2"):
+    for version in ("cccore-icp-v1", "cccore-icp-v2", "cccore-icp-v3"):
         legacy_cc = AlignmentProvenanceRecord(
             model_id="cc-old",
             method="ICP",

@@ -27,7 +27,7 @@ class IcpSolverBackend(str, Enum):
 
 
 _BACKEND_ALGORITHM_VERSIONS = {
-    IcpSolverBackend.CCCORELIB: "cccore-icp-v3",
+    IcpSolverBackend.CCCORELIB: "cccore-icp-v4",
     IcpSolverBackend.CUSTOM_HYBRID: ICP_BACKEND_ALGORITHM_VERSION_CUSTOM_HYBRID,
     IcpSolverBackend.OPEN3D_GICP: ICP_BACKEND_ALGORITHM_VERSION_OPEN3D_GICP,
     IcpSolverBackend.SMALL_GICP: ICP_BACKEND_ALGORITHM_VERSION_SMALL_GICP,

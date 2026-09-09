@@ -264,7 +264,7 @@ function Add-SmallGicpEmbeddedRuntime {
 }
 
 function Add-CcCoreEmbeddedRuntime {
-    <# 고정 CC 런타임을 준비하고 복사한 스테이징에서 실제 최소 정렬을 검사합니다. #>
+    <# 지정 Python과 v4 CC 런타임을 준비하고 스테이징의 실제 최소 정렬을 검사합니다. #>
     param([string]$ProjectRoot, [string]$AlignPackagePath)
 
     $helper = Join-Path $PSScriptRoot "cccore_distribution.py"
@@ -276,7 +276,7 @@ function Add-CcCoreEmbeddedRuntime {
         if ($LASTEXITCODE -ne 0) { throw "정식 CC Python 준비에 실패했습니다." }
     }
     if (!$CcCoreRuntimePath -and !(Test-Path -LiteralPath (Join-Path $nativeSource "colmap_cccore_worker.exe"))) {
-        & (Join-Path $PSScriptRoot "prepare_cccore_runtime.ps1") -EnvironmentRoot $cacheRoot -RuntimePath $nativeSource
+        & (Join-Path $PSScriptRoot "prepare_cccore_runtime.ps1") -EnvironmentRoot $cacheRoot -RuntimePath $nativeSource -PythonPath (Join-Path $pythonSource "python.exe")
         if ($LASTEXITCODE -ne 0) { throw "정식 CC 네이티브 런타임 준비에 실패했습니다." }
     }
     $runtime = Join-Path $AlignPackagePath "runtime"
@@ -287,7 +287,7 @@ function Add-CcCoreEmbeddedRuntime {
     if ($LASTEXITCODE -ne 0) { throw "스테이징 CC 정렬 환경 검사가 실패했습니다." }
     $environment = $result | ConvertFrom-Json
     if (!$environment.ok -or $environment.backend_id -ne "CCCORELIB" -or
-        $environment.algorithm_version -ne "cccore-icp-v3" -or $environment.job_protocol_version -ne "cccore-job-v3" -or
+        $environment.algorithm_version -ne "cccore-icp-v4" -or $environment.job_protocol_version -ne "cccore-job-v4" -or
         $environment.native_environment.self_test -ne "passed") {
         throw "스테이징 CC 엔진 또는 최소 정렬 결과가 배포 계약과 다릅니다."
     }
@@ -356,6 +356,7 @@ function Test-BuiltArchive {
             }
             foreach ($required in @(
                 "tools/align/alignment/icp_cccore_solver.py",
+                "tools/align/alignment/icp_cccore_overlap.py",
                 "tools/align/alignment/icp_cccore_worker.py",
                 "tools/align/runtime/python/python.exe",
                 "tools/align/runtime/python/runtime_manifest.json",

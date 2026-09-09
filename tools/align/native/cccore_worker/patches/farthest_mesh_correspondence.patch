@@ -1,0 +1,20 @@
+diff --git a/src/RegistrationTools.cpp b/src/RegistrationTools.cpp
+--- a/src/RegistrationTools.cpp
++++ b/src/RegistrationTools.cpp
+@@ -458,6 +458,7 @@
+ 				if (!filteredData.cloud->reserve(pointCount)
+ 					|| (filteredData.CPSetRef && !filteredData.CPSetRef->reserve(pointCount))
+ 					|| (filteredData.CPSetPlain && !filteredData.CPSetPlain->reserve(pointCount))
++					|| (filteredData.CPSetPlain && !filteredData.CPSetPlain->enableScalarField()) // 최근접 삼각형 식별자를 보존합니다.
+ 					|| (filteredData.weights && !filteredData.weights->reserveSafe(pointCount)))
+ 				{
+ 					//not enough memory
+@@ -479,6 +480,8 @@
+ 						else if (filteredData.CPSetPlain)
+ 						{
+ 							filteredData.CPSetPlain->addPoint(*(data.CPSetPlain->getPoint(i)));
++							// 이후 겹침 필터가 같은 최근접 삼각형을 읽도록 점과 식별자를 함께 복사합니다.
++							filteredData.CPSetPlain->addPointScalarValue(data.CPSetPlain->getPointScalarValue(i));
+ 						}
+ 						if (filteredData.weights)
+ 						{
