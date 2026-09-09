@@ -198,14 +198,14 @@ Projection Painting의 `COLMAP 데이터 업데이트`는 그 시점의 Modifier
 
 현재 구현과 정식 배포 기록을 우선한다. 이전 계획서와 변경 기록은 작성 당시 버전을 확인하고, 현재 화면과 다른 내용은 그대로 옮기지 않는다.
 
-- [제품 개요와 현재 기능](../../README.md)
-- [제품 경계와 도구 관계](../architecture/PRODUCT_BOUNDARIES.md)
-- [독립 도구 안내](../tools/README.md)
+- [제품 개요와 현재 기능](../../../README.md)
+- [제품 경계와 도구 관계](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/architecture/PRODUCT_BOUNDARIES.md)
+- [독립 도구 안내](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/tools/README.md)
 - [Align 0.3.37 변경 기록](../migration/ALIGN_CC_MAIN_RELEASE_NOTE.md)
-- [Modifier 전용 되돌리기와 저장 동작](../migration/MODIFIER_INDEPENDENT_RUNTIME_UNDO_RELEASE_NOTE.md)
-- [Projection Painting 수동 데이터 업데이트](../migration/INDEPENDENT_PROJECTION_SNAPSHOT_RELEASE_NOTE.md)
-- [Projection Painting 레이어 선택·활성화·삭제](../migration/LAYER_SELECTION_ACTIVATION_DELETE_UX_RELEASE_NOTE.md)
-- [표시 레이어 기반 텍스처 내보내기](../migration/VISIBLE_LAYER_TEXTURE_EXPORT_RELEASE_NOTE.md)
+- [Modifier 전용 되돌리기와 저장 동작](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/migration/MODIFIER_INDEPENDENT_RUNTIME_UNDO_RELEASE_NOTE.md)
+- [Projection Painting 수동 데이터 업데이트](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/migration/INDEPENDENT_PROJECTION_SNAPSHOT_RELEASE_NOTE.md)
+- [Projection Painting 레이어 선택·활성화·삭제](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/migration/LAYER_SELECTION_ACTIVATION_DELETE_UX_RELEASE_NOTE.md)
+- [표시 레이어 기반 텍스처 내보내기](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/migration/VISIBLE_LAYER_TEXTURE_EXPORT_RELEASE_NOTE.md)
 - [검증 방법과 검증 범위](../TESTING.md)
 
 버튼·패널·설정의 최종 표기는 `shell/menu.py`, `shell/preferences.py`와 각 도구의 현재 UI 구현을 기준으로 확인한다.

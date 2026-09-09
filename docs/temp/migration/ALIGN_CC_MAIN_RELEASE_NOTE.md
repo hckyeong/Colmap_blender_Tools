@@ -66,7 +66,7 @@ Blender 5.2.0 LTS, Windows 11, 논리 CPU 32개·요청/적용 31스레드에서
 
 Windows PDH는 정렬 전 3초 기준 구간과 정렬 중 약 1초 구간별로 수집했다. 기준 CPU 부하는 정렬 0~2.99%, 오정렬 0~4.09%였다. 다른 Blender 검사·빌드는 측정 종료 뒤 순차 실행했다. 페이지 쓰기·Pages Output·페이지 파일 점유의 최대값은 모두 0이고 최소 가용 RAM은 107,709,624,320바이트였다. 디스크 페이지 읽기는 최대 약 60.64회/초로 실제 존재했다. 이 읽기는 DLL·실행 파일·매핑 파일의 하드 폴트도 포함하므로 특정 워커의 스왑 읽기량으로 해석하지 않는다. 이 환경에서 스왑 악화 증거가 없다는 결론이며 모든 컴퓨터·더 큰 입력에 일반화하지 않는다. [Microsoft 카운터 해석 안내](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/how-to-determine-the-appropriate-page-file-size-for-64-bit-versions-of-windows)
 
-프로토콜 왕복 부가 비용은 정렬 상태 0.151757~0.220671초(3.2926~4.8035%), 오정렬 상태 0.278556~0.402785초(0.2766~0.3997%)다. 기존 1% 목표는 짧은 입력에서 여전히 실패한다. [ADR-0011](../decisions/0011-cccore-production-runtime.md)에 따라 비율은 최적화 목표로 유지하고 전체 시간·정확성·메모리·기능을 근거로 정식 채택했다. 이전 `EXPERIMENT_ONLY` 결과를 통과로 고쳐 쓰지 않는다.
+프로토콜 왕복 부가 비용은 정렬 상태 0.151757~0.220671초(3.2926~4.8035%), 오정렬 상태 0.278556~0.402785초(0.2766~0.3997%)다. 기존 1% 목표는 짧은 입력에서 여전히 실패한다. [ADR-0011](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/decisions/0011-cccore-production-runtime.md)에 따라 비율은 최적화 목표로 유지하고 전체 시간·정확성·메모리·기능을 근거로 정식 채택했다. 이전 `EXPERIMENT_ONLY` 결과를 통과로 고쳐 쓰지 않는다.
 
 원시 결과·페이징 표본·집계는 `outputs/benchmark-installed-01/`에 있다. 측정 ZIP 해시는 `ecc83f723ec6212631af58f7944c72bdd399e38f204a5f1aacb76be87069851e`다. 최종 ZIP과의 바이트 비교에서 바뀐 파일은 사용자 안내 `README.md`, 프로필별 설명·비교판 입력 제한을 연결한 `operators/marker_alignment.py`, `ui/panels.py` 세 개뿐이다. 정렬 계산·복원·입출력·Python·네이티브 바이너리는 동일하며, 최종 ZIP의 변경된 UI와 설치·저장 경로는 전체 격리 GUI 검사로 검증했다. 연결 근거는 `final-package-comparison.json`이다.
 

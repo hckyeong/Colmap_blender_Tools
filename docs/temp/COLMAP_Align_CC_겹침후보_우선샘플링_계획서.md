@@ -5,7 +5,7 @@
 - 구현·검증 결과: [0.3.41 릴리스 기록](migration/ALIGN_OVERLAP_SAMPLING_RELEASE_NOTE.md)
 - 기준: `main`, `81fb956`, COLMAP Tools 0.3.40
 - 목적: 겹치지 않는 부분을 먼저 제외하고 남은 후보 영역에서 정렬용 표본을 확보하여, 부분 겹침 자료의 잘못된 대응과 후보 평가 문제를 줄인다.
-- 관련 문서: [CC 엔진 교체 계획서](COLMAP_Align_CCCoreLib_엔진교체_계획서.md), [단일 세션·캐시 계획서](COLMAP_Align_CCCoreLib_단일세션워커_지오메트리캐시_계획서.md), [ADR-0011](decisions/0011-cccore-production-runtime.md)
+- 관련 문서: [CC 엔진 교체 계획서](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/COLMAP_Align_CCCoreLib_%EC%97%94%EC%A7%84%EA%B5%90%EC%B2%B4_%EA%B3%84%ED%9A%8D%EC%84%9C.md), [단일 세션·캐시 계획서](COLMAP_Align_CCCoreLib_단일세션워커_지오메트리캐시_계획서.md), [ADR-0011](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/decisions/0011-cccore-production-runtime.md)
 
 ## 1. 결정 요약
 

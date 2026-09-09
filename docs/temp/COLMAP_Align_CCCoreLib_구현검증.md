@@ -4,7 +4,7 @@
 - 상태: 실험 구현·설치·검증 완료
 - 브랜치: `codex/align-test-env`
 - 대상: `E:\DEV\DEV_RND\colmap_align_test_env\source`
-- 관련: [계획서](COLMAP_Align_CCCoreLib_엔진교체_계획서.md), [배포 결정](decisions/0010-cccore-align-test-runtime.md)
+- 관련: [계획서](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/COLMAP_Align_CCCoreLib_%EC%97%94%EC%A7%84%EA%B5%90%EC%B2%B4_%EA%B3%84%ED%9A%8D%EC%84%9C.md), [배포 결정](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/decisions/0010-cccore-align-test-runtime.md)
 
 ## 반영된 동작
 

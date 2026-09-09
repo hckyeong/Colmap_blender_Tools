@@ -5,7 +5,7 @@
 - 대상: `codex/align-test-env` 브랜치의 독립 실험 애드온 `colmap_align_test_env`
 - 소스: `E:\DEV\DEV_RND\colmap_align_test_env\source`
 - 목적: CCCoreLib 정렬 결과와 현재 UX를 유지하면서 등록·거리 계산의 CPU 병렬 처리를 활성화하고, 사용자가 작업당 최대 스레드 수를 제어할 수 있게 한다.
-- 관련 문서: [CCCoreLib 엔진 교체 계획서](COLMAP_Align_CCCoreLib_엔진교체_계획서.md), [구현·검증 기록](COLMAP_Align_CCCoreLib_구현검증.md), [ADR-0010](decisions/0010-cccore-align-test-runtime.md)
+- 관련 문서: [CCCoreLib 엔진 교체 계획서](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/COLMAP_Align_CCCoreLib_%EC%97%94%EC%A7%84%EA%B5%90%EC%B2%B4_%EA%B3%84%ED%9A%8D%EC%84%9C.md), [구현·검증 기록](COLMAP_Align_CCCoreLib_구현검증.md), [ADR-0010](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/decisions/0010-cccore-align-test-runtime.md)
 
 ## 1. 결정 요약
 

@@ -8,9 +8,9 @@
 
 세 도구는 순차 파이프라인이 아닌 독립 도구입니다. `COLMAP Modifier`만 COLMAP 데이터를 Import·편집·Export하며, `Projection Painting`은 사용자가 업데이트 버튼을 누른 시점의 값을 독립 Snapshot으로 복사합니다. `COLMAP Align`은 이 전달 구조에도 연결되지 않습니다.
 
-`.blend`를 다시 열 때 Modifier의 대용량 원본은 자동 복원하지 않습니다. Modifier Workspace 진입 또는 Projection Painting의 `COLMAP 데이터 업데이트`에서만 진행률과 함께 지연 복원하며, 기존 Projection Painting Snapshot은 Modifier Runtime과 무관하게 재진입합니다.
+0.3.34 이후 저장된 정상 Modifier Active Payload는 `.blend`를 다시 열 때 원본과 확정 편집 기록으로 Runtime을 자동 복원합니다. 기존 Projection Painting Snapshot은 Modifier Runtime과 독립적으로 유지하며, 최신 편집 결과는 사용자가 `COLMAP 데이터 업데이트`를 실행할 때만 복사합니다.
 
-통합 원칙과 단계별 작업 범위는 [독립 도구 통합 계획서](docs/COLMAP_Tools_독립도구_통합_계획서.md)를 참조하십시오.
+완료된 기능·제품 경계·저장·검증 결과는 [통합 문서](docs/README.md)를 참조하십시오. `docs/temp/`에는 후속 집필·검증에 필요한 자료 9개만 남겼으며, 정리한 원문의 확인·복원 방법은 [문서 정리 내역](docs/README.md#archive)을 참조하십시오.
 
 ## 현재 구조
 
@@ -19,7 +19,7 @@ shell/       공통 Extension 등록과 메뉴
 tools/       서로 독립된 Align, Modifier, Projection Painting
 shared/      Workspace Runtime, 값 Snapshot 전달과 Legacy 마이그레이션 계약
 tests/       Architecture, 공존과 도구별 회귀 검증
-docs/        현행 설계와 통합 계획
+docs/        완료 기능 통합 문서와 temp/의 선별 보존 자료
 build_tools/ Extension 검증과 빌드 도구
 ```
 
@@ -45,19 +45,19 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 
 ## Align 0.3.41
 
-3점 정렬 또는 현재 위치에서 먼 영역을 먼저 제외하고, 겹침 후보 안에서 메시 표본 50,000개를 확보합니다. 점군은 중복 없이 최대 50,000개를 사용합니다. 결과는 처음 고정한 겹침 평가 표본으로 비교하며, 상태창에서 전체 참고 RMS와 구분합니다. 추가 초기 ICP는 실행하지 않습니다. [변경 기록](docs/migration/ALIGN_OVERLAP_SAMPLING_RELEASE_NOTE.md)
+3점 정렬 또는 현재 위치에서 먼 영역을 먼저 제외하고, 겹침 후보 안에서 메시 표본 50,000개를 확보합니다. 점군은 중복 없이 최대 50,000개를 사용합니다. 결과는 처음 고정한 겹침 평가 표본으로 비교하며, 상태창에서 전체 참고 RMS와 구분합니다. 추가 초기 ICP는 실행하지 않습니다. [통합 정렬 설명](docs/README.md#align-cc)
 
 ### 0.3.40 왼쪽 패널 기본값
 
-새 Align 작업공간에서는 왼쪽 A 뷰의 N 패널은 닫고 오른쪽 P 뷰의 정렬 패널만 엽니다. 이후 사용자가 왼쪽 패널을 직접 열면 재진입해도 그 상태를 유지합니다. [변경 기록](docs/migration/ALIGN_REFERENCE_SIDEBAR_DEFAULT_RELEASE_NOTE.md)
+새 Align 작업공간에서는 왼쪽 A 뷰의 N 패널은 닫고 오른쪽 P 뷰의 정렬 패널만 엽니다. 이후 사용자가 왼쪽 패널을 직접 열면 재진입해도 그 상태를 유지합니다. [통합 패널 설명](docs/README.md#align-ui)
 
 ### 0.3.39 기본 폭
 
-새 Align 작업공간의 N 패널을 요청한 기본 폭으로 엽니다. 기본 폭은 화면 배율 적용 전 370이며, 현재 환경에서는 약 478픽셀입니다. 기존 `.blend`에 저장된 폭과 사용자가 조절한 폭은 유지합니다. [변경 기록](docs/migration/ALIGN_SIDEBAR_DEFAULT_WIDTH_RELEASE_NOTE.md)
+새 Align 작업공간의 N 패널을 요청한 기본 폭으로 엽니다. 기본 폭은 화면 배율 적용 전 370이며, 현재 환경에서는 약 478픽셀입니다. 기존 `.blend`에 저장된 폭과 사용자가 조절한 폭은 유지합니다. [통합 패널 설명](docs/README.md#align-ui)
 
 ### 0.3.38 오류 수정
 
-내보내기를 실행하지 않은 상태에서 `.blend`를 열 때 `COLMAP Export 오류`가 표시되던 문제를 수정했습니다. 실행 중인 작업이 없으면 이전 내보내기 상태를 비우고, 실제 작업을 중단한 경우에만 중단 사유를 남깁니다. [변경 기록](docs/migration/ALIGN_EXPORT_IDLE_LOAD_RELEASE_NOTE.md)
+내보내기를 실행하지 않은 상태에서 `.blend`를 열 때 `COLMAP Export 오류`가 표시되던 문제를 수정했습니다. 실행 중인 작업이 없으면 이전 내보내기 상태를 비우고, 실제 작업을 중단한 경우에만 중단 사유를 남깁니다. [통합 복원 설명](docs/README.md#align-ui)
 
 ### 0.3.37에서 이어지는 기능
 
@@ -65,4 +65,4 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 
 3점 마커 정렬 후 CC 정밀 정렬을 실행하거나 현재 위치에서 직접 정렬할 수 있습니다. CC는 강체 정렬 뒤 초기값 대비 최대 ±10% 균일 배율 보정을 수행합니다. 환경설정의 **CPU 스레드**는 0 자동, 1 단일, 2 이상 수동 상한이며 다음 작업부터 적용됩니다.
 
-Align 작업공간에서 저장한 `.blend`를 다시 열면 데이터 복원 후 세션이 자동 연결됩니다. 일반 작업공간에서 저장한 파일은 해당 작업공간을 유지합니다. 변경·검증 범위는 [0.3.37 승격 기록](docs/migration/ALIGN_CC_MAIN_RELEASE_NOTE.md)을 참조하십시오.
+Align 작업공간에서 저장한 `.blend`를 다시 열면 데이터 복원 후 세션이 자동 연결됩니다. 일반 작업공간에서 저장한 파일은 해당 작업공간을 유지합니다. [통합 저장·복원 설명](docs/README.md#storage)과 [완료 이력](docs/README.md#history)을 참조하십시오.

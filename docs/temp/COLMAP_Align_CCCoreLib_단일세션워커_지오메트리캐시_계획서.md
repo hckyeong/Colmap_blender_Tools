@@ -5,7 +5,7 @@
 - 대상: `codex/align-test-env` 브랜치의 독립 실험 애드온 `colmap_align_test_env`
 - 소스: `E:\DEV\DEV_RND\colmap_align_test_env\source`
 - 목적: 한 Align 작업에서 반복 실행되는 CCCoreLib 네이티브 프로세스를 하나의 작업 전용 세션으로 통합하고, 동일 지오메트리와 안전하게 재사용할 수 있는 가속 구조를 메모리에 유지해 전체 정렬 시간을 줄인다.
-- 관련 문서: [CCCoreLib CPU 멀티스레드 적용 계획서](COLMAP_Align_CCCoreLib_CPU_멀티스레드_적용_계획서.md), [CCCoreLib 구현·검증 기록](COLMAP_Align_CCCoreLib_구현검증.md), [ADR-0010](decisions/0010-cccore-align-test-runtime.md)
+- 관련 문서: [CCCoreLib CPU 멀티스레드 적용 계획서](COLMAP_Align_CCCoreLib_CPU_멀티스레드_적용_계획서.md), [CCCoreLib 구현·검증 기록](COLMAP_Align_CCCoreLib_구현검증.md), [ADR-0010](https://github.com/hckyeong/Colmap_blender_Tools/blob/fd2d9cf57bb022505ea3b021a3bc2ee9f7f41df6/docs/decisions/0010-cccore-align-test-runtime.md)
 
 ## 1. 결정 요약
 
