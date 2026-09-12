@@ -7,6 +7,8 @@ from typing import Any
 import uuid
 
 from ..core.edit_replay import history_hash
+from ..core.edit_history import dataset_transform_from_history
+from ..core.dataset_transform import IDENTITY_TRANSFORM, validate_transform
 
 
 def _pointer(value: Any) -> int:
@@ -70,6 +72,7 @@ class ModifierRuntimeDomain:
     persistence_dirty: bool = False
     saved_generation: int = -1
     display_revision: int = 0
+    transform_preview_active: bool = False
     session_generation: int = 0
     transient_scene_pointer: int = 0
     last_status: str = ""
@@ -107,6 +110,8 @@ class ModifierRuntimeDomain:
         """Runtime Reconstruction·Index·History 토큰의 일관성을 검사합니다."""
 
         state = self.dataset_state
+        if validate_transform(getattr(state, "dataset_transform", IDENTITY_TRANSFORM)) != dataset_transform_from_history(state.operations):
+            raise ValueError("확정 데이터셋 변환과 편집 이력이 일치하지 않습니다.")
         _normalized_uuid(str(state.dataset_uuid), "Dataset UUID")
         if state.edit_revision != state.index_revision:
             raise ValueError("Runtime 모델과 관계 인덱스 revision이 일치하지 않습니다.")

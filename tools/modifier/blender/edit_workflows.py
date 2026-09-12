@@ -6,6 +6,9 @@ from dataclasses import dataclass
 
 from ..core.edit_delta import EditStateToken
 from ..core.edit_journal import EditCommand, EditJournalCheckpoint, capture_edit_command
+from ..core.edit_journal import TransformCommand, create_transform_command
+from ..core.edit_history import transform_operation
+from ..core.dataset_transform import validate_transform
 from ..core.edit_replay import history_hash
 from ..core.edits import (
     ImageObservationRemovalPlan,
@@ -163,6 +166,7 @@ def commit_edit(
     journal_checkpoint: EditJournalCheckpoint | None = None,
     runtime_rollback=None,
     camera_list_changed_override: bool | None = None,
+    transform_only: bool = False,
 ) -> tuple[str, ...]:
     """독립 Runtime을 먼저 갱신하고 Scene 표시 실패 시 전체 Transaction을 복구합니다."""
 
@@ -269,7 +273,7 @@ def commit_edit(
         settings.point_selection_status = status
         if shared_commit is not None:
             shared_commit.apply()
-        warnings = synchronize_scene(context, new_state, settings)
+        warnings = _synchronize_edit(context, new_state, settings, transform_only)
     except Exception as exc:
         if shared_commit is not None:
             shared_commit.rollback()
@@ -293,7 +297,7 @@ def commit_edit(
         for name, value in old_values.items():
             setattr(settings, name, value)
         try:
-            synchronize_scene(context, previous_state, settings)
+            _synchronize_edit(context, previous_state, settings, transform_only)
         except Exception as display_rollback_exc:
             raise RuntimeError(
                 "Modifier 편집 실패 뒤 Blender 표시 복구에도 실패했습니다. "
@@ -361,6 +365,32 @@ def commit_edit(
     if shared_commit is not None:
         shared_commit.complete()
     return (*warnings, *post_warnings)
+
+
+def _synchronize_edit(context, state, settings, transform_only):
+    """순수 변환은 기존 표시 루트만 갱신하고 삭제는 표시를 재구축합니다."""
+    if transform_only:
+        from .axis_display import apply_dataset_transform_preview
+        apply_dataset_transform_preview(context.scene, state.dataset_transform)
+        return ()
+    return synchronize_scene(context, state, settings)
+
+
+def commit_dataset_transform(context, matrix):
+    """미리보기 누적 행렬을 배열 복사 없이 전용 이력 한 건으로 확정합니다."""
+    from .camera_filter_queue import require_no_pending_filters
+    require_no_pending_filters(context, "데이터셋 변환")
+    state = ensure_runtime(context.scene)
+    matrix = validate_transform(matrix)
+    if matrix == state.dataset_transform:
+        return state
+    operation = transform_operation(state.dataset_transform, matrix, state.dataset_uuid,
+                                    state.source.source_fingerprint, state.edit_revision)
+    new_state = state_with_current(state, state.current_reconstruction, state.indexes,
+                                   (*state.operations, operation))
+    commit_edit(context, new_state, "데이터셋 변환을 확정했습니다.", previous_state=state,
+                journal_command=create_transform_command(operation), transform_only=True)
+    return new_state
 
 
 def resolve_remove_target(context, state) -> tuple[str, tuple[int, ...]]:
@@ -716,6 +746,7 @@ def undo_last_edit(context):
         domain_checkpoint=domain_checkpoint,
         journal_checkpoint=journal_checkpoint,
         runtime_rollback=rollback_runtime,
+        transform_only=isinstance(journal_checkpoint.undo_stack[-1], TransformCommand),
         camera_list_changed_override=(
             previous_image_ids
             != frozenset(new_state.current_reconstruction.images)
@@ -771,6 +802,7 @@ def redo_last_edit(context):
         domain_checkpoint=domain_checkpoint,
         journal_checkpoint=journal_checkpoint,
         runtime_rollback=rollback_runtime,
+        transform_only=isinstance(journal_checkpoint.redo_stack[-1], TransformCommand),
         camera_list_changed_override=(
             previous_image_ids
             != frozenset(new_state.current_reconstruction.images)

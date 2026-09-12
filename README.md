@@ -12,6 +12,8 @@
 
 완료된 기능·제품 경계·저장·검증 결과는 [통합 문서](docs/README.md)를 참조하십시오. `docs/temp/`에는 후속 집필·검증에 필요한 자료 9개만 남겼으며, 정리한 원문의 확인·복원 방법은 [문서 정리 내역](docs/README.md#archive)을 참조하십시오.
 
+설치·실행은 [사용자 매뉴얼 공통 안내](docs/manual/README.md), 기능별 사용 방법은 [Align](docs/manual/ALIGN.md) · [Modifier](docs/manual/MODIFIER.md) · [Projection Paint](docs/manual/PROJECTION_PAINT.md)를 참조하십시오. 캡처 위치 22곳을 표시했으며 화면 이미지는 삽입 대기 상태입니다.
+
 ## 현재 구조
 
 ```text

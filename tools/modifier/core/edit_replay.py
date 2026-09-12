@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 from typing import Iterable
 
-from .edit_history import serialize_history
+from .edit_history import serialize_history, dataset_transform_from_history
+from .edit_types import TransformOperation
+from .dataset_transform import validate_transform
 from .edit_types import (
     AnyEditOperation,
     EditOperation,
@@ -43,6 +45,8 @@ def replay_history(
 ) -> tuple[Reconstruction, RelationshipIndexes]:
     """기준 Reconstruction에 저장된 편집 이력을 순서대로 재생합니다."""
 
+    operations = tuple(operations)
+    dataset_transform_from_history(operations)
     current = baseline
     indexes = (
         build_relationship_indexes(current)
@@ -86,6 +90,12 @@ def _replay_operation(
         raise ValueError("편집 이력의 source fingerprint가 현재 원본과 다릅니다.")
     if operation.previous_revision != expected_revision:
         raise ValueError("편집 이력 revision 순서가 연속적이지 않습니다.")
+    if operation.resulting_revision != expected_revision + 1:
+        raise ValueError("편집 이력 결과 revision이 연속적이지 않습니다.")
+    if isinstance(operation, TransformOperation):
+        validate_transform(operation.before_transform)
+        validate_transform(operation.after_transform)
+        return current, indexes, operation.resulting_revision
 
     if not isinstance(operation, EditOperation):
         plan = plan_removal(

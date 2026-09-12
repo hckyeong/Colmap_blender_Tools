@@ -173,7 +173,7 @@ def find_main_window(window_manager: Any, preferred: Any = None):
 
 
 def _ensure_dedicated_workspace(context: Any):
-    """현행 Workspace를 재사용하거나 독립 Seed에서 새 Workspace를 Append합니다."""
+    """현행 Workspace를 재사용하거나 저장된 UI 폭을 보존해 독립 Seed를 불러옵니다."""
 
     window = getattr(context, "window", None)
     if window is None:
@@ -280,6 +280,7 @@ def _ensure_dedicated_workspace(context: Any):
             window,
             MODIFIER_WORKSPACE_SPEC,
             source_workspace,
+            preserve_seed_ui=True,
         )
     except WorkspaceFactoryError as error:
         raise ModifierWorkspaceError(str(error)) from error

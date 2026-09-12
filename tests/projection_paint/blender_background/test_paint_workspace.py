@@ -290,6 +290,7 @@ class PaintWorkspaceGeometryTests(unittest.TestCase):
             window,
             PAINT_WORKSPACE_SPEC,
             origin,
+            preserve_seed_ui=True,
         )
 
     def test_viewport_contract_enables_every_object_filter(self) -> None:

@@ -11,7 +11,10 @@ from typing import Any
 
 from ..core.edit_replay import history_hash, replay_history, replay_operation_indexed
 from ..core.edits import AnyEditOperation, deserialize_history, serialize_history
-from ..core.edit_journal import EditJournal
+from ..core.edit_journal import EditJournal, create_transform_command
+from ..core.edit_history import dataset_transform_from_history
+from ..core.edit_types import TransformOperation
+from ..core.dataset_transform import IDENTITY_TRANSFORM
 from ..core.edit_types import (
     REMOVE_IMAGES_OPERATION,
     REMOVE_POINTS_OPERATION,
@@ -64,6 +67,7 @@ class DatasetRuntimeState:
     history_hash: str
     point_id_order: tuple[int, ...]
     image_path_manifest: ImagePathManifest | None
+    dataset_transform: tuple[tuple[float, ...], ...] = IDENTITY_TRANSFORM
 
 
 _RESTORE_JOBS: dict[int, "RuntimeRestoreJob"] = {}
@@ -607,7 +611,9 @@ class RuntimeRestoreJob:
                 expected_revision=self._expected_revision,
             )
         )
-        if plan is None:
+        if isinstance(operation, TransformOperation):
+            self._journal.append_rebuilt_command(create_transform_command(operation))
+        elif plan is None:
             self._journal = EditJournal(
                 self.token.dataset_uuid,
                 self.token.source_fingerprint,
@@ -700,6 +706,7 @@ class RuntimeRestoreJob:
             current_reconstruction=self._current,
             indexes=self._indexes,
             operations=self._operations,
+            dataset_transform=dataset_transform_from_history(self._operations),
             edit_revision=self.token.edit_revision,
             index_revision=self.token.edit_revision,
             history_hash=self.token.history_hash,
@@ -829,7 +836,9 @@ def _make_state_and_journal(
             source_fingerprint=loaded.source.source_fingerprint,
             expected_revision=expected_revision,
         )
-        if plan is None:
+        if isinstance(operation, TransformOperation):
+            journal.append_rebuilt_command(create_transform_command(operation))
+        elif plan is None:
             journal = EditJournal(
                 loaded.source.dataset_uuid,
                 loaded.source.source_fingerprint,
@@ -851,6 +860,7 @@ def _make_state_and_journal(
         current_reconstruction=current,
         indexes=indexes,
         operations=operations,
+        dataset_transform=dataset_transform_from_history(operations),
         edit_revision=len(operations),
         index_revision=len(operations),
         history_hash=history_hash(operations),
@@ -911,10 +921,13 @@ def state_from_successful_export(
     state: DatasetRuntimeState,
     loaded: LoadedReconstruction,
 ) -> DatasetRuntimeState:
-    """검증된 현재 모델과 관계 인덱스를 재순회하지 않고 새 기준선으로 전환합니다."""
+    """검증된 출력과 이미지 경로를 새 출처에 연결하고 편집 기준선을 전환합니다."""
 
     if loaded.reconstruction is not state.current_reconstruction:
-        raise ValueError("Export 결과가 현재 Runtime Reconstruction 객체와 다릅니다.")
+        if state.dataset_transform == IDENTITY_TRANSFORM:
+            raise ValueError("Export 결과가 현재 Runtime Reconstruction 객체와 다릅니다.")
+        if reconstruction_counts(loaded.reconstruction) != reconstruction_counts(state.current_reconstruction):
+            raise ValueError("변환된 Export 결과의 레코드 수가 현재 Runtime과 다릅니다.")
     if loaded.source.dataset_uuid != state.dataset_uuid:
         raise ValueError("Export 결과의 Dataset UUID가 현재 Runtime과 다릅니다.")
     if state.edit_revision != state.index_revision:
@@ -922,18 +935,29 @@ def state_from_successful_export(
     if len(state.point_id_order) != len(state.current_reconstruction.points3d):
         raise ValueError("Runtime Point3D 순서표와 현재 모델의 레코드 수가 다릅니다.")
     empty_operations: tuple[AnyEditOperation, ...] = ()
+    image_manifest = loaded.image_path_manifest
+    if image_manifest is None and state.image_path_manifest is not None:
+        image_manifest = ImagePathManifest(
+            dataset_uuid=loaded.source.dataset_uuid,
+            source_fingerprint=loaded.source.source_fingerprint,
+            images_directory=loaded.source.images_directory,
+            entries={
+                image_id: state.image_path_manifest.entries[image_id]
+                for image_id in loaded.reconstruction.images
+            },
+        )
     return DatasetRuntimeState(
         dataset_uuid=state.dataset_uuid,
         source=loaded.source,
-        baseline_reconstruction=state.current_reconstruction,
-        current_reconstruction=state.current_reconstruction,
+        baseline_reconstruction=loaded.reconstruction,
+        current_reconstruction=loaded.reconstruction,
         indexes=state.indexes,
         operations=empty_operations,
         edit_revision=0,
         index_revision=0,
         history_hash=history_hash(empty_operations),
         point_id_order=state.point_id_order,
-        image_path_manifest=loaded.image_path_manifest,
+        image_path_manifest=image_manifest,
     )
 
 
@@ -963,7 +987,7 @@ def _journal_for_install(
         elif (
             len(state.operations) == len(previous_state.operations) + 1
             and state.operations[:-1] == previous_state.operations
-            and isinstance(state.operations[-1], EditOperation)
+            and isinstance(state.operations[-1], (EditOperation, TransformOperation))
             and getattr(previous_journal, "revision", -1)
             == previous_state.edit_revision
         ):
@@ -974,14 +998,17 @@ def _journal_for_install(
                 operation,
                 previous_state.edit_revision,
             )
-            previous_journal.append_rebuilt(
-                before_reconstruction=previous_state.current_reconstruction,
-                before_indexes=previous_state.indexes,
-                after_reconstruction=state.current_reconstruction,
-                after_indexes=state.indexes,
-                plan=plan,
-                operation=operation,
-            )
+            if isinstance(operation, TransformOperation):
+                previous_journal.append_rebuilt_command(create_transform_command(operation))
+            else:
+                previous_journal.append_rebuilt(
+                    before_reconstruction=previous_state.current_reconstruction,
+                    before_indexes=previous_state.indexes,
+                    after_reconstruction=state.current_reconstruction,
+                    after_indexes=state.indexes,
+                    plan=plan,
+                    operation=operation,
+                )
             journal = previous_journal
     if journal is None:
         journal = EditJournal(
@@ -1213,6 +1240,7 @@ def state_with_current(
     indexes: RelationshipIndexes,
     operations: tuple[AnyEditOperation, ...],
 ) -> DatasetRuntimeState:
+    """형상과 확정 이력에 일치하는 변환을 새 런타임 상태로 묶습니다."""
     revision = len(operations)
     return DatasetRuntimeState(
         dataset_uuid=state.dataset_uuid,
@@ -1221,10 +1249,13 @@ def state_with_current(
         current_reconstruction=current,
         indexes=indexes,
         operations=operations,
+        dataset_transform=dataset_transform_from_history(operations),
         edit_revision=revision,
         index_revision=revision,
         history_hash=history_hash(operations),
-        point_id_order=tuple(sorted(current.points3d)),
+        point_id_order=(state.point_id_order if current is state.current_reconstruction
+                        and len(state.point_id_order) == len(current.points3d)
+                        else tuple(sorted(current.points3d))),
         image_path_manifest=state.image_path_manifest,
     )
 

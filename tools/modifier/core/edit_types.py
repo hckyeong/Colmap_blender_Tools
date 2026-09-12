@@ -10,6 +10,8 @@ EDIT_SCHEMA_VERSION = 2
 REMOVE_SELECTED_OPERATION = "remove_selected_points_and_observing_images"
 REMOVE_POINTS_OPERATION = "remove_selected_points"
 REMOVE_IMAGES_OPERATION = "remove_selected_images_and_observed_points"
+TRANSFORM_SCHEMA_VERSION = 3
+DATASET_TRANSFORM_OPERATION = "dataset_transform"
 
 
 @dataclass(frozen=True)
@@ -134,4 +136,20 @@ class EditOperation:
     created_at_utc: str
 
 
-AnyEditOperation: TypeAlias = LegacyEditOperation | EditOperation
+@dataclass(frozen=True)
+class TransformOperation:
+    """점 배열 없이 확정된 데이터셋 변환 전후 행렬만 저장합니다."""
+
+    schema_version: int
+    operation_id: str
+    operation_type: str
+    dataset_uuid: str
+    source_fingerprint: str
+    before_transform: tuple[tuple[float, ...], ...]
+    after_transform: tuple[tuple[float, ...], ...]
+    previous_revision: int
+    resulting_revision: int
+    created_at_utc: str
+
+
+AnyEditOperation: TypeAlias = LegacyEditOperation | EditOperation | TransformOperation

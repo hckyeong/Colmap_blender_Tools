@@ -1,5 +1,7 @@
 # COLMAP Tools 사용자 매뉴얼 구성안
 
+> 이 문서는 최초 구성안입니다. 현재 [사용자 매뉴얼](../../manual/README.md)은 공통 안내와 Align·Modifier·Projection Paint 기능별 문서로 나뉘어 있으며, 각 기능에 사용자 캡처 위치를 표시했습니다.
+
 - 작성일: 2026-09-06
 - 기준 버전: 정식 `COLMAP Tools 0.3.37`
 - 기준 환경: Windows x64, Blender 5.2.0 이상. 화면과 조작 검증은 Blender 5.2를 기준으로 한다.

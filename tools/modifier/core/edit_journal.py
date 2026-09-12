@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from .edit_history import dataset_transform_from_history, operation_from_dict, serialize_history
+from .edit_types import TransformOperation
+import json
 
 from .edit_delta import (
     EditDelta,
@@ -71,10 +74,59 @@ class EditCommand:
 
 
 @dataclass(frozen=True)
+class TransformCommand:
+    """점·카메라 배열을 소유하지 않는 순수 변환 명령입니다."""
+
+    operation: TransformOperation
+    previous_revision: int
+    resulting_revision: int
+
+    def __post_init__(self) -> None:
+        """저장 스키마와 명령의 개정 경계가 동일한지 검증합니다."""
+        if not isinstance(self.operation, TransformOperation):
+            raise TypeError("변환 명령에는 변환 작업이 필요합니다.")
+        operation_from_dict(json.loads(serialize_history((self.operation,)))[0])
+        if (self.previous_revision, self.resulting_revision) != (
+            self.operation.previous_revision, self.operation.resulting_revision
+        ):
+            raise ValueError("변환 명령과 작업의 개정 경계가 다릅니다.")
+
+
+def create_transform_command(operation: TransformOperation) -> TransformCommand:
+    """확정 변환 작업으로 배열 복사 없는 명령을 생성합니다."""
+    return TransformCommand(operation, operation.previous_revision, operation.resulting_revision)
+
+
+def _apply_command(reconstruction, indexes, command, token, *, forward):
+    """삭제는 델타로 적용하고 변환은 형상을 유지한 채 개정만 이동합니다."""
+    if isinstance(command, TransformCommand):
+        operation = command.operation
+        expected = command.previous_revision if forward else command.resulting_revision
+        if (token.dataset_uuid != operation.dataset_uuid
+                or token.source_fingerprint != operation.source_fingerprint
+                or token.edit_revision != expected or token.index_revision != expected):
+            raise ValueError("변환 명령과 현재 상태의 개정 또는 원본이 다릅니다.")
+        revision = command.resulting_revision if forward else command.previous_revision
+        return EditStateToken(token.dataset_uuid, token.source_fingerprint, revision, revision)
+    apply = apply_forward if forward else apply_inverse
+    return apply(reconstruction, indexes, command.delta, token)
+
+
+def _apply_forward(reconstruction, indexes, command, token):
+    """명령을 정방향으로 적용합니다."""
+    return _apply_command(reconstruction, indexes, command, token, forward=True)
+
+
+def _apply_inverse(reconstruction, indexes, command, token):
+    """명령을 역방향으로 적용합니다."""
+    return _apply_command(reconstruction, indexes, command, token, forward=False)
+
+
+@dataclass(frozen=True)
 class ResetCommand:
     """현재 적용된 편집 Command 묶음을 같은 세션에서만 되돌릴 Reset으로 보관합니다."""
 
-    commands: tuple[EditCommand, ...]
+    commands: tuple[EditCommand | TransformCommand, ...]
     previous_revision: int
 
     def __post_init__(self) -> None:
@@ -85,7 +137,7 @@ class ResetCommand:
         if self.previous_revision != len(self.commands):
             raise ValueError("Reset 전 revision과 Command 수가 일치하지 않습니다.")
         for expected_revision, command in enumerate(self.commands):
-            if not isinstance(command, EditCommand):
+            if not isinstance(command, (EditCommand, TransformCommand)):
                 raise TypeError("Reset Command에는 EditCommand만 포함할 수 있습니다.")
             if (
                 command.previous_revision != expected_revision
@@ -94,7 +146,7 @@ class ResetCommand:
                 raise ValueError("Reset 전 Command revision이 연속적이지 않습니다.")
 
 
-JournalCommand = EditCommand | ResetCommand
+JournalCommand = EditCommand | TransformCommand | ResetCommand
 
 
 @dataclass(frozen=True)
@@ -102,7 +154,7 @@ class EditJournalCheckpoint:
     """Blender 표시 Transaction 실패 시 Journal 메타데이터를 복구할 지점입니다."""
 
     revision: int
-    history: tuple[EditOperation, ...]
+    history: tuple[EditOperation | TransformOperation, ...]
     undo_stack: tuple[JournalCommand, ...]
     redo_stack: tuple[JournalCommand, ...]
 
@@ -162,7 +214,7 @@ class EditJournal:
         self._dataset_uuid = initial_token.dataset_uuid
         self._source_fingerprint = initial_token.source_fingerprint
         self._revision = initial_revision
-        self._history: list[EditOperation] = []
+        self._history: list[EditOperation | TransformOperation] = []
         self._undo_stack: list[JournalCommand] = []
         self._redo_stack: list[JournalCommand] = []
 
@@ -185,7 +237,7 @@ class EditJournal:
         return self._revision
 
     @property
-    def history(self) -> tuple[EditOperation, ...]:
+    def history(self) -> tuple[EditOperation | TransformOperation, ...]:
         """현재 Reconstruction에 적용된 저장 operation 목록을 반환합니다."""
 
         return tuple(self._history)
@@ -222,10 +274,10 @@ class EditJournal:
 
         return self.poll_redo()
 
-    def _validate_command_for_push(self, command: EditCommand) -> None:
+    def _validate_command_for_push(self, command: EditCommand | TransformCommand) -> None:
         """새 command의 Source와 이전 revision이 현재 Journal 끝과 같은지 검사합니다."""
 
-        if not isinstance(command, EditCommand):
+        if not isinstance(command, (EditCommand, TransformCommand)):
             raise TypeError("Journal에는 EditCommand만 추가할 수 있습니다.")
         if command.operation.dataset_uuid != self._dataset_uuid:
             raise ValueError("Journal command의 Dataset UUID가 현재 Journal과 다릅니다.")
@@ -233,8 +285,9 @@ class EditJournal:
             raise ValueError("Journal command의 source fingerprint가 현재 Journal과 다릅니다.")
         if command.previous_revision != self._revision:
             raise ValueError("Journal command의 이전 revision이 현재 Journal과 다릅니다.")
+        dataset_transform_from_history((*self._history, command.operation))
 
-    def push(self, command: EditCommand) -> None:
+    def push(self, command: EditCommand | TransformCommand) -> None:
         """이미 forward 적용된 새 command를 추가하고 기존 redo 분기를 폐기합니다."""
 
         self._validate_command_for_push(command)
@@ -271,7 +324,7 @@ class EditJournal:
         self._undo_stack = list(checkpoint.undo_stack)
         self._redo_stack = list(checkpoint.redo_stack)
 
-    def append_rebuilt_command(self, command: EditCommand) -> None:
+    def append_rebuilt_command(self, command: EditCommand | TransformCommand) -> None:
         """외부 cold replay에서 재구축한 command를 순서대로 추가합니다."""
 
         self.push(command)
@@ -327,10 +380,10 @@ class EditJournal:
             return self._undo_reset(reconstruction, indexes, token, command)
         if not self._history or self._history[-1] != command.operation:
             raise RuntimeError("Journal history와 Undo stack의 현재 끝이 다릅니다.")
-        resulting_token = apply_inverse(
+        resulting_token = _apply_inverse(
             reconstruction,
             indexes,
-            command.delta,
+            command,
             token,
         )
         self._undo_stack.pop()
@@ -355,10 +408,10 @@ class EditJournal:
             return self._redo_reset(reconstruction, indexes, token, command)
         if command.previous_revision != self._revision:
             raise RuntimeError("Journal Redo stack의 이전 revision이 현재 상태와 다릅니다.")
-        resulting_token = apply_forward(
+        resulting_token = _apply_forward(
             reconstruction,
             indexes,
-            command.delta,
+            command,
             token,
         )
         self._redo_stack.pop()
@@ -379,28 +432,28 @@ class EditJournal:
             return None
         self._validate_runtime_token(token)
         if len(self._undo_stack) != len(self._history) or any(
-            not isinstance(command, EditCommand) for command in self._undo_stack
+            not isinstance(command, (EditCommand, TransformCommand)) for command in self._undo_stack
         ):
             raise RuntimeError("Reset 가능한 편집 Command 경계가 아닙니다.")
         commands = tuple(self._undo_stack)
         reset_command = ResetCommand(commands, self._revision)
         resulting_token = token
-        applied: list[EditCommand] = []
+        applied: list[EditCommand | TransformCommand] = []
         try:
             for command in reversed(commands):
-                resulting_token = apply_inverse(
+                resulting_token = _apply_inverse(
                     reconstruction,
                     indexes,
-                    command.delta,
+                    command,
                     resulting_token,
                 )
                 applied.append(command)
         except Exception:
             for command in reversed(applied):
-                resulting_token = apply_forward(
+                resulting_token = _apply_forward(
                     reconstruction,
                     indexes,
-                    command.delta,
+                    command,
                     resulting_token,
                 )
             raise
@@ -422,22 +475,22 @@ class EditJournal:
         if self._revision != 0 or self._history:
             raise RuntimeError("Reset Undo의 현재 Journal 경계가 올바르지 않습니다.")
         resulting_token = token
-        applied: list[EditCommand] = []
+        applied: list[EditCommand | TransformCommand] = []
         try:
             for item in command.commands:
-                resulting_token = apply_forward(
+                resulting_token = _apply_forward(
                     reconstruction,
                     indexes,
-                    item.delta,
+                    item,
                     resulting_token,
                 )
                 applied.append(item)
         except Exception:
             for item in reversed(applied):
-                resulting_token = apply_inverse(
+                resulting_token = _apply_inverse(
                     reconstruction,
                     indexes,
-                    item.delta,
+                    item,
                     resulting_token,
                 )
             raise
@@ -464,22 +517,22 @@ class EditJournal:
         ):
             raise RuntimeError("Reset Redo의 현재 Journal 경계가 올바르지 않습니다.")
         resulting_token = token
-        applied: list[EditCommand] = []
+        applied: list[EditCommand | TransformCommand] = []
         try:
             for item in reversed(command.commands):
-                resulting_token = apply_inverse(
+                resulting_token = _apply_inverse(
                     reconstruction,
                     indexes,
-                    item.delta,
+                    item,
                     resulting_token,
                 )
                 applied.append(item)
         except Exception:
             for item in reversed(applied):
-                resulting_token = apply_forward(
+                resulting_token = _apply_forward(
                     reconstruction,
                     indexes,
-                    item.delta,
+                    item,
                     resulting_token,
                 )
             raise
@@ -522,6 +575,8 @@ class EditJournal:
 __all__ = [
     "EditCommand",
     "ResetCommand",
+    "TransformCommand",
+    "create_transform_command",
     "EditJournalCheckpoint",
     "EditJournal",
     "create_edit_command",

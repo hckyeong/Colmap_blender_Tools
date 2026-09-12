@@ -5,7 +5,7 @@
 - 지원 기준: Windows x64, Blender 5.2 이상. 기록된 실행 검증 환경은 Blender 5.2.0 LTS다.
 - 범위: 기존 문서 107개의 완료 기능, 현행 설계, 검증 결과와 남은 확인 사항을 정리한다. 중복·완료 문서 98개를 정리하고 후속 집필·검증에 필요한 원문 9개만 `docs/temp/`에 남겼다. 이전 원문 전체는 Git 커밋 `fd2d9cf`에 보존되어 있다.
 
-현재 동작을 확인할 때는 이 문서를 먼저 읽는다. 보관 문서의 첫머리에 남아 있는 `구현 전`, `실험판`, 구버전 설명은 후속 구현 기록과 다를 수 있다. 이 문서에서는 최신 완료 기록과 현재 코드로 차이를 확인했다. 계획만 있는 항목, 미달한 성능 목표, 별도 사용자 검수가 필요한 부분은 완료 기능과 구분한다.
+현재 동작을 확인할 때는 이 문서를 먼저 읽는다. 설치·조작 절차는 [사용자 매뉴얼](manual/README.md)을 참고한다. 보관 문서의 첫머리에 남아 있는 `구현 전`, `실험판`, 구버전 설명은 후속 구현 기록과 다를 수 있다. 이 문서에서는 최신 완료 기록과 현재 코드로 차이를 확인했다. 계획만 있는 항목, 미달한 성능 목표, 별도 사용자 검수가 필요한 부분은 완료 기능과 구분한다.
 
 ## 찾아보기
 
@@ -66,6 +66,10 @@ docs/temp/                 후속 집필·검증에 필요한 원문 9개
 ### 2.1 작업공간 생성과 이동
 
 각 도구는 현재 화면을 복제하지 않고 자기 Blender 5.2 Workspace Seed에서 독립 Workspace와 Screen을 만든다. Tool ID·UUID·Workspace/Seed 스키마·Screen 소유권을 검사한다. Align의 Object 표시 필터가 Modifier·Painting 화면으로 전파되지 않으며, Modifier와 Painting은 필요한 Object 필터와 Local View 상태를 자체 구성한다.
+
+Modifier와 Projection Paint의 신규 작업공간도 Align과 같은 N 패널 기본 폭(화면 배율 적용 전 약 370)을 사용한다. 두 도구의 중립 Seed를 Align Seed의 저장된 화면 배치에서 생성하며, 도구별 내부 이름과 Tool ID는 분리한다. 생성 시에는 반드시 `append_seed_workspace(..., preserve_seed_ui=True)`로 저장된 폭을 보존한다. 런타임에서는 기존 작업공간과 사용자가 조절한 폭을 덮어쓰지 않는다. 재생성에는 `build_tools/workspaces/create_workspace_seed.py --template`에 Align Seed 경로를 지정한다. `--template`은 배경 모드에서 실행할 수 있고 `--sidebar-width`와 동시에 지정하지 않는다.
+
+0.3.42에서는 두 Seed만 변경하고 위 보존 옵션을 빠뜨려 `workspace.append_activate`가 패널 폭을 Blender 기본값으로 초기화했다. 0.3.43에서 두 도구의 호출을 수정했다. Blender 5.2, UI 배율 1.25의 실제 작업공간 생성 경로에서 수정 전 Modifier·Painting 350px / Align 461px를 재현했고, 수정 후 세 도구 모두 461px를 확인했다. `tests/blender_gui/test_sidebar_width.py`는 캡처 없이 실제 표시 폭을 비교한다. 이미 만들어진 작업공간의 폭을 자동 변경하는 마이그레이션은 포함하지 않는다. 새 기본 폭은 새 파일에서 작업공간을 생성할 때 적용된다.
 
 다른 도구나 일반 Blender 작업공간으로 이동하면 공통 교대 조정기가 이전 세션의 정식 종료 완료를 확인한 후 다음 진입을 실행한다. 공통 계층은 각 도구가 등록한 시작·종료·점유·완료 판정 함수를 호출하고, 도구 내부 Runtime을 직접 참조하지 않는다. 사용자가 고른 작업공간을 준비 Timer가 다시 덮어쓰지 않는다.
 
@@ -195,6 +199,12 @@ Normal·Roughness·Metallic 등 임의 MTL 확장 전체를 지원한다고 해�
 <a id="modifier"></a>
 ## 4. COLMAP Modifier
 
+표시 축 설정은 `COLMAP Import → Dataset Root 경로 오른쪽 폴더 아이콘`으로 여는 파일 탐색기 오른쪽 `Display Axis`에서 조절한다. 선택창의 값은 확정 전까지 임시로 보관해 취소 시 기존 경로와 축을 유지한다. 0.3.45부터 파일 선택창의 `Import`를 누르면 기존 증분 Import와 진행창을 바로 시작한다. N패널에는 경로 입력·폴더 아이콘·Input Format과 Point/Camera Display를 표시하며 별도의 Import 버튼은 두지 않는다. 내부 `colmap.import_model` API 및 원본 좌표계 Export 방식은 유지한다.
+
+0.3.44 소스 및 실제 설치본의 숨김 GUI에서 `tests/blender_gui/test_modifier_dataset_browser.py`로 선택창 취소 시 기존 설정 보존과 확정 시 경로·사용자 정의 축 적용을 검증했다.
+
+0.3.45에서는 같은 GUI 검증을 실제 데이터 가져오기까지 확장했다. 소스 및 실제 설치본에서 취소 시 설정 보존, 파일 선택창 Import 한 번으로 점 1개·카메라 1개 생성과 진행 작업 종료를 확인했다.
+
 ### 4.1 편집 권위와 되돌리기
 
 0.3.34부터 독립 Python Runtime Domain이 현재 COLMAP Reconstruction·확정 EditOperation·관계 Index·전용 Journal을 소유한다. Scene Property, Point Mesh, Camera와 Timeline Marker는 저장 연결 또는 다시 만들 수 있는 파생 표시다. Domain UUID·Generation·Dataset 지문·Revision·History Hash로 현재 상태를 확인한다.
@@ -288,7 +298,7 @@ Align은 구현된 이전 스키마와 과거 엔진 승인 기록을 읽으며 
 <a id="build"></a>
 ## 7. 빌드·배포
 
-현재 설치 산출물은 **`build/colmap_tools-0.3.41.zip`**이다. CC 전용 CPython 3.12.10·NumPy 1.26.4, 네이티브 워커·DLL·oneTBB 2022.0.0, 라이선스와 재빌드 원문을 포함한다. 사용자는 별도 Python을 설치하지 않아도 된다. 업데이트 전에 열린 Blender는 이전 모듈을 유지하므로 재시작해야 새 설치본이 적용된다.
+현재 설치 산출물은 **`build/colmap_tools-0.3.45.zip`**이다. CC 전용 CPython 3.12.10·NumPy 1.26.4, 네이티브 워커·DLL·oneTBB 2022.0.0, 라이선스와 재빌드 원문을 포함한다. 사용자는 별도 Python을 설치하지 않아도 된다. 업데이트 전에 열린 Blender는 이전 모듈을 유지하므로 재시작해야 새 설치본이 적용된다. 0.3.43 실제 설치본에서도 숨김 GUI 검증으로 세 도구의 N 패널 폭이 모두 461px(UI 배율 1.25)임을 확인했다.
 
 | 빌드 프로필 | 기본 엔진 | 용도 |
 |---|---|---|
@@ -316,7 +326,7 @@ CCCoreLib 고정 커밋은 `dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432`다. 잠금
 
 # 격리 설치본과 작업공간·파일 재연결까지 검사
 .\build_tools\test_installed_extension.ps1 `
-  -PackagePath "$PWD\build\colmap_tools-0.3.41.zip" -WorkspaceGui
+  -PackagePath "$PWD\build\colmap_tools-0.3.45.zip" -WorkspaceGui
 ```
 
 새 네이티브 실행 환경 준비와 다른 세부 검사 명령은 [보관된 검증 문서](temp/TESTING.md)와 현재 빌드 스크립트를 참조한다. 보관 문서의 실험판 경로·과거 버전 고정 인자는 그 시점의 재현 기록이다.
@@ -399,7 +409,8 @@ v4는 강체 결과를 선택했다. 초기 대비 고정 겹침 RMS는 약 13.9
 
 | 항목 | 현재 상태 |
 |---|---|
-| 상세 사용자 매뉴얼 | 목차와 장별 집필 범위만 작성. 조작 절차·실제 화면·빠른 시작 예제는 미작성. [구성안](temp/manual/README.md) 보존 |
+| Modifier 데이터셋 변환 기즈모 화면 검수 | [구현·검증 기록](COLMAP_Modifier_기즈모_데이터셋_변환_계획서.md). 전체 점군·카메라 이동·회전·균일 배율, 전용 이력·저장·출력·Painter 전달 구현 및 자동 검증 완료. 0.3.42 빌드·설치본 반영 완료. 실제 GUI 조작감·대용량 화면 성능은 별도 |
+| 사용자 매뉴얼 화면 삽입·최종 검수 | [공통 안내](manual/README.md)와 [Align](manual/ALIGN.md) · [Modifier](manual/MODIFIER.md) · [Projection Paint](manual/PROJECTION_PAINT.md) 기능별 본문 및 캡처 위치 22곳 작성. 사용자가 직접 화면을 촬영·삽입한 뒤 최종 대조할 예정. 최초 [구성안](temp/manual/README.md)은 보존 |
 | 실데이터 정렬의 독립 품질 판정 | 0.3.41 고정 표본 비교는 완료. 독립 검사점·공통 부위 시각 판정·RC 재구성은 별도 확인 대상 |
 | OBJ 실데이터 최종 검수 | 원본 면·UV·저장·외부 OBJ 삭제 회귀는 완료. 초기 계획의 사용자 최종 QC를 자동 검사로 승인한 것으로 보지 않음 |
 | CC 가속 구조의 장기 공유 | 기본 형상 적재와 정확 평가 캐시는 구현. 등록 내부 옥트리/격자 추가 성능 패치는 미채택 |
@@ -420,7 +431,7 @@ v4는 강체 결과를 선택했다. 초기 대비 고정 겹침 RMS는 약 13.9
 
 | 남긴 자료 | 보존 이유 |
 |---|---|
-| [COLMAP Tools 사용자 매뉴얼 구성안](temp/manual/README.md) | 미작성 상세 매뉴얼의 목차·집필 범위 |
+| [COLMAP Tools 사용자 매뉴얼 구성안](temp/manual/README.md) | 상세 매뉴얼 작성에 사용한 최초 목차·집필 범위 |
 | [통합 검증 방법](temp/TESTING.md) | 도구별 상세 재현 명령과 회귀 검사 절차 |
 | [COLMAP Align CC 겹침 후보 우선 샘플링 계획서](temp/COLMAP_Align_CC_겹침후보_우선샘플링_계획서.md) | 겹침 선별 계약과 독립 품질 검수 기준 |
 | [COLMAP Align OBJ 내장 원본 토폴로지·정렬 프록시 계획서](temp/COLMAP_Align_OBJ_원본토폴로지_보존_정렬프록시_계획서.md) | 원본 면·UV 보존 계약과 실데이터 최종 검수 기준 |

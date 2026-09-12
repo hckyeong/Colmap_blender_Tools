@@ -225,13 +225,20 @@ def _cleanup_after_failure(transaction_directory: Path | None) -> Path | None:
 def execute_export(
     plan: ExportPlan,
     reconstruction: Reconstruction,
+    *,
+    dataset_transform=None,
 ) -> ExportResult:
-    """새 Job을 동기식으로 끝까지 실행해 기존 공개 API를 유지합니다."""
+    """선택적인 데이터셋 변환을 포함해 동일한 출력 Job을 동기로 실행합니다."""
 
     # 순환 import를 피하면서 증분 실행과 동기 실행이 같은 구현을 사용하게 합니다.
     from .export_job import ExportTransactionJob
 
-    job = ExportTransactionJob(plan, reconstruction)
+    from .dataset_transform import IDENTITY_TRANSFORM
+
+    job = ExportTransactionJob(
+        plan, reconstruction,
+        dataset_transform=IDENTITY_TRANSFORM if dataset_transform is None else dataset_transform,
+    )
     while not job.done:
         job.advance(work_budget_ms=None)
     return job.result

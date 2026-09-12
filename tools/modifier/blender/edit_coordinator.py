@@ -46,6 +46,8 @@ def synchronize_scene(context, state, settings) -> tuple[str, ...]:
         )
         warnings = commit_staging(context.scene, staged)
         staged = None
+        from .axis_display import apply_dataset_transform_preview
+        apply_dataset_transform_preview(context.scene, state.dataset_transform)
         force_end_point_mode(context, state.dataset_uuid)
         force_end_camera_mode(context, state.dataset_uuid)
         return warnings

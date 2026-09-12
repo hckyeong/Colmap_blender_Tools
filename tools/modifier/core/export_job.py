@@ -18,6 +18,7 @@ from .export_types import (
     SourceManifest,
 )
 from .model import LoadedReconstruction, Reconstruction
+from .dataset_transform import IDENTITY_TRANSFORM, TransformReconstructionJob
 from .export_staging_jobs import StagingReadJob, StagingWriteJob
 from .export_integrity_job import ReconstructionValidationJob
 from .export_validation import LayoutManifestJob
@@ -64,11 +65,17 @@ class ExportTransactionJob:
         self,
         plan: ExportPlan,
         reconstruction: Reconstruction,
+        *,
+        dataset_transform=IDENTITY_TRANSFORM,
     ) -> None:
+        """기준 Runtime 토큰과 출력용 변환 작업을 분리해 준비합니다."""
+
         if not isinstance(plan, ExportPlan):
             raise ValueError("유효한 ExportPlan이 필요합니다.")
         self._plan = plan
+        self._source_reconstruction = reconstruction
         self._reconstruction = reconstruction
+        self._transform_job = TransformReconstructionJob(reconstruction, dataset_transform)
         self._phase = ExportPhase.CREATED
         self._started_at = time.monotonic()
         self._progress = self._snapshot(
@@ -246,10 +253,23 @@ class ExportTransactionJob:
         )
 
     def _advance_current_phase(self, work_budget_ms: float | None) -> None:
+        """출력 변환 준비를 포함한 현재 단계를 시간 예산 안에서 진행합니다."""
+
         if self._phase is ExportPhase.CREATED:
             self._enter_phase(ExportPhase.PREPARE)
             return
         if self._phase is ExportPhase.PREPARE:
+            if not self._transform_job.done:
+                self._transform_job.advance(work_budget_ms)
+                if not self._transform_job.done:
+                    self._enter_phase(
+                        ExportPhase.PREPARE,
+                        completed_units=self._transform_job.completed_units,
+                        total_units=self._transform_job.total_units,
+                        phase_fraction=(self._transform_job.completed_units / max(1, self._transform_job.total_units)),
+                    )
+                    return
+            self._reconstruction = self._transform_job.result
             self._prepare()
             self._enter_phase(
                 ExportPhase.COPY_SOURCE,
@@ -298,10 +318,12 @@ class ExportTransactionJob:
         raise RuntimeError(f"실행할 수 없는 Export 단계입니다: {self._phase.name}")
 
     def _prepare(self) -> None:
+        """변환 전 Runtime의 출처를 검증하고 출력용 임시 경로를 준비합니다."""
+
         transaction.assert_runtime_token_matches(
             self._plan.runtime_token,
             self._plan.source,
-            self._reconstruction,
+            self._source_reconstruction,
         )
         self._transaction_directory = Path(
             tempfile.mkdtemp(
@@ -472,6 +494,8 @@ class ExportTransactionJob:
         )
 
     def _commit(self) -> None:
+        """기준 Runtime의 유효성을 재검사한 뒤 변환된 출력을 확정합니다."""
+
         self._stage = "commit"
         if self._staging_directory is None:
             raise RuntimeError("Staging 경로가 준비되지 않았습니다.")
@@ -480,7 +504,7 @@ class ExportTransactionJob:
         transaction.assert_runtime_token_matches(
             self._plan.runtime_token,
             self._plan.source,
-            self._reconstruction,
+            self._source_reconstruction,
         )
         # 부분 교체 상태를 UI tick 사이에 노출하지 않도록 commit은 분할하지 않습니다.
         for destination, relative_path in zip(

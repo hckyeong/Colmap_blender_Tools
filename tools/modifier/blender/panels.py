@@ -2,7 +2,6 @@
 
 import bpy
 
-from .axis_display import CUSTOM_AXIS_PRESET, axis_summary
 from .camera_filter_queue import (
     PENDING_STATUS_APPLYING,
     PENDING_STATUS_READY,
@@ -102,33 +101,49 @@ class COLMAP_PT_import(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        """가져오기와 축 및 Point·Camera 표시 설정을 한 패널에 그립니다."""
+        """경로 옆 폴더 아이콘으로 가져오기 창을 열고 표시 크기를 설정합니다."""
 
         layout = self.layout
         settings = context.scene.colmap_import
 
-        layout.prop(settings, "dataset_root", text="Dataset Root")
+        row = layout.row(align=True)
+        row.prop(settings, "dataset_root_text")
+        row.operator("colmap.select_dataset_root", text="", icon="FILE_FOLDER")
 
         layout.prop(settings, "input_format")
-        layout.operator("colmap.import_model", icon="IMPORT")
-
-        axis_box = layout.box()
-        axis_box.label(text="Display Axis")
-        axis_box.prop(settings, "axis_preset")
-        if settings.axis_preset == CUSTOM_AXIS_PRESET:
-            axis_box.prop(settings, "axis_forward")
-            axis_box.prop(settings, "axis_up")
-        else:
-            axis_box.label(
-                text=axis_summary(settings.axis_forward, settings.axis_up)
-            )
-        axis_box.label(text="Export: COLMAP 원본 축 유지", icon="INFO")
 
         display_box = layout.box()
         display_box.label(text="Point Display")
         display_box.prop(settings, "point_size")
         display_box.label(text="Camera Display")
         display_box.prop(settings, "camera_frustum_size")
+
+
+class COLMAP_PT_dataset_transform(_COLMAPModifierPanelMixin, bpy.types.Panel):
+    """전체 데이터 변환 표시와 이동·회전·균일 배율 작업을 제공합니다."""
+
+    bl_label = "Dataset Transform"
+    bl_idname = "COLMAP_PT_dataset_transform"
+    bl_parent_id = "COLMAP_PT_modifier"
+    bl_order = 25
+
+    def draw(self, context):
+        """현재 편집 잠금에 맞춰 전체 데이터 변환 입력을 표시합니다."""
+        from .dataset_transform_gizmo import dataset_transform_block_reason
+
+        layout = self.layout
+        layout.label(text="전체 점군 + 카메라")
+        layout.prop(context.scene.colmap_import, "show_transform_gizmo")
+        column = layout.column()
+        reason = dataset_transform_block_reason(context)
+        column.enabled = reason is None
+        if reason:
+            layout.label(text=reason, icon="INFO")
+        row = column.row(align=True)
+        row.operator_context = "INVOKE_DEFAULT"
+        for mode, label in (("TRANSLATE", "이동"), ("ROTATE", "회전"), ("SCALE", "배율")):
+            row.operator("colmap.transform_dataset", text=label).mode = mode
+        column.operator("colmap.reset_dataset_pivot", text="피벗 원점 초기화")
 
 
 class COLMAP_PT_point_selection(_COLMAPModifierPanelMixin, bpy.types.Panel):
@@ -431,6 +446,7 @@ CLASSES = (
     COLMAP_PT_modifier,
     COLMAP_PT_status,
     COLMAP_PT_import,
+    COLMAP_PT_dataset_transform,
     COLMAP_PT_point_selection,
     COLMAP_PT_camera_review,
     COLMAP_PT_export,

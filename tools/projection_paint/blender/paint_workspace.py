@@ -573,7 +573,7 @@ def rebuild_paint_workspace_cleanup(
 
 
 def ensure_paint_workspace(context: Any, *, reuse_existing: bool = False) -> Any:
-    """도구 전용 Seed에서 Paint Workspace를 Append하거나 현행 구성을 재사용합니다."""
+    """저장된 UI 폭을 보존해 Paint Seed를 불러오거나 현행 구성을 재사용합니다."""
     window = getattr(context, "window", None)
     if window is None or _pointer(window) == 0:
         raise PaintWorkspaceError("Paint 작업공간을 표시할 Blender Window가 없습니다.")
@@ -604,6 +604,7 @@ def ensure_paint_workspace(context: Any, *, reuse_existing: bool = False) -> Any
             window,
             PAINT_WORKSPACE_SPEC,
             origin_workspace,
+            preserve_seed_ui=True,
         )
         tag_owned(
             created_workspace,

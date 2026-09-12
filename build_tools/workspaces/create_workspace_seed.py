@@ -24,7 +24,7 @@ def _script_arguments() -> list[str]:
 
 
 def _parse_arguments() -> argparse.Namespace:
-    """도구 ID, 내부 Workspace ID, 출력 경로와 선택적 Sidebar 폭을 검증해 읽습니다."""
+    """도구 ID와 출력 경로, Sidebar 폭 또는 기존 중립 Seed 사용 옵션을 읽습니다."""
 
     parser = argparse.ArgumentParser(description="COLMAP Tools Workspace Seed 생성기")
     parser.add_argument("--tool-id", required=True)
@@ -32,12 +32,35 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed-schema", type=int, default=1)
     parser.add_argument("--sidebar-width", type=int, default=0, help="화면 배율을 적용하기 전 Sidebar 기본 폭")
+    parser.add_argument("--template", type=Path, help="저장된 패널 폭과 중립 화면 배치를 재사용할 Workspace Seed")
     arguments = parser.parse_args(_script_arguments())
     if arguments.seed_schema < 1:
         parser.error("--seed-schema는 1 이상이어야 합니다.")
     if arguments.sidebar_width and not 100 <= arguments.sidebar_width <= 800:
         parser.error("--sidebar-width는 100~800 사이여야 합니다.")
+    if arguments.template and arguments.sidebar_width:
+        parser.error("--template과 --sidebar-width는 동시에 사용할 수 없습니다.")
     return arguments
+
+
+def _load_template_workspace(path: Path) -> bpy.types.WorkSpace:
+    """런타임 데이터가 없는 중립 Seed를 읽어 저장된 패널 폭과 화면 배치를 보존합니다."""
+
+    path = path.expanduser().resolve(strict=True)
+    with bpy.data.libraries.load(str(path), link=False) as (source, target):
+        if len(source.workspaces) != 1:
+            raise RuntimeError("템플릿에는 Workspace가 정확히 하나 있어야 합니다.")
+        for collection in (
+            "scenes", "objects", "collections", "meshes", "curves",
+            "cameras", "lights", "materials", "images",
+        ):
+            if getattr(source, collection):
+                raise RuntimeError(f"템플릿에 런타임 데이터가 포함되어 있습니다: {collection}")
+        target.workspaces = list(source.workspaces)
+    workspace = target.workspaces[0]
+    if not str(workspace.get(SEED_BLENDER_VERSION_KEY, "")).startswith("5.2."):
+        raise RuntimeError("Blender 5.2에서 생성된 Seed만 템플릿으로 사용할 수 있습니다.")
+    return workspace
 
 
 def _clear_scene_runtime_data() -> None:
@@ -210,7 +233,7 @@ def _collapse_seed_area(window: bpy.types.Window) -> bool:
 
 
 def main() -> None:
-    """Factory Startup 상태를 확인하고 요청한 Workspace Seed를 생성합니다."""
+    """Factory Startup 또는 기존 중립 템플릿에서 도구별 Workspace Seed를 생성합니다."""
 
     arguments = _parse_arguments()
     if bpy.app.version[:2] != (5, 2):
@@ -219,6 +242,8 @@ def main() -> None:
     if workspace is None:
         raise RuntimeError("--factory-startup의 Layout Workspace를 찾을 수 없습니다.")
     _clear_scene_runtime_data()
+    if arguments.template:
+        workspace = _load_template_workspace(arguments.template)
     workspace = _prepare_workspace(
         arguments.tool_id,
         arguments.workspace_name,

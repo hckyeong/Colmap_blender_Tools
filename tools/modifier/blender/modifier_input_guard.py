@@ -39,6 +39,15 @@ _GUARD_WINDOW_MANAGER: Any = None
 _GUARD_WINDOW_POINTER = 0
 _HELD_KEY_TYPES: set[str] = set()
 _EDIT_TRANSACTION_LOCK_REASON = ""
+_TRANSFORM_INPUT_CALLBACK = None
+_TRANSFORM_CANCEL_CALLBACK = None
+
+
+def set_transform_input_callbacks(route, cancel) -> None:
+    """변환 기능이 제공하는 입력·취소 콜백을 단방향으로 연결합니다."""
+    global _TRANSFORM_INPUT_CALLBACK, _TRANSFORM_CANCEL_CALLBACK
+    _TRANSFORM_INPUT_CALLBACK = route
+    _TRANSFORM_CANCEL_CALLBACK = cancel
 
 
 def _pointer(value: Any) -> int:
@@ -233,6 +242,8 @@ def _journal_transaction_lock_reason(scene: Any) -> str | None:
         return None
     if domain is None:
         return None
+    if bool(getattr(domain, "transform_preview_active", False)):
+        return "데이터 변환을 확정하거나 취소한 뒤 실행하십시오."
     frozen_reason = str(getattr(domain, "frozen_reason", "") or "").strip()
     if frozen_reason:
         return f"Modifier Runtime 편집이 잠겼습니다: {frozen_reason}"
@@ -341,6 +352,8 @@ def _execute_modifier_redo(context: Any) -> None:
 def route_modifier_input_event(context: Any, event: Any) -> set[str]:
     """현재 Context의 단축키를 통과시키거나 Modifier 전용 동작으로 소비합니다."""
 
+    if _TRANSFORM_INPUT_CALLBACK is not None and _TRANSFORM_INPUT_CALLBACK(context, event):
+        return {"RUNNING_MODAL"}
     action = route_modifier_input(event)
     if action is None or not _shortcut_scope_is_active(context, event):
         return {"PASS_THROUGH"}
@@ -412,6 +425,8 @@ def start_modifier_input_guard(window: Any | None = None) -> bool:
 def stop_modifier_input_guard() -> None:
     """종료·등록 해제 전에 Guard Timer와 Window 소유 상태를 모두 정리합니다."""
 
+    if _TRANSFORM_CANCEL_CALLBACK is not None:
+        _TRANSFORM_CANCEL_CALLBACK()
     global _GUARD_ACTIVE
     global _GUARD_GENERATION
     global _GUARD_TIMER

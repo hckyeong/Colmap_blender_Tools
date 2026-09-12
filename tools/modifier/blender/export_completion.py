@@ -97,6 +97,10 @@ def commit_exported_runtime(context, state, result) -> tuple[str, ...]:
     warnings = list(result.loaded.warnings)
     warnings.extend(result.cleanup_warnings)
     try:
+        if exported_state.current_reconstruction is not state.current_reconstruction:
+            from .edit_coordinator import synchronize_scene
+
+            warnings.extend(synchronize_scene(context, exported_state, settings))
         ensure_review_session(context, state=exported_state)
     except Exception as exc:
         warnings.append(

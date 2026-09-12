@@ -46,6 +46,7 @@ from .runtime_state import (
     runtime_restore_token,
 )
 from .modifier_runtime_domain import domain_for_scene
+from ..core.dataset_transform import IDENTITY_TRANSFORM, transform_image, transform_point, validate_transform
 
 
 PROVIDER_NAME = "modifier"
@@ -71,7 +72,7 @@ def _image_paths(state: Any) -> dict[int, str]:
 
 
 def build_projection_snapshot(context: Any) -> ColmapTransferSnapshot:
-    """현재 Modifier 확정 상태를 Blender ID 없는 불변 값 Snapshot으로 변환합니다."""
+    """확정된 점·카메라 변환을 Blender ID 없는 독립 Snapshot에 반영합니다."""
 
     scene = _scene(context)
     settings = getattr(scene, "colmap_import", None)
@@ -79,10 +80,13 @@ def build_projection_snapshot(context: Any) -> ColmapTransferSnapshot:
         raise ValueError("COLMAP Modifier에서 데이터를 먼저 불러오세요.")
     state = ensure_runtime(scene)
     domain = domain_for_scene(scene, required=True)
+    if getattr(domain, "transform_preview_active", False):
+        raise ValueError("데이터셋 변환을 확정하거나 취소한 뒤 업데이트하십시오.")
     if domain.dataset_state is not state:
         raise ValueError("Modifier Domain과 Snapshot Runtime 상태가 일치하지 않습니다.")
     identity = domain.identity
     reconstruction = state.current_reconstruction
+    matrix = validate_transform(getattr(state, "dataset_transform", IDENTITY_TRANSFORM))
     paths = _image_paths(state)
     cameras = tuple(
         CameraValue(
@@ -104,12 +108,13 @@ def build_projection_snapshot(context: Any) -> ColmapTransferSnapshot:
             tvec=tuple(record.tvec),
             image_path=paths[int(record.image_id)],
         )
-        for _image_id, record in sorted(reconstruction.images.items())
+        for _image_id, source_record in sorted(reconstruction.images.items())
+        for record in (transform_image(matrix, source_record),)
     )
     points = tuple(
         Point3DValue(
             point3d_id=int(record.point3d_id),
-            xyz=tuple(record.xyz),
+            xyz=transform_point(matrix, record.xyz),
             rgb=tuple(record.rgb),
             error=float(record.error),
         )
@@ -158,6 +163,7 @@ class ProjectionSnapshotProviderHandle:
 
         self._context = context
         self._scene = _scene(context)
+        self._transform = IDENTITY_TRANSFORM
         self._token = runtime_restore_token(self._scene)
         self._domain_identity = None
         self._runtime_job = None
@@ -183,6 +189,8 @@ class ProjectionSnapshotProviderHandle:
         )
         domain = domain_for_scene(self._scene)
         if domain is not None:
+            if getattr(domain, "transform_preview_active", False):
+                raise ValueError("데이터셋 변환을 확정하거나 취소한 뒤 업데이트하십시오.")
             domain.require_editable()
             self._state = domain.dataset_state
             self._domain_identity = domain.identity
@@ -273,11 +281,14 @@ class ProjectionSnapshotProviderHandle:
         self._begin_transfer()
 
     def _begin_transfer(self) -> None:
-        """검증된 Runtime에서 결정론적 Camera·Image·Point ID 순서를 준비합니다."""
+        """확정 변환과 결정론적인 레코드 순서를 전달 시작 시 고정합니다."""
 
         if self._state is None:
             raise RuntimeError("Snapshot으로 변환할 Modifier Runtime이 없습니다.")
         reconstruction = self._state.current_reconstruction
+        self._transform = validate_transform(
+            getattr(self._state, "dataset_transform", IDENTITY_TRANSFORM)
+        )
         self._paths = _image_paths(self._state)
         self._camera_ids = tuple(sorted(int(value) for value in reconstruction.cameras))
         self._image_ids = tuple(sorted(int(value) for value in reconstruction.images))
@@ -329,7 +340,7 @@ class ProjectionSnapshotProviderHandle:
                 self._cameras.append(value)
                 self._fingerprint().add_camera(value)
             elif self._phase == "IMAGES":
-                record = reconstruction.images[record_id]
+                record = transform_image(self._transform, reconstruction.images[record_id])
                 value = ImageValue(
                     image_id=int(record.image_id),
                     camera_id=int(record.camera_id),
@@ -344,7 +355,7 @@ class ProjectionSnapshotProviderHandle:
                 record = reconstruction.points3d[record_id]
                 value = Point3DValue(
                     point3d_id=int(record.point3d_id),
-                    xyz=tuple(record.xyz),
+                    xyz=transform_point(self._transform, record.xyz),
                     rgb=tuple(record.rgb),
                     error=float(record.error),
                 )

@@ -65,7 +65,10 @@ def create_export_progress_session(
         dataset_uuid=state.dataset_uuid,
         state=state,
         plan=plan,
-        job=ExportTransactionJob(plan, state.current_reconstruction),
+        job=ExportTransactionJob(
+            plan, state.current_reconstruction,
+            dataset_transform=state.dataset_transform,
+        ),
         scene=scene,
         started_at=monotonic(),
     )

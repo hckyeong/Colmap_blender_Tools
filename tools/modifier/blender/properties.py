@@ -170,6 +170,16 @@ def _update_axis_preset(settings, context):
     )
 
 
+def _get_dataset_root_text(settings):
+    """폴더 선택 아이콘이 없는 경로 입력란에서 기존 경로 값을 읽습니다."""
+    return settings.dataset_root
+
+
+def _set_dataset_root_text(settings, value):
+    """경로 입력을 기존 속성에 전달해 자동 탐색 콜백을 유지합니다."""
+    settings.dataset_root = value
+
+
 class COLMAP_PG_status_display_line(bpy.types.PropertyGroup):
     """Status UIList에 표시할 한 줄짜리 파생 표시 데이터입니다."""
 
@@ -178,11 +188,23 @@ class COLMAP_PG_status_display_line(bpy.types.PropertyGroup):
 
 
 class COLMAP_PG_import_settings(bpy.types.PropertyGroup):
+    show_transform_gizmo: BoolProperty(
+        name="변환 기즈모 표시",
+        description="전체 데이터 변환 핸들을 표시합니다. G/R/S 단축키는 계속 사용할 수 있습니다",
+        default=True,
+    )
     dataset_root: StringProperty(
         name="Dataset Root",
         description="선택하면 sparse/0과 images 폴더를 자동 탐색합니다",
         subtype="DIR_PATH",
         update=_update_dataset_root_paths,
+    )
+    dataset_root_text: StringProperty(
+        name="Dataset Root",
+        description="COLMAP 데이터셋 경로. 오른쪽 폴더 아이콘으로 가져옵니다",
+        get=_get_dataset_root_text,
+        set=_set_dataset_root_text,
+        options={"SKIP_SAVE"},
     )
     sparse_directory: StringProperty(
         name="Sparse Directory",

@@ -10,7 +10,7 @@ from mathutils import Matrix, Quaternion, Vector
 from ..core.camera_models import pinhole_parameters
 from ..core.import_types import DEFAULT_CAMERA_FRUSTUM_SIZE
 from ..core.model import LoadedReconstruction
-from .axis_display import display_axis_matrix
+from .axis_display import dataset_display_matrix
 from .ownership import (
     COMMON_RECORD_ID_KEY,
     DATASET_METADATA_KEYS,
@@ -441,6 +441,8 @@ def _create_axis_root(
     forward_axis: str,
     up_axis: str,
 ) -> bpy.types.Object:
+    """기준 좌표의 하위 표시를 현재 데이터셋 변환으로 배치할 루트를 만듭니다."""
+
     axis_root = bpy.data.objects.new("COLMAP_Axis_Root", None)
     mark_managed(axis_root, loaded, "AXIS_ROOT")
     axis_root.empty_display_type = "ARROWS"
@@ -448,7 +450,9 @@ def _create_axis_root(
     axis_root.hide_render = True
     axis_root["colmap_display_forward_axis"] = forward_axis
     axis_root["colmap_display_up_axis"] = up_axis
-    axis_root.matrix_world = display_axis_matrix(forward_axis, up_axis)
+    axis_root.matrix_world = dataset_display_matrix(
+        loaded.source.dataset_uuid, forward_axis, up_axis
+    )
     collection.objects.link(axis_root)
     return axis_root
 

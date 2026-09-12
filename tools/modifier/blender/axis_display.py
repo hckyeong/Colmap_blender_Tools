@@ -1,4 +1,4 @@
-"""COLMAP 원본 좌표를 보존한 채 Blender 표시 축만 변환합니다."""
+"""COLMAP 표시 축과 확정 데이터셋 변환을 관리 루트에 합성합니다."""
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ from types import MappingProxyType
 
 import bpy
 from bpy_extras.io_utils import axis_conversion
+from mathutils import Matrix
+
+from ..core.dataset_transform import IDENTITY_TRANSFORM, validate_transform
 
 from .ownership import DATASET_UUID_KEY, OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
 
@@ -88,6 +91,14 @@ DEFAULT_FORWARD_AXIS = _DEFAULT_PRESET.forward_axis
 DEFAULT_UP_AXIS = _DEFAULT_PRESET.up_axis
 _VALID_AXES = frozenset(item[0] for item in AXIS_ITEMS)
 _axis_update_in_progress = False
+_transform_cancel_callback = None
+
+
+def set_transform_cancel_callback(callback) -> None:
+    """기즈모 생명주기가 표시 축 변경 전에 취소할 함수를 등록하거나 해제합니다."""
+
+    global _transform_cancel_callback
+    _transform_cancel_callback = callback
 
 
 def axis_preset_items() -> tuple[tuple[str, str, str], ...]:
@@ -173,10 +184,59 @@ def _redraw_viewports(context) -> None:
                 area.tag_redraw()
 
 
-def _apply_display_axis(settings, context) -> None:
-    """현재 저장된 축을 관리 Axis Root와 Viewport에 한 번 적용합니다."""
+def dataset_display_matrix(dataset_uuid, forward_axis, up_axis, matrix=None):
+    """표시 축과 원본 좌표계의 데이터셋 변환을 같은 순서로 합성합니다."""
 
-    matrix = display_axis_matrix(settings.axis_forward, settings.axis_up)
+    if matrix is None:
+        from .runtime_state import cached_runtime
+
+        state = cached_runtime(dataset_uuid) if dataset_uuid else None
+        matrix = state.dataset_transform if state is not None else IDENTITY_TRANSFORM
+    return display_axis_matrix(forward_axis, up_axis) @ Matrix(validate_transform(matrix))
+
+
+def dataset_transform_roots(scene):
+    """변환 시작 시 해당 데이터셋의 표시 루트만 한 번 수집합니다."""
+
+    dataset_uuid = scene.colmap_import.dataset_uuid
+    return tuple(_managed_axis_roots(dataset_uuid)) if dataset_uuid else ()
+
+
+def apply_dataset_transform_preview(scene, matrix=None, *, roots=None) -> None:
+    """점 배열을 수정하지 않고 미리보기 또는 확정 변환을 표시 루트에 적용합니다."""
+
+    settings = scene.colmap_import
+    dataset_uuid = settings.dataset_uuid
+    if not dataset_uuid:
+        return
+    if matrix is None:
+        from .modifier_runtime_domain import domain_for_scene
+
+        domain = domain_for_scene(scene)
+        if domain is not None:
+            matrix = domain.dataset_state.dataset_transform
+    composed = dataset_display_matrix(
+        dataset_uuid, settings.axis_forward, settings.axis_up, matrix
+    )
+    for axis_root in dataset_transform_roots(scene) if roots is None else roots:
+        if (
+            axis_root.get(OWNER_KEY) != OWNER_TOKEN
+            or axis_root.get(RECORD_KIND_KEY) != "AXIS_ROOT"
+            or axis_root.get(DATASET_UUID_KEY) != dataset_uuid
+        ):
+            raise ValueError("변환 시작 이후 표시 루트의 소유권이 변경되었습니다.")
+        axis_root.matrix_world = composed
+        axis_root["colmap_display_forward_axis"] = settings.axis_forward
+        axis_root["colmap_display_up_axis"] = settings.axis_up
+        axis_root.update_tag(refresh={"OBJECT"})
+
+
+def _apply_display_axis(settings, context) -> None:
+    """현재 표시 축을 확정 변환과 합성하고 뷰포트를 갱신합니다."""
+
+    matrix = dataset_display_matrix(
+        settings.dataset_uuid, settings.axis_forward, settings.axis_up
+    )
     dataset_uuid = settings.dataset_uuid or None
     if dataset_uuid is not None:
         for axis_root in _managed_axis_roots(dataset_uuid):
@@ -193,6 +253,9 @@ def update_display_axis_preset(settings, context) -> None:
     global _axis_update_in_progress
     if _axis_update_in_progress:
         return
+
+    if _transform_cancel_callback is not None:
+        _transform_cancel_callback(settings.id_data)
 
     preset_axes = axes_for_preset(settings.axis_preset)
     if preset_axes is None:
@@ -212,6 +275,9 @@ def update_display_axis(settings, context, changed_axis: str) -> None:
     global _axis_update_in_progress
     if _axis_update_in_progress:
         return
+
+    if _transform_cancel_callback is not None:
+        _transform_cancel_callback(settings.id_data)
 
     _axis_update_in_progress = True
     try:

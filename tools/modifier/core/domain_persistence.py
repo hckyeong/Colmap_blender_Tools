@@ -10,9 +10,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
-from .edit_history import operation_from_dict, operation_to_dict
+from .edit_history import operation_from_dict, operation_to_dict, dataset_transform_from_history
 from .edit_replay import history_hash
-from .edit_types import AnyEditOperation, EditOperation, LegacyEditOperation
+from .edit_types import AnyEditOperation, EditOperation, LegacyEditOperation, TransformOperation
 from .model import SourceDescriptor
 
 
@@ -208,7 +208,7 @@ def _validated_operations(
         raise DomainPersistenceError("operations는 EditOperation tuple이어야 합니다.")
     validated: list[AnyEditOperation] = []
     for index, operation in enumerate(operations):
-        if not isinstance(operation, (LegacyEditOperation, EditOperation)):
+        if not isinstance(operation, (LegacyEditOperation, EditOperation, TransformOperation)):
             raise DomainPersistenceError(
                 f"operations[{index}]가 지원하는 EditOperation이 아닙니다."
             )
@@ -250,6 +250,10 @@ def validate_domain_payload(payload: DomainPersistencePayload) -> None:
     _validate_source_metadata(payload.source)
 
     operations = _validated_operations(payload.operations)
+    try:
+        dataset_transform_from_history(operations)
+    except ValueError as exc:
+        raise DomainPersistenceError(str(exc)) from exc
     if len(operations) != header.edit_revision:
         raise DomainPersistenceError(
             "operations 길이와 edit_revision이 일치하지 않습니다."

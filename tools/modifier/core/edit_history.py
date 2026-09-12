@@ -8,6 +8,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Iterable
+from .dataset_transform import IDENTITY_TRANSFORM, validate_transform
 
 from .edit_types import (
     EDIT_SCHEMA_VERSION,
@@ -21,7 +22,36 @@ from .edit_types import (
     LegacyEditOperation,
     PointRemovalReport,
     RemovalReport,
+    TransformOperation,
+    TRANSFORM_SCHEMA_VERSION,
+    DATASET_TRANSFORM_OPERATION,
 )
+
+
+def transform_operation(before, after, dataset_uuid: str, source_fingerprint: str,
+                        previous_revision: int) -> TransformOperation:
+    """검증한 누적 변환 전후 행렬을 하나의 확정 작업으로 생성합니다."""
+    before = validate_transform(before)
+    after = validate_transform(after)
+    if before == after:
+        raise ValueError("변경되지 않은 데이터셋 변환은 기록할 수 없습니다.")
+    base = _new_operation_base(DATASET_TRANSFORM_OPERATION, dataset_uuid,
+                               source_fingerprint, previous_revision)
+    base["schema_version"] = TRANSFORM_SCHEMA_VERSION
+    return TransformOperation(**base, before_transform=before, after_transform=after)
+
+
+def dataset_transform_from_history(operations):
+    """확정 이력의 변환 연결을 검증하고 마지막 누적 행렬을 반환합니다."""
+    current = IDENTITY_TRANSFORM
+    for operation in operations:
+        if isinstance(operation, TransformOperation):
+            before = validate_transform(operation.before_transform)
+            after = validate_transform(operation.after_transform)
+            if before != current or before == after:
+                raise ValueError("데이터셋 변환 이력의 전후 행렬 연결이 올바르지 않습니다.")
+            current = after
+    return current
 
 
 def _new_operation_base(
@@ -168,6 +198,7 @@ def _normalize_id_fields(
 
 
 def operation_from_dict(value: dict[str, Any]) -> AnyEditOperation:
+    """삭제와 변환 작업의 스키마를 각각 엄격히 검증해 복원합니다."""
     if not isinstance(value, dict):
         raise ValueError("EditOperation은 JSON 객체여야 합니다.")
     if type(value.get("schema_version")) is not int:
@@ -196,6 +227,10 @@ def operation_from_dict(value: dict[str, Any]) -> AnyEditOperation:
             "removed_frame_ids",
             "removed_rig_ids",
         )
+    elif schema_version == TRANSFORM_SCHEMA_VERSION:
+        operation_class = TransformOperation
+        valid_types = {DATASET_TRANSFORM_OPERATION}
+        tuple_fields = ()
     else:
         raise ValueError("지원하지 않는 EditOperation schema version입니다.")
 
@@ -207,6 +242,11 @@ def operation_from_dict(value: dict[str, Any]) -> AnyEditOperation:
     normalized = dict(value)
     _normalize_id_fields(normalized, tuple_fields)
     _validate_common_operation_fields(normalized)
+    if operation_class is TransformOperation:
+        normalized["before_transform"] = validate_transform(normalized["before_transform"])
+        normalized["after_transform"] = validate_transform(normalized["after_transform"])
+        if normalized["before_transform"] == normalized["after_transform"]:
+            raise ValueError("변경되지 않은 데이터셋 변환 이력입니다.")
     operation = operation_class(**normalized)
     if isinstance(operation, EditOperation):
         if operation.operation_type == REMOVE_POINTS_OPERATION:

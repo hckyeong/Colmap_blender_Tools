@@ -161,6 +161,8 @@ class COLMAP_OT_export(bpy.types.Operator):
         layout.label(text="Blender Undo로 디스크 파일을 복구할 수 없습니다.")
 
     def execute(self, context):
+        """확정된 데이터셋 변환을 출력 작업에 전달하고 새 기준선을 설치합니다."""
+
         settings = context.scene.colmap_import
         if settings.export_running:
             self.report({"WARNING"}, "이미 Export가 진행 중입니다.")
@@ -178,7 +180,10 @@ class COLMAP_OT_export(bpy.types.Operator):
         settings.export_status = "Export 중: 원본과 편집 결과를 검증하고 있습니다."
         try:
             state, plan = _execution_inputs(context, self._prepared_plan)
-            result = execute_export(plan, state.current_reconstruction)
+            result = execute_export(
+                plan, state.current_reconstruction,
+                dataset_transform=state.dataset_transform,
+            )
         except Exception as exc:
             error_message = _export_error_message(exc)
             settings.export_status = f"Export 실패: {error_message}"

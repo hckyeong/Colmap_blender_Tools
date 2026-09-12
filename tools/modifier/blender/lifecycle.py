@@ -30,6 +30,11 @@ from .delete_guard import (
     unregister_delete_guard_keymaps,
 )
 from .camera_edit_session import clear_camera_edit_sessions
+from .dataset_transform_gizmo import (
+    CLASSES as DATASET_TRANSFORM_CLASSES,
+    register_transform_runtime,
+    unregister_transform_runtime,
+)
 from .camera_review_keymap import (
     register_camera_review_keymap,
     unregister_camera_review_keymap,
@@ -55,6 +60,7 @@ from .edit_coordinator import (
 from .export_progress_session import clear_export_progress_sessions
 from .import_progress_session import clear_import_progress_sessions
 from .operators_import import CLASSES as OPERATOR_CLASSES
+from .operators_dataset_browser import CLASSES as DATASET_BROWSER_CLASSES
 from .operators_export import CLASSES as EXPORT_OPERATOR_CLASSES
 from .operators_export_progress import CLASSES as EXPORT_PROGRESS_OPERATOR_CLASSES
 from .operators_camera_review import CLASSES as CAMERA_REVIEW_OPERATOR_CLASSES
@@ -103,6 +109,7 @@ CLASSES = (
     *PROPERTY_CLASSES,
     *STATUS_UI_CLASSES,
     *OPERATOR_CLASSES,
+    *DATASET_BROWSER_CLASSES,
     *POINT_EDIT_MODE_OPERATOR_CLASSES,
     *CAMERA_EDIT_MODE_OPERATOR_CLASSES,
     *POINT_SELECTION_OPERATOR_CLASSES,
@@ -111,6 +118,7 @@ CLASSES = (
     *EXPORT_OPERATOR_CLASSES,
     *DELETE_GUARD_CLASSES,
     *MODIFIER_INPUT_GUARD_CLASSES,
+    *DATASET_TRANSFORM_CLASSES,
     *MODIFIER_WORKSPACE_OPERATOR_CLASSES,
     *PANEL_CLASSES,
 )
@@ -252,8 +260,10 @@ def register():
         workspace_runtime_registered = True
         register_modifier_workspace_runtime()
         register_workspace_handoff_adapter(_MODIFIER_HANDOFF_ADAPTER)
+        register_transform_runtime()
         _REGISTERED = True
     except Exception:
+        unregister_transform_runtime()
         unregister_workspace_handoff_adapter("modifier")
         if snapshot_provider_registered:
             unregister_projection_snapshot_provider()
@@ -292,6 +302,7 @@ def unregister():
     if not _REGISTERED:
         return
     _detach_modifier_markers_before_unregister()
+    unregister_transform_runtime()
     stop_modifier_input_guard()
     _REGISTERED = False
     from .camera_filter_queue import (
