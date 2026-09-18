@@ -23,8 +23,7 @@ from .display_axes import (
 )
 from .mesh_io import TriangleMeshModelData
 from .mesh_io.embedded_obj_store import (
-    build_triangle_proxy_from_embedded_mesh,
-    commit_embedded_obj_mesh,
+    commit_embedded_obj_mesh_and_build_proxy,
 )
 from .mesh_io.obj_native_import import NativeObjStaging, import_obj_to_staging
 from .mesh_io.validation import validate_obj_limits
@@ -379,7 +378,7 @@ class MeshImportJob:
         return "FINISHED"
 
     def step(self, runtime: Any | None = None, *, time_budget_seconds: float = 0.025) -> str:
-        """OBJ를 단계별로 준비하고 준비 전용이면 등록 없이 완료 상태를 반환합니다."""
+        """OBJ를 단계별로 준비하며 원본 확정과 프록시 생성의 전체 형상 검증을 공유합니다."""
         if self.is_terminal:
             return "FINISHED" if self.stage == MESH_IMPORT_STAGE_COMPLETED else "CANCELLED"
         if self.cancel_requested:
@@ -439,13 +438,7 @@ class MeshImportJob:
                 if not model_id:
                     raise MeshImportJobError("OBJ 모델 ID를 생성하지 못했습니다.")
                 display_name = self.display_name_hint.strip() or Path(self.source_path).stem
-                commit_embedded_obj_mesh(
-                    mesh,
-                    model_id=model_id,
-                    source_path=self.source_path,
-                    geometry_revision=1,
-                )
-                self.staged_model = build_triangle_proxy_from_embedded_mesh(
+                self.staged_model = commit_embedded_obj_mesh_and_build_proxy(
                     mesh,
                     model_id=model_id,
                     display_name=display_name,

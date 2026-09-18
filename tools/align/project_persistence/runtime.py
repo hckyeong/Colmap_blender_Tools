@@ -50,6 +50,7 @@ from ..mesh_io.embedded_obj_store import (
     retire_embedded_obj_mesh,
     validate_embedded_obj_project_cleanup,
     validate_embedded_obj_mesh,
+    validate_embedded_obj_identity,
 )
 from ..model_repository import CompanionMeshSourceMetadata, ImportedModelSourceMetadata
 from ..viewport.display_sampling import build_display_indices
@@ -697,15 +698,9 @@ def _embedded_proxy(
     display_limit: int,
     geometry_only: bool,
 ) -> Any:
-    """저장 UUID로 내장 Mesh를 검증하고 결정적 표시 표본을 가진 프록시를 복원합니다."""
+    """저장 식별자와 형상을 프록시 생성 시 한 번 검증하고 결정적 표시 표본을 복원합니다."""
 
     mesh = find_embedded_obj_mesh(asset_uuid)
-    validate_embedded_obj_mesh(
-        mesh,
-        expected_asset_uuid=asset_uuid,
-        expected_model_id=model_id,
-        expected_revision=geometry_revision,
-    )
     if int(schema_version) != int(mesh.get("schema_version", 0)):
         raise ProjectPersistenceRuntimeError("내장 OBJ schema가 저장 상태와 다릅니다.")
     proxy = build_triangle_proxy_from_embedded_mesh(
@@ -714,6 +709,8 @@ def _embedded_proxy(
         display_name=display_name,
         source_path=source_path,
         geometry_only=geometry_only,
+        expected_asset_uuid=asset_uuid,
+        expected_revision=geometry_revision,
     )
     offsets = build_display_indices(
         proxy.registration_vertex_indices.astype(np.uint64, copy=False),
@@ -929,13 +926,13 @@ def _resolve_restore_companion(model: ProjectModelSnapshot, dataset_root: str) -
 
 
 def _preflight_restore_sources(runtime: Any, snapshot: ProjectStateSnapshot) -> None:
-    """COLMAP·구버전 OBJ 출처와 v8 내장 OBJ 식별자를 먼저 검사합니다."""
+    """외부 출처와 내장 식별자를 먼저 검사하며 내장 형상은 복원 확정 전에 검사합니다."""
 
     for model in sorted(snapshot.models, key=lambda item: item.load_order):
         try:
             if _source_is_mesh(model) and model.has_embedded_obj:
                 mesh = find_embedded_obj_mesh(model.embedded_obj_asset_uuid)
-                validate_embedded_obj_mesh(
+                validate_embedded_obj_identity(
                     mesh,
                     expected_asset_uuid=model.embedded_obj_asset_uuid,
                     expected_model_id=model.model_id,
@@ -949,7 +946,7 @@ def _preflight_restore_sources(runtime: Any, snapshot: ProjectStateSnapshot) -> 
             if model.has_embedded_companion_obj:
                 source = model.companion_source
                 mesh = find_embedded_obj_mesh(source.embedded_obj_asset_uuid)
-                validate_embedded_obj_mesh(
+                validate_embedded_obj_identity(
                     mesh,
                     expected_asset_uuid=source.embedded_obj_asset_uuid,
                     expected_model_id=model.model_id,

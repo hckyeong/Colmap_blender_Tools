@@ -13,7 +13,8 @@ New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
 
 # 실험 관리기에 있던 필수 Align 회귀 목록을 정식 소스 검증 경계로 이관합니다.
 $scripts = @(
-    "test_colmap_io.py", "test_mesh_extension.py", "test_embedded_obj.py", "test_marker_sim3.py",
+    "test_colmap_io.py", "test_mesh_extension.py", "test_embedded_obj.py",
+    "test_embedded_obj_optimization.py", "test_mesh_normal_reuse.py", "test_marker_sim3.py",
     "test_icp_direct_align.py", "test_icp_cccore_geometry.py", "test_icp_cccore_ui.py",
     "test_icp_cccore_runtime.py", "test_icp_cccore_persistence.py",
     "test_merge_export_transforms.py", "test_merge_export_writer.py", "test_merge_export_runtime.py",

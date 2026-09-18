@@ -339,12 +339,13 @@ def _mesh_vertex_normals(vertices: Any, triangles: Any) -> np.ndarray:
     return np.ascontiguousarray(vertex_normals, dtype=np.float32)
 
 
-def _mesh_surface_arrays(model_data: Any) -> tuple[np.ndarray, tuple[tuple[int, np.ndarray, np.ndarray, np.ndarray], ...]]:
-    """메시 면을 역할 색상 인덱스와 재질별 face-corner 위치·법선·UV 배열로 분리합니다."""
+def _mesh_surface_arrays(model_data: Any, *, normals: np.ndarray | None = None) -> tuple[np.ndarray, tuple[tuple[int, np.ndarray, np.ndarray, np.ndarray], ...]]:
+    """전달받은 정점 법선을 재사용해 메시 면을 역할 색상 인덱스와 재질별 위치·법선·UV로 분리합니다."""
 
     vertices = np.ascontiguousarray(model_data.vertices_float64, dtype=np.float32)
     triangles = np.ascontiguousarray(model_data.triangles_uint32, dtype=np.uint32)
-    normals = _mesh_vertex_normals(vertices, triangles)
+    if normals is None:
+        normals = _mesh_vertex_normals(vertices, triangles)
     face_materials = np.asarray(model_data.triangle_material_indices_int32, dtype=np.int32)
     face_texcoords = np.asarray(model_data.triangle_texcoord_indices_int32, dtype=np.int32)
     texcoords = np.asarray(model_data.texcoords_float64, dtype=np.float32)
@@ -463,7 +464,7 @@ def _batch_vertex_data(model_data: Any) -> tuple[np.ndarray, np.ndarray, int, in
 
 
 def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) -> Any:
-    """지정 형상의 GPU 배치를 준비하고 같은 소유 모델의 다른 형상 캐시는 보존합니다."""
+    """메시 법선을 한 번 계산해 GPU 배치를 준비하고 같은 소유 모델의 다른 형상 캐시는 보존합니다."""
     data = model_data if model_data is not None else model_data_for_id(model_id)
     if data is None:
         raise KeyError(f"GPU 배치를 만들 모델을 찾을 수 없습니다: {model_id}")
@@ -516,7 +517,7 @@ def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) ->
                 dtype=np.uint32,
             )
             mesh_normals = _mesh_vertex_normals(mesh_vertices, mesh_triangles)
-            solid_triangles, textured_groups = _mesh_surface_arrays(data)
+            solid_triangles, textured_groups = _mesh_surface_arrays(data, normals=mesh_normals)
             solid_batch = (
                 None
                 if solid_triangles.size == 0

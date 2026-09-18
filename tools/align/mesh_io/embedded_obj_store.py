@@ -73,9 +73,10 @@ def _mesh_objects(mesh: Any) -> tuple[Any, ...]:
 
 
 def _foreach_array(collection: Any, attribute: str, dtype: Any, shape: tuple[int, ...]) -> np.ndarray:
-    """Blender collection 속성을 연속 NumPy 배열로 복사합니다."""
+    """좌표·UV는 Blender의 float32 버퍼로 읽고 요청한 연속 배열 자료형으로 변환합니다."""
 
-    array = np.empty(int(np.prod(shape, dtype=np.int64)), dtype=dtype)
+    buffer_dtype = np.float32 if attribute in {"co", "uv"} and np.dtype(dtype) == np.float64 else dtype
+    array = np.empty(int(np.prod(shape, dtype=np.int64)), dtype=buffer_dtype)
     collection.foreach_get(attribute, array)
     return np.ascontiguousarray(array.reshape(shape), dtype=dtype)
 
@@ -128,7 +129,7 @@ def _material_data(mesh: Any) -> tuple[ObjMaterialData, ...]:
     return tuple(materials)
 
 
-def validate_embedded_obj_mesh(
+def validate_embedded_obj_identity(
     mesh: Any,
     *,
     expected_asset_uuid: str | None = None,
@@ -136,7 +137,7 @@ def validate_embedded_obj_mesh(
     expected_revision: int | None = None,
     require_unlinked: bool = True,
 ) -> Any:
-    """내장 OBJ Mesh의 소유권·식별자·기본 Polygon 구조를 원자 경계에서 검증합니다."""
+    """내장 OBJ 소유권·식별자만 확인하며 형상 검증은 프록시 생성 경계에서 수행합니다."""
 
     if not isinstance(mesh, bpy.types.Mesh):
         raise EmbeddedObjStoreError("내장 OBJ 데이터가 Blender Mesh가 아닙니다.")
@@ -159,6 +160,37 @@ def validate_embedded_obj_mesh(
         raise EmbeddedObjStoreError("내장 OBJ Mesh의 Fake User가 해제되었습니다.")
     if require_unlinked and _mesh_objects(mesh):
         raise EmbeddedObjStoreError("내장 OBJ Mesh가 Scene Object에 연결되어 있습니다.")
+    return mesh
+
+
+def _validate_polygon_vertices(starts: np.ndarray, totals: np.ndarray, loop_vertices: np.ndarray) -> None:
+    """면 크기별 제한된 배열 묶음으로 면 내부의 반복 정점을 검사합니다."""
+
+    for offset in range(0, len(starts), 65_536):
+        chunk_starts = starts[offset : offset + 65_536]
+        chunk_totals = totals[offset : offset + 65_536]
+        for size in np.unique(chunk_totals):
+            size = int(size)
+            selected = chunk_starts[chunk_totals == size]
+            batch_size = max(1, 262_144 // size)
+            for begin in range(0, len(selected), batch_size):
+                corners = loop_vertices[selected[begin : begin + batch_size, None] + np.arange(size)]
+                if size == 3:
+                    repeated = np.any(
+                        (corners[:, 0] == corners[:, 1])
+                        | (corners[:, 1] == corners[:, 2])
+                        | (corners[:, 2] == corners[:, 0])
+                    )
+                else:
+                    corners.sort(axis=1)
+                    repeated = np.any(corners[:, 1:] == corners[:, :-1])
+                if repeated:
+                    raise EmbeddedObjStoreError("내장 OBJ Mesh Polygon이 같은 정점을 반복합니다.")
+
+
+def _validated_geometry_vertices(mesh: Any) -> np.ndarray:
+    """원본 형상을 전체 검증하고 같은 호출의 프록시에서 재사용할 좌표를 반환합니다."""
+
     vertex_count = len(mesh.vertices)
     polygon_count = len(mesh.polygons)
     loop_count = len(mesh.loops)
@@ -176,17 +208,35 @@ def validate_embedded_obj_mesh(
     loop_vertices = _foreach_array(mesh.loops, "vertex_index", np.int64, (loop_count,))
     if np.any(loop_vertices < 0) or np.any(loop_vertices >= vertex_count):
         raise EmbeddedObjStoreError("내장 OBJ Mesh Loop 정점 인덱스가 범위를 벗어났습니다.")
-    for start, total in zip(starts, totals, strict=True):
-        corners = loop_vertices[int(start) : int(start + total)]
-        if np.unique(corners).shape[0] != corners.shape[0]:
-            raise EmbeddedObjStoreError("내장 OBJ Mesh Polygon이 같은 정점을 반복합니다.")
+    _validate_polygon_vertices(starts, totals, loop_vertices)
     mesh.calc_loop_triangles()
     if len(mesh.loop_triangles) < 1:
         raise EmbeddedObjStoreError("내장 OBJ Mesh 삼각형 프록시를 만들 수 없습니다.")
+    return coordinates
+
+
+def validate_embedded_obj_mesh(
+    mesh: Any,
+    *,
+    expected_asset_uuid: str | None = None,
+    expected_model_id: str | None = None,
+    expected_revision: int | None = None,
+    require_unlinked: bool = True,
+) -> Any:
+    """내장 OBJ의 식별자와 전체 형상을 검사하고 기존 계약대로 Mesh를 반환합니다."""
+
+    validate_embedded_obj_identity(
+        mesh,
+        expected_asset_uuid=expected_asset_uuid,
+        expected_model_id=expected_model_id,
+        expected_revision=expected_revision,
+        require_unlinked=require_unlinked,
+    )
+    _validated_geometry_vertices(mesh)
     return mesh
 
 
-def commit_embedded_obj_mesh(
+def _assign_embedded_obj_identity(
     mesh: Any,
     *,
     model_id: str,
@@ -194,7 +244,7 @@ def commit_embedded_obj_mesh(
     asset_uuid: str | None = None,
     geometry_revision: int = 1,
 ) -> str:
-    """Staging Mesh에 안정 식별자와 Fake User를 지정해 비연결 원본으로 확정합니다."""
+    """확정 전 Staging Mesh에 충돌 없는 식별자와 Fake User를 지정합니다."""
 
     normalized_model_id = str(model_id).strip()
     if not normalized_model_id:
@@ -217,13 +267,47 @@ def commit_embedded_obj_mesh(
     mesh[_REVISION_KEY] = revision
     mesh.name = f"{EMBEDDED_OBJ_NAME_PREFIX}{normalized_uuid}"
     mesh.use_fake_user = True
+    return normalized_uuid
+
+
+def commit_embedded_obj_mesh(
+    mesh: Any,
+    *,
+    model_id: str,
+    source_path: str | Path,
+    asset_uuid: str | None = None,
+    geometry_revision: int = 1,
+) -> str:
+    """Staging Mesh에 식별자를 지정하고 전체 검증 후 비연결 원본으로 확정합니다."""
+
+    normalized_uuid = _assign_embedded_obj_identity(
+        mesh, model_id=model_id, source_path=source_path,
+        asset_uuid=asset_uuid, geometry_revision=geometry_revision,
+    )
     validate_embedded_obj_mesh(
         mesh,
         expected_asset_uuid=normalized_uuid,
-        expected_model_id=normalized_model_id,
-        expected_revision=revision,
+        expected_model_id=model_id,
+        expected_revision=geometry_revision,
     )
     return normalized_uuid
+
+
+def commit_embedded_obj_mesh_and_build_proxy(
+    mesh: Any,
+    *,
+    model_id: str,
+    display_name: str,
+    source_path: str | Path,
+    geometry_only: bool = False,
+) -> TriangleMeshModelData:
+    """가져온 Mesh의 식별자 지정과 프록시 생성을 전체 형상 검증 한 번으로 처리합니다."""
+
+    asset_uuid = _assign_embedded_obj_identity(mesh, model_id=model_id, source_path=source_path)
+    return build_triangle_proxy_from_embedded_mesh(
+        mesh, model_id=model_id, display_name=display_name, source_path=source_path,
+        geometry_only=geometry_only, expected_asset_uuid=asset_uuid, expected_revision=1,
+    )
 
 
 def find_embedded_obj_mesh(asset_uuid: str, *, allow_missing: bool = False) -> Any | None:
@@ -340,14 +424,17 @@ def build_triangle_proxy_from_embedded_mesh(
     source_path: str | Path,
     display_vertex_indices: np.ndarray | None = None,
     geometry_only: bool = False,
+    expected_asset_uuid: str | None = None,
+    expected_revision: int | None = None,
 ) -> TriangleMeshModelData:
-    """원본 Polygon을 바꾸지 않고 calc_loop_triangles 기반 정렬 프록시를 생성합니다."""
+    """식별자와 원본 형상을 한 번 검증하고 좌표를 재사용하여 삼각형 프록시를 생성합니다."""
 
-    validate_embedded_obj_mesh(mesh, expected_model_id=model_id)
-    vertex_count = len(mesh.vertices)
-    mesh.calc_loop_triangles()
+    validate_embedded_obj_identity(
+        mesh, expected_model_id=model_id,
+        expected_asset_uuid=expected_asset_uuid, expected_revision=expected_revision,
+    )
+    vertices = _validated_geometry_vertices(mesh)
     triangle_count = len(mesh.loop_triangles)
-    vertices = _foreach_array(mesh.vertices, "co", np.float64, (vertex_count, 3))
     triangles = _foreach_array(mesh.loop_triangles, "vertices", np.uint32, (triangle_count, 3))
     triangle_polygons = _foreach_array(
         mesh.loop_triangles, "polygon_index", np.uint32, (triangle_count,)
@@ -462,6 +549,7 @@ __all__ = (
     "EmbeddedObjStoreError",
     "build_triangle_proxy_from_embedded_mesh",
     "commit_embedded_obj_mesh",
+    "commit_embedded_obj_mesh_and_build_proxy",
     "extract_embedded_obj_export_geometry",
     "find_embedded_obj_mesh",
     "remove_all_embedded_obj_meshes",
@@ -470,4 +558,5 @@ __all__ = (
     "sweep_embedded_obj_support_data",
     "validate_embedded_obj_project_cleanup",
     "validate_embedded_obj_mesh",
+    "validate_embedded_obj_identity",
 )
