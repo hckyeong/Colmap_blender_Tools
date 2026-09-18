@@ -209,7 +209,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 실행 파일·DLL·Manifest의 고정 v4 배포 지문을 엄격히 검증합니다."""
+    """네이티브 v4 배포 지문과 등록 안전·격자 메모리 패치의 일치를 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -230,6 +230,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "octree_multithread_support", "coordinate_type", "matrix_scalar_type",
         "binary_sha256", "self_test",
         "registration_safety_patch", "registration_safety_patch_sha256", "patched_registration_sha256",
+        "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
     }
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
@@ -263,6 +264,33 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         or _manifest_sha256(manifest["patched_registration_sha256"], "최종 등록 원문") != safety.get("patched_sha256")
     ):
         raise contract.CcCoreEnvironmentError("CC 메시 먼 점 필터의 대응 면 보존 패치가 검증되지 않았습니다.")
+    grid = core_dependency.get("mesh_grid_memory_patch")
+    if (
+        not isinstance(grid, Mapping)
+        or grid.get("id") != "mesh-grid-memory-budget-v1"
+        or grid.get("file") != "patches/mesh_grid_memory_budget.patch"
+        or manifest["mesh_grid_memory_patch"] != grid["id"]
+        or grid["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["mesh_grid_memory_patch_sha256"], "격자 메모리 패치")
+        != _manifest_sha256(grid.get("sha256"), "격자 메모리 의존성 패치")
+    ):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 메모리 예산 패치가 검증되지 않았습니다.")
+    grid_files = grid.get("files")
+    grid_sources = manifest["mesh_grid_source_sha256"]
+    if (
+        not isinstance(grid_files, list) or len(grid_files) != 1
+        or not isinstance(grid_files[0], Mapping)
+        or grid_files[0].get("path") != "src/DistanceComputationTools.cpp"
+        or not isinstance(grid_sources, Mapping)
+        or set(grid_sources) != {"src/DistanceComputationTools.cpp"}
+    ):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 패치의 원문 목록이 올바르지 않습니다.")
+    grid_file = grid_files[0]
+    _manifest_sha256(grid_file.get("original_sha256"), "격자 패치 이전 원문")
+    if _manifest_sha256(grid_sources[grid_file["path"]], "최종 격자 원문") != _manifest_sha256(
+        grid_file.get("patched_sha256"), "격자 의존성 최종 원문"
+    ):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 패치의 최종 원문 해시가 의존성과 다릅니다.")
     tbb_dependency = dependencies.get("tbb") if isinstance(dependencies, Mapping) else None
     if not isinstance(tbb_dependency, Mapping) or tbb_dependency.get("version") != contract.CC_TBB_VERSION:
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 oneTBB 고정 의존성이 올바르지 않습니다.")
@@ -328,6 +356,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "matrix_scalar_type", "build_type", "compiler", "architecture", "platform",
         "core_patch_sha256", "concurrency_patch", "concurrency_patch_sha256",
         "registration_safety_patch", "registration_safety_patch_sha256",
+        "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",

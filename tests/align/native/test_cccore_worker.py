@@ -644,6 +644,53 @@ class NativeContractTest(unittest.TestCase):
         for actual,expected in zip(distances,(.5,.2,1)):
             self.assertAlmostEqual(actual,expected,delta=1e-6)
 
+    def large_mesh_grid_request(self, operation, *, max_threads=4):
+        """미세 표면 군집의 반복 정점으로 고단계 자동 격자를 유도하되 파일을 작은 묶음으로 씁니다."""
+        vertices = [(0,0,0),(1,0,0),(1,1,0),(0,1,0),
+                    (0,0,1),(1,0,1),(1,1,1),(0,1,1)]
+        triangles = [(0,2,1),(0,3,2),(4,5,6),(4,6,7),
+                     (0,1,5),(0,5,4),(1,2,6),(1,6,5),
+                     (2,3,7),(2,7,6),(3,0,4),(3,4,7)]
+        cluster = [(.25 + x * 2**-19, .25 + y * 2**-19, 0)
+                   for y in range(8) for x in range(8)]
+        data = vertices + ([(x,y,.125) for x,y,_ in cluster] if operation == "distance" else cluster)
+        request = self.request(data=data, model=vertices + cluster, triangles=triangles,
+                               operation=operation, max_threads=max_threads)
+        cluster_bytes = struct.pack("<" + "d" * (len(cluster) * 3),
+                                    *(axis for point in cluster for axis in point))
+        repetitions = 31_250
+        remaining = repetitions - 1
+        with (self.root / "model.bin").open("ab") as stream:
+            while remaining:
+                count = min(remaining, 512)
+                stream.write(cluster_bytes * count)
+                remaining -= count
+        request["model"]["point_count"] = len(vertices) + len(cluster) * repetitions
+        request["parameters"]["sampling_limit"] = request["model"]["point_count"]
+        return request, data
+
+    def test_large_mesh_auto_grid_distance_preserves_analytic_values(self):
+        """고밀도 미세 군집의 자동 격자가 메모리 오류 없이 정확한 표면 거리와 병렬 일치를 유지합니다."""
+        request, data = self.large_mesh_grid_request("distance", max_threads=1)
+        result = self.run_request(request)
+        expected_bytes = (self.root / result["distances_file"]).read_bytes()
+        distances = struct.unpack("<" + "d" * len(data), expected_bytes)
+        for actual, expected in zip(distances, [0.0] * 8 + [.125] * 64):
+            self.assertAlmostEqual(actual, expected, delta=1e-7)
+        request["parameters"]["max_threads"] = 4
+        result = self.run_request(request)
+        self.assertEqual((self.root / result["distances_file"]).read_bytes(), expected_bytes)
+
+    def test_large_mesh_auto_grid_registration_preserves_identity(self):
+        """등록 내부의 동일 고단계 격자도 정상 표면의 항등 변환과 영 잔차를 보존합니다."""
+        request, data = self.large_mesh_grid_request("register")
+        result = self.run_request(request)
+        for actual, expected in zip(apply_matrix(data, result["matrix_4x4"]), data):
+            for coordinate, target in zip(actual, expected):
+                self.assertAlmostEqual(coordinate, target, delta=1e-7)
+        self.assertAlmostEqual(result["scale"], 1.0, delta=1e-7)
+        self.assertLess(result["final_rms"], 1e-7)
+
     def test_point_and_mesh_distance_single_and_parallel_equivalence(self):
         """C2C·C2M 거리 배열이 단일·병렬 실행에서 같은 값을 유지하는지 확인합니다."""
         cases=[

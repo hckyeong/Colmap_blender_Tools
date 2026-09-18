@@ -179,7 +179,7 @@ def physical_native_call_summaries(logical_operations: list[dict]) -> list[dict]
 
 
 def make_native_runtime(directory: Path) -> tuple[Path, dict]:
-    """등록 안전 패치 식별자를 포함하는 최소 v4 실행 환경을 만듭니다."""
+    """등록 안전·격자 메모리 패치 지문을 포함하는 최소 v4 실행 환경을 만듭니다."""
     directory.mkdir(parents=True, exist_ok=True)
     binary_contents = {
         "colmap_cccore_worker.exe": b"worker-v4",
@@ -196,14 +196,22 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
         "id": "farthest-mesh-correspondence-v1", "file": "patches/farthest_mesh_correspondence.patch",
         "sha256": "b" * 64, "original_sha256": "c" * 64, "patched_sha256": "d" * 64,
     }
-    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"]
+    grid = {
+        "id": "mesh-grid-memory-budget-v1", "file": "patches/mesh_grid_memory_budget.patch",
+        "sha256": "e" * 64, "files": [{"path": "src/DistanceComputationTools.cpp",
+                                        "original_sha256": "f" * 64, "patched_sha256": "a" * 64}],
+    }
+    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"]
     manifest = {
         "protocol_version": contract.CC_NATIVE_PROTOCOL_VERSION,
         "platform": "windows-x64",
         "core_commit": thread_metadata["core_commit"],
         "core_patch": thread_metadata["core_patch"],
         "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
-                         "cccore": {"registration_safety_patch": safety}},
+                         "cccore": {"registration_safety_patch": safety, "mesh_grid_memory_patch": grid}},
+        "mesh_grid_memory_patch": grid["id"],
+        "mesh_grid_memory_patch_sha256": grid["sha256"],
+        "mesh_grid_source_sha256": {item["path"]: item["patched_sha256"] for item in grid["files"]},
         "registration_safety_patch": safety["id"],
         "registration_safety_patch_sha256": safety["sha256"],
         "patched_registration_sha256": safety["patched_sha256"],
@@ -929,6 +937,48 @@ class PureContractTests(unittest.TestCase):
                 target.write_bytes(target.read_bytes() + b" ")
                 with self.assertRaises(contract.CcCoreEnvironmentError):
                     runner.call("distance", {"point_count": 1}, {"point_count": 1})
+
+    def test_native_identity_requires_mesh_grid_patch_and_matching_sources(self) -> None:
+        """구형 실행 환경과 격자 패치·최종 원문 지문 불일치를 실행 전에 거부합니다."""
+        cases = ("missing_id", "missing_hash", "missing_sources", "missing_dependency", "wrong_id",
+                 "missing_core_patch", "wrong_patch_hash", "wrong_source_hash", "wrong_source_path",
+                 "duplicate_source", "invalid_original_hash", "invalid_patched_hash")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                executable, manifest = make_native_runtime(Path(temporary) / "runtime")
+                identity = solver.native_build_identity(executable)
+                self.assertEqual(identity["mesh_grid_memory_patch"], "mesh-grid-memory-budget-v1")
+                self.assertEqual(identity["mesh_grid_memory_patch_sha256"], "e" * 64)
+                self.assertEqual(identity["mesh_grid_source_sha256"], {"src/DistanceComputationTools.cpp": "a" * 64})
+                dependency = manifest["dependencies"]["cccore"]
+                grid = dependency["mesh_grid_memory_patch"]
+                if case == "missing_id":
+                    manifest.pop("mesh_grid_memory_patch")
+                elif case == "missing_hash":
+                    manifest.pop("mesh_grid_memory_patch_sha256")
+                elif case == "missing_sources":
+                    manifest.pop("mesh_grid_source_sha256")
+                elif case == "missing_dependency":
+                    dependency.pop("mesh_grid_memory_patch")
+                elif case == "wrong_id":
+                    grid["id"] = manifest["mesh_grid_memory_patch"] = "unrecognized-patch"
+                elif case == "missing_core_patch":
+                    manifest["core_patch"] = manifest["core_patch"].replace("+mesh-grid-memory-budget-v1", "")
+                elif case == "wrong_patch_hash":
+                    manifest["mesh_grid_memory_patch_sha256"] = "0" * 64
+                elif case == "wrong_source_hash":
+                    manifest["mesh_grid_source_sha256"]["src/DistanceComputationTools.cpp"] = "0" * 64
+                elif case == "wrong_source_path":
+                    grid["files"][0]["path"] = "src/Other.cpp"
+                elif case == "duplicate_source":
+                    grid["files"].append(dict(grid["files"][0]))
+                elif case == "invalid_original_hash":
+                    grid["files"][0]["original_sha256"] = "invalid"
+                elif case == "invalid_patched_hash":
+                    grid["files"][0]["patched_sha256"] = "invalid"
+                contract.write_json_atomic(executable.with_name("runtime_manifest.json"), manifest)
+                with self.assertRaises(contract.CcCoreEnvironmentError):
+                    solver.native_build_identity(executable)
 
     def test_native_runner_requires_manifest_fields(self) -> None:
         """시작 시 필수 Manifest 필드가 빠진 v4 런타임을 거부합니다."""

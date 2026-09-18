@@ -55,7 +55,7 @@ PowerShell 7에서 다음 명령을 실행합니다. 출력은 지정한 격리 
 
 ## 배포된 원문만으로 재빌드
 
-원문 ZIP을 별도 작업 폴더에 풀고, 해당 폴더에서 실행합니다. ZIP의 코어는 기존 두 패치와 등록 안전 패치가 적용된 상태이며 `tbb/`에는 검증된 공식 Windows 패키지가 있습니다. 네트워크 다운로드가 필요하지 않습니다.
+원문 ZIP을 별도 작업 폴더에 풀고, 해당 폴더에서 실행합니다. ZIP의 코어는 배율·동시성·등록 안전·격자 메모리 패치가 적용된 상태이며 `tbb/`에는 검증된 공식 Windows 패키지가 있습니다. 네트워크 다운로드가 필요하지 않습니다.
 
 ```powershell
 $cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
@@ -64,7 +64,7 @@ Expand-Archive -LiteralPath .\tbb\oneapi-tbb-2022.0.0-win.zip -DestinationPath .
   "-DCCCORE_SOURCE=$PWD\cccore-src" "-DJSON_INCLUDE_DIR=$PWD\json" `
   "-DTBB_DIR=$PWD\tbb\oneapi-tbb-2022.0.0\lib\cmake\tbb" `
   -DCORE_COMMIT=dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 `
-  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1
+  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1
 & $cmake --build .\build --config Release --parallel 8
 Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -Destination .\build\bin\tbb12.dll
 & .\build\bin\colmap_cccore_worker.exe --check-environment
@@ -80,7 +80,15 @@ v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비
 
 독립 거리 API의 삼각면 경로는 `octreeLevel=0`을 자동 보정하지 않아 실데이터 약 3만 점과 6만 5천 면을 단일 셀에서 비교했습니다. 기존 실험의 전체 계산은 약 264초였으며 거리 평가가 대부분을 차지했습니다. 워커는 동일 고정 코어의 `RegistrationTools.cpp`가 사용하는 공개 `DgmOctree::findBestLevelForComparisonWithOctree`로 점군과 메시 꼭짓점의 옥트리 단계 값을 선택합니다. 거리 계산 자체는 공식 `computeCloud2MeshDistances`를 그대로 사용합니다. 임의 고정 단계나 거리 근사는 적용하지 않았습니다.
 
-회귀는 삼각면 내부·외부의 기존 해석적 정답을 유지하고, 64800개 삼각면과 30000개 점의 해석적 거리 및 15초 처리 한도를 검사합니다. 이 변경은 워커의 공개 API 설정이며 해당 거리 최적화는 코어 원문을 바꾸지 않으며, 등록 안전 수정은 아래 별도 패치로 고지합니다.
+회귀는 삼각면 내부·외부의 기존 해석적 정답을 유지하고, 64800개 삼각면과 30000개 점의 해석적 거리 및 15초 처리 한도를 검사합니다. 이 자동 선택은 워커의 공개 API 설정입니다. 0.3.56부터 선택한 수준을 아래 메모리 예산 패치로 제한합니다.
+
+### 메시 격자 메모리 예산
+
+`mesh-grid-memory-budget-v1`은 공통 `computeCloud2MeshDistances`에서 실제 결합 경계·셀 크기를 사용해 교차 격자의 포인터 배열 크기를 계산합니다. 요청 단계에서 시작해 예산 안에 들어오는 가장 세밀한 단계를 선택합니다. Windows 예산은 `min(256 MiB, min(가용 물리 메모리, 프로세스 가용 커밋)/16)`이며, 조회 실패·다른 운영체제는 16 MiB를 사용합니다. 면 목록·좌표·병렬 작업의 추가 메모리를 남기기 위한 포인터 배열 예산이며 전체 프로세스 메모리의 상한은 아닙니다.
+
+평면 축의 3칸 보정, 비유한 셀 크기, 인덱스·곱셈 범위를 검사합니다. 요청 단계 0은 기존 단일 셀 의미를 보존하며, 실행 가능한 단계가 없으면 메모리 오류를 반환합니다. 거리 맵 근사는 바꾸지 않고 실제 제품의 정확 거리 경로만 보호합니다. 호출자 매개변수의 요청 단계와 공개 API·ABI·v4 규약은 유지합니다. 준비 조회와 ICP 내부 반복·최종 거리 평가가 모두 같은 공통 보호를 사용합니다.
+
+원본 면이나 표본 수를 줄이지 않으며 단계 변경으로 거리 근사를 켜지 않습니다. 패치 원문과 적용 전후 SHA-256은 `dependencies.lock.json`의 `mesh_grid_memory_patch`, 런타임의 패치 식별자·최종 원문 지문은 `runtime_manifest.json`에 연결합니다. 빌드와 실행 전 검증은 이 패치가 없는 구형 런타임을 거부합니다. 회귀에는 200만 정점에서 기존 자동 격자 실패를 재현하는 해석적 거리와 실제 등록 사례가 포함됩니다.
 
 ## 메시 최원거리점 필터의 대응 식별자 보존
 

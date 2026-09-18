@@ -1,0 +1,157 @@
+diff --git a/src/DistanceComputationTools.cpp b/src/DistanceComputationTools.cpp
+--- a/src/DistanceComputationTools.cpp
++++ b/src/DistanceComputationTools.cpp
+@@ -20,6 +20,16 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cassert>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ 
+ #ifndef CC_DEBUG
+ #if defined(CC_CORE_LIB_USES_QT_CONCURRENT)
+@@ -1861,12 +1871,100 @@
+ #endif // ENABLE_CLOUD2MESH_DIST_MT
+ }
+ 
++
++namespace
++{
++// 포인터 격자만 제한하며 면 목록·좌표·병렬 작업을 포함한 전체 메모리는 보장하지 않습니다.
++std::uint64_t MeshGridPointerBudget(std::uint64_t availablePhysical, std::uint64_t availableCommit, bool available)
++{
++	const std::uint64_t maximumBudget = 256ull * 1024 * 1024;
++	const std::uint64_t fallbackBudget = 16ull * 1024 * 1024;
++	return available ? std::min(maximumBudget, std::min(availablePhysical, availableCommit) / 16) : fallbackBudget;
++}
++
++// 운영체제의 가용 물리·커밋 메모리를 조회하고 실패하면 보수적인 고정 예산을 사용합니다.
++std::uint64_t AvailableMeshGridPointerBudget()
++{
++#if defined(_WIN32)
++	MEMORYSTATUSEX status{};
++	status.dwLength = sizeof(status);
++	if (GlobalMemoryStatusEx(&status))
++		return MeshGridPointerBudget(status.ullAvailPhys, status.ullAvailPageFile, true);
++#endif
++	return MeshGridPointerBudget(0, 0, false);
++}
++
++// 실제 교차 격자의 단정도 인덱스·평면축 보정을 재현하고 크기 및 곱셈 범위를 검사합니다.
++bool MeshGridPointerBytes(const CCVector3& meshMin, const CCVector3& meshMax,
++	const CCVector3& gridMin, PointCoordinateType cellSize, std::uint64_t& bytes)
++{
++	bytes = 0;
++	if (!std::isfinite(cellSize) || cellSize <= 0)
++		return false;
++	std::uint64_t cells = 1;
++	for (unsigned axis = 0; axis < 3; ++axis)
++	{
++		if (!std::isfinite(meshMin.u[axis]) || !std::isfinite(meshMax.u[axis])
++			|| !std::isfinite(gridMin.u[axis]) || meshMin.u[axis] > meshMax.u[axis])
++			return false;
++		const double first = std::floor((meshMin.u[axis] - gridMin.u[axis]) / cellSize);
++		const double last = std::floor((meshMax.u[axis] - gridMin.u[axis]) / cellSize);
++		if (!std::isfinite(first) || !std::isfinite(last)
++			|| first < (std::numeric_limits<int>::min)() || last > (std::numeric_limits<int>::max)()
++			|| first > last)
++			return false;
++		std::uint64_t dimension = static_cast<std::uint64_t>(last - first) + 1;
++		if (dimension > static_cast<std::uint64_t>((std::numeric_limits<int>::max)()))
++			return false;
++		if (dimension == 1)
++		{
++			if (last > (std::numeric_limits<int>::max)() - 2
++				|| !std::isfinite(gridMin.u[axis] - cellSize))
++				return false;
++			dimension = 3;
++		}
++		if (cells > (std::numeric_limits<std::uint64_t>::max)() / dimension)
++			return false;
++		cells *= dimension;
++	}
++	if (cells > (std::numeric_limits<std::uint64_t>::max)() / sizeof(void*)
++		|| cells > (std::numeric_limits<std::size_t>::max)() / sizeof(void*))
++		return false;
++	bytes = cells * sizeof(void*);
++	return true;
++}
++
++// 기본값 0의 단일 셀을 보존하고 요청 범위에서 가장 세밀한 실행 가능 단계를 선택합니다.
++bool SelectMeshGridLevel(const CCVector3& meshMin, const CCVector3& meshMax,
++	const CCVector3& gridMin, const DgmOctree& octree, unsigned char requestedLevel,
++	std::uint64_t budget, unsigned char& selectedLevel)
++{
++	const int minimumLevel = requestedLevel == 0 ? 0 : 1;
++	for (int level = requestedLevel; level >= minimumLevel; --level)
++	{
++		std::uint64_t bytes = 0;
++		if (MeshGridPointerBytes(meshMin, meshMax, gridMin,
++			octree.getCellSize(static_cast<unsigned char>(level)), bytes) && bytes <= budget)
++		{
++			selectedLevel = static_cast<unsigned char>(level);
++			return true;
++		}
++	}
++	return false;
++}
++}
++
++// 실제 격자 예산 안에서 정확 거리 계산 단계를 제한하며 호출자의 요청 단계는 보존합니다.
+ int DistanceComputationTools::computeCloud2MeshDistances(	GenericIndexedCloudPersist* pointCloud,
+ 															GenericIndexedMesh* mesh,
+ 															Cloud2MeshDistancesComputationParams& params,
+ 															GenericProgressCallback* progressCb/*=nullptr*/,
+ 															DgmOctree* cloudOctree/*=nullptr*/)
+ {
++
++	// 기본값 0은 단일 셀로 유지하고 배열 조회의 상한만 검사합니다.
++	if (params.octreeLevel > DgmOctree::MAX_OCTREE_LEVEL)
++		return DISTANCE_COMPUTATION_RESULTS::ERROR_OCTREE_LEVEL_GT_MAX_OCTREE_LEVEL;
+ 	//check the input
+ 	if (!pointCloud)
+ 	{
+@@ -1972,7 +2070,19 @@
+ 		}
+ 	}
+ 
+-	PointCoordinateType cellSize = octree->getCellSize(params.octreeLevel);
++
++	Cloud2MeshDistancesComputationParams effectiveParams = params;
++	// 실제 거리 맵 근사 경로는 그대로 두고 포인터 격자를 사용하는 정확 계산만 보호합니다.
++	if (!params.useDistanceMap)
++	{
++		CCVector3 meshMin;
++		CCVector3 meshMax;
++		mesh->getBoundingBox(meshMin, meshMax);
++		if (!SelectMeshGridLevel(meshMin, meshMax, cubicalMinBB, *octree,
++			params.octreeLevel, AvailableMeshGridPointerBudget(), effectiveParams.octreeLevel))
++			return DISTANCE_COMPUTATION_RESULTS::ERROR_OUT_OF_MEMORY;
++	}
++	PointCoordinateType cellSize = octree->getCellSize(effectiveParams.octreeLevel);
+ 
+ 	//Intersect the octree (grid) with the mesh
+ 	GridAndMeshIntersection intersection;
+@@ -1996,8 +2106,12 @@
+ 	pointCloud->setPointScalarValues(CCCoreLib::NAN_VALUE);
+ 
+ 	//WE CAN EVENTUALLY COMPUTE THE DISTANCES!
+-	int result = computeCloud2MeshDistancesWithOctree(octree, intersection, params, progressCb);
+-
++	int result = computeCloud2MeshDistancesWithOctree(octree, intersection, effectiveParams, progressCb);
++
++
++	// 단계 외의 기존 출력 매개변수 변경은 유지합니다.
++	effectiveParams.octreeLevel = params.octreeLevel;
++	params = effectiveParams;
+ 	//don't forget to compute the square root of the (squared) unsigned distances
+ 	if (result == DISTANCE_COMPUTATION_RESULTS::SUCCESS &&
+ 			!params.signedDistances &&

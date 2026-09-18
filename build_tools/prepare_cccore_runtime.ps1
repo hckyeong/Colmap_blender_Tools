@@ -155,19 +155,34 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 패치 식별자·최종 원문·허용 파일과 배포 해시를 빠짐없이 연결하는지 검사합니다. #>
+    <# Manifest가 등록·격자 메모리 패치와 최종 원문·배포 해시를 빠짐없이 연결하는지 검사합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.protocol_version -ne $Lock.protocol_version -or $manifest.tbb_version -ne $Lock.tbb.version) {
         throw "Runtime Manifest의 프로토콜 또는 oneTBB 버전이 잠금 정보와 다릅니다."
     }
-    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)"
+    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)"
     if ($manifest.core_patch -ne $expectedCorePatch -or $manifest.self_test.core_patch -ne $expectedCorePatch -or
         $manifest.registration_safety_patch -ne $Lock.cccore.registration_safety_patch.id -or
         $manifest.registration_safety_patch_sha256 -ne $Lock.cccore.registration_safety_patch.sha256 -or
         $manifest.patched_registration_sha256 -ne $Lock.cccore.registration_safety_patch.patched_sha256) {
         throw "Runtime Manifest의 등록 안전 패치 또는 최종 원문 해시가 잠금 정보와 다릅니다."
+    }
+    $gridPatch = $Lock.cccore.mesh_grid_memory_patch
+    if ($manifest.mesh_grid_memory_patch -ne $gridPatch.id -or
+        $manifest.mesh_grid_memory_patch_sha256 -ne $gridPatch.sha256) {
+        throw "Runtime Manifest의 격자 메모리 패치가 잠금 정보와 다릅니다."
+    }
+    $gridSourceNames = @($manifest.mesh_grid_source_sha256.PSObject.Properties.Name | Sort-Object)
+    $expectedGridNames = @($gridPatch.files | ForEach-Object { $_.path } | Sort-Object)
+    if (@(Compare-Object -ReferenceObject $expectedGridNames -DifferenceObject $gridSourceNames).Count -ne 0) {
+        throw "Runtime Manifest의 격자 메모리 원문 목록이 다릅니다."
+    }
+    foreach ($source in $gridPatch.files) {
+        if ($manifest.mesh_grid_source_sha256.($source.path) -ne $source.patched_sha256) {
+            throw "Runtime Manifest의 격자 메모리 최종 원문 해시가 다릅니다: $($source.path)"
+        }
     }
     $manifestFiles = @($manifest.runtime_files | ForEach-Object { [string]$_ } | Sort-Object)
     if (@(Compare-Object -ReferenceObject @($ExpectedRuntimeFiles | Sort-Object) -DifferenceObject $manifestFiles).Count -ne 0) {
@@ -252,6 +267,17 @@ Assert-Hash $RegistrationSource $RegistrationSafetyPatch.patched_sha256
 $ConcurrencyPatch = $Lock.cccore.concurrency_patch
 $ConcurrencyPatchFile = Join-Path $NativeSource $ConcurrencyPatch.patch_file
 Assert-Hash $ConcurrencyPatchFile $ConcurrencyPatch.patch_sha256
+$MeshGridPatch = $Lock.cccore.mesh_grid_memory_patch
+$MeshGridPatchFile = Join-Path $NativeSource $MeshGridPatch.file
+Assert-Hash $MeshGridPatchFile $MeshGridPatch.sha256
+$MeshGridSources = @{}
+foreach ($source in $MeshGridPatch.files) {
+    $MeshGridSources[$source.path] = $source
+    $predecessor = @($ConcurrencyPatch.files | Where-Object { $_.path -eq $source.path })
+    if ($predecessor.Count -ne 1 -or $predecessor[0].patched_sha256 -ne $source.original_sha256) {
+        throw "격자 메모리 패치의 입력 원문이 동시성 패치 결과와 연결되지 않습니다: $($source.path)"
+    }
+}
 $originalConcurrencyFiles = 0
 $patchedConcurrencyFiles = 0
 foreach ($source in $ConcurrencyPatch.files) {
@@ -259,6 +285,9 @@ foreach ($source in $ConcurrencyPatch.files) {
     $sourceHash = Get-NormalizedSha256 $sourcePath
     if ($sourceHash -eq $source.original_normalized_sha256) { $originalConcurrencyFiles++ }
     elseif ($sourceHash -eq $source.patched_sha256) { $patchedConcurrencyFiles++ }
+    elseif ($MeshGridSources.ContainsKey($source.path) -and $sourceHash -eq $MeshGridSources[$source.path].patched_sha256) {
+        $patchedConcurrencyFiles++
+    }
     else { throw "CCCoreLib 동시성 패치 원문 해시가 다릅니다: $($source.path)" }
 }
 if ($originalConcurrencyFiles -and $patchedConcurrencyFiles) { throw "CCCoreLib 동시성 패치가 일부 파일에만 적용되어 있습니다." }
@@ -271,7 +300,27 @@ if ($originalConcurrencyFiles -eq $ConcurrencyPatch.files.Count) {
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $ConcurrencyPatchFile)
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $ConcurrencyPatchFile)
 }
-foreach ($source in $ConcurrencyPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
+# 후속 격자 패치가 적용된 캐시도 허용하되 두 단계의 원문 해시를 모두 고정합니다.
+foreach ($source in $ConcurrencyPatch.files) {
+    $sourcePath = Join-Path $CoreSource $source.path
+    if ($MeshGridSources.ContainsKey($source.path) -and
+        (Get-NormalizedSha256 $sourcePath) -eq $MeshGridSources[$source.path].patched_sha256) { continue }
+    Assert-Hash $sourcePath $source.patched_sha256
+}
+$originalGridFiles = 0
+$patchedGridFiles = 0
+foreach ($source in $MeshGridPatch.files) {
+    $sourceHash = Get-NormalizedSha256 (Join-Path $CoreSource $source.path)
+    if ($sourceHash -eq $source.original_sha256) { $originalGridFiles++ }
+    elseif ($sourceHash -eq $source.patched_sha256) { $patchedGridFiles++ }
+    else { throw "격자 메모리 패치 원문 해시가 다릅니다: $($source.path)" }
+}
+if ($originalGridFiles -and $patchedGridFiles) { throw "격자 메모리 패치가 일부 파일에만 적용되어 있습니다." }
+if ($originalGridFiles -eq $MeshGridPatch.files.Count) {
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $MeshGridPatchFile)
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $MeshGridPatchFile)
+}
+foreach ($source in $MeshGridPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
 Get-PinnedFile $Lock.json.header_url (Join-Path $Dependencies 'json.hpp') $Lock.json.header_sha256
 Get-PinnedFile $Lock.json.license_url (Join-Path $Dependencies 'json-LICENSE.MIT') $Lock.json.license_sha256
 Get-PinnedFile $Lock.tbb.archive_url $TbbArchive $Lock.tbb.archive_sha256
@@ -293,7 +342,7 @@ $CMake = Join-Path $VisualStudio "Common7\IDE\CommonExtensions\Microsoft\CMake\C
 if (!(Test-Path -LiteralPath $CMake)) { throw "Visual Studio에 포함된 CMake를 찾지 못했습니다." }
 Invoke-Checked $CMake @('-S',$NativeSource,'-B',$BuildPath,'-G','Visual Studio 17 2022','-A','x64',
     "-DCCCORE_SOURCE=$CoreSource","-DJSON_INCLUDE_DIR=$Dependencies","-DTBB_DIR=$TbbCMake","-DCORE_COMMIT=$($Lock.cccore.commit)",
-    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)")
+    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)")
 Invoke-Checked $CMake @('--build',$BuildPath,'--config','Release','--parallel','8')
 foreach ($binary in @('colmap_cccore_worker.exe','CCCoreLib.dll')) {
     Copy-Item -LiteralPath (Join-Path $BuildPath "bin\$binary") -Destination (Join-Path $StagedRuntime $binary) -Force
@@ -358,17 +407,22 @@ $LicenseHashes = [ordered]@{}
 foreach ($license in $RuntimeLicenses) {
     $LicenseHashes[$license] = (Get-FileHash -LiteralPath (Join-Path $StagedRuntime "licenses\$license") -Algorithm SHA256).Hash.ToLowerInvariant()
 }
+$MeshGridSourceHashes = [ordered]@{}
+foreach ($source in $MeshGridPatch.files) { $MeshGridSourceHashes[$source.path] = $source.patched_sha256 }
 $Manifest = [ordered]@{
     protocol_version = $Lock.protocol_version
     platform = 'windows-x64'
     core_commit = $Lock.cccore.commit
-    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)"
+    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)"
     core_patch_sha256 = $Lock.cccore.patch_sha256
     concurrency_patch = $ConcurrencyPatch.patch_id
     concurrency_patch_sha256 = $ConcurrencyPatch.patch_sha256
     registration_safety_patch = $RegistrationSafetyPatch.id
     registration_safety_patch_sha256 = $RegistrationSafetyPatch.sha256
     patched_registration_sha256 = $RegistrationSafetyPatch.patched_sha256
+    mesh_grid_memory_patch = $MeshGridPatch.id
+    mesh_grid_memory_patch_sha256 = $MeshGridPatch.sha256
+    mesh_grid_source_sha256 = $MeshGridSourceHashes
     dependencies = $Lock
     build_options = @{ CCCORELIB_SHARED=$true; CCCORELIB_USE_QT_CONCURRENT=$false; CCCORELIB_USE_TBB=$true; CCCORELIB_USE_CGAL=$false; configuration='Release' }
     cmake_version = ((& $CMake --version) | Select-Object -First 1)

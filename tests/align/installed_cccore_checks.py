@@ -272,7 +272,7 @@ def _verified_thread_metadata(
 
 def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, reference_mesh: bool,
                                 native_path: Path) -> dict[str, Any]:
-    """설치본의 표본 목표·실제 후보 수·방향별 고정 평가 분모와 주지표를 검증합니다."""
+    """설치본 패치 지문과 표본 목표·방향별 고정 평가 분모·주지표를 검증합니다."""
     assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v4"
     assert metadata["job_protocol_version"] == "cccore-job-v4"
     identity = metadata["native_build_identity"]
@@ -283,6 +283,14 @@ def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, ref
     assert safety["id"] == identity["registration_safety_patch"]
     assert identity["registration_safety_patch_sha256"] == safety["sha256"]
     assert identity["patched_registration_sha256"] == safety["patched_sha256"]
+    grid = runtime_manifest["dependencies"]["cccore"]["mesh_grid_memory_patch"]
+    assert grid["id"] == identity["mesh_grid_memory_patch"] == "mesh-grid-memory-budget-v1"
+    assert grid["id"] in identity["core_patch"].split("+")
+    assert grid["id"] in metadata["core_patch"].split("+")
+    assert identity["mesh_grid_memory_patch_sha256"] == grid["sha256"]
+    assert identity["mesh_grid_source_sha256"] == {
+        item["path"]: item["patched_sha256"] for item in grid["files"]
+    }
     parameters = metadata["parameters"]
     assert parameters["point_sample_count"] == parameters["mesh_sample_count"] == 50000
     assert parameters["evaluation_sample_count"] == 30000

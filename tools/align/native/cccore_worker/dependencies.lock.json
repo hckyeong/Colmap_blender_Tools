@@ -42,6 +42,18 @@
           "patched_sha256": "1fe77038451dfed19dcd3a772d95519c6e729b6c80c817e949487a1c566af7dc"
         }
       ]
+    },
+    "mesh_grid_memory_patch": {
+      "id": "mesh-grid-memory-budget-v1",
+      "file": "patches/mesh_grid_memory_budget.patch",
+      "sha256": "41a41b8ef7b946a8ea79e4753c05b49511233478eca3874a3143a949e78d2d32",
+      "files": [
+        {
+          "path": "src/DistanceComputationTools.cpp",
+          "original_sha256": "1fe77038451dfed19dcd3a772d95519c6e729b6c80c817e949487a1c566af7dc",
+          "patched_sha256": "4fca04fd590ba9b6b3028b1d5c9acde833fff75130468bffce51f14bdaf01e1f"
+        }
+      ]
     }
   },
   "nanoflann": {

@@ -152,23 +152,28 @@ def validate_cccore_runtime(runtime_root):
 
 
 def validate_cccore_distribution(runtime_root):
-    """배포 파일·라이선스·등록 안전 패치와 최종 재빌드 원문을 고정 소스와 대조합니다."""
+    """배포 파일·등록·격자 메모리 패치와 최종 재빌드 원문을 고정 소스와 대조합니다."""
     root = Path(runtime_root).resolve()
     manifest = validate_cccore_runtime(root)
     lock = read_json(ROOT / "tools/align/native/cccore_worker/dependencies.lock.json")
     if manifest.get("dependencies") != lock:
         raise RuntimeError("CC 런타임의 의존성 잠금 정보가 현재 소스와 다릅니다.")
     safety = lock["cccore"]["registration_safety_patch"]
+    grid = lock["cccore"]["mesh_grid_memory_patch"]
     expected_core_patch = "+".join((
         lock["cccore"]["patch_id"], lock["cccore"]["concurrency_patch"]["patch_id"], safety["id"],
+        grid["id"],
     ))
     expected_safety = {
         "core_patch": expected_core_patch, "registration_safety_patch": safety["id"],
         "registration_safety_patch_sha256": safety["sha256"],
         "patched_registration_sha256": safety["patched_sha256"],
+        "mesh_grid_memory_patch": grid["id"],
+        "mesh_grid_memory_patch_sha256": grid["sha256"],
+        "mesh_grid_source_sha256": {source["path"]: source["patched_sha256"] for source in grid["files"]},
     }
     if any(manifest.get(name) != expected for name, expected in expected_safety.items()):
-        raise RuntimeError("CC 런타임의 등록 안전 패치 또는 최종 원문 해시가 고정 계약과 다릅니다.")
+        raise RuntimeError("CC 런타임의 등록·격자 메모리 패치 또는 최종 원문 해시가 고정 계약과 다릅니다.")
     if manifest["self_test"].get("core_patch") != expected_core_patch:
         raise RuntimeError("CC 자체 검사의 코어 패치 식별자가 최종 원문과 다릅니다.")
     required = {
@@ -202,10 +207,12 @@ def validate_cccore_distribution(runtime_root):
         source_hashes = {
             "native/" + safety["file"]: safety["sha256"],
             "cccore-src/src/RegistrationTools.cpp": safety["patched_sha256"],
+            "native/" + grid["file"]: grid["sha256"],
+            **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in grid["files"]},
         }
         for name, expected_hash in source_hashes.items():
             if hashlib.sha256(archive.read(name)).hexdigest() != expected_hash:
-                raise RuntimeError(f"CC 배포 원문의 등록 안전 패치 해시가 다릅니다: {name}")
+                raise RuntimeError(f"CC 배포 원문의 등록·격자 메모리 패치 해시가 다릅니다: {name}")
         if json.loads(archive.read("native/dependencies.lock.json")) != lock:
             raise RuntimeError("CC 배포 원문의 의존성 잠금 정보가 현재 소스와 다릅니다.")
         for field, name in (("worker_source_sha256", "main.cpp"), ("cmake_source_sha256", "CMakeLists.txt")):
