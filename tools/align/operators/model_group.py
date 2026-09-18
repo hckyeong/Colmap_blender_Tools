@@ -36,6 +36,7 @@ from ..properties import sync_marker_pair_list
 from ..session import is_session_active_for_window, session_align_workspace
 from ..status import set_workspace_status_text
 from ..state import RUNTIME
+from ..viewport.picking import discard_mesh_surface_pick_cache_for_model
 from ..viewport.point_data import surface_model_data_for_id
 from ..viewport.renderer import discard_gpu_batch_for_model, request_redraw
 from .marker_alignment import is_marker_preview_active
@@ -170,7 +171,7 @@ def model_deletion_block_reason(model_id: str | None = None) -> str | None:
 
 
 def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
-    """모델 삭제를 원자 확정하며 실패하면 같은 원본의 등록 순서와 대표까지 복원합니다."""
+    """삭제 확정 후 소유 피킹 캐시를 해제하며 실패하면 등록 순서와 대표까지 복원합니다."""
     normalized_id = str(model_id).strip()
     reason = model_deletion_block_reason(normalized_id)
     if reason is not None:
@@ -256,6 +257,7 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
         RUNTIME.gpu_batches.update(gpu_snapshot)
         raise
 
+    discard_mesh_surface_pick_cache_for_model(normalized_id)
     for asset_uuid in embedded_asset_uuids:
         try:
             remove_embedded_obj_mesh(asset_uuid, expected_model_id=normalized_id)

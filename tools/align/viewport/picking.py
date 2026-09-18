@@ -21,7 +21,7 @@ from ..constants import (
     ROLE_MOVING,
     ROLE_REFERENCE,
 )
-from ..geometry_access import geometry_kind_for_model
+from ..geometry_access import display_point_indices_for_model, geometry_kind_for_model
 from ..marker_geometry import normalize_marker_geometry_source
 from ..display_axes import ModelDisplayTransform, display_positions
 from ..logging_utils import get_logger
@@ -36,10 +36,29 @@ from .point_data import (
     runtime_models,
 )
 from .registry import find_window_region, role_for_area
+from .embedded_pick_bvh import build_embedded_pick_bvh
 
 
 _LOGGER = get_logger("viewport.picking")
-_MESH_SURFACE_BVH_CACHE: dict[tuple[str, str, int, int, int, int], BVHTree] = {}
+_MESH_SURFACE_BVH_CACHE: dict[tuple[str, str, int, int, int, int], _MeshSurfacePickBvh] = {}
+
+
+@dataclass(frozen=True)
+class _MeshSurfacePickBvh:
+    """검색 구조와 원본 Polygon에서 안정 프록시 Triangle ID로 가는 대응을 보관합니다."""
+
+    tree: BVHTree
+    polygon_indices: np.ndarray | None = None
+    triangle_order: np.ndarray | None = None
+
+    def triangle_candidates(self, face_index: int) -> range | np.ndarray:
+        """전체 배열의 형 변환 없이 적중 원본 면의 프록시 삼각형을 ID 순서로 반환합니다."""
+        if self.polygon_indices is None:
+            return range(face_index, face_index + 1)
+        polygon_id = np.uint32(face_index)
+        first = int(np.searchsorted(self.polygon_indices, polygon_id, side="left"))
+        last = int(np.searchsorted(self.polygon_indices, polygon_id, side="right"))
+        return range(first, last) if self.triangle_order is None else self.triangle_order[first:last]
 
 
 @dataclass(frozen=True)
@@ -253,8 +272,8 @@ def _mesh_surface_bvh(
     model_id: str,
     model_data: Any,
     geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
-) -> BVHTree:
-    """축·정렬에 무관한 원본 면 캐시를 소유자·형상 슬롯·리비전별로 재사용합니다."""
+) -> _MeshSurfacePickBvh:
+    """내장 Mesh의 네이티브 검색 구조와 프록시 대응을 형상 리비전별로 재사용합니다."""
 
     vertices = np.asarray(
         getattr(model_data, "vertices_float64", getattr(model_data, "vertices")),
@@ -277,14 +296,26 @@ def _mesh_surface_bvh(
     if cached is not None:
         return cached
     discard_mesh_surface_pick_cache_for_model(model_id, source)
-    tree = BVHTree.FromPolygons(
-        vertices,
-        triangles,
-        all_triangles=True,
-        epsilon=0.0,
-    )
-    _MESH_SURFACE_BVH_CACHE[cache_key] = tree
-    return tree
+    if str(getattr(model_data, "embedded_asset_uuid", "")).strip():
+        try:
+            tree = build_embedded_pick_bvh(model_id, model_data)
+        except RuntimeError as error:
+            raise ModelRepositoryError(f"내장 메시의 면 선택 검색 구조를 만들 수 없습니다: {error}") from error
+        polygon_indices = np.asarray(model_data.triangle_polygon_indices_uint32, dtype=np.uint32)
+        triangle_order = None
+        if np.any(polygon_indices[1:] < polygon_indices[:-1]):
+            triangle_order = np.argsort(polygon_indices, kind="stable")
+            polygon_indices = polygon_indices[triangle_order]
+            triangle_order.setflags(write=False)
+            polygon_indices.setflags(write=False)
+        result = _MeshSurfacePickBvh(tree, polygon_indices, triangle_order)
+    else:
+        # 내장 원본이 없는 배열 모델의 기존 피킹 계약도 유지합니다.
+        result = _MeshSurfacePickBvh(BVHTree.FromPolygons(
+            vertices, triangles, all_triangles=True, epsilon=0.0,
+        ))
+    _MESH_SURFACE_BVH_CACHE[cache_key] = result
+    return result
 
 
 def _ray_triangle_position_float64(
@@ -333,7 +364,7 @@ def _pick_model_mesh_surface_from_ray(
     ray_direction: np.ndarray,
     geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
 ) -> PickResult | None:
-    """선택한 메시 슬롯의 앞쪽 교차점을 원본 면 좌표와 소유 ID로 반환합니다."""
+    """적중 원본 면의 프록시 삼각형만 재교차해 기존 Triangle ID와 float64 좌표를 보존합니다."""
 
     local_origin, local_direction = _ray_in_source_local(
         model_id,
@@ -345,11 +376,14 @@ def _pick_model_mesh_surface_from_ray(
     maximum = np.asarray(getattr(model_data, "bounds_max"), dtype=np.float64)
     if not _ray_intersects_bounds(local_origin, local_direction, minimum, maximum):
         return None
-    location, _normal, face_index, _distance = _mesh_surface_bvh(
+    surface_bvh = _mesh_surface_bvh(
         model_id,
         model_data,
         geometry_source,
-    ).ray_cast(Vector(local_origin.tolist()), Vector(local_direction.tolist()))
+    )
+    location, _normal, face_index, _distance = surface_bvh.tree.ray_cast(
+        Vector(local_origin.tolist()), Vector(local_direction.tolist()),
+    )
     if location is None or face_index is None:
         return None
     vertices = np.asarray(
@@ -360,12 +394,19 @@ def _pick_model_mesh_surface_from_ray(
         getattr(model_data, "triangles_uint32", getattr(model_data, "triangles")),
         dtype=np.uint32,
     )
-    triangle = vertices[triangles[int(face_index)].astype(np.int64, copy=False)]
-    local_position = _ray_triangle_position_float64(
-        local_origin,
-        local_direction,
-        triangle,
-    )
+    local_position = None
+    nearest_distance = math.inf
+    triangle_index = -1
+    for candidate_index in surface_bvh.triangle_candidates(int(face_index)):
+        triangle = vertices[triangles[int(candidate_index)]]
+        candidate_position = _ray_triangle_position_float64(local_origin, local_direction, triangle)
+        if candidate_position is None:
+            continue
+        distance = float(np.dot(candidate_position - local_origin, local_direction))
+        if distance < nearest_distance:
+            nearest_distance = distance
+            local_position = candidate_position
+            triangle_index = int(candidate_index)
     if local_position is None:
         return None
     project_position = effective_positions_for_model_id(
@@ -379,12 +420,12 @@ def _pick_model_mesh_surface_from_ray(
     position = tuple(float(value) for value in local_position)
     return PickResult(
         model_id=model_id,
-        point3d_id=int(face_index),
+        point3d_id=triangle_index,
         position=position,
         screen_distance=0.0,
         depth=ray_depth,
         point_kind=MARKER_POINT_KIND_MESH_SURFACE,
-        source_point_id=int(face_index),
+        source_point_id=triangle_index,
         geometry_source=normalize_marker_geometry_source(geometry_source),
     )
 
@@ -444,16 +485,27 @@ def _pick_model_nearest_point(
     ray_origin: np.ndarray | None = None,
     ray_direction: np.ndarray | None = None,
 ) -> PickResult | None:
-    """반경 안의 표시 점을 형상 간 비교와 같은 광선 깊이 우선순위로 선택합니다."""
+    """메시의 전체 ID·색상을 만들지 않고 표시 정점만 기존 깊이 우선순위로 선택합니다."""
     model_data = model_data_for_id(model_id)
     if model_data is None:
         return None
-    arrays = point_arrays(model_data)
-    display_indices = arrays.display_indices
+    is_mesh = geometry_kind_for_model(model_data) == "TRIANGLE_MESH"
+    if is_mesh:
+        positions = np.asarray(
+            getattr(model_data, "vertices_float64", getattr(model_data, "vertices")),
+            dtype=np.float64,
+        )
+        display_indices = display_point_indices_for_model(model_data)
+        point_ids = None
+    else:
+        arrays = point_arrays(model_data)
+        positions = arrays.positions
+        display_indices = arrays.display_indices
+        point_ids = arrays.point_ids
     if display_indices.size == 0:
         return None
 
-    source_display_positions = arrays.positions[display_indices]
+    source_display_positions = positions[display_indices]
     shown_positions = effective_positions_for_model_id(
         model_id,
         source_display_positions,
@@ -485,16 +537,16 @@ def _pick_model_nearest_point(
     candidate_order = np.lexsort(candidate_keys)
     display_offset = int(candidate_offsets[int(candidate_order[0])])
     source_index = int(display_indices[display_offset])
-    position = arrays.positions[source_index]
+    position = positions[source_index]
     point_kind = (
         MARKER_POINT_KIND_MESH_VERTEX
-        if geometry_kind_for_model(model_data) == "TRIANGLE_MESH"
+        if is_mesh
         else MARKER_POINT_KIND_COLMAP
     )
-    source_point_id = int(arrays.point_ids[source_index])
+    source_point_id = source_index if point_ids is None else int(point_ids[source_index])
     return PickResult(
         model_id=model_id,
-        point3d_id=int(arrays.point_ids[source_index]),
+        point3d_id=source_point_id,
         position=(float(position[0]), float(position[1]), float(position[2])),
         screen_distance=math.sqrt(float(distance_squared[display_offset])),
         depth=float(depths[display_offset]),

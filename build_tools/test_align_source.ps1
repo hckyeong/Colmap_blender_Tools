@@ -25,6 +25,7 @@ $scripts = @(
     "test_geometry_axes_runtime.py", "test_geometry_axes_ui.py", "test_geometry_axes_export.py",
     "test_marker_state.py", "test_marker_alignment_runtime.py", "test_marker_alignment_integration.py",
     "test_marker_preview_combined_clouds.py", "test_mesh_surface_picking.py",
+    "test_embedded_pick_bvh.py", "test_picking_optimization.py", "test_picking_cache_lifecycle.py",
     "test_project_restore.py", "test_project_restore_roundtrip.py",
     "test_marker_geometry_state.py", "test_marker_geometry_ui.py",
     "test_companion_marker_alignment.py", "test_companion_marker_picking.py",
