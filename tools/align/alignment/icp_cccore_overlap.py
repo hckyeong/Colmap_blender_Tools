@@ -102,7 +102,7 @@ def _spatial_metadata(points, bounds):
 def build_overlap_domain(geometry: CcCoreGeometry, model_bounds, radius, distance_query: Callable,
                          *, cancel_probe=None, batch_size=8192, max_subdivision_depth=8,
                          max_candidate_patches=250000) -> OverlapDomain:
-    """보수적인 구 경계와 임시 사분할로 실제 겹침을 잃지 않는 후보를 구성합니다."""
+    """초기 거리 판정을 재사용하고 보수적인 구 경계와 사분할로 겹침 후보를 구성합니다."""
     _cancel(cancel_probe)
     radius = _radius(radius)
     batch_size = _positive_int(batch_size, "CC 거리 조회 묶음 크기")
@@ -142,7 +142,7 @@ def build_overlap_domain(geometry: CcCoreGeometry, model_bounds, radius, distanc
     faces = np.asarray(geometry.triangles)
     if faces.ndim != 2 or faces.shape[1:] != (3,) or not np.issubdtype(faces.dtype, np.integer) or not len(faces) or np.any(faces < 0) or np.any(faces >= len(points)):
         raise CcCoreInputError("CC 후보 삼각면 인덱스가 올바르지 않습니다.")
-    pending, pending_ids, original_area = [], [], 0.0
+    pending, pending_ids, pending_inside, original_area = [], [], [], 0.0
     initial_count = 0
     for start in range(0, len(faces), batch_size):
         _cancel(cancel_probe)
@@ -153,28 +153,39 @@ def build_overlap_domain(geometry: CcCoreGeometry, model_bounds, radius, distanc
         if np.any(keep):
             centers = patch[keep].mean(axis=1)
             radii = np.linalg.norm(patch[keep] - centers[:, None], axis=2).max(axis=1)
-            near = _distances(centers, distance_query, cancel_probe, batch_size) - radii <= radius
+            distances = _distances(centers, distance_query, cancel_probe, batch_size)
+            near = distances - radii <= radius
             ids = np.arange(start, start + len(patch))[keep][near]
             pending.append(patch[keep][near])
             pending_ids.append(ids)
+            pending_inside.append((distances + radii <= radius)[near])
             initial_count += len(ids)
     if not np.isfinite(original_area) or original_area <= 0 or not initial_count:
         raise CcCoreInputError("CC 겹침 후보 면이 없거나 원본 면적이 퇴화했습니다.")
     patches, ids = np.concatenate(pending), np.concatenate(pending_ids)
+    initial_inside = np.concatenate(pending_inside)
+    del pending_inside
     retained, retained_ids, retained_count, limited, additional_patches = [], [], 0, 0, 0
     for depth in range(max_subdivision_depth + 1):
         _cancel(cancel_probe)
         if not len(patches):
             break
-        centers = patches.mean(axis=1)
-        radii = np.linalg.norm(patches - centers[:, None], axis=2).max(axis=1)
-        distances = _distances(centers, distance_query, cancel_probe, batch_size)
-        inside = distances + radii <= radius
-        mixed = (distances - radii <= radius) & ~inside
+        if depth == 0:
+            # 초기 후보는 이미 근접 판정을 통과했으므로 내부 여부만 재사용합니다.
+            inside = initial_inside
+            mixed = ~inside
+            del initial_inside
+        else:
+            centers = patches.mean(axis=1)
+            radii = np.linalg.norm(patches - centers[:, None], axis=2).max(axis=1)
+            distances = _distances(centers, distance_query, cancel_probe, batch_size)
+            inside = distances + radii <= radius
+            mixed = (distances - radii <= radius) & ~inside
         retained.append(patches[inside])
         retained_ids.append(ids[inside])
         retained_count += int(inside.sum())
         patches, ids = patches[mixed], ids[mixed]
+        del inside, mixed
         # 원본 면 수는 제한하지 않고 사분할로 추가되는 조각 수만 예산에서 차감합니다.
         split_count = min(len(patches), max(0, (cap - additional_patches) // 3)) if depth < max_subdivision_depth else 0
         additional_patches += 3 * split_count

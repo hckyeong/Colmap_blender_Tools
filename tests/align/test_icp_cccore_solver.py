@@ -1259,6 +1259,70 @@ NATIVE_WORKER = os.environ.get("CCCORE_NATIVE_WORKER", "")
 class NativeIntegrationTests(unittest.TestCase):
     """실제 CC 바이너리로 coordinator 전체 흐름을 검증합니다."""
 
+    def test_overlap_center_repacking_preserves_native_boundary_and_samples(self) -> None:
+        """경계상 중심의 묶음 재구성이 실제 거리·후보 순서·결정적 표본을 바꾸지 않는지 확인합니다."""
+        from dataclasses import replace
+        import icp_cccore_overlap as overlap
+
+        vertices, triangles = box_mesh()
+        faces = vertices[triangles]
+        centers = faces.mean(axis=1)
+        patches = centers[:, None] + (faces - centers[:, None]) * 0.02
+        patches += np.array((0.0, 0.0, 0.025))
+        # 외딴 면을 사이에 넣어 초기 경계 상자 필터가 재조회와 다른 묶음을 만들게 합니다.
+        interleaved = np.stack((patches, patches + 20.0), axis=1).reshape(-1, 3, 3)
+        geometry = contract.CcCoreGeometry(
+            "TRIANGLE_MESH", interleaved.reshape(-1, 3),
+            np.arange(interleaved.size // 3, dtype=np.uint32).reshape(-1, 3), {},
+        )
+        parameters = contract.resolve_parameters({"cc_max_threads": 1})
+        with tempfile.TemporaryDirectory() as temporary:
+            with solver.NativeRunner(Path(temporary), NATIVE_WORKER, parameters) as runner:
+                model = runner.geometry("repacking-model", vertices, triangles)
+                query_index = 0
+
+                def query(points):
+                    """각 중심·표본 묶음의 실제 CCCore 거리를 독립 형상으로 조회합니다."""
+                    nonlocal query_index
+                    query_index += 1
+                    data = runner.geometry(f"repacking-query-{query_index}", points)
+                    return runner.call("distance", data, model, stage="PREPARING")["distances"]
+
+                patch_centers = patches.mean(axis=1)
+                radii = np.linalg.norm(patches - patch_centers[:, None], axis=2).max(axis=1)
+                distances = query(patch_centers)
+                repacked = np.concatenate([query(patch_centers[start:start + 3])
+                                           for start in range(0, len(patches), 3)])
+                np.testing.assert_array_equal(repacked, distances)
+                threshold = float(distances[0] + radii[0])
+                bounds = np.array((vertices.min(axis=0), vertices.max(axis=0)))
+                for radius in (np.nextafter(threshold, 0.0), threshold, np.nextafter(threshold, np.inf)):
+                    with self.subTest(radius=radius):
+                        domains = [overlap.build_overlap_domain(
+                            geometry, bounds, radius, query, batch_size=batch_size,
+                            max_subdivision_depth=1, max_candidate_patches=18,
+                        ) for batch_size in (5, 8192)]
+                        first, second = domains
+                        first_face_count = int(np.count_nonzero(first.source_indices == 0))
+                        self.assertEqual(first_face_count, 1 if radius >= threshold else 4)
+                        self.assertLess(first.metadata["initial_candidate_face_count"], len(interleaved))
+                        np.testing.assert_array_equal(first.patches, second.patches)
+                        np.testing.assert_array_equal(first.source_indices, second.source_indices)
+                        np.testing.assert_array_equal(first.patch_areas, second.patch_areas)
+                        self.assertEqual(
+                            {key: value for key, value in first.metadata.items() if key != "distance_batch_size"},
+                            {key: value for key, value in second.metadata.items() if key != "distance_batch_size"},
+                        )
+                        # 표본 제안 묶음은 고정하여 후보 구성 단계의 재구성만 비교합니다.
+                        samples = [overlap.sample_overlap_domain(
+                            replace(domain, metadata={**domain.metadata, "distance_batch_size": 8192}),
+                            32, contract.CC_OPTIMIZER_SEED, query,
+                        ) for domain in domains]
+                        np.testing.assert_array_equal(samples[0].positions, samples[1].positions)
+                        np.testing.assert_array_equal(samples[0].distances, samples[1].distances)
+                        np.testing.assert_array_equal(samples[0].source_indices, samples[1].source_indices)
+                        self.assertEqual(samples[0].fingerprint, samples[1].fingerprint)
+
     def test_mesh_cleanup_before_native_registration(self) -> None:
         """극단 외딴 퇴화면과 단정도 재퇴화면을 제외하고 원본 파일 보존 및 실제 정렬을 검증합니다."""
         with tempfile.TemporaryDirectory() as temporary:
