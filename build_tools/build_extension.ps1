@@ -357,6 +357,7 @@ function Test-BuiltArchive {
             foreach ($required in @(
                 "tools/align/alignment/icp_cccore_solver.py",
                 "tools/align/alignment/icp_cccore_overlap.py",
+                "tools/align/alignment/icp_mesh_cleanup.py",
                 "tools/align/alignment/icp_cccore_worker.py",
                 "tools/align/runtime/python/python.exe",
                 "tools/align/runtime/python/runtime_manifest.json",

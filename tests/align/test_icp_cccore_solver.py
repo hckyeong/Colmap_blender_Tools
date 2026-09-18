@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import math
@@ -229,6 +230,78 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
     }
     contract.write_json_atomic(directory / "runtime_manifest.json", manifest)
     return directory / "colmap_cccore_worker.exe", manifest
+
+
+class MeshCleanupTests(unittest.TestCase):
+    """원본 보존과 두 정밀도 단계의 계산 전용 메시 정리를 검증합니다."""
+
+    def test_clean_mesh_is_unchanged(self) -> None:
+        """정상 메시의 배열·면 순서·배정도 좌표가 그대로 유지되는지 확인합니다."""
+        positions, triangles = box_mesh()
+        for native in (False, True):
+            result = solver.prepare_mesh_alignment_geometry(positions, triangles, native_precision=native)
+            self.assertIs(result[0], positions)
+            self.assertIs(result[1], triangles)
+
+    def test_native_rounding_removes_only_collapsed_face(self) -> None:
+        """배정도에서 유효하지만 단정도에서 겹치는 작은 면만 제외합니다."""
+        positions = np.asarray(((0, 0, 0), (1, 0, 0), (0, 1, 0),
+                                (0.5, 0.5, 0.5), (0.5 + 1e-9, 0.5, 0.5),
+                                (0.5, 0.5 + 1e-9, 0.5)), dtype=np.float64)
+        triangles = np.asarray(((3, 4, 5), (0, 1, 2)), dtype=np.uint32)
+        original = positions.copy(), triangles.copy()
+        world = solver.prepare_mesh_alignment_geometry(positions, triangles)
+        self.assertEqual(len(world[1]), 2)
+        native = solver.prepare_mesh_alignment_geometry(*world, native_precision=True)
+        np.testing.assert_array_equal(native[0], positions[:3])
+        np.testing.assert_array_equal(native[1], ((0, 1, 2),))
+        np.testing.assert_array_equal(positions, original[0])
+        np.testing.assert_array_equal(triangles, original[1])
+
+    def test_remote_degenerate_vertices_do_not_affect_normalization(self) -> None:
+        """퇴화면 전용 외딴 정점을 제거해 공통 원점·단위와 원본 출처를 보존합니다."""
+        positions, triangles = box_mesh()
+        expanded = np.vstack((positions, ((1e12, 0, 0), (1e12 + 1, 0, 0), (1e12 + 2, 0, 0))))
+        faces = np.vstack((triangles, ((8, 9, 10),))).astype(np.uint32)
+        provenance = {"point_count": len(expanded), "triangle_count": len(faces)}
+        cleaned = solver._clean_mesh_geometry(contract.CcCoreGeometry("TRIANGLE_MESH", expanded, faces, provenance), "검사")
+        self.assertIs(cleaned.provenance, provenance)
+        reference = positions + 0.1
+        expected = solver.make_normalization(positions, reference)
+        actual = solver.make_normalization(cleaned.positions, reference)
+        np.testing.assert_array_equal(actual.origin, expected.origin)
+        self.assertEqual(actual.unit, expected.unit)
+        np.testing.assert_array_equal(cleaned.triangles, triangles)
+
+    def test_degenerate_and_invalid_inputs_are_distinguished(self) -> None:
+        """전체 퇴화와 잘못된 좌표·인덱스 형식을 엄격히 거부합니다."""
+        positions = np.asarray(((0, 0, 0), (1, 0, 0), (2, 0, 0)), dtype=np.float64)
+        triangles = np.asarray(((0, 1, 2),), dtype=np.uint32)
+        for native in (False, True):
+            with self.assertRaisesRegex(ValueError, "퇴화"):
+                solver.prepare_mesh_alignment_geometry(positions, triangles, native_precision=native)
+        with self.assertRaisesRegex(contract.CcCoreInputError, "CC 검사 메시.*퇴화"):
+            solver._clean_mesh_geometry(contract.CcCoreGeometry("TRIANGLE_MESH", positions, triangles, {}), "검사")
+        for invalid_positions, invalid_faces in (
+            (positions, np.asarray(((0, 1, 3),))),
+            (positions, np.asarray(((0, 1, -1),))),
+            (positions, triangles.astype(float)),
+            (positions[:, :2], triangles),
+            (np.full((3, 3), np.nan), triangles),
+        ):
+            with self.subTest(shape=invalid_positions.shape, faces=invalid_faces), self.assertRaises(ValueError):
+                solver.prepare_mesh_alignment_geometry(invalid_positions, invalid_faces)
+
+    def test_block_boundary_keeps_face_order_and_compacts_vertices(self) -> None:
+        """블록 경계를 넘는 면의 순서를 유지하고 미참조 정점만 압축합니다."""
+        positions = np.asarray(((9, 9, 9), (0, 0, 0), (1, 0, 0), (0, 1, 0)), dtype=float)
+        triangles = np.tile(np.asarray((1, 2, 3), dtype=np.uint32), (65_538, 1))
+        triangles[65_535] = (1, 1, 2)
+        triangles[-1] = (3, 2, 1)
+        result_positions, result_faces = solver.prepare_mesh_alignment_geometry(positions, triangles)
+        np.testing.assert_array_equal(result_positions, positions[1:])
+        self.assertEqual(len(result_faces), len(triangles) - 1)
+        np.testing.assert_array_equal(result_faces[-1], (2, 1, 0))
 
 
 class PureContractTests(unittest.TestCase):
@@ -1135,6 +1208,39 @@ NATIVE_WORKER = os.environ.get("CCCORE_NATIVE_WORKER", "")
 @unittest.skipUnless(NATIVE_WORKER and Path(NATIVE_WORKER).is_file(), "실제 CC 실행 경로가 지정되지 않았습니다.")
 class NativeIntegrationTests(unittest.TestCase):
     """실제 CC 바이너리로 coordinator 전체 흐름을 검증합니다."""
+
+    def test_mesh_cleanup_before_native_registration(self) -> None:
+        """극단 외딴 퇴화면과 단정도 재퇴화면을 제외하고 원본 파일 보존 및 실제 정렬을 검증합니다."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest, expected = make_job(directory, "TRIANGLE_MESH", "TRIANGLE_MESH")
+            for role in ("moving", "reference"):
+                entry = manifest["geometry"][role]
+                positions = np.fromfile(directory / entry["positions_file"], dtype="<f8").reshape(-1, 3)
+                triangles = np.fromfile(directory / entry["triangles_file"], dtype="<u4").reshape(-1, 3)
+                extra = np.asarray(((1e20, 0, 0), (1e20 + 32768, 0, 0), (1e20 + 65536, 0, 0),
+                                    (0.5, 0.5, 0.5), (0.5 + 1e-12, 0.5, 0.5),
+                                    (0.5, 0.5 + 1e-12, 0.5)))
+                positions = np.vstack((positions, extra))
+                triangles = np.vstack((triangles, ((8, 9, 10), (11, 12, 13)))).astype("<u4")
+                positions.astype("<f8").tofile(directory / entry["positions_file"])
+                triangles.tofile(directory / entry["triangles_file"])
+                entry.update(point_count=len(positions), triangle_count=len(triangles))
+            contract.write_json_atomic(directory / "manifest.json", manifest)
+            source_paths = [directory / "manifest.json"]
+            for role in ("moving", "reference"):
+                entry = manifest["geometry"][role]
+                source_paths.extend(directory / entry[key] for key in ("positions_file", "triangles_file"))
+            source_hashes = {path: hashlib.sha256(path.read_bytes()).digest() for path in source_paths}
+            worker.run_cccore_worker(directory, NATIVE_WORKER)
+            self.assertEqual(source_hashes, {path: hashlib.sha256(path.read_bytes()).digest() for path in source_paths})
+            with np.load(directory / "result.npz", allow_pickle=False) as arrays:
+                np.testing.assert_allclose(arrays["delta_4x4"], expected, atol=8.0e-4)
+            result = contract.read_json_object(directory / "result.json")
+            self.assertEqual(result["quality"], "PASS")
+            model_stats = [item for item in result["geometry_statistics"] if item["triangle_count"]]
+            self.assertTrue(model_stats)
+            self.assertTrue(all(item["point_count"] == 8 and item["triangle_count"] == 12 for item in model_stats))
 
     def test_inverse_surface_query_matches_transformed_mesh_distances(self) -> None:
         """역변환 질의·배율 복원 거리가 기존 후보별 변형 메시 거리와 허용오차 안에서 같은지 확인합니다."""

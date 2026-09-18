@@ -22,6 +22,7 @@ from ..constants import (
 )
 from ..geometry_access import geometry_kind_for_model
 from ..marker_geometry import marker_geometry_model_for_source
+from .icp_mesh_cleanup import prepare_mesh_alignment_geometry
 from .types import Sim3Transform
 
 
@@ -98,7 +99,7 @@ class GeometryProvenance:
 
 @dataclass(frozen=True, slots=True)
 class GeometryInput:
-    """소유 ID와 삼각면 연결을 유지한 공통 프로젝트 좌표 입력입니다."""
+    """원본 출처와 분리하여 유효면·참조 정점만 보관하는 공통 좌표 정렬 입력입니다."""
 
     owner_model_ids: tuple[str, ...]
     geometry_kind: str
@@ -348,8 +349,15 @@ def _raw_arrays(selected: _SelectedGeometry) -> tuple[np.ndarray, np.ndarray | N
     return positions, triangles
 
 
-def _validate_raw_geometry(positions: np.ndarray, triangles: np.ndarray | None, name: str) -> None:
-    """블록 단위로 비유한 좌표·잘못된 면 인덱스·퇴화 형상을 거부합니다."""
+def _validate_raw_geometry(
+    positions: np.ndarray, triangles: np.ndarray | None, name: str,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """손상 입력은 거부하고 메시의 퇴화면·미참조 정점만 정렬용 사본에서 제외합니다."""
+    if triangles is not None:
+        try:
+            return prepare_mesh_alignment_geometry(positions, triangles)
+        except ValueError as error:
+            raise CcCoreGeometryError(f"{name}: {error}") from error
     for start in range(0, len(positions), _BLOCK_ROWS):
         if not np.isfinite(positions[start:start + _BLOCK_ROWS]).all():
             raise CcCoreGeometryError(f"{name}: 원본 좌표에 유한하지 않은 값이 있습니다.")
@@ -366,21 +374,8 @@ def _validate_raw_geometry(positions: np.ndarray, triangles: np.ndarray | None, 
         for start in range(0, len(positions), _BLOCK_ROWS):
             offsets = (positions[start:start + _BLOCK_ROWS].astype(np.float64, copy=False) - origin) / span.max()
             if np.any(np.max(np.abs(np.cross(offsets, direction)), axis=1) > 32.0 * np.finfo(np.float64).eps):
-                return
+                return positions, None
         raise CcCoreGeometryError(f"{name}: 모든 등록점이 한 직선에 놓인 퇴화 점군입니다.")
-    for start in range(0, len(triangles), _BLOCK_ROWS):
-        faces = triangles[start:start + _BLOCK_ROWS]
-        if np.any(faces < 0) or np.any(faces >= len(positions)):
-            raise CcCoreGeometryError(f"{name}: 삼각면 인덱스가 원본 정점 범위를 벗어났습니다.")
-        vertices = positions[faces.astype(np.intp, copy=False)].astype(np.float64, copy=False)
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            first = vertices[:, 1] - vertices[:, 0]
-            second = vertices[:, 2] - vertices[:, 0]
-            scale = np.maximum(np.abs(first).max(axis=1), np.abs(second).max(axis=1))
-            cross = np.cross(first / scale[:, None], second / scale[:, None])
-        area = np.abs(cross).max(axis=1)
-        if not np.isfinite(area).all() or np.any(area <= 32.0 * np.finfo(np.float64).eps):
-            raise CcCoreGeometryError(f"{name}: 정점이 중복되거나 면적이 없는 퇴화 삼각면이 있습니다.")
 
 
 def _array_fingerprint(array: np.ndarray, dtype: str) -> str:
@@ -411,11 +406,14 @@ def _marker_signature(runtime: Any) -> tuple[tuple, ...]:
 
 def _prepare_source(repository: Any, selected: _SelectedGeometry, applied_alignment: object | None,
                     *, verify_content: bool, validate_geometry: bool) -> tuple[GeometrySourceProvenance, np.ndarray, np.ndarray | None]:
-    """실제 선택 슬롯의 원본 배열과 축·확정 정렬·적용 정렬을 함께 캡처합니다."""
+    """원본 전체의 지문·개수를 보존하고 정렬에 전달할 배열만 별도로 정제합니다."""
     owner_id = str(selected.record.model_id)
     positions, triangles = _raw_arrays(selected)
+    alignment_positions, alignment_triangles = positions, triangles
     if validate_geometry:
-        _validate_raw_geometry(positions, triangles, str(selected.record.display_name))
+        alignment_positions, alignment_triangles = _validate_raw_geometry(
+            positions, triangles, str(selected.record.display_name),
+        )
     companion = selected.geometry_source == MARKER_GEOMETRY_SOURCE_COMPANION
     getter = (repository.companion_display_transform_for_model_id if companion
               else repository.display_transform_for_model_id)
@@ -437,7 +435,7 @@ def _prepare_source(repository: Any, selected: _SelectedGeometry, applied_alignm
         committed_alignment_fingerprint=str(committed.fingerprint), committed_alignment_float64=committed_matrix,
         applied_alignment_float64=applied,
     )
-    return provenance, positions, triangles
+    return provenance, alignment_positions, alignment_triangles
 
 
 def _geometry_input(prepared: tuple[GeometrySourceProvenance, np.ndarray, np.ndarray | None]) -> GeometryInput:

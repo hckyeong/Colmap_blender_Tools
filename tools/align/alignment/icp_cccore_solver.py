@@ -19,9 +19,11 @@ import numpy as np
 if __package__:
     from . import icp_cccore_contract as contract
     from . import icp_cccore_overlap as overlap
+    from .icp_mesh_cleanup import prepare_mesh_alignment_geometry
 else:
     import icp_cccore_contract as contract
     import icp_cccore_overlap as overlap
+    from icp_mesh_cleanup import prepare_mesh_alignment_geometry
 
 ProgressSink = Callable[[Mapping[str, Any]], None] | None
 CancelProbe = Callable[[], bool] | None
@@ -78,6 +80,22 @@ class Normalization:
             "formula": "x_native = (x_project_world - origin) / unit",
             "delta_formula": "D_world = inverse(H) @ D_native @ H",
         }
+
+
+def _clean_mesh_geometry(
+    geometry: contract.CcCoreGeometry, label: str, *, native_precision: bool = False,
+) -> contract.CcCoreGeometry:
+    """원본 출처를 유지하며 계산 메시의 퇴화면을 제외하고 오류에 형상 맥락을 붙입니다."""
+    if geometry.triangles is None:
+        return geometry
+    try:
+        positions, triangles = prepare_mesh_alignment_geometry(
+            geometry.positions, geometry.triangles, native_precision=native_precision,
+        )
+    except ValueError as error:
+        stage = "단정도 변환" if native_precision else "공통 좌표"
+        raise contract.CcCoreInputError(f"CC {label} 메시 {stage}: {error}") from error
+    return contract.CcCoreGeometry(geometry.kind, positions, triangles, geometry.provenance)
 
 
 def make_normalization(moving: np.ndarray, reference: np.ndarray) -> Normalization:
@@ -1509,12 +1527,12 @@ def solve_cccore_job(
     )
 
     def execute_session() -> CcCoreSolverResult:
-        """준비부터 결과 메타데이터 확정까지 하나의 네이티브 세션 안에서 실행합니다."""
+        """퇴화면을 제외한 동일 계산 메시로 표본·등록·평가를 한 네이티브 세션에서 실행합니다."""
         runner.start()
         progress("PREPARING", 0.02, "현재 초기 정렬에서 겹침 후보와 독립 평가 표본을 준비합니다.")
         runner.check_cancelled()
-        moving_world = contract.load_geometry(root, manifest["geometry"]["moving"])
-        reference_world = contract.load_geometry(root, manifest["geometry"]["reference"])
+        moving_world = _clean_mesh_geometry(contract.load_geometry(root, manifest["geometry"]["moving"]), "이동")
+        reference_world = _clean_mesh_geometry(contract.load_geometry(root, manifest["geometry"]["reference"]), "기준")
         normalization = make_normalization(moving_world.positions, reference_world.positions)
         moving = contract.CcCoreGeometry(
             moving_world.kind, normalization.apply(moving_world.positions), moving_world.triangles, moving_world.provenance
@@ -1522,6 +1540,8 @@ def solve_cccore_job(
         reference = contract.CcCoreGeometry(
             reference_world.kind, normalization.apply(reference_world.positions), reference_world.triangles, reference_world.provenance
         )
+        moving = _clean_mesh_geometry(moving, "이동", native_precision=True)
+        reference = _clean_mesh_geometry(reference, "기준", native_precision=True)
         mode = contract.GEOMETRY_MODES[(moving.kind, reference.kind)]
         reverse = mode == "MESH_TO_POINT"
         marker_initial_rms = manifest.get("marker_initial_rms", 0.0)

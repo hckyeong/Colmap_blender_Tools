@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 from dataclasses import replace
 import importlib
 import json
@@ -260,7 +261,7 @@ def _mutable_geometry(runtime, *, mesh: bool):
 
 def test_invalid_raw_geometry_reports_specific_errors() -> None:
     """누락·빈 면·잘못된 인덱스·비유한 좌표·퇴화 입력을 명시적으로 거부합니다."""
-    for issue in ("누락", "빈면", "음수", "초과", "실수", "비유한", "퇴화"):
+    for issue in ("누락", "빈면", "음수", "초과", "실수", "비유한", "무한", "퇴화"):
         runtime = _runtime()
         model = _mutable_geometry(runtime, mesh=True)
         if issue == "누락":
@@ -275,11 +276,11 @@ def test_invalid_raw_geometry_reports_specific_errors() -> None:
         elif issue == "실수":
             model.triangles_uint32 = np.array(((0.0, 1.5, 2.0),))
             expected = "정수"
-        elif issue == "비유한":
-            model.vertices_float64[0, 0] = np.nan
+        elif issue in {"비유한", "무한"}:
+            model.vertices_float64[0, 0] = np.nan if issue == "비유한" else np.inf
             expected = "유한하지"
         else:
-            model.triangles_uint32[0] = (0, 0, 2)
+            model.triangles_uint32[:] = (0, 0, 2)
             expected = "퇴화"
         _expect_error(lambda: _snapshot(runtime), expected)
     runtime = _runtime()
@@ -289,6 +290,148 @@ def test_invalid_raw_geometry_reports_specific_errors() -> None:
     runtime.model_repository.companion_meshes.pop("이동")
     _surface(runtime, "이동")
     _expect_error(lambda: _snapshot(runtime), "연결 메시 원본이 없습니다")
+
+
+def _install_mixed_faces(runtime, model_id: str, *, standalone: bool = False):
+    """반복 인덱스·동일 좌표·공선면 사이의 정상면을 읽기 전용 원본으로 설치합니다."""
+    mapping = runtime.model_repository.models if standalone else runtime.model_repository.companion_meshes
+    original = mapping[model_id]
+    vertices = np.asarray(((10, 0, 0), (12, 0, 0), (10, 2, 0), (10, 0, 3),
+                           (10, 0, 0), (11, 0, 0)), dtype=np.float64)
+    triangles = np.asarray(((0, 0, 2), (0, 1, 2), (0, 4, 2), (0, 5, 1), (0, 1, 3)), dtype=np.uint32)
+    vertices.setflags(write=False)
+    triangles.setflags(write=False)
+    model = SimpleNamespace(
+        geometry_kind="TRIANGLE_MESH", model_id=model_id, geometry_revision=1,
+        source_path=original.source_path, vertices_float64=vertices, triangles_uint32=triangles,
+    )
+    mapping[model_id] = model
+    _surface(runtime, model_id)
+    return model
+
+
+def _source_digest(array, dtype: str) -> str:
+    """원본 전체의 표준 바이트를 독립 해시하여 출처 지문을 확인합니다."""
+    digest = hashlib.sha256()
+    digest.update(f"{dtype}:{array.shape}".encode("ascii"))
+    digest.update(np.asarray(array, dtype=dtype).tobytes())
+    return digest.hexdigest()
+
+
+def test_degenerate_faces_filter_snapshot_only_and_preserve_marker_ids() -> None:
+    """독립·연결 메시의 정렬 입력만 압축하고 원본 지문·정점·마커 ID·불변성을 보존합니다."""
+    from tools.align.alignment.icp_geometry import geometry_snapshot_validation_message
+
+    for standalone in (False, True):
+        runtime = _runtime(standalone_moving=standalone)
+        model = _install_mixed_faces(runtime, "이동", standalone=standalone)
+        pair = _marker_pair(runtime)
+        pair = replace(pair, moving=replace(
+            pair.moving, point3d_id=1, source_point_id=1,
+            geometry_source="MAIN" if standalone else "COMPANION",
+        ))
+        runtime.marker_selection.completed_pairs[:] = [pair]
+        original_faces = model.triangles_uint32.copy()
+        original_positions = model.vertices_float64.copy()
+        snapshot = _snapshot(runtime)
+        np.testing.assert_array_equal(snapshot.moving.triangles_uint32, original_faces[[1, 4]])
+        np.testing.assert_array_equal(snapshot.moving.positions_float64, original_positions[:4])
+        source = snapshot.provenance.moving
+        assert source.point_count == 6 and source.triangle_count == 5
+        assert source.positions_fingerprint == _source_digest(original_positions, "<f8")
+        assert source.triangles_fingerprint == _source_digest(original_faces, "<u4")
+        assert runtime.marker_selection.completed_pairs[0] is pair
+        assert pair.moving.source_point_id == 1
+        np.testing.assert_array_equal(model.triangles_uint32, original_faces)
+        np.testing.assert_array_equal(model.vertices_float64, original_positions)
+        for array in (model.triangles_uint32, model.vertices_float64,
+                      snapshot.moving.triangles_uint32, snapshot.moving.positions_float64):
+            assert not array.flags.writeable
+        metadata = snapshot.without_arrays()
+        assert geometry_snapshot_validation_message(runtime, metadata, verify_content=True) is None
+        changed = original_faces.copy()
+        changed[0] = (1, 1, 2)
+        model.triangles_uint32 = changed
+        assert geometry_snapshot_validation_message(runtime, metadata, verify_content=True) is not None
+        assert geometry_snapshot_validation_message(runtime, metadata, verify_content=False) is None
+        model.triangles_uint32 = original_faces
+        changed_positions = original_positions.copy()
+        changed_positions[5, 0] = 11.5
+        model.vertices_float64 = changed_positions
+        assert geometry_snapshot_validation_message(runtime, metadata, verify_content=True) is not None
+        assert geometry_snapshot_validation_message(runtime, metadata, verify_content=False) is None
+        model.vertices_float64 = original_positions
+        assert geometry_snapshot_validation_message(runtime, metadata, verify_content=True) is None
+        np.testing.assert_array_equal(snapshot.moving.triangles_uint32, original_faces[[1, 4]])
+
+
+def test_single_valid_face_survives_large_origin_and_small_uniform_scale() -> None:
+    """큰 원점과 작은 균일 배율에서도 정상면 하나를 보존하고 공선면만 제외합니다."""
+    from tools.align.alignment.types import create_sim3_transform
+
+    for offset, scale in ((1e12, 1.0), (0.0, 1e-9), (1e12, 1e-9)):
+        runtime = _runtime()
+        model = _install_mixed_faces(runtime, "이동")
+        model.vertices_float64 = model.vertices_float64 + offset
+        model.triangles_uint32 = model.triangles_uint32[:4]
+        initial = create_sim3_transform(np.eye(3), scale, np.zeros(3))
+        snapshot = _snapshot(runtime, initial.matrix_float64)
+        np.testing.assert_array_equal(snapshot.moving.triangles_uint32, ((0, 1, 2),))
+        np.testing.assert_allclose(snapshot.moving.positions_float64,
+                                   model.vertices_float64[:3] * scale, rtol=0, atol=0)
+        assert snapshot.provenance.moving.triangle_count == 4
+    runtime = _runtime()
+    model = _install_mixed_faces(runtime, "이동")
+    model.vertices_float64 = model.vertices_float64 * 1e-12
+    snapshot = _snapshot(runtime)
+    np.testing.assert_array_equal(snapshot.moving.triangles_uint32, ((0, 1, 2), (0, 1, 3)))
+
+
+def test_filter_across_triangle_blocks_and_mixed_reference_sources() -> None:
+    """블록 양쪽 정상면과 연결·독립 A의 압축 정점 오프셋 및 원본 출처를 보존합니다."""
+    from tools.align.alignment.icp_geometry import geometry_snapshot_validation_message
+
+    runtime = _runtime()
+    first = _install_mixed_faces(runtime, "기준")
+    faces = np.tile(np.asarray((0, 0, 2), dtype=np.uint32), (65_538, 1))
+    faces[65_535] = (0, 1, 2)
+    faces[65_536] = (0, 1, 3)
+    faces.setflags(write=False)
+    first.triangles_uint32 = faces
+    _add_layer(runtime, "추가독립기준", standalone=True)
+    _install_mixed_faces(runtime, "추가독립기준", standalone=True)
+    runtime.model_catalog.promote_model_for_icp_commit("추가독립기준")
+    _select(runtime, "이동")
+    snapshot = _snapshot(runtime)
+    np.testing.assert_array_equal(snapshot.references[0].triangles_uint32, ((0, 1, 2), (0, 1, 3)))
+    np.testing.assert_array_equal(snapshot.reference_combined.triangles_uint32,
+                                  ((0, 1, 2), (0, 1, 3), (4, 5, 6), (4, 5, 7)))
+    assert len(snapshot.reference_combined.positions_float64) == 8
+    assert snapshot.reference_combined.geometry_source == "MIXED_SOURCE"
+    assert tuple(source.triangle_count for source in snapshot.reference_combined.provenance.sources) == (65_538, 5)
+    assert first.triangles_uint32 is faces and not faces.flags.writeable
+    assert geometry_snapshot_validation_message(runtime, snapshot.without_arrays(), verify_content=True) is None
+
+
+def test_unused_outlier_vertices_are_removed_only_from_alignment_geometry() -> None:
+    """퇴화면의 외딴 정점과 중간 미참조 정점을 정렬 입력에서만 제거하고 면을 재색인합니다."""
+    runtime = _runtime()
+    model = _install_mixed_faces(runtime, "이동")
+    vertices = np.asarray(((1e12, 1e12, 1e12), (10, 0, 0), (10, 0, 0),
+                           (12, 0, 0), (10, 2, 0)), dtype=np.float64)
+    faces = np.asarray(((0, 0, 0), (1, 3, 4), (1, 2, 4)), dtype=np.uint32)
+    vertices.setflags(write=False)
+    faces.setflags(write=False)
+    model.vertices_float64 = vertices
+    model.triangles_uint32 = faces
+    snapshot = _snapshot(runtime)
+    np.testing.assert_array_equal(snapshot.moving.positions_float64, vertices[[1, 3, 4]])
+    np.testing.assert_array_equal(snapshot.moving.triangles_uint32, ((0, 1, 2),))
+    assert model.vertices_float64 is vertices and model.triangles_uint32 is faces
+    assert snapshot.provenance.moving.point_count == 5
+    assert snapshot.provenance.moving.triangle_count == 3
+    assert snapshot.provenance.moving.positions_fingerprint == _source_digest(vertices, "<f8")
+    assert snapshot.provenance.moving.triangles_fingerprint == _source_digest(faces, "<u4")
 
 
 def test_immutable_arrays_and_small_metadata_detect_content_changes() -> None:

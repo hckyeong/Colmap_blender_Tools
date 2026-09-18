@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
 $scripts = @(
     "test_colmap_io.py", "test_mesh_extension.py", "test_embedded_obj.py",
     "test_embedded_obj_optimization.py", "test_mesh_normal_reuse.py", "test_duplicate_sources.py", "test_marker_sim3.py",
-    "test_icp_direct_align.py", "test_icp_cccore_geometry.py", "test_icp_cccore_ui.py",
+    "test_icp_direct_align.py", "test_icp_cccore_geometry.py", "test_degenerate_mesh_preservation.py", "test_icp_cccore_ui.py",
     "test_icp_cccore_runtime.py", "test_icp_cccore_persistence.py",
     "test_merge_export_transforms.py", "test_merge_export_writer.py", "test_merge_export_runtime.py",
     "test_project_persistence_codec.py", "test_project_persistence_store.py",

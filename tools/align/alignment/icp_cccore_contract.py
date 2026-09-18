@@ -871,7 +871,7 @@ class CcCoreGeometry:
 
 
 def load_geometry(directory: Path, entry: Mapping[str, Any]) -> CcCoreGeometry:
-    """파일 크기를 먼저 확인한 뒤 원본 좌표·면을 읽고 인덱스를 검증합니다."""
+    """파일·좌표·인덱스를 검증하며 메시의 비퇴화 검사는 계산용 면 정제 단계에 맡깁니다."""
     count = positive_integer(entry["point_count"], "CC 좌표 수")
     path = job_path(directory, entry["positions_file"])
     if path.stat().st_size != count * 3 * 8:
@@ -879,7 +879,7 @@ def load_geometry(directory: Path, entry: Mapping[str, Any]) -> CcCoreGeometry:
     positions = np.fromfile(path, dtype="<f8").reshape(count, 3)
     if not np.isfinite(positions).all():
         raise CcCoreInputError("CC 좌표에 유한하지 않은 값이 있습니다.")
-    if np.linalg.matrix_rank(positions - positions[0]) < 2:
+    if entry["kind"] == "COLMAP_POINT_CLOUD" and np.linalg.matrix_rank(positions - positions[0]) < 2:
         raise CcCoreInputError("CC 좌표가 한 점이나 직선으로 퇴화했습니다.")
     triangles = None
     if entry["kind"] == "TRIANGLE_MESH":
