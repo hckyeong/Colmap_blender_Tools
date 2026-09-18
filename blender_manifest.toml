@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "colmap_tools"
-version = "0.3.53"
+version = "0.3.54"
 name = "COLMAP Tools"
 tagline = "독립적인 COLMAP 정렬 편집 프로젝션 페인트 도구 모음"
 maintainer = "COLMAP Tools Contributors"

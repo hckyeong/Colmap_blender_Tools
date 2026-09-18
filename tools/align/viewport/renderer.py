@@ -1032,8 +1032,7 @@ def point_cloud_draw_passes_for_role(role: str) -> tuple[PointCloudDrawPass, ...
 
 
 def _draw_point_clouds(role: str) -> None:
-    """표시 토글을 반영해 점군과 마커 입력 중인 독립 메시 정점을 제출합니다."""
-    marker_model_ids = set(marker_source_model_ids(role)) if RUNTIME.marker_selection.has_draft else set()
+    """표시 중인 COLMAP 점군만 제출하고 마커 입력 중에도 메시 정점은 겹쳐 그리지 않습니다."""
     for draw_pass in point_cloud_draw_passes_for_role(role):
         model_ids = tuple(
             model_id
@@ -1041,10 +1040,7 @@ def _draw_point_clouds(role: str) -> None:
             if (
                 (model := model_data_for_id(model_id)) is not None
                 and model_geometry_is_visible(model_id, geometry_kind_for_model(model))
-                and (
-                    not is_triangle_mesh_model(model)
-                    or model_id in marker_model_ids
-                )
+                and not is_triangle_mesh_model(model)
             )
         )
         if not model_ids:
