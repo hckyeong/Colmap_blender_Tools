@@ -170,7 +170,7 @@ def model_deletion_block_reason(model_id: str | None = None) -> str | None:
 
 
 def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
-    """모델 삭제를 원자 확정하고 소유 내장 Mesh와 부속 Data Block을 정리합니다."""
+    """모델 삭제를 원자 확정하며 실패하면 같은 원본의 등록 순서와 대표까지 복원합니다."""
     normalized_id = str(model_id).strip()
     reason = model_deletion_block_reason(normalized_id)
     if reason is not None:
@@ -184,6 +184,8 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
     display_transform = repository.display_transform_for_model_id(normalized_id)
     alignment_transform = repository.alignment_transform_for_model_id(normalized_id)
     source_metadata = repository.source_metadata.get(normalized_id)
+    models_snapshot = dict(repository.models)
+    source_index_snapshot = dict(repository.source_path_index)
     # 연결 메시·개별 축·평가 캐시는 삭제 실패 시 원래 객체와 존재 여부까지 복원합니다.
     companion_snapshot = tuple(
         (mapping, normalized_id in mapping, mapping.get(normalized_id))
@@ -237,6 +239,10 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
             repository.add_model(model, imported_display, source_metadata)
             repository.set_display_transform(normalized_id, display_transform)
             repository.set_alignment_transform(normalized_id, alignment_transform)
+        repository.models.clear()
+        repository.models.update(models_snapshot)
+        repository.source_path_index.clear()
+        repository.source_path_index.update(source_index_snapshot)
         for mapping, present, value in companion_snapshot:
             if present:
                 mapping[normalized_id] = value

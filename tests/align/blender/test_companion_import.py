@@ -217,7 +217,7 @@ def test_explicit_sparse_partial_file_set_does_not_resolve_to_zero():
 
 
 def test_bad_obj_and_cancellation_preserve_existing_dataset():
-    """연결 오류·취소·중복 입력이 기존 데이터셋과 선택 상태를 바꾸지 않습니다."""
+    """연결 오류·취소·모델 ID 충돌이 기존 데이터셋과 선택 상태를 바꾸지 않습니다."""
     with TemporaryDirectory() as temporary:
         root = Path(temporary)
         first = root / "first"
@@ -242,8 +242,69 @@ def test_bad_obj_and_cancellation_preserve_existing_dataset():
         assert finish(job, runtime) == "CANCELLED"
         assert runtime.model_catalog.snapshot() == snapshot
         assert runtime.model_repository.models == {"first": original}
-        assert finish(make_job(first, "duplicate"), runtime) == "CANCELLED"
+        collision = make_job(first, "first")
+        assert finish(collision, runtime) == "CANCELLED"
+        assert "ID" in collision.error_message
+        assert runtime.model_catalog.snapshot() == snapshot
         assert runtime.model_repository.models == {"first": original}
+
+
+def test_same_dataset_owns_independent_meshes_and_survives_failure_and_deletion():
+    """동일 데이터셋의 재가져오기·실패·삭제가 다른 레이어의 내장 원본 메시를 보존합니다."""
+    from unittest.mock import patch
+    from tools.align.mesh_io.embedded_obj_store import find_embedded_obj_mesh
+    from tools.align.operators import model_group
+    from tools.align.state import RUNTIME
+
+    RUNTIME.clear_transient()
+    try:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sparse = write_dataset(root)
+            assert finish(make_job(root, "pair-first"), RUNTIME) == "FINISHED"
+            assert finish(make_job(sparse, "pair-second"), RUNTIME) == "FINISHED"
+            repository = RUNTIME.model_repository
+            first = repository.companion_meshes["pair-first"]
+            second = repository.companion_meshes["pair-second"]
+            assert first.embedded_asset_uuid and second.embedded_asset_uuid
+            assert first.embedded_asset_uuid != second.embedded_asset_uuid
+            first_mesh = find_embedded_obj_mesh(first.embedded_asset_uuid)
+            second_mesh = find_embedded_obj_mesh(second.embedded_asset_uuid)
+            assert first_mesh.as_pointer() != second_mesh.as_pointer()
+            assert first.vertices_float64 is not second.vertices_float64
+            assert np.array_equal(first.vertices_float64, second.vertices_float64)
+            assert RUNTIME.model_catalog.models["pair-second"].registration_status == "PENDING"
+            snapshot = RUNTIME.model_catalog.snapshot()
+            models_before = dict(repository.models)
+            meshes_before = dict(repository.companion_meshes)
+
+            def fail_gpu(_model_id, _model):
+                """세 번째 복사본의 GPU 준비만 실패시켜 원본 메시 정리를 검증합니다."""
+                raise RuntimeError("복사본 GPU 준비 실패")
+
+            with patch.object(importer, "_prepare_gpu_batch_for_model", fail_gpu):
+                failed = create_import_job(root, model_id_factory=lambda: "pair-failed")
+                assert finish(failed, RUNTIME) == "CANCELLED"
+            assert "복사본 GPU 준비 실패" in failed.error_message
+            assert RUNTIME.model_catalog.snapshot() == snapshot
+            assert repository.models == models_before
+            assert repository.companion_meshes == meshes_before
+            assert find_embedded_obj_mesh(first.embedded_asset_uuid) is first_mesh
+            assert find_embedded_obj_mesh(second.embedded_asset_uuid) is second_mesh
+            assert RUNTIME.model_catalog.select_model(
+                "pair-first", has_marker_draft=False, completed_pair_count=0,
+            )
+            model_group.delete_model_from_runtime("pair-first")
+            assert find_embedded_obj_mesh(first.embedded_asset_uuid, allow_missing=True) is None
+            assert find_embedded_obj_mesh(second.embedded_asset_uuid) is second_mesh
+            assert repository.companion_meshes["pair-second"] is second
+            assert repository.model_id_for_source_path(sparse) == "pair-second"
+            assert RUNTIME.model_catalog.select_model(
+                "pair-second", has_marker_draft=False, completed_pair_count=0,
+            )
+            model_group.delete_model_from_runtime("pair-second")
+    finally:
+        RUNTIME.clear_transient()
 
 
 def test_changed_obj_and_partial_gpu_failure_are_atomic():

@@ -28,7 +28,6 @@ from .mesh_io.embedded_obj_store import (
 from .mesh_io.obj_native_import import NativeObjStaging, import_obj_to_staging
 from .mesh_io.validation import validate_obj_limits
 from .model_repository import (
-    DuplicateModelSourceError,
     ImportedModelSourceMetadata,
     ModelRepositoryError,
     canonical_source_path,
@@ -378,7 +377,7 @@ class MeshImportJob:
         return "FINISHED"
 
     def step(self, runtime: Any | None = None, *, time_budget_seconds: float = 0.025) -> str:
-        """OBJ를 단계별로 준비하며 원본 확정과 프록시 생성의 전체 형상 검증을 공유합니다."""
+        """독립 OBJ의 기존 ID는 자산·GPU 준비 전에 거부하고 연결 표면의 부모 ID는 허용합니다."""
         if self.is_terminal:
             return "FINISHED" if self.stage == MESH_IMPORT_STAGE_COMPLETED else "CANCELLED"
         if self.cancel_requested:
@@ -438,6 +437,10 @@ class MeshImportJob:
                 if not model_id:
                     raise MeshImportJobError("OBJ 모델 ID를 생성하지 못했습니다.")
                 display_name = self.display_name_hint.strip() or Path(self.source_path).stem
+                if runtime is not None and not self.stage_only:
+                    if model_id in runtime.model_repository.models:
+                        raise ModelRepositoryError(f"중복 OBJ 모델 ID입니다: {model_id}")
+                    display_name = runtime.model_repository.unique_display_name(display_name)
                 self.staged_model = commit_embedded_obj_mesh_and_build_proxy(
                     mesh,
                     model_id=model_id,
@@ -510,6 +513,8 @@ class MeshImportJob:
             if self.stage == MESH_IMPORT_STAGE_PREPARE_GPU:
                 if runtime is None:
                     raise MeshImportJobError("OBJ GPU 준비에는 Runtime이 필요합니다.")
+                if self.staged_model.model_id in runtime.model_repository.models:
+                    raise ModelRepositoryError(f"중복 OBJ 모델 ID입니다: {self.staged_model.model_id}")
                 _prepare_gpu_batch_for_model(self.staged_model.model_id, self.staged_model)  # type: ignore[union-attr]
                 self.gpu_batch_prepared = True
                 self._advance(MESH_IMPORT_STAGE_COMMIT, 0.94)

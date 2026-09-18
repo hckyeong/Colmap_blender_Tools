@@ -335,9 +335,10 @@ def test_cancel_during_display_sampling_leaves_no_partial_model_or_gpu_batch() -
     assert job.staged_model is None
 
 
-def test_duplicate_source_fails_before_incremental_reader_creation() -> None:
-    """상위·직접 경로가 같은 모델이면 reader 생성 전에 중복으로 거부하는지 확인합니다."""
+def test_duplicate_source_creates_reader_and_independent_pending_layers() -> None:
+    """같은 원본을 매번 다시 읽어 고유 이름과 독립 배열·변환의 대기 레이어로 등록합니다."""
     from tools.align import colmap_io, importer
+    from tools.align.alignment.types import create_sim3_transform
     from tools.align.importer import create_import_job
     from tools.align.state import RuntimeState
 
@@ -353,26 +354,48 @@ def test_duplicate_source_fails_before_incremental_reader_creation() -> None:
             _write_text_sparse_model(model_path)
             first = create_import_job(selected_root, model_id_factory=lambda: "first-model")
             assert _run_job_until_terminal(first, runtime) == "FINISHED"
+            runtime.model_repository.set_alignment_transform(
+                "first-model",
+                create_sim3_transform(((1, 0, 0), (0, 1, 0), (0, 0, 1)), 2.0, (3, 4, 5)),
+            )
+            first_model = runtime.model_repository.models["first-model"]
+            first_transform = runtime.model_repository.display_transforms["first-model"]
+            first_alignment = runtime.model_repository.alignment_transforms["first-model"]
 
-            def _unexpected_reader_factory(*_args, **_kwargs):
-                """중복 사전 검사 뒤 호출되면 안 되는 reader 생성을 감시합니다."""
+            def _count_reader_factory(*args, **kwargs):
+                """같은 경로를 다시 읽는 실제 reader 생성 횟수를 기록합니다."""
                 nonlocal reader_creation_count
                 reader_creation_count += 1
-                raise AssertionError("중복 소스에서 증분 reader를 생성했습니다.")
+                return original_reader_factory(*args, **kwargs)
 
-            colmap_io.create_incremental_sparse_model_reader = _unexpected_reader_factory
-            duplicate = create_import_job(model_path, model_id_factory=lambda: "duplicate-model")
-            assert duplicate.step(runtime) == "CANCELLED"
+            colmap_io.create_incremental_sparse_model_reader = _count_reader_factory
+            _write_text_sparse_model_with_point_count(model_path, 3)
+            duplicate = create_import_job(selected_root, model_id_factory=lambda: "duplicate-model")
+            assert _run_job_until_terminal(duplicate, runtime) == "FINISHED"
+            third = create_import_job(selected_root, model_id_factory=lambda: "third-model")
+            assert _run_job_until_terminal(third, runtime) == "FINISHED"
     finally:
         importer._prepare_gpu_batch_for_model = original_prepare_gpu
         colmap_io.create_incremental_sparse_model_reader = original_reader_factory
 
-    assert reader_creation_count == 0
-    assert runtime.model_catalog.model_count == 1
-    assert tuple(runtime.model_repository.models) == ("first-model",)
+    assert reader_creation_count == 2
+    assert runtime.model_catalog.model_count == 3
+    assert tuple(runtime.model_repository.models) == ("first-model", "duplicate-model", "third-model")
     assert runtime.model_repository.models["first-model"].source_path == model_path.resolve()
     assert runtime.model_repository.models["first-model"].display_name == "duplicate"
-    assert "같은 COLMAP 모델 폴더" in duplicate.error_message
+    assert runtime.model_repository.models["first-model"] is first_model
+    assert first_model.points.point_ids.size == 2
+    assert runtime.model_repository.display_transforms["first-model"] is first_transform
+    assert runtime.model_repository.alignment_transforms["first-model"] is first_alignment
+    assert runtime.model_repository.model_id_for_source_path(model_path) == "first-model"
+    for model_id, name in (("duplicate-model", "duplicate_2"), ("third-model", "duplicate_3")):
+        model = runtime.model_repository.models[model_id]
+        assert model.display_name == name
+        assert model.points.point_ids.size == 3
+        assert model.points.positions is not first_model.points.positions
+        record = runtime.model_catalog.models[model_id]
+        assert record.registration_status == "PENDING" and not record.is_anchor
+    assert runtime.model_catalog.selected_model_id == "third-model"
 
 
 def test_import_records_inferred_dataset_root_from_sparse_zero_selection() -> None:
@@ -403,11 +426,13 @@ def test_import_records_inferred_dataset_root_from_sparse_zero_selection() -> No
         importer._prepare_gpu_batch_for_model = original_prepare_gpu
 
 
-def test_second_import_selects_pending_layer_and_duplicate_is_atomic() -> None:
-    """두 번째 모델은 PENDING으로 선택되고 같은 정규 경로 중복은 상태를 바꾸지 않는지 확인합니다."""
+def test_second_import_selects_pending_layer_and_id_collision_is_atomic() -> None:
+    """대기 레이어 선택을 유지하고 기존 ID 충돌은 실제 GPU 정리 경로에서도 캐시를 보존합니다."""
+    from unittest.mock import patch
     from tools.align.importer import create_import_job
     from tools.align.state import RuntimeState
     from tools.align import importer
+    from tools.align.viewport import renderer
 
     runtime = RuntimeState()
     original_prepare_gpu = importer._prepare_gpu_batch_for_model
@@ -426,8 +451,16 @@ def test_second_import_selects_pending_layer_and_duplicate_is_atomic() -> None:
             catalog_before = runtime.model_catalog.snapshot()
             repository_before = dict(runtime.model_repository.models)
             transforms_before = dict(runtime.model_repository.display_transforms)
-            duplicate = create_import_job(first_path, model_id_factory=lambda: "duplicate-model")
-            assert _run_job_until_terminal(duplicate, runtime) == "CANCELLED"
+            cache_key = ("first-model", 1, 1, "기존 표시 표본")
+            cached_batch = object()
+            runtime.gpu_batches[cache_key] = cached_batch
+            duplicate = create_import_job(first_path, model_id_factory=lambda: "first-model")
+            with patch.object(renderer, "RUNTIME", runtime), patch.object(
+                importer, "_prepare_gpu_batch_for_model",
+            ) as prepare_gpu:
+                assert _run_job_until_terminal(duplicate, runtime) == "CANCELLED"
+                prepare_gpu.assert_not_called()
+                assert runtime.gpu_batches == {cache_key: cached_batch}
     finally:
         importer._prepare_gpu_batch_for_model = original_prepare_gpu
 
@@ -442,8 +475,57 @@ def test_second_import_selects_pending_layer_and_duplicate_is_atomic() -> None:
         for model_id, transform in transforms_before.items()
     )
     assert runtime.model_catalog.snapshot() == catalog_before
-    assert "같은 COLMAP 모델 폴더" in duplicate.error_message
+    assert "ID" in duplicate.error_message
     assert runtime.model_repository.models["second-model"].display_name == "sparse_2"
+
+
+def test_mesh_id_collision_preserves_gpu_cache_and_embedded_asset() -> None:
+    """독립 OBJ의 ID 충돌이 기존 GPU 캐시·내장 메시를 보존하고 후보 자산을 남기지 않습니다."""
+    from unittest.mock import patch
+    import bpy
+    from tools.align import mesh_importer
+    from tools.align.mesh_io.embedded_obj_store import (
+        find_embedded_obj_mesh,
+        remove_embedded_obj_mesh,
+    )
+    from tools.align.state import RuntimeState
+    from tools.align.viewport import renderer
+
+    runtime = RuntimeState()
+    asset_uuid = ""
+    try:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.obj"
+            path.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8")
+            first = mesh_importer.create_mesh_import_job(
+                path, model_id_factory=lambda: "mesh-existing", prepare_gpu=False,
+            )
+            assert _run_job_until_terminal(first, runtime) == "FINISHED"
+            model = runtime.model_repository.models["mesh-existing"]
+            asset_uuid = model.embedded_asset_uuid
+            original_mesh = find_embedded_obj_mesh(asset_uuid)
+            mesh_pointers = {mesh.as_pointer() for mesh in bpy.data.meshes}
+            catalog_before = runtime.model_catalog.snapshot()
+            cache_key = ("mesh-existing", 1, 1, "기존 표시 표본")
+            cached_batch = object()
+            runtime.gpu_batches[cache_key] = cached_batch
+            with patch.object(renderer, "RUNTIME", runtime), patch.object(
+                mesh_importer, "_prepare_gpu_batch_for_model",
+            ) as prepare_gpu:
+                collision = mesh_importer.create_mesh_import_job(
+                    path, model_id_factory=lambda: "mesh-existing",
+                )
+                assert _run_job_until_terminal(collision, runtime) == "CANCELLED"
+                assert "ID" in collision.error_message
+                prepare_gpu.assert_not_called()
+                assert runtime.gpu_batches == {cache_key: cached_batch}
+            assert runtime.model_repository.models == {"mesh-existing": model}
+            assert runtime.model_catalog.snapshot() == catalog_before
+            assert find_embedded_obj_mesh(asset_uuid) is original_mesh
+            assert {mesh.as_pointer() for mesh in bpy.data.meshes} == mesh_pointers
+    finally:
+        if asset_uuid:
+            remove_embedded_obj_mesh(asset_uuid, expected_model_id="mesh-existing")
 
 
 def test_cancel_and_gpu_failure_leave_catalog_and_repository_untouched() -> None:
@@ -627,9 +709,10 @@ def run_all() -> None:
     test_import_job_snapshots_default_and_custom_display_point_limit()
     test_import_display_sampling_is_incremental_and_keeps_custom_snapshot()
     test_cancel_during_display_sampling_leaves_no_partial_model_or_gpu_batch()
-    test_duplicate_source_fails_before_incremental_reader_creation()
+    test_duplicate_source_creates_reader_and_independent_pending_layers()
     test_import_records_inferred_dataset_root_from_sparse_zero_selection()
-    test_second_import_selects_pending_layer_and_duplicate_is_atomic()
+    test_second_import_selects_pending_layer_and_id_collision_is_atomic()
+    test_mesh_id_collision_preserves_gpu_cache_and_embedded_asset()
     test_cancel_and_gpu_failure_leave_catalog_and_repository_untouched()
     test_import_rejects_source_changed_after_initial_fingerprint()
     test_import_ui_exposes_folder_selection_progress_and_cancel()

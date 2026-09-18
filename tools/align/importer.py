@@ -20,7 +20,6 @@ from .logging_utils import get_logger
 from .model_repository import (
     ColmapModelData,
     CompanionMeshSourceMetadata,
-    DuplicateModelSourceError,
     ImportedModelSourceMetadata,
     ModelRepositoryError,
     canonical_source_path,
@@ -554,7 +553,7 @@ class ImportJob:
         return "FINISHED"
 
     def step(self, runtime: Any) -> ImportStepResult:
-        """한 TIMER에서 COLMAP 또는 연결 OBJ의 준비 단계를 진행합니다."""
+        """같은 출처를 독립 레이어로 읽되 기존 ID는 자산·GPU 준비 전에 거부합니다."""
         if self.is_terminal:
             return "FINISHED" if self.stage == IMPORT_STAGE_COMPLETED else "CANCELLED"
         if self.cancel_requested:
@@ -576,10 +575,6 @@ class ImportJob:
                     self.dataset_root = str(inferred_dataset_root)
                 resolved_source_path = str(self.layout.source_path)
                 canonical_path = canonical_source_path(resolved_source_path)
-                if runtime.model_repository.contains_source_path(canonical_path):
-                    raise DuplicateModelSourceError(
-                        f"같은 COLMAP 모델 폴더를 이미 불러왔습니다: {canonical_path}"
-                    )
                 if canonical_source_path(selected_root) != canonical_path:
                     self.display_name_hint = (
                         Path(selected_root).expanduser().resolve(strict=False).name
@@ -659,6 +654,10 @@ class ImportJob:
                     model_id_factory=self.model_id_factory,
                     display_name_hint=self.display_name_hint,
                 )
+                if self.staged_model.model_id in runtime.model_repository.models:
+                    raise ModelRepositoryError(
+                        f"중복 COLMAP 모델 ID입니다: {self.staged_model.model_id}"
+                    )
                 self.display_index_builder = IncrementalDisplayIndexBuilder(
                     self.staged_model.points.point_ids,
                     max_points=self.display_point_limit,
@@ -763,6 +762,10 @@ class ImportJob:
             if self.stage == IMPORT_STAGE_PREPARE_GPU:
                 if self.staged_model is None:
                     raise ImportJobError("GPU 배치를 준비할 staged COLMAP 모델이 없습니다.")
+                if self.staged_model.model_id in runtime.model_repository.models:
+                    raise ModelRepositoryError(
+                        f"중복 COLMAP 모델 ID입니다: {self.staged_model.model_id}"
+                    )
                 if not self.prepare_gpu:
                     self._advance(IMPORT_STAGE_COMMIT, 0.96)
                     return "RUNNING"

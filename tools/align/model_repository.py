@@ -26,7 +26,7 @@ class ModelRepositoryError(RuntimeError):
 
 
 class DuplicateModelSourceError(ModelRepositoryError):
-    """같은 sparse model 폴더의 중복 등록 요청을 나타냅니다."""
+    """기존 호출부의 예외 참조 호환을 위해 유지하는 원본 경로 중복 오류입니다."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +112,7 @@ class CompanionMeshSourceMetadata:
 
 
 def canonical_source_path(source_path: str | os.PathLike[str]) -> str:
-    """중복 탐지용 sparse model 폴더 경로를 플랫폼 규칙으로 정규화합니다."""
+    """COLMAP·OBJ 원본 경로를 출처 조회에 사용할 플랫폼 규칙으로 정규화합니다."""
     normalized = Path(source_path).expanduser().resolve(strict=False)
     return os.path.normcase(os.path.normpath(str(normalized)))
 
@@ -207,7 +207,7 @@ def model_image_count(model: ColmapModelData | TriangleMeshModelData) -> int:
 
 @dataclass
 class ColmapModelRepository:
-    """대규모 실제 모델과 정규화된 소스 경로 색인을 소유합니다."""
+    """독립 모델과 경로별 첫 생존 모델을 가리키는 출처 색인을 소유합니다."""
 
     models: dict[str, ColmapModelData | TriangleMeshModelData]
     source_path_index: dict[str, str]
@@ -265,11 +265,11 @@ class ColmapModelRepository:
         self.icp_confidence_cache[normalized_model_id] = (current_revision, confidence)
 
     def contains_source_path(self, source_path: str | os.PathLike[str]) -> bool:
-        """정규화한 sparse model 폴더가 이미 등록됐는지 반환합니다."""
+        """정규화한 원본 경로를 사용하는 레이어가 하나 이상 있는지 반환합니다."""
         return canonical_source_path(source_path) in self.source_path_index
 
     def model_id_for_source_path(self, source_path: str | os.PathLike[str]) -> str | None:
-        """정규화한 sparse model 폴더에 연결된 런타임 모델 ID를 반환합니다."""
+        """해당 원본 경로에서 가장 먼저 등록되어 남아 있는 모델 ID를 반환합니다."""
         return self.source_path_index.get(canonical_source_path(source_path))
 
     def geometry_kind_for_model_id(self, model_id: str) -> str:
@@ -282,7 +282,7 @@ class ColmapModelRepository:
         return GEOMETRY_KIND_COLMAP_POINT_CLOUD
 
     def unique_display_name(self, preferred_name: str) -> str:
-        """동일 폴더 이름에 `_2`, `_3` 접미사를 붙여 표시 이름을 고유하게 만듭니다."""
+        """동일 원본·폴더 이름에 `_2`, `_3`을 붙여 레이어 표시 이름을 구분합니다."""
         normalized_name = preferred_name.strip()
         if not normalized_name:
             raise ModelRepositoryError("COLMAP 모델 표시 이름이 비어 있습니다.")
@@ -302,13 +302,8 @@ class ColmapModelRepository:
         model_id_factory: Callable[[], str] = create_model_id,
         display_name_hint: str = "",
     ) -> ColmapModelData | TriangleMeshModelData:
-        """중복 소스를 미리 거부하고 고유 표시 이름의 staged 모델을 생성합니다."""
+        """원본 경로가 같아도 새 ID와 고유 표시 이름의 준비 모델을 생성합니다."""
         canonical_path = canonical_source_path(source_path)
-        existing_model_id = self.source_path_index.get(canonical_path)
-        if existing_model_id is not None:
-            raise DuplicateModelSourceError(
-                f"같은 COLMAP 모델 폴더를 이미 불러왔습니다: {canonical_path}"
-            )
         preferred_name = display_name_hint.strip() or Path(canonical_path).name
         display_name = self.unique_display_name(preferred_name)
         return build_model_data(
@@ -324,7 +319,7 @@ class ColmapModelRepository:
         display_transform: ModelDisplayTransform,
         source_metadata: ImportedModelSourceMetadata | None = None,
     ) -> None:
-        """모델·경로·축·alignment와 선택 source metadata를 하나의 원자 단위로 등록합니다."""
+        """같은 원본의 레이어도 모델 ID별로 독립 등록하고 경로의 첫 대표를 유지합니다."""
         if model.model_id in self.models:
             raise ModelRepositoryError(f"중복 COLMAP 모델 ID입니다: {model.model_id}")
         if model.model_id in self.display_transforms:
@@ -341,10 +336,6 @@ class ColmapModelRepository:
             raise ModelRepositoryError("COLMAP 모델 source metadata 형식이 올바르지 않습니다.")
         stored_path = os.path.normcase(os.path.normpath(str(model.source_path)))
         canonical_path = canonical_source_path(model.source_path)
-        if canonical_path in self.source_path_index:
-            raise DuplicateModelSourceError(
-                f"같은 COLMAP 모델 폴더를 이미 불러왔습니다: {canonical_path}"
-            )
         if stored_path != canonical_path:
             raise ModelRepositoryError("COLMAP 모델 소스 경로가 정규화되지 않았습니다.")
         if source_metadata is not None:
@@ -359,14 +350,14 @@ class ColmapModelRepository:
                 raise ModelRepositoryError("COLMAP source metadata의 표시 축 snapshot이 모델과 다릅니다.")
         self.models[model.model_id] = model
         try:
-            self.source_path_index[canonical_path] = model.model_id
+            self.source_path_index.setdefault(canonical_path, model.model_id)
             self.display_transforms[model.model_id] = display_transform
             self.alignment_transforms[model.model_id] = identity_sim3_transform()
             if source_metadata is not None:
                 self.source_metadata[model.model_id] = source_metadata
         except Exception:
             self.models.pop(model.model_id, None)
-            self.source_path_index.pop(canonical_path, None)
+            self._remove_source_reference(canonical_path, model.model_id)
             self.display_transforms.pop(model.model_id, None)
             self.alignment_transforms.pop(model.model_id, None)
             self.source_metadata.pop(model.model_id, None)
@@ -505,12 +496,29 @@ class ColmapModelRepository:
         self.set_alignment_transform(normalized_model_id, transform)
         return True
 
+    def _remove_source_reference(self, canonical_path: str, model_id: str) -> None:
+        """삭제한 모델이 경로 대표였다면 같은 원본의 다음 생존 모델로 교체합니다."""
+        if self.source_path_index.get(canonical_path) != model_id:
+            return
+        replacement = next(
+            (
+                remaining_id
+                for remaining_id, remaining in self.models.items()
+                if os.path.normcase(os.path.normpath(str(remaining.source_path))) == canonical_path
+            ),
+            None,
+        )
+        if replacement is None:
+            self.source_path_index.pop(canonical_path, None)
+        else:
+            self.source_path_index[canonical_path] = replacement
+
     def remove_model(self, model_id: str) -> ColmapModelData | TriangleMeshModelData | None:
-        """모델·연결 메시·변환·출처와 파생 평가 캐시를 함께 제거합니다."""
+        """해당 레이어의 자원을 제거하며 같은 원본을 사용하는 다른 레이어의 출처는 유지합니다."""
         model = self.models.pop(model_id, None)
         if model is None:
             return None
-        self.source_path_index.pop(canonical_source_path(model.source_path), None)
+        self._remove_source_reference(canonical_source_path(model.source_path), model_id)
         self.display_transforms.pop(model_id, None)
         self.alignment_transforms.pop(model_id, None)
         self.source_metadata.pop(model_id, None)
