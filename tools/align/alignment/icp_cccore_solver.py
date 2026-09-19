@@ -1154,12 +1154,16 @@ def prepare_overlap_policy(
 def prepare_candidate_samples(
     runner: NativeRunner, moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry,
     policy: Mapping[str, Any], reverse: bool,
+    *, full_samples: dict[str, np.ndarray] | None = None,
+    preparation_progress: Callable[[str], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """원본 크기에 맞는 조회 예산 안에서 등록 표본과 독립 평가 표본을 확보합니다."""
+    """면적 표본의 정확 거리만 검사하여 독립 등록·평가 집합을 준비합니다."""
     parameters = runner.parameters
     sampling = {"directions": {}, "optimizer_seed": contract.CC_OPTIMIZER_SEED,
                 "evaluation_seed": contract.CC_EVALUATION_SEED,
+                "probe_seed": parameters["probe_seed"],
                 "candidate_shortage": False, "spatial_distribution_warning": False}
+    full_samples = {} if full_samples is None else full_samples
     registration = None
     samples = {"moving_to_reference": np.empty((0, 3)), "reference_to_moving": np.empty((0, 3))}
     directions = []
@@ -1167,74 +1171,131 @@ def prepare_candidate_samples(
         directions.append(("moving_to_reference", moving, reference, "reference-model"))
     if moving.triangles is not None:
         directions.append(("reference_to_moving", reference, moving, "moving-model"))
-    operation_limit = contract.preparing_operation_limit(
-        tuple(len(source.triangles) if source.triangles is not None else len(source.positions)
-              for _, source, _, _ in directions),
-        parameters["candidate_probe_batch_size"],
+    operation_limit = contract.surface_preparing_operation_limit(
+        tuple((source.kind, len(source.triangles) if source.triangles is not None else len(source.positions),
+               (parameters["mesh_sample_count"] if source.triangles is not None else parameters["point_sample_count"])
+               if direction == policy["primary_direction"] else 0,
+               parameters["evaluation_sample_count"])
+              for direction, source, _, _ in directions),
+        parameters["candidate_probe_batch_size"], consumed_operations=runner.counter,
     )
+    sampling["preparing_operation_limit"] = operation_limit
     for number, (direction, source, target, model_label) in enumerate(directions):
         runner.check_cancelled()
         model = runner.geometry(model_label, target.positions, target.triangles)
 
         def query(points: np.ndarray) -> np.ndarray:
-            """원본 순회와 추가 후보 탐색을 합친 입력별 조회 예산을 지킵니다."""
+            """독립 탐색과 합격 표본의 사전 계산된 명령 예산을 지킵니다."""
             if runner.counter >= operation_limit:
                 raise contract.CcCoreInputError(
-                    "CC 원본 순회 이후의 추가 겹침 후보 거리 조회 예산을 초과했습니다. "
+                    "CC 겹침 표본의 준비 거리 조회 예산을 초과했습니다. "
                     f"현재 준비 조회 상한은 {operation_limit:,}회입니다."
                 )
             data = runner.geometry(f"candidate-query-{runner.counter + 1}", points, cache_scope="COMMAND")
             return runner.call("distance", data, model, stage="PREPARING")["distances"]
 
+        def sample_progress(event: Mapping[str, Any]) -> None:
+            """실제 확보 개수로 준비 상태를 전달하고 취소를 확인합니다."""
+            runner.check_cancelled()
+            if preparation_progress is not None:
+                preparation_progress(
+                    f"겹침 표본 확보 {event['accepted_count']:,} / {event['requested_count']:,}"
+                )
+
+        count = parameters["mesh_sample_count"] if source.triangles is not None else parameters["point_sample_count"]
+        full_seed = contract.CC_EVALUATION_SEED + (100 if direction == "moving_to_reference" else 101)
         domain_started = monotonic()
-        domain = overlap.build_overlap_domain(
-            source, (target.positions.min(axis=0), target.positions.max(axis=0)),
-            policy["candidate_radius_normalized"], query,
-            cancel_probe=runner.cancel_probe, batch_size=parameters["candidate_probe_batch_size"],
-            max_subdivision_depth=parameters["candidate_max_depth"],
-            max_candidate_patches=parameters["candidate_max_patch_points"],
-        )
-        domain_seconds = float(monotonic() - domain_started)
-        evaluation_started = monotonic()
-        evaluation = overlap.sample_overlap_domain(
-            domain, parameters["evaluation_sample_count"], contract.CC_EVALUATION_SEED + number,
-            query, radius=policy["correspondence_radius_normalized"], cancel_probe=runner.cancel_probe,
-            max_proposals_factor=parameters["candidate_proposal_limit"],
-        )
-        evaluation_seconds = float(monotonic() - evaluation_started)
+        if preparation_progress is not None:
+            preparation_progress("원본 표면의 면적과 표본을 준비합니다.")
+        if source.triangles is not None:
+            with overlap.build_surface_sampler(
+                source, (target.positions.min(axis=0), target.positions.max(axis=0)),
+                policy["candidate_radius_normalized"], runner.directory,
+                cancel_probe=runner.check_cancelled, batch_size=parameters["candidate_probe_batch_size"],
+            ) as sampler:
+                domain_seconds = float(monotonic() - domain_started)
+                probe_started = monotonic()
+                probe = sampler.probe(
+                    query, valid_radius=policy["correspondence_radius_normalized"],
+                    minimum_fraction=policy["minimum_candidate_fraction"], seed=parameters["probe_seed"] + number,
+                )
+                probe_seconds = float(monotonic() - probe_started)
+                evaluation_started = monotonic()
+                evaluation = sampler.sample(
+                    parameters["evaluation_sample_count"], contract.CC_EVALUATION_SEED + number, query,
+                    radius=policy["correspondence_radius_normalized"],
+                    max_proposals=contract.surface_proposal_limit(parameters["evaluation_sample_count"]),
+                    acceptance_hint=probe["valid_acceptance_fraction"], progress=sample_progress,
+                )
+                evaluation_seconds = float(monotonic() - evaluation_started)
+                diagnostics = {
+                    "domain": dict(sampler.metadata), "probe": probe, "probe_seconds": probe_seconds,
+                }
+                fraction = probe["estimated_overlap_fraction"]
+                if direction == policy["primary_direction"]:
+                    registration_started = monotonic()
+                    chosen = sampler.sample(
+                        count, contract.CC_OPTIMIZER_SEED, query, radius=policy["candidate_radius_normalized"],
+                        max_proposals=contract.surface_proposal_limit(count),
+                        acceptance_hint=probe["candidate_acceptance_fraction"], progress=sample_progress,
+                    )
+                    registration = chosen.positions
+                    diagnostics.update(registration=chosen.metadata, registration_sample_fingerprint=chosen.fingerprint,
+                                       registration_sampling_seconds=float(monotonic() - registration_started))
+                full_started = monotonic()
+                full_samples[direction] = sampler.sample_full(parameters["evaluation_sample_count"], full_seed)
+                diagnostics["full_sampling_seconds"] = float(monotonic() - full_started)
+        else:
+            domain = overlap.build_overlap_domain(
+                source, (target.positions.min(axis=0), target.positions.max(axis=0)),
+                policy["candidate_radius_normalized"], query,
+                cancel_probe=runner.check_cancelled, batch_size=parameters["candidate_probe_batch_size"],
+                max_subdivision_depth=parameters["candidate_max_depth"],
+                max_candidate_patches=parameters["candidate_max_patch_points"],
+            )
+            domain_seconds = float(monotonic() - domain_started)
+            evaluation_started = monotonic()
+            evaluation = overlap.sample_overlap_domain(
+                domain, parameters["evaluation_sample_count"], contract.CC_EVALUATION_SEED + number,
+                query, radius=policy["correspondence_radius_normalized"], cancel_probe=runner.check_cancelled,
+                max_proposals_factor=parameters["candidate_proposal_limit"],
+            )
+            evaluation_seconds = float(monotonic() - evaluation_started)
+            diagnostics = {"domain": domain.metadata}
+            fraction = domain.metadata["candidate_fraction"]
+            if direction == policy["primary_direction"]:
+                registration_started = monotonic()
+                chosen = overlap.sample_overlap_domain(
+                    domain, count, contract.CC_OPTIMIZER_SEED, query, cancel_probe=runner.check_cancelled,
+                    max_proposals_factor=parameters["candidate_proposal_limit"],
+                )
+                registration = chosen.positions
+                diagnostics.update(registration=chosen.metadata, registration_sample_fingerprint=chosen.fingerprint,
+                                   registration_sampling_seconds=float(monotonic() - registration_started))
+                sampling["candidate_shortage"] = len(registration) < count
+            full_samples[direction] = fixed_evaluation_points(source, parameters["evaluation_sample_count"], full_seed)
         # 표본 개수가 많아도 원본의 작은 접촉점·선에만 몰린 결과는 사용하지 않습니다.
         centered = evaluation.positions - np.mean(evaluation.positions, axis=0)
         original_positions = np.unique(source.positions, axis=0) if source.triangles is None else source.positions
-        original_centered = original_positions - np.mean(original_positions, axis=0)
         spread = np.sqrt(np.maximum(0.0, np.linalg.eigvalsh(centered.T @ centered / len(centered))))
-        original_spread = np.sqrt(np.maximum(0.0, np.linalg.eigvalsh(
-            original_centered.T @ original_centered / len(original_centered))))
+        original_mean = np.mean(original_positions, axis=0)
+        covariance = np.zeros((3, 3), dtype=np.float64)
+        for start in range(0, len(original_positions), parameters["candidate_probe_batch_size"]):
+            runner.check_cancelled()
+            block = original_positions[start:start + parameters["candidate_probe_batch_size"]] - original_mean
+            covariance += block.T @ block
+        original_spread = np.sqrt(np.maximum(0.0, np.linalg.eigvalsh(covariance / len(original_positions))))
         span = spread[-2:] / np.maximum(original_spread[-2:], np.finfo(float).tiny)
-        if source.triangles is None:
-            fraction = domain.metadata["candidate_fraction"]
-        else:
-            fraction = domain.metadata["candidate_area_fraction"] * evaluation.metadata["acceptance_fraction"]
         if fraction < policy["minimum_candidate_fraction"] or np.any(span < policy["minimum_original_span_ratio"]):
             raise contract.CcCoreInputError("CC 겹침 후보가 원본의 작은 접촉점이나 좁은 선에 집중되어 있습니다.")
-        diagnostics = {
-            "domain": domain.metadata, "evaluation": evaluation.metadata,
+        diagnostics.update({
+            "evaluation": evaluation.metadata,
             "evaluation_sample_fingerprint": evaluation.fingerprint,
             "evaluation_sample_count": len(evaluation.positions),
             "original_span_ratios": span.tolist(), "estimated_overlap_fraction": fraction,
             "domain_seconds": domain_seconds, "evaluation_sampling_seconds": evaluation_seconds,
-        }
+        })
         samples[direction] = evaluation.positions
-        if direction == policy["primary_direction"]:
-            count = parameters["mesh_sample_count"] if source.triangles is not None else parameters["point_sample_count"]
-            registration_started = monotonic()
-            chosen = overlap.sample_overlap_domain(
-                domain, count, contract.CC_OPTIMIZER_SEED, query, cancel_probe=runner.cancel_probe,
-                max_proposals_factor=parameters["candidate_proposal_limit"],
-            )
-            registration = chosen.positions
-            diagnostics.update(registration=chosen.metadata, registration_sample_fingerprint=chosen.fingerprint,
-                               registration_sampling_seconds=float(monotonic() - registration_started))
-            sampling["candidate_shortage"] = source.triangles is None and len(registration) < count
         sampling["directions"][direction] = diagnostics
     if registration is None:
         raise contract.CcCoreInputError("CC 등록 방향의 겹침 표본을 확보하지 못했습니다.")
@@ -1616,14 +1677,17 @@ def solve_cccore_job(
         overlap_policy = prepare_overlap_policy(
             runner, moving, reference, reverse, marker_initial_rms=marker_initial_rms / normalization.unit,
         )
+        def preparation_progress(message: str) -> None:
+            """표본 준비의 실제 작업과 확보 개수를 기존 진행 파일에 전달합니다."""
+            progress("PREPARING", 0.02, message)
+
+        full_samples: dict[str, np.ndarray] = {}
         data_positions, moving_overlap, reference_overlap, sampling_diagnostics = prepare_candidate_samples(
             runner, moving, reference, overlap_policy, reverse,
+            full_samples=full_samples, preparation_progress=preparation_progress,
         )
-        seed = contract.CC_EVALUATION_SEED
-        moving_samples = np.concatenate((moving_overlap, fixed_evaluation_points(
-            moving, parameters["evaluation_sample_count"], seed + 100)))
-        reference_samples = np.concatenate((reference_overlap, fixed_evaluation_points(
-            reference, parameters["evaluation_sample_count"], seed + 101)))
+        moving_samples = np.concatenate((moving_overlap, full_samples.get("moving_to_reference", np.empty((0, 3)))))
+        reference_samples = np.concatenate((reference_overlap, full_samples.get("reference_to_moving", np.empty((0, 3)))))
         overlap_counts = {"moving_to_reference": len(moving_overlap), "reference_to_moving": len(reference_overlap)}
         for direction, values in sampling_diagnostics["directions"].items():
             combined = moving_samples if direction == "moving_to_reference" else reference_samples

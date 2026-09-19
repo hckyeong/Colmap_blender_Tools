@@ -285,3 +285,292 @@ def sample_overlap_domain(domain: OverlapDomain, count, seed, distance_query: Ca
     for array in (points, values, source):
         digest.update(np.ascontiguousarray(array).tobytes())
     return CandidateSamples(points, values, source, metadata, digest.hexdigest())
+
+
+def _surface_interval(successes, total):
+    """두 방향·두 반경·세 관측의 단측 오류 합을 1% 이하로 제한합니다."""
+    import math
+    observed = successes / total
+    limit = math.log(2400.0) / total
+
+    def divergence(value):
+        """관측 비율과 가정 비율 사이의 이항 상대 엔트로피를 계산합니다."""
+        if value <= 0:
+            return 0.0 if observed == 0 else math.inf
+        if value >= 1:
+            return 0.0 if observed == 1 else math.inf
+        return ((observed * math.log(observed / value) if observed else 0.0)
+                + ((1 - observed) * math.log((1 - observed) / (1 - value)) if observed < 1 else 0.0))
+
+    left, right = 0.0, observed
+    for _ in range(64):
+        middle = (left + right) * 0.5
+        if divergence(middle) > limit:
+            left = middle
+        else:
+            right = middle
+    # 이분법의 바깥 경계와 외향 반올림으로 신뢰 구간의 수치적 축소를 피합니다.
+    lower = float(np.nextafter(left, 0.0)) if observed else 0.0
+    left, right = observed, 1.0
+    for _ in range(64):
+        middle = (left + right) * 0.5
+        if divergence(middle) > limit:
+            right = middle
+        else:
+            left = middle
+    return (lower, float(np.nextafter(right, 1.0)) if observed < 1 else 1.0)
+
+
+def _surface_rng(seed):
+    """재현 가능한 표면 난수열의 씨드를 음이 아닌 정수로 검증합니다."""
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise CcCoreInputError("CC 표면 표본 씨드는 음이 아닌 정수여야 합니다.")
+    return np.random.default_rng(int(seed))
+
+
+def _surface_radius(value):
+    """넘파이 논리값도 반경으로 받아들이지 않도록 검사합니다."""
+    if isinstance(value, np.bool_):
+        raise CcCoreInputError("CC 표면 반경은 유한한 양수여야 합니다.")
+    return _radius(value)
+
+
+class MeshSurfaceSampler:
+    """원본 면적 누적 색인을 디스크에 보관하며 독립 표면 표본을 생성합니다."""
+
+    def __init__(self, geometry, model_bounds, radius, directory, *, cancel_probe=None, batch_size=8192):
+        """한정된 묶음으로 전체 및 보수적 후보 면적 색인을 작성합니다."""
+        import os
+        import tempfile
+        from pathlib import Path
+        self._paths, self._indices = [], []
+        self._closed = False
+        self.cancel_probe = cancel_probe
+        self.batch_size = min(8192, _positive_int(batch_size, "CC 표면 묶음 크기"))
+        self.radius = _surface_radius(radius)
+        self.points = np.asarray(geometry.positions)
+        self.faces = np.asarray(geometry.triangles)
+        bounds = np.asarray(model_bounds, dtype=np.float64)
+        if geometry.kind != "TRIANGLE_MESH" or self.points.ndim != 2 or self.points.shape[1:] != (3,) or len(self.points) < 3:
+            raise CcCoreInputError("CC 표면 샘플러에는 삼각 메시가 필요합니다.")
+        if self.faces.ndim != 2 or self.faces.shape[1:] != (3,) or not len(self.faces) or not np.issubdtype(self.faces.dtype, np.integer):
+            raise CcCoreInputError("CC 표면 삼각면 인덱스가 올바르지 않습니다.")
+        if bounds.shape != (2, 3) or not np.isfinite(bounds).all() or np.any(bounds[0] > bounds[1]):
+            raise CcCoreInputError("CC 대상 경계가 올바르지 않습니다.")
+        lower, upper = bounds[0] - self.radius, bounds[1] + self.radius
+        if not np.isfinite([lower, upper]).all():
+            raise CcCoreInputError("CC 확장 대상 경계가 유한하지 않습니다.")
+        original_lower, original_upper = np.full(3, np.inf), np.full(3, -np.inf)
+        try:
+            root = Path(directory).resolve(strict=True)
+            for _ in range(2):
+                descriptor, name = tempfile.mkstemp(prefix="cc_surface_", suffix=".bin", dir=root)
+                self._paths.append(Path(name))
+                os.close(descriptor)
+                self._indices.append(np.memmap(name, dtype=np.float64, mode="w+", shape=(len(self.faces),)))
+            for start in range(0, len(self.points), self.batch_size):
+                _cancel(cancel_probe)
+                vertices = self.points[start:start + self.batch_size]
+                if not np.isfinite(vertices).all():
+                    raise CcCoreInputError("CC 원본 표면 좌표가 유한하지 않습니다.")
+                original_lower = np.minimum(original_lower, vertices.min(axis=0))
+                original_upper = np.maximum(original_upper, vertices.max(axis=0))
+            totals = [0.0, 0.0]
+            eligible_faces = 0
+            for start in range(0, len(self.faces), self.batch_size):
+                _cancel(cancel_probe)
+                faces = self.faces[start:start + self.batch_size]
+                if np.any(faces < 0) or np.any(faces >= len(self.points)):
+                    raise CcCoreInputError("CC 표면 삼각면 인덱스가 범위를 벗어났습니다.")
+                patches = np.asarray(self.points[faces], dtype=np.float64)
+                areas = _areas(patches)
+                if not np.isfinite(areas).all():
+                    raise CcCoreInputError("CC 표면 면적이 유한하지 않습니다.")
+                eligible = (areas > 0) & np.all(patches.max(axis=1) >= lower, axis=1) & np.all(patches.min(axis=1) <= upper, axis=1)
+                eligible_faces += int(eligible.sum())
+                for index, weights in enumerate((areas, np.where(eligible, areas, 0.0))):
+                    cumulative = np.cumsum(weights, dtype=np.float64) + totals[index]
+                    increments = np.diff(np.concatenate(([totals[index]], cumulative)))
+                    if not np.isfinite(cumulative).all() or np.any((weights > 0) & (increments <= 0)):
+                        raise CcCoreInputError("CC 양수 면적이 누적 색인의 수치 정밀도에서 소실되었습니다.")
+                    self._indices[index][start:start + len(faces)] = cumulative
+                    totals[index] = float(cumulative[-1])
+            if totals[0] <= 0 or totals[1] <= 0:
+                raise CcCoreInputError("CC 원본 또는 후보 표면 면적이 없습니다.")
+            for index in self._indices:
+                index.flush()
+            self.metadata = dict(kind="TRIANGLE_MESH", original_area=totals[0], eligible_area=totals[1], eligible_area_fraction=totals[1] / totals[0],
+                                 original_bounds=[original_lower.tolist(), original_upper.tolist()], original_face_count=len(self.faces),
+                                 eligible_face_count=eligible_faces, index_bytes=16 * len(self.faces), radius=self.radius,
+                                 distance_batch_size=self.batch_size, provenance=dict(geometry.provenance), sampling_policy="MESH_SURFACE_AREA_REJECTION_V1")
+        except OSError as error:
+            failure = CcCoreInputError("CC 표면 면적 색인을 디스크에 작성하지 못했습니다.")
+            self._close_after_error(failure)
+            raise failure from error
+        except BaseException as error:
+            self._close_after_error(error)
+            raise
+
+    def __enter__(self):
+        """열린 샘플러를 문맥 관리자에 제공합니다."""
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """정상 종료와 예외 종료 모두에서 자체 임시 색인을 제거합니다."""
+        if exc_value is None:
+            self.close()
+        else:
+            self._close_after_error(exc_value)
+        return False
+
+    def _close_after_error(self, error):
+        """정리 실패를 부가 정보로 기록하여 원래 작업 예외를 보존합니다."""
+        try:
+            self.close()
+        except CcCoreInputError as cleanup_error:
+            if hasattr(error, "add_note"):
+                error.add_note(str(cleanup_error))
+
+    def close(self):
+        """일부 정리가 실패해도 모든 자원을 처리하고 실패 자원은 재시도용으로 남깁니다."""
+        self._closed = True
+        remaining_indices, remaining_paths, failures = [], [], []
+        for index in self._indices:
+            try:
+                index._mmap.close()
+            except (OSError, ValueError, BufferError) as error:
+                remaining_indices.append(index)
+                failures.append(error)
+        self._indices = remaining_indices
+        for path in self._paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                remaining_paths.append(path)
+                failures.append(error)
+        self._paths = remaining_paths
+        if failures:
+            raise CcCoreInputError(f"CC 표면 임시 색인 정리에 실패했습니다: {len(failures)}개 자원 오류.") from failures[0]
+
+    def _ensure_open(self):
+        """이미 해제한 샘플러의 사용과 취소를 검사합니다."""
+        if self._closed:
+            raise CcCoreInputError("CC 표면 샘플러가 이미 닫혔습니다.")
+        _cancel(self.cancel_probe)
+
+    def _draw(self, count, rng, *, full=False):
+        """표본마다 세 난수를 사용하여 묶음 크기에 독립적인 면적 표본을 만듭니다."""
+        self._ensure_open()
+        cumulative = self._indices[0 if full else 1]
+        random = rng.random((count, 3))
+        area_positions = np.minimum(random[:, 0] * cumulative[-1], np.nextafter(cumulative[-1], 0.0))
+        source = np.searchsorted(cumulative, area_positions, side="right")
+        patches = np.asarray(self.points[self.faces[source]], dtype=np.float64)
+        root = np.sqrt(random[:, 1])
+        weights = np.column_stack((1 - root, root * (1 - random[:, 2]), root * random[:, 2]))
+        points = np.sum(patches * weights[:, :, None], axis=1)
+        if not np.isfinite(points).all():
+            raise CcCoreInputError("CC 표면 표본 좌표가 유한하지 않습니다.")
+        return points, source
+
+    def sample_full(self, count, seed):
+        """후보 필터 없이 원본 전체 면적에 비례하는 표본을 반환합니다."""
+        self._ensure_open()
+        count = _positive_int(count, "CC 전체 표면 표본 수")
+        if count < 3:
+            raise CcCoreInputError("CC 전체 표면 표본은 3개 이상이어야 합니다.")
+        rng = _surface_rng(seed)
+        result = np.empty((count, 3), dtype=np.float64)
+        for start in range(0, count, self.batch_size):
+            result[start:start + self.batch_size] = self._draw(min(self.batch_size, count - start), rng, full=True)[0]
+        _cancel(self.cancel_probe)
+        if len(np.unique(result, axis=0)) != count or count < 3 or np.linalg.matrix_rank(result - result[0]) < 2:
+            raise CcCoreInputError("CC 전체 표면 표본에 중복 좌표가 있거나 공간적으로 퇴화했습니다.")
+        _cancel(self.cancel_probe)
+        return result
+
+    def probe(self, distance_query, *, valid_radius, minimum_fraction, seed):
+        """세 고정 관측에서 보정된 이항 구간으로 원본 대비 겹침을 판정합니다."""
+        self._ensure_open()
+        valid_radius = _surface_radius(valid_radius)
+        if isinstance(minimum_fraction, (bool, np.bool_)) or not isinstance(minimum_fraction, (int, float, np.integer, np.floating)):
+            raise CcCoreInputError("CC 최소 겹침 비율은 0과 1 사이의 수여야 합니다.")
+        if valid_radius > self.radius or not np.isfinite(minimum_fraction) or not 0 < minimum_fraction < 1:
+            raise CcCoreInputError("CC 탐색 반경 또는 최소 겹침 비율이 올바르지 않습니다.")
+        rng = _surface_rng(seed)
+        total = candidate = valid = 0
+        fraction = self.metadata["eligible_area_fraction"]
+        for target in (8192, 32768, 131072):
+            while total < target:
+                size = min(self.batch_size, target - total)
+                points, _ = self._draw(size, rng)
+                values = _distances(points, distance_query, self.cancel_probe, self.batch_size)
+                candidate += int(np.count_nonzero(values <= self.radius))
+                valid += int(np.count_nonzero(values <= valid_radius))
+                total += size
+            candidate_ci, valid_ci = _surface_interval(candidate, total), _surface_interval(valid, total)
+            overlap_ci = [value * fraction for value in valid_ci]
+            result = dict(estimated_overlap_fraction=fraction * valid / total, overlap_fraction_interval=overlap_ci,
+                          valid_acceptance_fraction=valid / total, candidate_acceptance_fraction=candidate / total,
+                          valid_acceptance_interval=list(valid_ci), candidate_acceptance_interval=list(candidate_ci),
+                          probe_count=total, candidate_accepted_count=candidate, valid_accepted_count=valid,
+                          confidence_family_error=0.01, confidence_method="Chernoff-KL", probe_seed=int(seed), decision="pass")
+            if overlap_ci[0] >= minimum_fraction:
+                return result
+            if overlap_ci[1] < minimum_fraction:
+                raise CcCoreInputError(f"CC 원본 면적 대비 겹침이 최소 비율보다 작습니다: {overlap_ci}.")
+        raise CcCoreInputError(f"CC 겹침 신뢰 구간이 최소 비율을 걸쳐 판정할 수 없습니다: {overlap_ci}.")
+
+    def sample(self, count, seed, distance_query, *, radius, max_proposals, acceptance_hint=None, progress=None):
+        """고정된 면적 분포와 반경에서 독립 합격 표본을 정해진 예산까지 확보합니다."""
+        self._ensure_open()
+        count = _positive_int(count, "CC 합격 표본 수")
+        if count < 3:
+            raise CcCoreInputError("CC 합격 표면 표본은 3개 이상이어야 합니다.")
+        budget = _positive_int(max_proposals, "CC 표본 제안 상한")
+        radius = _surface_radius(radius)
+        if radius > self.radius:
+            raise CcCoreInputError("CC 표본 반경은 후보 반경보다 클 수 없습니다.")
+        try:
+            hint = float(acceptance_hint) if acceptance_hint is not None else 1.0
+        except (TypeError, ValueError, OverflowError) as error:
+            raise CcCoreInputError("CC 합격률 힌트가 유한한 확률이 아닙니다.") from error
+        if isinstance(acceptance_hint, (bool, np.bool_)) or not np.isfinite(hint) or not 0 <= hint <= 1:
+            raise CcCoreInputError("CC 합격률 힌트는 0 이상 1 이하의 유한한 수여야 합니다.")
+        rng = _surface_rng(seed)
+        points, values, sources = np.empty((count, 3)), np.empty(count), np.empty(count, dtype=np.int64)
+        achieved = proposals = accepted_proposals = 0
+        while achieved < count and proposals < budget:
+            size = min(self.batch_size, budget - proposals)
+            proposed, source = self._draw(size, rng)
+            distances = _distances(proposed, distance_query, self.cancel_probe, self.batch_size)
+            passed = np.flatnonzero(distances <= radius)
+            accepted_proposals += len(passed)
+            keep = passed[:count - achieved]
+            end = achieved + len(keep)
+            points[achieved:end], values[achieved:end], sources[achieved:end] = proposed[keep], distances[keep], source[keep]
+            achieved, proposals = end, proposals + size
+            if progress is not None:
+                progress(dict(accepted_count=achieved, requested_count=count, proposal_count=proposals, max_proposals=budget))
+        if achieved < count:
+            raise CcCoreInputError(f"CC 겹침 합격 표본이 부족합니다: {achieved}/{count}, 제안 상한 {budget}개.")
+        _cancel(self.cancel_probe)
+        if len(np.unique(points, axis=0)) != count or count < 3 or np.linalg.matrix_rank(points - points[0]) < 2:
+            raise CcCoreInputError("CC 겹침 표본에 중복 좌표가 있거나 공간적으로 퇴화했습니다.")
+        metadata = dict(self.metadata)
+        metadata.update(sample_count=count, accepted_count=count, requested_sample_count=count, proposal_count=proposals, accepted_radius=radius,
+                        seed=int(seed), max_proposals=budget, acceptance_hint=hint, acceptance_fraction=count / proposals,
+                        retained_sample_fraction=count / proposals, accepted_proposal_count=accepted_proposals,
+                        proposal_acceptance_fraction=accepted_proposals / proposals,
+                        sample_spatial_distribution=_spatial_metadata(points, self.metadata["original_bounds"]))
+        digest = hashlib.sha256()
+        for array in (points, values, sources):
+            digest.update(np.ascontiguousarray(array).tobytes())
+        _cancel(self.cancel_probe)
+        return CandidateSamples(points, values, sources, metadata, digest.hexdigest())
+
+
+def build_surface_sampler(geometry, model_bounds, radius, directory, *, cancel_probe=None, batch_size=8192):
+    """원본 전체와 보수적 후보의 면적 색인을 가진 표면 샘플러를 만듭니다."""
+    return MeshSurfaceSampler(geometry, model_bounds, radius, directory, cancel_probe=cancel_probe, batch_size=batch_size)

@@ -14,7 +14,7 @@ from typing import Any, Mapping
 import numpy as np
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v4"
+CC_ALGORITHM_VERSION = "cccore-icp-v5"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
 CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v4"
 CC_LEGACY_NATIVE_PROTOCOL_VERSION = "cccore-native-v2"
@@ -65,6 +65,11 @@ CC_MIN_SCALE = 0.9
 CC_MAX_SCALE = 1.1
 CC_OPTIMIZER_SEED = 1729
 CC_EVALUATION_SEED = 104729
+CC_PROBE_SEED = 130363
+CC_MESH_SAMPLING_POLICY = "MESH_SURFACE_AREA_REJECTION_V1"
+CC_MESH_PROBE_COUNTS = (8192, 32768, 131072)
+CC_MESH_MIN_OVERLAP_FRACTION = 0.01
+CC_MESH_PROPOSAL_BUDGET_FACTOR = 2
 GEOMETRY_KINDS = ("COLMAP_POINT_CLOUD", "TRIANGLE_MESH")
 GEOMETRY_MODES = {
     ("COLMAP_POINT_CLOUD", "COLMAP_POINT_CLOUD"): "POINT_TO_POINT",
@@ -442,6 +447,53 @@ def preparing_operation_limit(original_counts: tuple[int, ...], batch_size: int)
     return limit
 
 
+def surface_proposal_limit(count: int) -> int:
+    """표면 합격 표본 스트림의 고정 최악 제안 수를 계산합니다."""
+    count = positive_integer(count, "CC 표면 요청 표본 수")
+    return math.ceil(CC_MESH_PROPOSAL_BUDGET_FACTOR * count / CC_MESH_MIN_OVERLAP_FRACTION)
+
+
+def surface_preparing_operation_limit(
+    directions: tuple[tuple[str, int, int, int], ...],
+    batch_size: int = 8192,
+    *,
+    consumed_operations: int = 0,
+) -> int:
+    """방향별 표본 거절 예산과 이미 실행한 조회를 합산하여 세션 순번을 보호합니다."""
+    size = positive_integer(batch_size, "CC 준비 조회 묶음 크기")
+    if isinstance(consumed_operations, bool) or not isinstance(consumed_operations, int) or consumed_operations < 0:
+        raise CcCoreInputError("CC 기존 준비 조회 수는 0 이상의 정수여야 합니다.")
+    if not directions:
+        raise CcCoreInputError("CC 준비 조회 방향이 없습니다.")
+    limit = consumed_operations
+    for kind, original_count, registration_count, evaluation_count in directions:
+        positive_integer(original_count, "CC 준비 원본 개수")
+        for count in (registration_count, evaluation_count):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise CcCoreInputError("CC 준비 표본 개수는 0 이상의 정수여야 합니다.")
+        if kind == "TRIANGLE_MESH":
+            # 누적 탐색 단계의 마지막 작은 묶음도 방향마다 독립적으로 계산합니다.
+            previous = 0
+            for cumulative in CC_MESH_PROBE_COUNTS:
+                limit += (cumulative - previous + size - 1) // size
+                previous = cumulative
+            for count in (registration_count, evaluation_count):
+                budget = surface_proposal_limit(count) if count else 0
+                limit += (budget + size - 1) // size
+        elif kind == "COLMAP_POINT_CLOUD":
+            # 후보 원본 순회와 정합·평가 후보 재조회는 각각 전체 원본을 넘지 않습니다.
+            scans = 1 + int(registration_count > 0) + int(evaluation_count > 0)
+            limit += scans * ((original_count + size - 1) // size)
+        else:
+            raise CcCoreInputError("CC 준비 조회 원본 종류가 올바르지 않습니다.")
+    if limit > CC_MAX_PREPARING_OPERATIONS:
+        raise CcCoreInputError(
+            "CC 입력 크기가 현재 네이티브 세션의 준비 조회 상한을 초과합니다. "
+            f"필요 예산 {limit:,}회, 지원 상한 {CC_MAX_PREPARING_OPERATIONS:,}회입니다."
+        )
+    return limit
+
+
 def validate_native_call_summaries(
     value: Any,
     *,
@@ -779,9 +831,13 @@ def identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def resolve_parameters(value: Mapping[str, Any]) -> dict[str, Any]:
-    """후보 우선 표본·자동 겹침 추정 정책과 명시적 성능 옵션을 검증합니다."""
+    """면적 표본 우선 겹침 추정 정책과 명시적 성능 옵션을 검증합니다."""
     if not isinstance(value, Mapping):
         raise CcCoreInputError("CC 작업 매개변수는 객체여야 합니다.")
+    probe_counts = value.get("cc_mesh_probe_counts", CC_MESH_PROBE_COUNTS)
+    if (not isinstance(probe_counts, (tuple, list)) or tuple(probe_counts) != CC_MESH_PROBE_COUNTS
+            or any(type(count) is not int for count in probe_counts)):
+        raise CcCoreInputError("CC 표면 탐색 누적 표본 수가 고정 정책과 다릅니다.")
     fixed_policy = {
         "overlap_mode": "ESTIMATED_ON_CANDIDATES",
         "filter_out_farthest_points": True,
@@ -789,6 +845,10 @@ def resolve_parameters(value: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_max_depth": 8,
         "candidate_max_patch_points": 250000,
         "candidate_proposal_limit": 20,
+        "mesh_sampling_policy": CC_MESH_SAMPLING_POLICY,
+        "mesh_min_overlap_fraction": CC_MESH_MIN_OVERLAP_FRACTION,
+        "mesh_proposal_budget_factor": CC_MESH_PROPOSAL_BUDGET_FACTOR,
+        "probe_seed": CC_PROBE_SEED,
         "validation_distance_diagonal_fraction": 0.01,
         "validation_distance_spacing_factor": 3.0,
         "validation_distance_marker_factor": 2.0,
@@ -814,8 +874,9 @@ def resolve_parameters(value: Mapping[str, Any]) -> dict[str, Any]:
         "max_scale": CC_MAX_SCALE,
         "optimizer_seed": CC_OPTIMIZER_SEED,
         "evaluation_seed": CC_EVALUATION_SEED,
+        "mesh_probe_counts": CC_MESH_PROBE_COUNTS,
         "point_input_policy": "OVERLAP_CANDIDATES_SPATIAL_SAMPLE",
-        "mesh_sampling_policy": "OVERLAP_PATCHES_AREA_WEIGHTED_FIXED_SEED",
+        "mesh_sampling_policy": CC_MESH_SAMPLING_POLICY,
         "automatic_overlap_search": True,
     }
     if any(values[name] < 3 for name in ("mesh_sample_count", "point_sample_count", "evaluation_sample_count")):

@@ -273,7 +273,7 @@ def _verified_thread_metadata(
 def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, reference_mesh: bool,
                                 native_path: Path) -> dict[str, Any]:
     """설치본의 격자 재사용 패치와 표본 목표·방향별 평가 분모·주지표를 검증합니다."""
-    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v4"
+    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v5"
     assert metadata["job_protocol_version"] == "cccore-job-v4"
     identity = metadata["native_build_identity"]
     assert identity["protocol_version"] == "cccore-native-v4"
@@ -401,7 +401,7 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
         commit = api.approve_icp_result(runtime)
         provenance = runtime.model_catalog.models["moving"].alignment_provenance
         assert provenance.backend_id == "CCCORELIB"
-        assert provenance.algorithm_version == "cccore-icp-v4"
+        assert provenance.algorithm_version == "cccore-icp-v5"
         assert provenance.icp_rmse == metrics["overlap_mean_rms"]
         assert runtime.model_catalog.models["moving"].registration_status == "REGISTERED"
         expected_dependencies = tuple(sorted((("moving", "COMPANION" if moving_mesh else "MAIN"),

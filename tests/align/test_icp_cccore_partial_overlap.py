@@ -1,4 +1,4 @@
-"""비대칭 곡면의 네 겹침 비율을 실제 CC 정렬과 사전 고정 허용오차로 검사합니다."""
+"""비대칭 곡면의 부분 겹침과 얇은 형상을 실제 CC 정렬의 고정 허용오차로 검사합니다."""
 
 from __future__ import annotations
 
@@ -19,7 +19,10 @@ import icp_cccore_contract as contract
 import icp_cccore_solver as solver
 
 
-CASES = {"full": 1.0, "70": 0.7, "40": 0.4, "20": 0.2}
+CASES = {"full": 1.0, "70": 0.7, "40": 0.4, "20": 0.2, "10": 0.1, "5": 0.05, "thin20": 0.2, "thinfull": 1.0}
+# 5·thin20·thinfull은 기준선과 신규 구현 모두 고정 정답 오차를 초과한 명시 선택 진단 사례입니다.
+# 진단도 같은 허용오차로 실패를 보고하며 일반 자동 회귀에는 통과를 확인한 사례만 둡니다.
+DEFAULT_CASES = ("full", "70", "40", "20", "10")
 # 실제 계산 전에 고정하며 실패 시 실행 인자로 완화할 수 없습니다.
 MAX_POSITION_RMS_DIAGONAL_FRACTION = 0.003
 MAX_RELATIVE_SCALE_ERROR = 0.003
@@ -51,10 +54,12 @@ def known_transform(diagonal: float) -> np.ndarray:
     return transform
 
 
-def create_job(directory: Path, fraction: float, threads: int) -> tuple[dict, np.ndarray, np.ndarray, float]:
-    """동일 표면의 서로 다른 창에 알려진 역변환을 적용하여 원본 메시 작업을 기록합니다."""
+def create_job(directory: Path, fraction: float, threads: int, transverse_scale: float = 1.) -> tuple[dict, np.ndarray, np.ndarray, float]:
+    """같은 곡면 창의 횡단 폭을 고정한 뒤 알려진 역변환을 적용한 작업을 기록합니다."""
     truth, triangles = curved_patch(-1.0)
     reference, reference_triangles = curved_patch(-1.0 + 2.0 * (1.0 - fraction))
+    truth[:, 1:] *= transverse_scale
+    reference[:, 1:] *= transverse_scale
     diagonal = float(np.linalg.norm(np.ptp(truth, axis=0)))
     expected = known_transform(diagonal)
     moving = solver.transform_positions(truth, np.linalg.inv(expected))
@@ -66,7 +71,7 @@ def create_job(directory: Path, fraction: float, threads: int) -> tuple[dict, np
         geometry[role] = {"kind": "TRIANGLE_MESH", "positions_file": positions_name,
                           "point_count": len(positions), "triangles_file": triangles_name, "triangle_count": len(faces)}
     geometry.update(input_fingerprint=f"curved-overlap-{fraction}", provenance={
-        "synthetic": True, "parameter_domain_overlap_fraction": fraction,
+        "synthetic": True, "parameter_domain_overlap_fraction": fraction, "transverse_scale": transverse_scale,
         "overlap_definition": "동일 가로 길이 창의 공유 구간 비율이며 곡면 넓이 비율과 구분합니다.",
     })
     manifest = {
@@ -160,7 +165,8 @@ def run_case(name: str, native_worker: Path, threads: int) -> dict:
     """하나의 실제 작업을 완료·회수하고 실패 시에도 정답 오차를 보고서에 남깁니다."""
     with TemporaryDirectory(prefix=f"cc-overlap-{name}-") as temporary:
         directory = Path(temporary)
-        manifest, expected, moving, diagonal = create_job(directory, CASES[name], threads)
+        manifest, expected, moving, diagonal = create_job(directory, CASES[name], threads,
+                                                         transverse_scale=.15 if name.startswith("thin") else 1.)
         original_hashes = input_hashes(directory, manifest)
         result = solver.solve_cccore_job(directory, native_worker)
         report = {"case": name, "overlap_fraction": CASES[name], **measure_truth(result, expected, moving, diagonal),
@@ -190,7 +196,7 @@ def run_case(name: str, native_worker: Path, threads: int) -> dict:
 def main() -> int:
     """선택한 사례를 한 번에 하나씩 실행하고 고정 허용오차와 결과를 JSON으로 저장합니다."""
     parser = argparse.ArgumentParser(description="비대칭 곡면 부분 겹침 실제 CC 검사")
-    parser.add_argument("--case", choices=tuple(CASES), nargs="+", default=list(CASES))
+    parser.add_argument("--case", choices=tuple(CASES), nargs="+", default=list(DEFAULT_CASES))
     parser.add_argument("--native-worker", type=Path, default=ROOT / ".cccore-runtime" / "cccore" / "colmap_cccore_worker.exe")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--output", type=Path, default=ROOT / ".artifacts" / "cccore-partial-overlap-report.json")

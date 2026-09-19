@@ -23,7 +23,7 @@ from .icp_cccore_contract import CC_DEFAULT_MAX_ITERATIONS, CC_DEFAULT_SCALE_REF
 from .types import Sim3Transform
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v4"
+CC_ALGORITHM_VERSION = "cccore-icp-v5"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
 CC_PROGRESS_STAGES = frozenset({
     "PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE",
@@ -80,6 +80,11 @@ class CcCoreRuntimeParameters:
             "cc_candidate_max_depth": 8,
             "cc_candidate_max_patch_points": 250000,
             "cc_candidate_proposal_limit": 20,
+            "cc_mesh_sampling_policy": "MESH_SURFACE_AREA_REJECTION_V1",
+            "cc_mesh_min_overlap_fraction": 0.01,
+            "cc_mesh_proposal_budget_factor": 2,
+            "cc_probe_seed": 130363,
+            "cc_mesh_probe_counts": [8192, 32768, 131072],
             "cc_validation_distance_diagonal_fraction": 0.01,
             "cc_validation_distance_spacing_factor": 3.0,
             "cc_validation_distance_marker_factor": 2.0,
@@ -383,6 +388,83 @@ def current_geometry_matches(runtime: Any, input_data: Any, *, verify_content: b
     ) is None
 
 
+def _validate_surface_direction(direction: Mapping[str, Any], number: int) -> None:
+    """원본 면적과 겹침 추정·신뢰 구간 및 독립 표본 예산을 분리하여 검증합니다."""
+    from . import icp_cccore_contract as contract
+
+    domain = direction["domain"]
+    if domain.get("sampling_policy") != contract.CC_MESH_SAMPLING_POLICY or domain.get("kind") != "TRIANGLE_MESH":
+        raise IcpJobProtocolError("CC 메시 표본 정책이 현재 계약과 다릅니다.")
+    if "candidate_area_fraction" in domain:
+        raise IcpJobProtocolError("CC 추정 겹침을 확정 후보 면적으로 기록할 수 없습니다.")
+    original = contract.finite_nonnegative_number(domain.get("original_area"), "CC 원본 면적")
+    eligible = contract.finite_nonnegative_number(domain.get("eligible_area"), "CC 후보 면적")
+    fraction = contract.finite_nonnegative_number(domain.get("eligible_area_fraction"), "CC 후보 면적 비율")
+    if not 0 < eligible <= original or not np.isclose(fraction, eligible / original, rtol=1.0e-12, atol=0):
+        raise IcpJobProtocolError("CC 원본과 후보 면적 비율이 일치하지 않습니다.")
+    if domain.get("distance_batch_size") != 8192:
+        raise IcpJobProtocolError("CC 메시 거리 조회 묶음 크기가 고정 정책과 다릅니다.")
+    probe = direction.get("probe")
+    if not isinstance(probe, Mapping) or probe.get("probe_seed") != contract.CC_PROBE_SEED + number:
+        raise IcpJobProtocolError("CC 독립 겹침 탐색 시드가 올바르지 않습니다.")
+    count = contract.nonnegative_integer(probe.get("probe_count"), "CC 탐색 표본 수")
+    if count not in contract.CC_MESH_PROBE_COUNTS or probe.get("decision") != "pass":
+        raise IcpJobProtocolError("CC 겹침 탐색 종료 상태가 올바르지 않습니다.")
+    valid = contract.nonnegative_integer(probe.get("valid_accepted_count"), "CC 유효 탐색 표본 수")
+    candidate = contract.nonnegative_integer(probe.get("candidate_accepted_count"), "CC 후보 탐색 표본 수")
+    if not 0 <= valid <= candidate <= count:
+        raise IcpJobProtocolError("CC 탐색 합격 개수가 전체 표본 수를 벗어났습니다.")
+    from .icp_cccore_overlap import _surface_interval
+    for name, expected in (("valid_acceptance_fraction", valid / count),
+                           ("candidate_acceptance_fraction", candidate / count),
+                           ("estimated_overlap_fraction", fraction * valid / count)):
+        value = contract.finite_nonnegative_number(probe.get(name), f"CC 탐색 {name}")
+        if not np.isclose(value, expected, rtol=1.0e-12, atol=1.0e-15):
+            raise IcpJobProtocolError("CC 겹침 추정이 실제 탐색 합격률과 다릅니다.")
+    for name, estimate in (("valid_acceptance_interval", valid / count),
+                           ("candidate_acceptance_interval", candidate / count),
+                           ("overlap_fraction_interval", fraction * valid / count)):
+        interval = probe.get(name)
+        if not isinstance(interval, (tuple, list)) or len(interval) != 2:
+            raise IcpJobProtocolError("CC 겹침 신뢰 구간이 올바르지 않습니다.")
+        lower, upper = [contract.finite_nonnegative_number(value, "CC 신뢰 구간 경계") for value in interval]
+        if not 0 <= lower <= estimate <= upper <= 1:
+            raise IcpJobProtocolError("CC 겹침 신뢰 구간이 추정값을 포함하지 않습니다.")
+        if name != "overlap_fraction_interval":
+            expected_interval = _surface_interval(valid if name == "valid_acceptance_interval" else candidate, count)
+            if not np.allclose((lower, upper), expected_interval, rtol=1.0e-12, atol=1.0e-15):
+                raise IcpJobProtocolError("CC 겹침 신뢰 구간이 고정 통계 계산과 다릅니다.")
+    if (probe["overlap_fraction_interval"][0] < contract.CC_MESH_MIN_OVERLAP_FRACTION
+            or not np.allclose(probe["overlap_fraction_interval"],
+                               np.asarray(probe["valid_acceptance_interval"]) * fraction, rtol=1.0e-12, atol=1.0e-15)
+            or probe.get("confidence_family_error") != 0.01 or probe.get("confidence_method") != "Chernoff-KL"):
+        raise IcpJobProtocolError("CC 겹침 신뢰 구간의 통과 기준이 고정 정책과 다릅니다.")
+    estimate = contract.finite_nonnegative_number(direction.get("estimated_overlap_fraction"), "CC 방향별 겹침 추정")
+    if not np.isclose(estimate, probe["estimated_overlap_fraction"], rtol=1.0e-12, atol=1.0e-15):
+        raise IcpJobProtocolError("CC 방향별 겹침 추정이 탐색 결과와 다릅니다.")
+    for name, seed in (("evaluation", contract.CC_EVALUATION_SEED + number), ("registration", contract.CC_OPTIMIZER_SEED)):
+        if name not in direction:
+            continue
+        sample = direction[name]
+        requested = contract.nonnegative_integer(sample.get("requested_sample_count"), "CC 요청 표본 수")
+        proposals = contract.nonnegative_integer(sample.get("proposal_count"), "CC 제안 표본 수")
+        budget = contract.nonnegative_integer(sample.get("max_proposals"), "CC 제안 표본 상한")
+        expected_budget = contract.surface_proposal_limit(requested)
+        if (sample.get("sampling_policy") != contract.CC_MESH_SAMPLING_POLICY or sample.get("seed") != seed
+                or requested != sample.get("sample_count") or not 3 <= requested <= proposals <= budget
+                or budget != expected_budget):
+            raise IcpJobProtocolError("CC 면적 합격 표본의 정책·시드·개수·제안 상한이 올바르지 않습니다.")
+        accepted = contract.nonnegative_integer(sample.get("accepted_count"), "CC 합격 표본 수")
+        radius = contract.finite_nonnegative_number(sample.get("accepted_radius"), "CC 합격 표본 반경")
+        domain_radius = contract.finite_nonnegative_number(domain.get("radius"), "CC 후보 반경")
+        if accepted != requested or not 0 < radius <= domain_radius:
+            raise IcpJobProtocolError("CC 합격 표본의 개수 또는 반경이 올바르지 않습니다.")
+        for area_name in ("original_area", "eligible_area", "eligible_area_fraction"):
+            value = contract.finite_nonnegative_number(sample.get(area_name), f"CC 표본 {area_name}")
+            if not np.isclose(value, domain[area_name], rtol=1.0e-12, atol=0):
+                raise IcpJobProtocolError("CC 합격 표본의 면적 출처가 탐색 영역과 다릅니다.")
+
+
 def _validate_overlap_result_metadata(metadata: Mapping[str, Any]) -> None:
     """고정 겹침 평가와 표본 진단의 수치·개수·출처 지문을 승인 전에 검사합니다."""
     from .icp_cccore_contract import finite_nonnegative_number, nonnegative_integer
@@ -393,10 +475,11 @@ def _validate_overlap_result_metadata(metadata: Mapping[str, Any]) -> None:
     total_registration = nonnegative_integer(sampling.get("registration_sample_count"), "CC 정합 표본 수")
     if not 3 <= total_registration <= 50000:
         raise IcpJobProtocolError("CC 정합 표본 수가 지원 범위를 벗어났습니다.")
-    for name in ("optimizer_seed", "evaluation_seed"):
-        nonnegative_integer(sampling.get(name), f"CC 표본 {name}")
-    if sampling["optimizer_seed"] == sampling["evaluation_seed"]:
-        raise IcpJobProtocolError("CC 정합과 독립 평가의 표본 시드가 같습니다.")
+    from . import icp_cccore_contract as contract
+    for name, expected in (("optimizer_seed", contract.CC_OPTIMIZER_SEED),
+                           ("evaluation_seed", contract.CC_EVALUATION_SEED), ("probe_seed", contract.CC_PROBE_SEED)):
+        if nonnegative_integer(sampling.get(name), f"CC 표본 {name}") != expected:
+            raise IcpJobProtocolError("CC 독립 표본 시드가 고정 정책과 다릅니다.")
     for name in ("candidate_shortage", "spatial_distribution_warning"):
         if name in sampling and type(sampling[name]) is not bool:
             raise IcpJobProtocolError(f"CC 표본 진단의 {name} 값이 논리값이 아닙니다.")
@@ -412,12 +495,15 @@ def _validate_overlap_result_metadata(metadata: Mapping[str, Any]) -> None:
         raise IcpJobProtocolError("CC 겹침 평가 방향이 입력 형상 조합과 다릅니다.")
     evaluation_count = 0
     registration_count = 0
-    for direction in directions.values():
+    for number, direction_name in enumerate(name for name in ("moving_to_reference", "reference_to_moving") if name in directions):
+        direction = directions[direction_name]
         if not isinstance(direction, Mapping):
             raise IcpJobProtocolError("CC 평가 방향 진단이 객체가 아닙니다.")
         for name in ("domain", "evaluation"):
             if not isinstance(direction.get(name), Mapping):
                 raise IcpJobProtocolError(f"CC 표본 진단의 {name} 값이 객체가 아닙니다.")
+        if metadata.get("geometry_mode") == "MESH_TO_MESH":
+            _validate_surface_direction(direction, number)
         count = nonnegative_integer(direction.get("evaluation_sample_count"), "CC 방향별 평가 표본 수")
         if not 3 <= count <= 30000:
             raise IcpJobProtocolError("CC 방향별 독립 평가 표본 수가 지원 범위를 벗어났습니다.")
@@ -510,6 +596,10 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
         finite_nonnegative_number,
     )
     try:
+        from .icp_cccore_contract import CC_MAX_PREPARING_OPERATIONS, positive_integer, resolve_parameters
+
+        if _plain(metadata.get("parameters")) != _plain(resolve_parameters(input_data.parameters.to_mapping())):
+            raise IcpJobProtocolError("CC 결과의 실행 매개변수가 요청한 고정 정책과 다릅니다.")
         _validate_overlap_result_metadata(metadata)
         marker_rms = finite_nonnegative_number(metadata.get("marker_initial_rms"), "CC 마커 초기 잔차")
         expected_marker_rms = 0.0 if input_data.seed.marker_result is None else float(input_data.seed.marker_result.metrics.rms)
@@ -527,6 +617,12 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
             requested_max_threads=native_identity["requested_max_threads"],
             effective_max_threads=native_identity["effective_max_threads"],
         )
+        preparation_limit = positive_integer(
+            metadata["sampling_diagnostics"].get("preparing_operation_limit"), "CC 준비 조회 상한",
+        )
+        preparation_count = sum(operation["stage"] == "PREPARING" for operation in operations)
+        if not preparation_count <= preparation_limit <= CC_MAX_PREPARING_OPERATIONS:
+            raise IcpJobProtocolError("CC 준비 조회가 사전에 정한 네이티브 명령 예산을 벗어났습니다.")
         if metadata.get("native_calls") != metadata.get("logical_operations"):
             raise IcpJobProtocolError("CC 정렬 결과의 호환 호출 요약이 논리 연산과 다릅니다.")
         if len(operations) < 1:

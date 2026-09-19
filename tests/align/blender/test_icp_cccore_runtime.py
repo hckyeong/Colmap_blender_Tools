@@ -85,7 +85,7 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
     result = _finish(runtime)
     assert not handle.files.job_directory.exists()
     assert result.solver_backend == "CCCORELIB" and result.metadata["geometry_mode"] == "POINT_TO_POINT"
-    assert result.algorithm_version == "cccore-icp-v4"
+    assert result.algorithm_version == "cccore-icp-v5"
     requested_threads = min(1024, max(1, (os.cpu_count() or 1) - 1))
     assert result.metadata["parameters"]["max_threads"] == requested_threads
     assert result.metadata["requested_max_threads"] == requested_threads

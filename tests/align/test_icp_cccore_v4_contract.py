@@ -41,6 +41,45 @@ class V4ContractTest(unittest.TestCase):
             summaries, geometry_mode=mode, requested_max_threads=1, effective_max_threads=1,
         )
 
+    def test_surface_budget_counts_each_stream_and_spacing(self):
+        """양방향 저합격률·마지막 묶음·선행 간격 조회를 모두 예산에 넣습니다."""
+        directions = (("TRIANGLE_MESH", 11303380, 50000, 30000),
+                      ("TRIANGLE_MESH", 11303380, 0, 30000))
+        self.assertEqual(contract.surface_preparing_operation_limit(directions, consumed_operations=2),
+                         2 + 32 + 1221 + 733 + 733)
+        self.assertEqual(contract.surface_preparing_operation_limit((("TRIANGLE_MESH", 3, 3, 3),)), 18)
+        self.assertEqual(contract.surface_preparing_operation_limit((("COLMAP_POINT_CLOUD", 8193, 3, 3),),
+                                                                   consumed_operations=2), 8)
+
+    def test_surface_budget_rejects_native_sequence_overflow(self):
+        """후속 열 번과 종료 한 번을 남길 수 없는 준비 예산을 거부합니다."""
+        directions = (("TRIANGLE_MESH", 3, 50000, 30000),)
+        required = contract.surface_preparing_operation_limit(directions)
+        self.assertEqual(contract.surface_preparing_operation_limit(
+            directions, consumed_operations=contract.CC_MAX_PREPARING_OPERATIONS - required), 9988)
+        with self.assertRaises(contract.CcCoreInputError):
+            contract.surface_preparing_operation_limit(
+                directions, consumed_operations=contract.CC_MAX_PREPARING_OPERATIONS - required + 1)
+        for arguments in (((), 8192), ((("UNKNOWN", 3, 3, 3),), 8192), (directions, 0)):
+            with self.subTest(arguments=arguments), self.assertRaises(contract.CcCoreInputError):
+                contract.surface_preparing_operation_limit(*arguments)
+
+    def test_surface_policy_changes_python_version_only(self):
+        """새 표면 정책과 세 독립 시드를 고정하되 기존 네이티브 계약을 유지합니다."""
+        parameters = contract.resolve_parameters({})
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
+        self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v4")
+        self.assertEqual(parameters["mesh_sampling_policy"], "MESH_SURFACE_AREA_REJECTION_V1")
+        self.assertEqual(parameters["mesh_probe_counts"], (8192, 32768, 131072))
+        self.assertEqual(contract.surface_proposal_limit(50000), 10000000)
+        self.assertEqual(len({parameters[name] for name in ("probe_seed", "optimizer_seed", "evaluation_seed")}), 3)
+        for key, value in (("mesh_sampling_policy", "OVERLAP_PATCHES_AREA_WEIGHTED_FIXED_SEED"),
+                           ("probe_seed", 1729), ("mesh_min_overlap_fraction", 0.02),
+                           ("mesh_proposal_budget_factor", 1), ("mesh_probe_counts", [8192])):
+            with self.subTest(key=key), self.assertRaises(contract.CcCoreInputError):
+                contract.resolve_parameters({f"cc_{key}": value})
+
     def test_large_project_budget_includes_original_mesh_scan(self):
         """실제 프로젝트의 양방향 원본 순회를 허용하고 조회 묶음은 키우지 않습니다."""
         limit = contract.preparing_operation_limit((11303380, 11303380), 8192)

@@ -338,8 +338,8 @@ class PureContractTests(unittest.TestCase):
         self.assertTrue(np.all(first[:, 2] == 0.0))
 
     def test_v4_protocol_and_thread_limit_contract(self) -> None:
-        """v4 식별자와 1..1024 범위의 네이티브 스레드 요청만 허용합니다."""
-        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v4")
+        """표본 정책 v5·통신 v4와 1..1024 범위의 스레드 요청만 허용합니다."""
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
         self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v4")
         self.assertEqual(contract.resolve_parameters({"cc_max_threads": 1024})["max_threads"], 1024)
