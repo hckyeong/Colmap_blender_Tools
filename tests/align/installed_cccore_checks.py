@@ -207,7 +207,7 @@ def _verified_thread_metadata(
         assert metadata["physical_native_command_count"] <= len(calls)
         assert geometry_mode in _NATIVE_OPERATION_SEQUENCES
         preparing_count = sum(call.get("stage") == "PREPARING" for call in calls)
-        assert 1 <= preparing_count <= 2048
+        assert 1 <= preparing_count <= 9999 - max(map(len, _NATIVE_OPERATION_SEQUENCES.values())) - 1
         assert all(call.get("stage") == "PREPARING" and call.get("operation") == "distance"
                    for call in calls[:preparing_count])
         assert tuple(call.get("operation") for call in calls[preparing_count:]) == _NATIVE_OPERATION_SEQUENCES[geometry_mode]

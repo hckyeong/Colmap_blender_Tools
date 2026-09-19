@@ -532,27 +532,36 @@ Json matrixJson(const Transform& transform) {
     return matrix;
 }
 
-// 동일한 불변 메시의 격자를 선택적으로 재사용하여 정확 거리를 계산합니다.
+// 불변 메시의 검색 단계와 격자를 재사용하고 조회점의 정확 거리는 매번 계산합니다.
 int computeDistances(
     Cloud& data, Cloud& model, CCCoreLib::SimpleMesh* mesh, Progress* progress,
     unsigned maxThreads, NativeTimings* timings = nullptr, OperationCounters* counters = nullptr,
-    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* meshGrid = nullptr
+    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* meshGrid = nullptr,
+    std::optional<unsigned char>* meshLevel = nullptr
 ) {
     if (mesh) {
-        progress->setSubstage("OCTREE");
-        const auto octreeStarted = Clock::now();
-        CCCoreLib::DgmOctree dataOctree(&data);
-        CCCoreLib::DgmOctree modelOctree(&model);
-        if (dataOctree.build(progress) < static_cast<int>(data.size())
-            || modelOctree.build(progress) < static_cast<int>(model.size())) {
+        unsigned char requestedLevel;
+        if (meshLevel && meshLevel->has_value()) {
+            requestedLevel = meshLevel->value();
+        } else {
+            progress->setSubstage("OCTREE");
+            const auto octreeStarted = Clock::now();
+            CCCoreLib::DgmOctree dataOctree(&data);
+            CCCoreLib::DgmOctree modelOctree(&model);
+            if (dataOctree.build(progress) < static_cast<int>(data.size())
+                || modelOctree.build(progress) < static_cast<int>(model.size())) {
+                progress->check();
+                throw WorkerError("OCTREE_BUILD_FAILED", "삼각면 거리 평가를 위한 옥트리를 생성하지 못했습니다.");
+            }
+            if (timings) timings->octreeSeconds += elapsedSeconds(octreeStarted);
+            if (counters) counters->octreeBuildCount += 2;
             progress->check();
-            throw WorkerError("OCTREE_BUILD_FAILED", "삼각면 거리 평가를 위한 옥트리를 생성하지 못했습니다.");
+            requestedLevel = dataOctree.findBestLevelForComparisonWithOctree(&modelOctree);
+            if (meshLevel) *meshLevel = requestedLevel;
         }
-        if (timings) timings->octreeSeconds += elapsedSeconds(octreeStarted);
-        if (counters) counters->octreeBuildCount += 2;
         progress->check();
         CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesComputationParams params;
-        params.octreeLevel = dataOctree.findBestLevelForComparisonWithOctree(&modelOctree);
+        params.octreeLevel = requestedLevel;
         params.signedDistances = false;
         params.useDistanceMap = false;
         params.multiThread = maxThreads > 1;
@@ -562,6 +571,9 @@ int computeDistances(
         const auto code = CCCoreLib::DistanceComputationTools::computeCloud2MeshDistancesWithCache(
             &data, mesh, params, progress, nullptr, meshGrid
         );
+        // 메모리 예산으로 낮아진 실제 단계를 유지하여 가용량 회복 때 재생성하지 않습니다.
+        if (meshLevel && meshGrid && code >= CCCoreLib::DistanceComputationTools::SUCCESS)
+            *meshLevel = meshGrid->level;
         if (timings) {
             const double gridSeconds = meshGrid ? meshGrid->buildSeconds : 0;
             timings->meshGridSeconds += gridSeconds;
@@ -771,6 +783,7 @@ class GeometryRegistry {
     std::uint64_t estimatedBytes = 0;
     // 한 세션에는 격자 한 개만 보관하며 메시 항목보다 먼저 파괴합니다.
     CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache meshGrid;
+    std::optional<unsigned char> meshLevel;
     CachedGeometry* meshGridOwner = nullptr;
     std::uint64_t meshGridBytes = 0;
 
@@ -836,6 +849,7 @@ public:
     // 다른 대상 또는 내부 ICP 격자를 만들기 전에 캐시와 상주 통계를 해제합니다.
     void clearMeshGrid() {
         meshGrid.clear();
+        meshLevel.reset();
         if (meshGridOwner) meshGridOwner->estimatedBytes -= meshGridBytes;
         estimatedBytes -= meshGridBytes;
         meshGridBytes = 0;
@@ -849,6 +863,11 @@ public:
         if (!model.mesh) return nullptr;
         meshGridOwner = &model;
         return &meshGrid;
+    }
+
+    // 격자 소유 메시의 검색 단계만 보관하여 전체 대상 옥트리의 상주 메모리를 추가하지 않습니다.
+    std::optional<unsigned char>* meshLevelCache() {
+        return &meshLevel;
     }
 
     // 완성된 격자의 실제 목록 용량을 소유 메시와 세션 메모리 추정치에 반영합니다.
@@ -989,8 +1008,9 @@ Json executeSessionOperation(
         result["native_code"] = code;
         timings.serializationSeconds += elapsedSeconds(serializationStarted);
     } else {
+        auto* meshGrid = registry.prepareMeshGrid(model);
         const auto code = computeDistances(*data.cloud, *model.cloud, model.mesh.get(), &progress,
-                                           threads.effective, &timings, &counters, registry.prepareMeshGrid(model));
+                                           threads.effective, &timings, &counters, meshGrid, registry.meshLevelCache());
         registry.accountMeshGrid();
         progress.check();
         if (code < CCCoreLib::DistanceComputationTools::SUCCESS)

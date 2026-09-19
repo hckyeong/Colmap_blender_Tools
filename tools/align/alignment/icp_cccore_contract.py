@@ -23,7 +23,8 @@ CC_TBB_VERSION = "2022.0.0"
 CC_MAX_THREADS = 1024
 CC_DEFAULT_MAX_ITERATIONS = 200
 CC_DEFAULT_SCALE_REFINE_MAX_ITERATIONS = 1000
-CC_MAX_PREPARING_OPERATIONS = 2048
+CC_MAX_NATIVE_OPERATIONS = 9999
+CC_EXTRA_PREPARING_OPERATIONS = 2048
 CC_NATIVE_OPERATION_SEQUENCES = {
     "POINT_TO_POINT": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
     "POINT_TO_MESH": ("distance", "distance", "register", "distance", "distance", "register", "distance"),
@@ -33,6 +34,9 @@ CC_NATIVE_OPERATION_SEQUENCES = {
         "distance", "distance", "register", "distance", "distance",
     ),
 }
+CC_MAX_PREPARING_OPERATIONS = CC_MAX_NATIVE_OPERATIONS - max(
+    len(sequence) for sequence in CC_NATIVE_OPERATION_SEQUENCES.values()
+) - 1  # 마지막 세션 종료 명령에도 네 자리 순번 하나를 남깁니다.
 CC_NATIVE_OPERATION_STAGES = {
     "POINT_TO_POINT": (
         "BASELINE", "RIGID", "RIGID", "RIGID_EVALUATION",
@@ -422,6 +426,22 @@ def _validate_evaluation_key_sha256(value: Any, *, required: bool) -> str:
     return value
 
 
+def preparing_operation_limit(original_counts: tuple[int, ...], batch_size: int) -> int:
+    """원본 순회 횟수와 추가 후보 탐색 예산을 합산하되 네이티브 순번 상한을 지킵니다."""
+    size = positive_integer(batch_size, "CC 준비 조회 묶음 크기")
+    original_operations = sum(
+        (positive_integer(count, "CC 준비 원본 개수") + size - 1) // size
+        for count in original_counts
+    )
+    limit = original_operations + CC_EXTRA_PREPARING_OPERATIONS
+    if limit > CC_MAX_PREPARING_OPERATIONS:
+        raise CcCoreInputError(
+            "CC 입력 크기가 현재 네이티브 세션의 준비 조회 상한을 초과합니다. "
+            f"필요 예산 {limit:,}회, 지원 상한 {CC_MAX_PREPARING_OPERATIONS:,}회입니다."
+        )
+    return limit
+
+
 def validate_native_call_summaries(
     value: Any,
     *,
@@ -449,7 +469,9 @@ def validate_native_call_summaries(
             break
         preparing_count += 1
     if not 1 <= preparing_count <= CC_MAX_PREPARING_OPERATIONS:
-        raise CcCoreEnvironmentError("CC 후보 준비 연산 수가 1~2048 범위를 벗어났습니다.")
+        raise CcCoreEnvironmentError(
+            f"CC 후보 준비 연산 수가 1~{CC_MAX_PREPARING_OPERATIONS} 범위를 벗어났습니다."
+        )
     expected_operations = ("distance",) * preparing_count + expected_operations
     expected_stages = ("PREPARING",) * preparing_count + expected_stages
     if len(value) != len(expected_operations):

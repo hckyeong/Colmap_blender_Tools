@@ -246,7 +246,7 @@ class NativeContractTest(unittest.TestCase):
         self.assertEqual(result["effective_max_threads"],result["hardware_thread_count"])
 
     def test_mesh_grid_reuses_different_queries_and_preserves_distances(self):
-        """평면·입체 메시에서 새 조회점의 동일 격자를 재사용하고 단발 거리와 바이트로 비교합니다."""
+        """검색 단계·격자를 한 번만 준비하고 새 조회점의 정확 거리를 단발 결과와 비교합니다."""
         for flat in (False, True):
             for threads in (1, 4):
                 with self.subTest(flat=flat, threads=threads):
@@ -269,9 +269,11 @@ class NativeContractTest(unittest.TestCase):
                             self.assertEqual(result["status"], "completed", result)
                             self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
                             self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
+                            self.assertEqual(result["operation_statistics"]["octree_build_count"], 2 if sequence == 1 else 0)
                             self.assertEqual((root / result["distances_file"]).read_bytes(), expected)
                             if sequence > 1:
                                 self.assertEqual(result["timings"]["mesh_grid_seconds"], 0)
+                                self.assertEqual(result["timings"]["octree_seconds"], 0)
                             query = query[1:] + query[:1]
                             expected = expected[8:] + expected[:8]
                         closed = self.session_command(root, identity, 4, "close")
@@ -288,8 +290,8 @@ class NativeContractTest(unittest.TestCase):
                         # 다음 하위 검사는 독립 세션 파일과 동일한 경로 계약으로 시작합니다.
                         shutil.rmtree(root)
 
-    def test_mesh_grid_invalidates_changed_level_with_same_bounds(self):
-        """메시와 결합 경계가 같아도 조회 밀도로 자동 단계가 바뀌면 격자를 다시 만듭니다."""
+    def test_mesh_grid_keeps_selected_level_when_query_density_changes(self):
+        """조회 밀도가 바뀌어도 검색 단계와 격자를 유지하며 해석적 거리 정답을 보존합니다."""
         root, identity, process, _ = self.start_session()
         try:
             corners = [(0,0,0),(1,0,0),(1,1,0),(0,1,0), (0,0,1),(1,0,1),(1,1,1),(0,1,1)]
@@ -303,8 +305,9 @@ class NativeContractTest(unittest.TestCase):
             for sequence, data in enumerate((small, dense, dense, small), 1):
                 result = self.session_command(root, identity, sequence, "distance", data=data, model=model)
                 self.assertEqual(result["status"], "completed", result)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence != 3))
-                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence == 3))
+                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
+                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
+                self.assertEqual(result["operation_statistics"]["octree_build_count"], 2 if sequence == 1 else 0)
                 values = array("d")
                 values.frombytes((root / result["distances_file"]).read_bytes())
                 points = small_points if data is small else dense_points
@@ -651,7 +654,7 @@ class NativeContractTest(unittest.TestCase):
                 process.wait()
 
     def test_session_parallel_cancel_probe_race(self):
-        """여러 병렬 거리 명령의 취소 조회 경쟁이 오취소나 입출력 오류를 만들지 않는지 반복합니다."""
+        """검색 준비를 재사용하는 병렬 거리 명령에서도 취소 조회 경쟁이 오류를 만들지 않는지 확인합니다."""
         root, identity, process, _ = self.start_session(max_threads=8)
         try:
             data = self.session_grid_geometry(root, "race-data", 100, .005)
@@ -669,7 +672,7 @@ class NativeContractTest(unittest.TestCase):
             self.assertEqual(closed["status"], "closed")
             self.assertEqual(closed["statistics"]["geometry_load_count"], 2)
             self.assertEqual(closed["statistics"]["geometry_cache_hits"], 14)
-            self.assertEqual(closed["statistics"]["octree_build_count"], 16)
+            self.assertEqual(closed["statistics"]["octree_build_count"], 2)
         finally:
             if process.poll() is None:
                 process.kill()

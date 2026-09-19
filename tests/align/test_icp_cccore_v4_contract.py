@@ -41,6 +41,22 @@ class V4ContractTest(unittest.TestCase):
             summaries, geometry_mode=mode, requested_max_threads=1, effective_max_threads=1,
         )
 
+    def test_large_project_budget_includes_original_mesh_scan(self):
+        """실제 프로젝트의 양방향 원본 순회를 허용하고 조회 묶음은 키우지 않습니다."""
+        limit = contract.preparing_operation_limit((11303380, 11303380), 8192)
+        self.assertEqual(limit, 2760 + contract.CC_EXTRA_PREPARING_OPERATIONS)
+        self.assertGreater(limit, 2048)
+        self.assertLessEqual(limit + 10 + 1, contract.CC_MAX_NATIVE_OPERATIONS)
+        values = operation_summaries("MESH_TO_MESH", 2780)
+        self.assertEqual(len(self.validate(values, "MESH_TO_MESH")), len(values))
+
+    def test_unsupported_input_budget_fails_before_distance_queries(self):
+        """프로토콜 순번을 넘는 입력과 잘못된 묶음 크기를 원본 순회 전에 거부합니다."""
+        with self.assertRaisesRegex(contract.CcCoreInputError, "입력 크기"):
+            contract.preparing_operation_limit((100000000, 100000000), 8192)
+        with self.assertRaises(contract.CcCoreInputError):
+            contract.preparing_operation_limit((10,), 0)
+
     def test_preparing_prefix_and_registration_overlap_distance(self):
         """모든 형상 모드의 제한된 준비 뒤 등록 전 거리 두 회를 허용합니다."""
         for mode in contract.CC_NATIVE_OPERATION_SEQUENCES:

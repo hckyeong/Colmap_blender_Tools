@@ -1155,7 +1155,7 @@ def prepare_candidate_samples(
     runner: NativeRunner, moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry,
     policy: Mapping[str, Any], reverse: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """원본 대상까지 거리를 재사용하여 등록 표본과 고정 겹침 평가 표본을 분리 확보합니다."""
+    """원본 크기에 맞는 조회 예산 안에서 등록 표본과 독립 평가 표본을 확보합니다."""
     parameters = runner.parameters
     sampling = {"directions": {}, "optimizer_seed": contract.CC_OPTIMIZER_SEED,
                 "evaluation_seed": contract.CC_EVALUATION_SEED,
@@ -1167,14 +1167,22 @@ def prepare_candidate_samples(
         directions.append(("moving_to_reference", moving, reference, "reference-model"))
     if moving.triangles is not None:
         directions.append(("reference_to_moving", reference, moving, "moving-model"))
+    operation_limit = contract.preparing_operation_limit(
+        tuple(len(source.triangles) if source.triangles is not None else len(source.positions)
+              for _, source, _, _ in directions),
+        parameters["candidate_probe_batch_size"],
+    )
     for number, (direction, source, target, model_label) in enumerate(directions):
         runner.check_cancelled()
         model = runner.geometry(model_label, target.positions, target.triangles)
 
         def query(points: np.ndarray) -> np.ndarray:
-            """준비 거리 명령을 같은 원본 모델에 보내며 세션의 명령 예산을 지킵니다."""
-            if runner.counter >= contract.CC_MAX_PREPARING_OPERATIONS:
-                raise contract.CcCoreInputError("CC 겹침 후보 거리 조회 예산을 초과했습니다. 초기 정렬을 확인하세요.")
+            """원본 순회와 추가 후보 탐색을 합친 입력별 조회 예산을 지킵니다."""
+            if runner.counter >= operation_limit:
+                raise contract.CcCoreInputError(
+                    "CC 원본 순회 이후의 추가 겹침 후보 거리 조회 예산을 초과했습니다. "
+                    f"현재 준비 조회 상한은 {operation_limit:,}회입니다."
+                )
             data = runner.geometry(f"candidate-query-{runner.counter + 1}", points, cache_scope="COMMAND")
             return runner.call("distance", data, model, stage="PREPARING")["distances"]
 
