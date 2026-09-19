@@ -152,7 +152,7 @@ def validate_cccore_runtime(runtime_root):
 
 
 def validate_cccore_distribution(runtime_root):
-    """배포 파일·등록·격자 메모리 패치와 최종 재빌드 원문을 고정 소스와 대조합니다."""
+    """배포 파일·등록·격자 메모리·재사용 패치와 최종 재빌드 원문을 고정 소스와 대조합니다."""
     root = Path(runtime_root).resolve()
     manifest = validate_cccore_runtime(root)
     lock = read_json(ROOT / "tools/align/native/cccore_worker/dependencies.lock.json")
@@ -160,14 +160,18 @@ def validate_cccore_distribution(runtime_root):
         raise RuntimeError("CC 런타임의 의존성 잠금 정보가 현재 소스와 다릅니다.")
     safety = lock["cccore"]["registration_safety_patch"]
     grid = lock["cccore"]["mesh_grid_memory_patch"]
+    reuse = lock["cccore"]["mesh_grid_reuse_patch"]
     expected_core_patch = "+".join((
         lock["cccore"]["patch_id"], lock["cccore"]["concurrency_patch"]["patch_id"], safety["id"],
-        grid["id"],
+        grid["id"], reuse["id"],
     ))
     expected_safety = {
         "core_patch": expected_core_patch, "registration_safety_patch": safety["id"],
         "registration_safety_patch_sha256": safety["sha256"],
         "patched_registration_sha256": safety["patched_sha256"],
+        "mesh_grid_reuse_patch": reuse["id"],
+        "mesh_grid_reuse_patch_sha256": reuse["sha256"],
+        "mesh_grid_reuse_source_sha256": {source["path"]: source["patched_sha256"] for source in reuse["files"]},
         "mesh_grid_memory_patch": grid["id"],
         "mesh_grid_memory_patch_sha256": grid["sha256"],
         "mesh_grid_source_sha256": {source["path"]: source["patched_sha256"] for source in grid["files"]},
@@ -209,6 +213,8 @@ def validate_cccore_distribution(runtime_root):
             "cccore-src/src/RegistrationTools.cpp": safety["patched_sha256"],
             "native/" + grid["file"]: grid["sha256"],
             **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in grid["files"]},
+            "native/" + reuse["file"]: reuse["sha256"],
+            **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in reuse["files"]},
         }
         for name, expected_hash in source_hashes.items():
             if hashlib.sha256(archive.read(name)).hexdigest() != expected_hash:

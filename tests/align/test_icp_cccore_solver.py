@@ -179,7 +179,7 @@ def physical_native_call_summaries(logical_operations: list[dict]) -> list[dict]
 
 
 def make_native_runtime(directory: Path) -> tuple[Path, dict]:
-    """등록 안전·격자 메모리 패치 지문을 포함하는 최소 v4 실행 환경을 만듭니다."""
+    """등록 안전·격자 메모리·재사용 패치 지문을 포함하는 최소 v4 실행 환경을 만듭니다."""
     directory.mkdir(parents=True, exist_ok=True)
     binary_contents = {
         "colmap_cccore_worker.exe": b"worker-v4",
@@ -201,14 +201,24 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
         "sha256": "e" * 64, "files": [{"path": "src/DistanceComputationTools.cpp",
                                         "original_sha256": "f" * 64, "patched_sha256": "a" * 64}],
     }
-    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"]
+    reuse = {
+        "id": "mesh-grid-reuse-v1", "file": "patches/mesh_grid_reuse.patch", "sha256": "1" * 64,
+        "files": [{"path": name, "original_sha256": "a" * 64, "patched_sha256": "2" * 64}
+                  for name in ("include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp",
+                               "include/GridAndMeshIntersection.h", "src/GridAndMeshIntersection.cpp")],
+    }
+    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"] + "+" + reuse["id"]
     manifest = {
         "protocol_version": contract.CC_NATIVE_PROTOCOL_VERSION,
         "platform": "windows-x64",
         "core_commit": thread_metadata["core_commit"],
         "core_patch": thread_metadata["core_patch"],
         "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
-                         "cccore": {"registration_safety_patch": safety, "mesh_grid_memory_patch": grid}},
+                         "cccore": {"registration_safety_patch": safety, "mesh_grid_memory_patch": grid,
+                                    "mesh_grid_reuse_patch": reuse}},
+        "mesh_grid_reuse_patch": reuse["id"],
+        "mesh_grid_reuse_patch_sha256": reuse["sha256"],
+        "mesh_grid_reuse_source_sha256": {item["path"]: item["patched_sha256"] for item in reuse["files"]},
         "mesh_grid_memory_patch": grid["id"],
         "mesh_grid_memory_patch_sha256": grid["sha256"],
         "mesh_grid_source_sha256": {item["path"]: item["patched_sha256"] for item in grid["files"]},
@@ -976,6 +986,29 @@ class PureContractTests(unittest.TestCase):
                     grid["files"][0]["original_sha256"] = "invalid"
                 elif case == "invalid_patched_hash":
                     grid["files"][0]["patched_sha256"] = "invalid"
+                contract.write_json_atomic(executable.with_name("runtime_manifest.json"), manifest)
+                with self.assertRaises(contract.CcCoreEnvironmentError):
+                    solver.native_build_identity(executable)
+
+    def test_native_identity_requires_complete_mesh_grid_reuse_patch(self) -> None:
+        """재사용 패치 누락·원문 연결 오류·최종 지문 변조를 실행 전에 거부합니다."""
+        for case in ("missing", "hash", "source", "chain", "files", "core"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                executable, manifest = make_native_runtime(Path(temporary) / "runtime")
+                self.assertEqual(solver.native_build_identity(executable)["mesh_grid_reuse_patch"], "mesh-grid-reuse-v1")
+                reuse = manifest["dependencies"]["cccore"]["mesh_grid_reuse_patch"]
+                if case == "missing":
+                    manifest.pop("mesh_grid_reuse_patch")
+                elif case == "hash":
+                    manifest["mesh_grid_reuse_patch_sha256"] = "0" * 64
+                elif case == "source":
+                    manifest["mesh_grid_reuse_source_sha256"]["src/DistanceComputationTools.cpp"] = "0" * 64
+                elif case == "chain":
+                    reuse["files"][1]["original_sha256"] = "0" * 64
+                elif case == "files":
+                    reuse["files"].pop()
+                elif case == "core":
+                    manifest["core_patch"] = manifest["core_patch"].replace("+mesh-grid-reuse-v1", "")
                 contract.write_json_atomic(executable.with_name("runtime_manifest.json"), manifest)
                 with self.assertRaises(contract.CcCoreEnvironmentError):
                     solver.native_build_identity(executable)

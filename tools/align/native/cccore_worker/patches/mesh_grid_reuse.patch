@@ -1,0 +1,170 @@
+--- a/include/DistanceComputationTools.h
++++ b/include/DistanceComputationTools.h
+@@ -10,6 +10,7 @@
+ #include "Grid3D.h"
+ #include "GridAndMeshIntersection.h"
+ #include "SquareMatrix.h"
++#include <memory>
+ 
+ namespace CCCoreLib
+ {
+@@ -219,6 +220,38 @@
+ 												Cloud2MeshDistancesComputationParams& params,
+ 												GenericProgressCallback* progressCb = nullptr,
+ 												DgmOctree* cloudOctree = nullptr);
++
++		// 변경되지 않는 메시의 정확 거리 격자 한 개와 생성 당시 경계를 보관합니다.
++		struct Cloud2MeshDistancesCache
++		{
++			std::unique_ptr<GridAndMeshIntersection> intersection;
++			CCVector3 minBB;
++			CCVector3 maxBB;
++			unsigned char level = 0;
++			std::size_t estimatedBytes = 0;
++			bool cacheHit = false;
++			double buildSeconds = 0;
++
++			// 격자 소유권을 복사하지 않도록 기본 생성만 허용합니다.
++			Cloud2MeshDistancesCache() = default;
++			Cloud2MeshDistancesCache(const Cloud2MeshDistancesCache&) = delete;
++			Cloud2MeshDistancesCache& operator=(const Cloud2MeshDistancesCache&) = delete;
++
++			// 경계가 달라지거나 소유 메시를 해제하기 전에 격자와 통계를 비웁니다.
++			void clear()
++			{
++				intersection.reset();
++				estimatedBytes = 0;
++				cacheHit = false;
++				buildSeconds = 0;
++			}
++		};
++
++		// 기존 공개 거리 API와 별도로 불변 메시의 격자 재사용을 명시적으로 요청합니다.
++		static int computeCloud2MeshDistancesWithCache(
++			GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
++			Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
++			DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache);
+ 
+ 		//! Computes the distances between a point cloud and a mesh projected into a grid structure
+ 		/** This method is used by computeCloud2MeshDistances, after intersectMeshWithOctree has been called.
+--- a/src/DistanceComputationTools.cpp
++++ b/src/DistanceComputationTools.cpp
+@@ -2,6 +2,7 @@
+ // Copyright © EDF R&D / TELECOM ParisTech (ENST-TSI)
+ 
+ #include <DistanceComputationTools.h>
++#include <chrono>
+ 
+ //local
+ #include <DgmOctreeReferenceCloud.h>
+@@ -1961,6 +1962,15 @@
+ 															GenericProgressCallback* progressCb/*=nullptr*/,
+ 															DgmOctree* cloudOctree/*=nullptr*/)
+ {
++	return computeCloud2MeshDistancesWithCache(pointCloud, mesh, params, progressCb, cloudOctree, nullptr);
++}
++
++// 메모리 예산과 기존 거리 계산을 유지하고 완전히 일치하는 격자만 재사용합니다.
++int DistanceComputationTools::computeCloud2MeshDistancesWithCache(
++	GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
++	Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
++	DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache)
++{
+ 
+ 	// 기본값 0은 단일 셀로 유지하고 배열 조회의 상한만 검사합니다.
+ 	if (params.octreeLevel > DgmOctree::MAX_OCTREE_LEVEL)
+@@ -2084,20 +2094,41 @@
+ 	}
+ 	PointCoordinateType cellSize = octree->getCellSize(effectiveParams.octreeLevel);
+ 
+-	//Intersect the octree (grid) with the mesh
+-	GridAndMeshIntersection intersection;
+-	if (params.useDistanceMap)
+-	{
+-		if (false == intersection.initDistanceTransformWithMesh(mesh, cubicalMinBB, cubicalMaxBB, minBB, maxBB, cellSize, progressCb))
+-		{
++	// 내부 평면 축 보정 전의 원래 경계로 비교하여 잘못된 재사용을 방지합니다.
++	if (cache)
++	{
++		cache->cacheHit = !params.useDistanceMap && cache->intersection && cache->intersection->hasGridMeshIntersection()
++			&& cache->intersection->mesh() == mesh && cache->level == effectiveParams.octreeLevel
++			&& cache->intersection->cellSize() == cellSize;
++		for (unsigned char k = 0; k < 3 && cache->cacheHit; ++k)
++			cache->cacheHit = cache->minBB.u[k] == cubicalMinBB.u[k] && cache->maxBB.u[k] == cubicalMaxBB.u[k];
++		cache->buildSeconds = 0;
++		if (!cache->cacheHit)
++			cache->clear();
++	}
++	GridAndMeshIntersection temporaryIntersection;
++	if (cache && !params.useDistanceMap && !cache->intersection)
++		cache->intersection.reset(new GridAndMeshIntersection);
++	GridAndMeshIntersection& intersection = cache && !params.useDistanceMap
++		? *cache->intersection : temporaryIntersection;
++	if (!cache || !cache->cacheHit)
++	{
++		const auto started = std::chrono::steady_clock::now();
++		const bool built = params.useDistanceMap
++			? intersection.initDistanceTransformWithMesh(mesh, cubicalMinBB, cubicalMaxBB, minBB, maxBB, cellSize, progressCb)
++			: intersection.computeMeshIntersection(mesh, cubicalMinBB, cubicalMaxBB, cellSize, progressCb);
++		if (!built)
++		{
++			if (cache) cache->clear();
+ 			return DISTANCE_COMPUTATION_RESULTS::ERROR_INTERSECT_MESH_WITH_OCTREE_FAILURE;
+ 		}
+-	}
+-	else
+-	{
+-		if (false == intersection.computeMeshIntersection(mesh, cubicalMinBB, cubicalMaxBB, cellSize, progressCb))
+-		{
+-			return DISTANCE_COMPUTATION_RESULTS::ERROR_INTERSECT_MESH_WITH_OCTREE_FAILURE;
++		if (cache && !params.useDistanceMap)
++		{
++			cache->minBB = cubicalMinBB;
++			cache->maxBB = cubicalMaxBB;
++			cache->level = effectiveParams.octreeLevel;
++			cache->estimatedBytes = intersection.estimatedMemoryBytes();
++			cache->buildSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+ 		}
+ 	}
+ 
+@@ -2126,6 +2157,7 @@
+ 
+ 	if (result < DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 	{
++		if (cache) cache->clear();
+ 		if (!(result == DISTANCE_COMPUTATION_RESULTS::ERROR_OUT_OF_MEMORY ||
+ 			  result == DISTANCE_COMPUTATION_RESULTS::CANCELED_BY_USER))
+ 		{
+--- a/include/GridAndMeshIntersection.h
++++ b/include/GridAndMeshIntersection.h
+@@ -46,6 +46,9 @@
+ 											const CCVector3& maxFilledBB,
+ 											PointCoordinateType cellSize,
+ 											GenericProgressCallback* progressCb = nullptr);
++
++		// 포인터 격자와 셀별 삼각형 목록의 할당 크기를 추정합니다.
++		std::size_t estimatedMemoryBytes() const;
+ 
+ 		//! Returns the grid size
+ 		const Tuple3ui& internalGridSize() const;
+--- a/src/GridAndMeshIntersection.cpp
++++ b/src/GridAndMeshIntersection.cpp
+@@ -81,6 +81,18 @@
+ 	}
+ }
+ 
++// 완성된 정확 거리 격자의 상주 배열과 삼각형 목록 용량을 합산합니다.
++std::size_t GridAndMeshIntersection::estimatedMemoryBytes() const
++{
++	if (!hasGridMeshIntersection()) return 0;
++	const auto count = m_perCellTriangleList.totalCellCount();
++	std::size_t bytes = count * sizeof(TriangleList*);
++	const auto cells = m_perCellTriangleList.data();
++	for (std::size_t i = 0; i < count; ++i)
++		if (cells[i]) bytes += sizeof(TriangleList) + cells[i]->indexes.capacity() * sizeof(unsigned);
++	return bytes;
++}
++
+ unsigned GridAndMeshIntersection::distanceTransformValue(const Tuple3i& cellPos, bool isLocalCellPos) const
+ {
+ 	if (m_distanceTransform)

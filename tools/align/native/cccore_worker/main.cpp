@@ -532,10 +532,11 @@ Json matrixJson(const Transform& transform) {
     return matrix;
 }
 
-// 점 또는 삼각면 모델에 대해 공식 거리 API로 모든 입력 점을 평가합니다.
+// 동일한 불변 메시의 격자를 선택적으로 재사용하여 정확 거리를 계산합니다.
 int computeDistances(
     Cloud& data, Cloud& model, CCCoreLib::SimpleMesh* mesh, Progress* progress,
-    unsigned maxThreads, NativeTimings* timings = nullptr, OperationCounters* counters = nullptr
+    unsigned maxThreads, NativeTimings* timings = nullptr, OperationCounters* counters = nullptr,
+    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* meshGrid = nullptr
 ) {
     if (mesh) {
         progress->setSubstage("OCTREE");
@@ -556,13 +557,20 @@ int computeDistances(
         params.useDistanceMap = false;
         params.multiThread = maxThreads > 1;
         params.maxThreadCount = static_cast<int>(maxThreads);
-        if (counters) counters->meshGridBuildCount += 1;
         progress->setSubstage("KERNEL");
         const auto kernelStarted = Clock::now();
-        const auto code = CCCoreLib::DistanceComputationTools::computeCloud2MeshDistances(
-            &data, mesh, params, progress
+        const auto code = CCCoreLib::DistanceComputationTools::computeCloud2MeshDistancesWithCache(
+            &data, mesh, params, progress, nullptr, meshGrid
         );
-        if (timings) timings->kernelSeconds += elapsedSeconds(kernelStarted);
+        if (timings) {
+            const double gridSeconds = meshGrid ? meshGrid->buildSeconds : 0;
+            timings->meshGridSeconds += gridSeconds;
+            timings->kernelSeconds += std::max(0.0, elapsedSeconds(kernelStarted) - gridSeconds);
+        }
+        if (counters) {
+            if (meshGrid && meshGrid->cacheHit) ++counters->meshGridCacheHits;
+            else ++counters->meshGridBuildCount;
+        }
         return code;
     }
     CCCoreLib::DistanceComputationTools::Cloud2CloudDistancesComputationParams params;
@@ -761,6 +769,10 @@ class GeometryRegistry {
     std::set<std::string> releasedIdentifiers;
     Json releasedStatistics = Json::array();
     std::uint64_t estimatedBytes = 0;
+    // 한 세션에는 격자 한 개만 보관하며 메시 항목보다 먼저 파괴합니다.
+    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache meshGrid;
+    CachedGeometry* meshGridOwner = nullptr;
+    std::uint64_t meshGridBytes = 0;
 
     // 지오메트리 설명의 필수 필드와 메시 필드 쌍을 검사합니다.
     static void validateDescriptor(const Json& entity) {
@@ -821,6 +833,37 @@ public:
     GeometryRegistry(fs::path jobRoot, SessionStatistics& sessionStatistics)
         : root(std::move(jobRoot)), statistics(sessionStatistics) {}
 
+    // 다른 대상 또는 내부 ICP 격자를 만들기 전에 캐시와 상주 통계를 해제합니다.
+    void clearMeshGrid() {
+        meshGrid.clear();
+        if (meshGridOwner) meshGridOwner->estimatedBytes -= meshGridBytes;
+        estimatedBytes -= meshGridBytes;
+        meshGridBytes = 0;
+        meshGridOwner = nullptr;
+        statistics.cacheResidentEstimated = estimatedBytes;
+    }
+
+    // 불변 메시 식별자가 같을 때만 기존 격자를 다음 거리 명령에 전달합니다.
+    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* prepareMeshGrid(CachedGeometry& model) {
+        if (meshGridOwner != &model || !model.mesh) clearMeshGrid();
+        if (!model.mesh) return nullptr;
+        meshGridOwner = &model;
+        return &meshGrid;
+    }
+
+    // 완성된 격자의 실제 목록 용량을 소유 메시와 세션 메모리 추정치에 반영합니다.
+    void accountMeshGrid() {
+        if (!meshGridOwner) return;
+        meshGridOwner->estimatedBytes -= meshGridBytes;
+        estimatedBytes -= meshGridBytes;
+        meshGridBytes = meshGrid.estimatedBytes;
+        meshGridOwner->estimatedBytes += meshGridBytes;
+        estimatedBytes += meshGridBytes;
+        statistics.cacheResidentEstimated = estimatedBytes;
+        statistics.cachePeakEstimated = std::max(statistics.cachePeakEstimated, estimatedBytes);
+        statistics.peakWorkingSet = std::max(statistics.peakWorkingSet, peakWorkingSetBytes());
+    }
+
     // 같은 ID·설명은 캐시하고 같은 ID의 다른 설명은 세션 오류로 거부합니다.
     CachedGeometry& resolve(
         const Json& entity, bool registration, OperationCounters& counters,
@@ -865,6 +908,7 @@ public:
                 ++iterator;
                 continue;
             }
+            if (meshGridOwner == iterator->second.get()) clearMeshGrid();
             releasedStatistics.push_back(statistic(iterator->first, *iterator->second, true));
             releasedIdentifiers.insert(iterator->first);
             estimatedBytes -= iterator->second->estimatedBytes;
@@ -919,6 +963,7 @@ Json executeSessionOperation(
     result["data_geometry_id"] = request.at("data").at("geometry_id");
     result["model_geometry_id"] = request.at("model").at("geometry_id");
     if (operation == "register") {
+        registry.clearMeshGrid();
         auto params = parameters(request.at("parameters"), data.cloud->size(), model.cloud->size(), bool(model.mesh), threads.effective);
         Transform transform;
         double rms = -1;
@@ -945,7 +990,8 @@ Json executeSessionOperation(
         timings.serializationSeconds += elapsedSeconds(serializationStarted);
     } else {
         const auto code = computeDistances(*data.cloud, *model.cloud, model.mesh.get(), &progress,
-                                           threads.effective, &timings, &counters);
+                                           threads.effective, &timings, &counters, registry.prepareMeshGrid(model));
+        registry.accountMeshGrid();
         progress.check();
         if (code < CCCoreLib::DistanceComputationTools::SUCCESS)
             throw WorkerError("NATIVE_DISTANCE_ERROR", "CCCoreLib 거리 평가가 실패했습니다.", code);

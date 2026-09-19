@@ -209,7 +209,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 v4 배포 지문과 등록 안전·격자 메모리 패치의 일치를 검증합니다."""
+    """네이티브 v4 배포 지문과 등록 안전·격자 메모리·재사용 패치의 일치를 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -231,6 +231,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "binary_sha256", "self_test",
         "registration_safety_patch", "registration_safety_patch_sha256", "patched_registration_sha256",
         "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
+        "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
     }
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
@@ -291,6 +292,33 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         grid_file.get("patched_sha256"), "격자 의존성 최종 원문"
     ):
         raise contract.CcCoreEnvironmentError("CC 메시 격자 패치의 최종 원문 해시가 의존성과 다릅니다.")
+    reuse = core_dependency.get("mesh_grid_reuse_patch")
+    if (
+        not isinstance(reuse, Mapping) or reuse.get("id") != "mesh-grid-reuse-v1"
+        or reuse.get("file") != "patches/mesh_grid_reuse.patch"
+        or manifest["mesh_grid_reuse_patch"] != reuse["id"]
+        or reuse["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["mesh_grid_reuse_patch_sha256"], "격자 재사용 패치")
+        != _manifest_sha256(reuse.get("sha256"), "격자 재사용 의존성 패치")
+    ):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 재사용 패치가 검증되지 않았습니다.")
+    reuse_files = reuse.get("files")
+    reuse_sources = manifest["mesh_grid_reuse_source_sha256"]
+    expected_reuse_names = {"include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp",
+                            "include/GridAndMeshIntersection.h", "src/GridAndMeshIntersection.cpp"}
+    if (not isinstance(reuse_files, list) or len(reuse_files) != 4
+        or any(not isinstance(item, Mapping) for item in reuse_files)
+        or {item.get("path") for item in reuse_files} != expected_reuse_names
+        or not isinstance(reuse_sources, Mapping) or set(reuse_sources) != expected_reuse_names):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 재사용 패치의 원문 목록이 올바르지 않습니다.")
+    for source in reuse_files:
+        previous = _manifest_sha256(source.get("original_sha256"), "격자 재사용 이전 원문")
+        if source["path"] == grid_file["path"] and previous != grid_file["patched_sha256"]:
+            raise contract.CcCoreEnvironmentError("CC 격자 메모리·재사용 패치의 원문 연결이 다릅니다.")
+        if _manifest_sha256(reuse_sources[source["path"]], "격자 재사용 최종 원문") != _manifest_sha256(
+            source.get("patched_sha256"), "격자 재사용 의존성 원문"
+        ):
+            raise contract.CcCoreEnvironmentError("CC 메시 격자 재사용 원문 해시가 다릅니다.")
     tbb_dependency = dependencies.get("tbb") if isinstance(dependencies, Mapping) else None
     if not isinstance(tbb_dependency, Mapping) or tbb_dependency.get("version") != contract.CC_TBB_VERSION:
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 oneTBB 고정 의존성이 올바르지 않습니다.")
@@ -357,6 +385,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "core_patch_sha256", "concurrency_patch", "concurrency_patch_sha256",
         "registration_safety_patch", "registration_safety_patch_sha256",
         "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
+        "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",

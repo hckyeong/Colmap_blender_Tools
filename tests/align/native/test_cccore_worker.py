@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -243,6 +244,132 @@ class NativeContractTest(unittest.TestCase):
         self.assertTrue(result["octree_multithread_support"])
         self.assertEqual(result["requested_max_threads"],result["hardware_thread_count"])
         self.assertEqual(result["effective_max_threads"],result["hardware_thread_count"])
+
+    def test_mesh_grid_reuses_different_queries_and_preserves_distances(self):
+        """평면·입체 메시에서 새 조회점의 동일 격자를 재사용하고 단발 거리와 바이트로 비교합니다."""
+        for flat in (False, True):
+            for threads in (1, 4):
+                with self.subTest(flat=flat, threads=threads):
+                    model_points = [(0, 0, 0), (3, 0, 0), (0, 3, 0), (0, 0, 3 if not flat else 0)]
+                    triangles = [(0, 1, 2)] if flat else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+                    query = [(0.2, 0.2, 0 if flat else .2), (.7, .2, 0 if flat else .3), (.2, .7, 0 if flat else .4)]
+                    if flat:
+                        model_points = [(0,0,0), (1,0,0), (0,1,0)]
+                        query = [(.25,.25,.5), (.1,.1,-.2), (2,0,0)]
+                    request = self.request(data=query, model=model_points, triangles=triangles,
+                                           operation="distance", max_threads=threads)
+                    self.run_request(request)
+                    expected = (self.root / "distances.bin").read_bytes()
+                    root, identity, process, _ = self.start_session(max_threads=threads)
+                    try:
+                        model = self.session_geometry(root, "mesh", model_points, triangles)
+                        for sequence in range(1, 4):
+                            data = self.session_geometry(root, f"query-{sequence}", query, cache_scope="COMMAND")
+                            result = self.session_command(root, identity, sequence, "distance", data=data, model=model, max_threads=threads)
+                            self.assertEqual(result["status"], "completed", result)
+                            self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
+                            self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
+                            self.assertEqual((root / result["distances_file"]).read_bytes(), expected)
+                            if sequence > 1:
+                                self.assertEqual(result["timings"]["mesh_grid_seconds"], 0)
+                            query = query[1:] + query[:1]
+                            expected = expected[8:] + expected[:8]
+                        closed = self.session_command(root, identity, 4, "close")
+                        self.finish_session(root, process)
+                        self.assertEqual(closed["statistics"]["mesh_grid_build_count"], 1)
+                        self.assertEqual(closed["statistics"]["mesh_grid_cache_hits"], 2)
+                        geometry = {item["geometry_id"]: item for item in closed["geometry_statistics"]}
+                        self.assertGreater(geometry["mesh"]["estimated_bytes"], len(model_points)*20 + len(triangles)*12)
+                        self.assertEqual(closed["statistics"]["cache_resident_estimated_bytes"], geometry["mesh"]["estimated_bytes"])
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+                        # 다음 하위 검사는 독립 세션 파일과 동일한 경로 계약으로 시작합니다.
+                        shutil.rmtree(root)
+
+    def test_mesh_grid_invalidates_changed_level_with_same_bounds(self):
+        """메시와 결합 경계가 같아도 조회 밀도로 자동 단계가 바뀌면 격자를 다시 만듭니다."""
+        root, identity, process, _ = self.start_session()
+        try:
+            corners = [(0,0,0),(1,0,0),(1,1,0),(0,1,0), (0,0,1),(1,0,1),(1,1,1),(0,1,1)]
+            triangles = [(0,2,1),(0,3,2),(4,5,6),(4,6,7), (0,1,5),(0,5,4),
+                         (1,2,6),(1,6,5),(2,3,7),(2,7,6),(3,0,4),(3,4,7)]
+            dense_points = [(x/32, y/32, z/32) for x in range(33) for y in range(33) for z in range(33)]
+            small_points = [(0,0,0), (1,1,1), (.5,.5,.5)]
+            model = self.session_geometry(root, "mesh", corners + dense_points, triangles)
+            small = self.session_geometry(root, "small", small_points)
+            dense = self.session_geometry(root, "dense", dense_points)
+            for sequence, data in enumerate((small, dense, dense, small), 1):
+                result = self.session_command(root, identity, sequence, "distance", data=data, model=model)
+                self.assertEqual(result["status"], "completed", result)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence != 3))
+                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence == 3))
+                values = array("d")
+                values.frombytes((root / result["distances_file"]).read_bytes())
+                points = small_points if data is small else dense_points
+                for point, value in zip(points, values):
+                    self.assertAlmostEqual(value, min(min(point), 1-max(point)), delta=1e-6)
+            self.session_command(root, identity, 5, "close")
+            self.finish_session(root, process)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_mesh_grid_invalidates_bounds_model_and_registration(self):
+        """조회 경계·모델 교체·등록 후에는 격자를 다시 만들고 독립 거리 결과를 유지합니다."""
+        points = [(0, 0, 0), (3, 0, 0), (0, 3, 0), (0, 0, 3)]
+        triangles = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+        query = [(.2, .2, .2), (.7, .2, .3), (.2, .7, .4)]
+        root, identity, process, _ = self.start_session()
+        try:
+            models = [self.session_geometry(root, f"mesh-{i}", points, triangles) for i in range(2)]
+            queries = [query, [(x+20, y, z) for x,y,z in query], query, query, query]
+            for sequence, (batch, model_index) in enumerate(zip(queries, (0, 0, 0, 1, 0)), 1):
+                data = self.session_geometry(root, f"query-{sequence}", batch, cache_scope="COMMAND")
+                result = self.session_command(root, identity, sequence, "distance", data=data, model=models[model_index])
+                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1, result)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 0)
+                self.run_request(self.request(data=batch, model=points, triangles=triangles, operation="distance"))
+                self.assertEqual((root / result["distances_file"]).read_bytes(), (self.root / "distances.bin").read_bytes())
+            registration_data = self.session_geometry(root, "registration", points, cache_scope="COMMAND")
+            result = self.session_command(root, identity, 6, "register", data=registration_data, model=models[0])
+            self.assertEqual(result["status"], "completed", result)
+            data = self.session_geometry(root, "after-register", query, cache_scope="COMMAND")
+            result = self.session_command(root, identity, 7, "distance", data=data, model=models[0])
+            self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
+            closed = self.session_command(root, identity, 8, "close")
+            self.finish_session(root, process)
+            self.assertEqual(closed["statistics"]["mesh_grid_build_count"], 6)
+            self.assertEqual(closed["statistics"]["mesh_grid_cache_hits"], 0)
+            geometry = {item["geometry_id"]: item for item in closed["geometry_statistics"]}
+            base_bytes = len(points)*20 + len(triangles)*12
+            self.assertEqual(geometry["mesh-1"]["estimated_bytes"], base_bytes)
+            self.assertGreater(geometry["mesh-0"]["estimated_bytes"], base_bytes)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_mesh_grid_command_model_releases_all_resident_memory(self):
+        """명령 전용 메시의 격자는 모델보다 먼저 해제되어 다음 명령에 재사용되지 않습니다."""
+        root, identity, process, _ = self.start_session()
+        try:
+            for sequence in (1, 2):
+                data = self.session_geometry(root, f"query-{sequence}", [(0.2, 0.2, .1)], cache_scope="COMMAND")
+                model = self.session_geometry(root, f"model-{sequence}", [(0,0,0), (1,0,0), (0,1,0)], [(0,1,2)], cache_scope="COMMAND")
+                result = self.session_command(root, identity, sequence, "distance", data=data, model=model)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 0)
+            closed = self.session_command(root, identity, 3, "close")
+            self.finish_session(root, process)
+            self.assertEqual(closed["statistics"]["cache_resident_estimated_bytes"], 0)
+            self.assertTrue(all(item["released_after_command"] for item in closed["geometry_statistics"]))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     def test_session_single_process_and_geometry_cache(self):
         """두 논리 연산이 한 PID에서 같은 지오메트리를 한 번만 적재하는지 확인합니다."""

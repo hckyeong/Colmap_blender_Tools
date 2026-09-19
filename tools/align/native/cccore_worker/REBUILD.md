@@ -64,7 +64,7 @@ Expand-Archive -LiteralPath .\tbb\oneapi-tbb-2022.0.0-win.zip -DestinationPath .
   "-DCCCORE_SOURCE=$PWD\cccore-src" "-DJSON_INCLUDE_DIR=$PWD\json" `
   "-DTBB_DIR=$PWD\tbb\oneapi-tbb-2022.0.0\lib\cmake\tbb" `
   -DCORE_COMMIT=dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 `
-  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1
+  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1+mesh-grid-reuse-v1
 & $cmake --build .\build --config Release --parallel 8
 Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -Destination .\build\bin\tbb12.dll
 & .\build\bin\colmap_cccore_worker.exe --check-environment
@@ -89,6 +89,16 @@ v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비
 평면 축의 3칸 보정, 비유한 셀 크기, 인덱스·곱셈 범위를 검사합니다. 요청 단계 0은 기존 단일 셀 의미를 보존하며, 실행 가능한 단계가 없으면 메모리 오류를 반환합니다. 거리 맵 근사는 바꾸지 않고 실제 제품의 정확 거리 경로만 보호합니다. 호출자 매개변수의 요청 단계와 공개 API·ABI·v4 규약은 유지합니다. 준비 조회와 ICP 내부 반복·최종 거리 평가가 모두 같은 공통 보호를 사용합니다.
 
 원본 면이나 표본 수를 줄이지 않으며 단계 변경으로 거리 근사를 켜지 않습니다. 패치 원문과 적용 전후 SHA-256은 `dependencies.lock.json`의 `mesh_grid_memory_patch`, 런타임의 패치 식별자·최종 원문 지문은 `runtime_manifest.json`에 연결합니다. 빌드와 실행 전 검증은 이 패치가 없는 구형 런타임을 거부합니다. 회귀에는 200만 정점에서 기존 자동 격자 실패를 재현하는 해석적 거리와 실제 등록 사례가 포함됩니다.
+
+## 정확 거리 격자 재사용
+
+`mesh-grid-reuse-v1`은 기존 공개 거리 함수와 수치 계산을 유지하면서 `computeCloud2MeshDistancesWithCache`를 추가합니다. v4 거리 명령은 불변 메시 식별자, 결합 큐브의 최소·최대 경계, 실제 격자 단계와 셀 크기가 모두 일치할 때만 격자를 재사용합니다. 평면 축 보정 이전의 경계를 별도로 저장합니다. 조회점 옥트리와 자동 단계 선택은 매 명령 수행하며 메모리 예산도 계속 검사합니다.
+
+워커는 격자 한 개만 보관합니다. 대상·경계·단계 변경, 등록 시작, COMMAND 메시 해제 때 기존 격자 객체를 파괴해 포인터 배열 용량까지 반환합니다. 실패·취소·세션 종료로 프로세스가 끝날 때도 소유 메시보다 먼저 파괴됩니다. ICP 내부 반복과 v2 단발 호출은 기존 비캐시 경로를 유지합니다.
+
+`mesh_grid_build_count`와 `mesh_grid_cache_hits`는 실제 생성·재사용을 기록합니다. 재사용 명령의 `mesh_grid_seconds`는 0이며 생성 시간은 `kernel_seconds`에서 분리합니다. 포인터 배열·삼각형 목록 용량의 추정 바이트를 소유 지오메트리와 세션 상주·최고 메모리에 포함합니다. 생성 실패의 불완전 격자는 재사용하지 않습니다.
+
+새 패치의 입력 해시는 이전 메모리 패치의 출력과 연결합니다. Manifest의 `mesh_grid_source_sha256`는 메모리 패치 단계의 해시이며, `mesh_grid_reuse_source_sha256`가 재사용 패치 적용 후 최종 네 파일의 해시입니다. 배포 원문 ZIP은 최종 해시로 검사합니다.
 
 ## 메시 최원거리점 필터의 대응 식별자 보존
 

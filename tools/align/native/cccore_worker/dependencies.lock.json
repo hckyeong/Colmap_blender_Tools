@@ -54,6 +54,33 @@
           "patched_sha256": "4fca04fd590ba9b6b3028b1d5c9acde833fff75130468bffce51f14bdaf01e1f"
         }
       ]
+    },
+    "mesh_grid_reuse_patch": {
+      "id": "mesh-grid-reuse-v1",
+      "file": "patches/mesh_grid_reuse.patch",
+      "sha256": "b27712d2dd800941f91a94e3e0d28228f0269556adc13603fd71227bcfc3a09c",
+      "files": [
+        {
+          "path": "include/DistanceComputationTools.h",
+          "original_sha256": "18f582824670e9d4b7789b9d99bb585b330a513f5139d18651ed9fb7780d0853",
+          "patched_sha256": "2aee6c1c0cf6afb002f8d861699cc2005d8a0fe3bb279cc6a16129ef7a502472"
+        },
+        {
+          "path": "src/DistanceComputationTools.cpp",
+          "original_sha256": "4fca04fd590ba9b6b3028b1d5c9acde833fff75130468bffce51f14bdaf01e1f",
+          "patched_sha256": "281d5da45323cc265e214d59ff15e5482d7b1ec67fc10c1a38aa10dde16b9ceb"
+        },
+        {
+          "path": "include/GridAndMeshIntersection.h",
+          "original_sha256": "112dd60c7cf150619466d854425a9be849d59dbda0de22e3e773c88207a224eb",
+          "patched_sha256": "8109cc426719be7addaac6c8169492535387466fba50ddc0aa616dcdb8e7954c"
+        },
+        {
+          "path": "src/GridAndMeshIntersection.cpp",
+          "original_sha256": "91157d276dea02fd43d90274328b4b86096488a3ca85a347df128bfe7d0c768b",
+          "patched_sha256": "55082c89aaf4bf0c72068523ebc1657dad0e4e7aa3c496b9fff6bb25f867891f"
+        }
+      ]
     }
   },
   "nanoflann": {
