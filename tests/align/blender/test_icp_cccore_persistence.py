@@ -338,11 +338,10 @@ def test_cc_mesh_approval_roundtrip_uses_real_project_snapshot() -> None:
         logical = tuple(audit["logical_operations"])
         assert audit["native_calls"] == audit["logical_operations"]
         contract.validate_exact_evaluation_cache_statistics(audit["exact_evaluation_cache"], logical)
-        physical = contract.validate_physical_native_call_summaries(
-            audit["physical_native_calls"], logical,
-            requested_max_threads=audit["requested_max_threads"],
-            effective_max_threads=audit["effective_max_threads"],
-        )
+        # 과거 물리 기록에는 v6 내부 ICP 통계가 없으므로 저장 당시 필드를 그대로 감사합니다.
+        physical = tuple(audit["physical_native_calls"])
+        assert all("icp_statistics" not in item for item in physical)
+        assert len(physical) == sum(item["execution_source"] == "native_session" for item in logical)
         contract.validate_native_session_aggregates(
             audit["session_statistics"], audit["geometry_statistics"], physical,
         )
@@ -440,6 +439,35 @@ def test_v4_overlap_audit_survives_project_restore() -> None:
         audit = json.loads(restored.model_catalog.models["moving"].alignment_provenance.engine_metadata_json)
         assert audit == compact
         assert restored.icp_alignment.input_data is None and restored.icp_alignment.result is None
+
+
+def test_native_v2_through_v5_audit_without_icp_statistics_restores() -> None:
+    """내부 ICP 통계가 없던 네이티브 v2~v5 승인 기록을 실제 저장·복원에서 보존합니다."""
+    from test_companion_persistence import _restore, _write_snapshot
+    from tools.align.project_persistence import decode_project_state, encode_project_state
+
+    for version in (2, 3, 4, 5):
+        with _project_fixture() as origin:
+            _set_distinct_axes_and_alignment(origin)
+            original = _cc_provenance(origin)
+            metadata = json.loads(original.engine_metadata_json)
+            metadata["native_build_identity"]["protocol_version"] = f"cccore-native-v{version}"
+            for name in ("logical_operations", "native_calls", "physical_native_calls", "registration_stages"):
+                for item in metadata.get(name, []):
+                    item.pop("icp_statistics", None)
+            provenance = replace(original, algorithm_version=f"cccore-icp-v{version}",
+                engine_metadata_json=json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+            origin.model_catalog.set_alignment_provenance("moving", provenance)
+            origin.model_catalog.promote_model_for_icp_commit("moving")
+            snapshot, _text = _write_snapshot(origin)
+            decoded = decode_project_state(encode_project_state(snapshot))
+            assert decoded.models[1].catalog.alignment_provenance == provenance
+            restored = _restore()
+            _assert_restored_geometry(origin, restored)
+            restored_provenance = restored.model_catalog.models["moving"].alignment_provenance
+            assert restored_provenance == provenance
+            assert json.loads(restored_provenance.engine_metadata_json) == metadata
+            assert restored.icp_alignment.input_data is None and restored.icp_alignment.result is None
 
 
 def test_schema_six_upgrades_to_current_and_preserves_old_engine() -> None:

@@ -208,10 +208,15 @@ class BlenderVerification:
         self.transition("Align 계산")
 
     def collect(self):
-        """제품이 작업 폴더를 정리하기 전에 명령·결과·진행 변화와 행렬 파일을 보존합니다."""
+        """접수 대기 요청과 네이티브 진행 파일을 열지 않고 안정된 접수본·응답과 최종 결과를 보존합니다."""
         if self.job is None:
             return
-        paths = list(self.job.glob("*.json")) + list((self.job / "native").glob("*.json"))
+        # 일반 읽기 핸들은 Windows 원자 접수의 이름 변경을 막으므로 요청 파일은 열기 전부터 제외합니다.
+        paths = [path for path in self.job.glob("*.json") if not path.name.endswith(".request.json")]
+        native = self.job / "native"
+        paths.extend(native.glob("*.accepted.json"))
+        paths.extend(native.glob("*.response.json"))
+        paths.extend(path for path in (native / "session-ready.json", native / "session-result.json") if path.is_file())
         for path in paths:
             relative = path.relative_to(self.job)
             name = relative.as_posix()

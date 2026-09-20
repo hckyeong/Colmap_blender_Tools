@@ -562,7 +562,7 @@ def _validate_overlap_result_metadata(metadata: Mapping[str, Any]) -> None:
 
 
 def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], arrays: Mapping[str, np.ndarray]) -> Any:
-    """CC 결과의 출처·스케일·합성 관계를 확인한 뒤 미리보기 값을 만듭니다."""
+    """CC 결과의 출처·배율·합성·내부 ICP 감사 기록을 확인한 뒤 미리보기를 만듭니다."""
     from . import icp_runtime as ir
 
     input_data = state.input_data
@@ -632,6 +632,26 @@ def result_from_cccore(runtime: Any, state: Any, metadata: Mapping[str, Any], ar
             requested_max_threads=native_identity["requested_max_threads"],
             effective_max_threads=native_identity["effective_max_threads"],
         )
+        from .icp_cccore_contract import validate_icp_statistics, validate_icp_native_result
+
+        registration_operations = [item for item in operations if item["operation"] == "register"]
+        registration_stages = metadata.get("registration_stages")
+        if not isinstance(registration_stages, list) or len(registration_stages) != 2:
+            raise IcpJobProtocolError("CC 등록 단계별 내부 ICP 감사 기록이 없습니다.")
+        for stage, operation, stage_name, limit_name in zip(
+            registration_stages, registration_operations, ("rigid", "scale_refine"),
+            ("max_iterations", "scale_refine_max_iterations"),
+        ):
+            if not isinstance(stage, Mapping) or stage.get("stage") != stage_name or "icp_statistics" not in stage:
+                raise IcpJobProtocolError("CC 등록 단계 식별자 또는 내부 ICP 통계가 없습니다.")
+            statistics = validate_icp_statistics(
+                stage["icp_statistics"], mesh_registration=input_data.snapshot.geometry_mode != "POINT_TO_POINT",
+                kernel_seconds=operation["timings"]["kernel_seconds"],
+                max_iterations=metadata["parameters"][limit_name],
+            )
+            validate_icp_native_result(statistics, stage.get("native_code"))
+            if statistics != operation["icp_statistics"]:
+                raise IcpJobProtocolError("CC 등록 단계의 내부 ICP 통계가 실행 요약과 다릅니다.")
         total_alignment_seconds = finite_nonnegative_number(
             metadata.get("elapsed_seconds"), "CC 전체 정렬 시간",
         )

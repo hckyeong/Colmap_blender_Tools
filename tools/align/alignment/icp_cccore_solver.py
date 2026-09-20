@@ -233,7 +233,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 v5 배포 지문과 등록 안전·격자 메모리·고정 범위 패치의 일치를 검증합니다."""
+    """네이티브 v6 배포 지문과 안전·메모리·고정 범위·내부 ICP 재사용 패치를 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -257,6 +257,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
         "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
         "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
+        "icp_mesh_grid_reuse_patch", "icp_mesh_grid_reuse_patch_sha256", "icp_mesh_grid_reuse_source_sha256",
     }
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
@@ -264,7 +265,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             f"CC Runtime Manifest의 필수 필드가 없습니다: {', '.join(missing_fields)}"
         )
     if manifest.get("protocol_version") != contract.CC_NATIVE_PROTOCOL_VERSION:
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v5 네이티브 계약이 아닙니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v6 네이티브 계약이 아닙니다.")
     if manifest.get("platform") != "windows-x64":
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 플랫폼이 windows-x64가 아닙니다.")
     if manifest.get("coordinate_type") != "float32" or manifest.get("matrix_scalar_type") != "float64":
@@ -376,6 +377,38 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             source.get("patched_sha256"), "격자 고정 범위 의존성 원문"
         ):
             raise contract.CcCoreEnvironmentError("CC 메시 격자 고정 범위 원문 해시가 다릅니다.")
+    icp_reuse = core_dependency.get("icp_mesh_grid_reuse_patch")
+    if (
+        not isinstance(icp_reuse, Mapping) or icp_reuse.get("id") != "icp-mesh-grid-reuse-v1"
+        or icp_reuse.get("file") != "patches/icp_mesh_grid_reuse.patch"
+        or manifest["icp_mesh_grid_reuse_patch"] != icp_reuse["id"]
+        or icp_reuse["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["icp_mesh_grid_reuse_patch_sha256"], "내부 ICP 격자 재사용 패치")
+        != _manifest_sha256(icp_reuse.get("sha256"), "내부 ICP 격자 재사용 의존성 패치")
+    ):
+        raise contract.CcCoreEnvironmentError("CC 내부 ICP 격자 재사용 패치가 검증되지 않았습니다.")
+    icp_files = icp_reuse.get("files")
+    icp_sources = manifest["icp_mesh_grid_reuse_source_sha256"]
+    if (not isinstance(icp_files, list) or not icp_files
+        or any(not isinstance(item, Mapping) for item in icp_files)
+        or not isinstance(icp_sources, Mapping)
+        or len(icp_sources) != len(icp_files)
+        or set(icp_sources) != {item.get("path") for item in icp_files}
+        or {"include/RegistrationTools.h", "src/RegistrationTools.cpp",
+            "include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp",
+            "src/GridAndMeshIntersection.cpp"} != set(icp_sources)):
+        raise contract.CcCoreEnvironmentError("CC 내부 ICP 패치의 원문 목록이 올바르지 않습니다.")
+    previous_sources = {**reuse_sources, **fixed_sources, "src/RegistrationTools.cpp": safety["patched_sha256"]}
+    for source in icp_files:
+        previous = _manifest_sha256(source.get("original_sha256"), "내부 ICP 패치 이전 원문")
+        if source["path"] in previous_sources and previous != previous_sources[source["path"]]:
+            raise contract.CcCoreEnvironmentError("CC 내부 ICP 패치의 이전 원문 연결이 다릅니다.")
+        if source["path"] == "include/RegistrationTools.h" and source.get("original_commit") != manifest["core_commit"]:
+            raise contract.CcCoreEnvironmentError("CC 내부 ICP 헤더의 원문 커밋이 고정 코어와 다릅니다.")
+        if _manifest_sha256(icp_sources[source["path"]], "내부 ICP 최종 원문") != _manifest_sha256(
+            source.get("patched_sha256"), "내부 ICP 의존성 원문",
+        ):
+            raise contract.CcCoreEnvironmentError("CC 내부 ICP 패치의 최종 원문 해시가 다릅니다.")
     tbb_dependency = dependencies.get("tbb") if isinstance(dependencies, Mapping) else None
     if not isinstance(tbb_dependency, Mapping) or tbb_dependency.get("version") != contract.CC_TBB_VERSION:
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 oneTBB 고정 의존성이 올바르지 않습니다.")
@@ -392,7 +425,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         or self_test.get("coordinate_type") != "float32"
         or self_test.get("matrix_scalar_type") != "float64"
     ):
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v5 계약과 다릅니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v6 계약과 다릅니다.")
     expected_self_test_libraries = {
         "library_path": "CCCoreLib.dll",
         "tbb_library_path": "tbb12.dll",
@@ -444,6 +477,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
         "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
         "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
+        "icp_mesh_grid_reuse_patch", "icp_mesh_grid_reuse_patch_sha256", "icp_mesh_grid_reuse_source_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",
@@ -856,7 +890,7 @@ class NativeRunner:
         overlap_ratio: float = 1.0,
         search_domain: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """후보 겹침 비율과 선택적 준비 격자 범위를 전달하고 응답·거리 파일을 검증합니다."""
+        """겹침 비율·준비 범위를 전달하고 응답·거리 파일·내부 ICP 통계를 검증합니다."""
         self.check_cancelled()
         self._validate_runtime_unchanged("CC 호출 전에 실행 파일이나 라이브러리 배포 정보가 변경되었습니다.")
         self.start()
@@ -922,6 +956,16 @@ class NativeRunner:
         )
         self._accept_native_identity(native_metadata)
         timings = contract.validate_native_timings(result.get("timings"))
+        if "icp_statistics" not in result:
+            raise contract.CcCoreEnvironmentError("CC 네이티브 응답에 내부 ICP 통계 필드가 없습니다.")
+        icp_statistics = contract.validate_icp_statistics(
+            result["icp_statistics"], mesh_registration=operation == "register" and "triangles_file" in model,
+            kernel_seconds=timings["kernel_seconds"], max_iterations=parameters.get("max_iterations"),
+        )
+        if icp_statistics is not None and icp_statistics["stop_reason"] in {"ERROR", "CANCELLED"}:
+            raise contract.CcCoreEnvironmentError("CC 성공 응답에 실패·취소된 내부 ICP 통계가 있습니다.")
+        contract.validate_icp_native_result(icp_statistics, result.get("native_code"))
+        result["icp_statistics"] = icp_statistics
         operation_statistics = result.get("operation_statistics")
         if not isinstance(operation_statistics, Mapping) or set(operation_statistics) != set(contract.CC_NATIVE_COUNTER_FIELDS):
             raise contract.CcCoreEnvironmentError("CC 네이티브 명령 통계가 고정 계약과 다릅니다.")
@@ -950,6 +994,7 @@ class NativeRunner:
             "data_geometry_id": data_geometry_id,
             "model_geometry_id": model_geometry_id,
             "timings": timings,
+            "icp_statistics": icp_statistics,
             **counters,
         }
         if operation == "distance":
@@ -1040,6 +1085,7 @@ class NativeRunner:
             "data_geometry_id": data_geometry_id,
             "model_geometry_id": model_geometry_id,
             "timings": {name: 0.0 for name in contract.CC_NATIVE_TIMING_FIELDS},
+            "icp_statistics": None,
             **{name: 0 for name in contract.CC_NATIVE_COUNTER_FIELDS},
         })
 

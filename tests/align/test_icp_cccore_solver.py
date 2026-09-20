@@ -32,6 +32,15 @@ package_manage = importlib.util.module_from_spec(MANAGE_MODULE_SPEC)
 MANAGE_MODULE_SPEC.loader.exec_module(package_manage)
 
 
+def mesh_icp_statistics():
+    """초기 거리와 한 번의 채택 반복을 가진 내부 ICP 통계를 만듭니다."""
+    return {**dict.fromkeys(contract.CC_ICP_COUNTER_FIELDS, 0),
+            **dict.fromkeys(contract.CC_ICP_TIMING_FIELDS, 0.0),
+            "iterations_attempted": 1, "iterations_accepted": 1, "distance_call_count": 2,
+            "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 1,
+            "query_octree_build_count": 2, "stop_reason": "MAX_ITERATIONS"}
+
+
 def box_mesh() -> tuple[np.ndarray, np.ndarray]:
     """세 축과 면 기울기가 다른 닫힌 합성 메시를 만듭니다."""
     vertices = np.array([
@@ -155,6 +164,7 @@ def native_call_summaries(
         "data_geometry_id": f"data-{index}",
         "model_geometry_id": "model",
         "timings": dict(timings),
+        "icp_statistics": mesh_icp_statistics() if operation == "register" and geometry_mode != "POINT_TO_POINT" else None,
         **counters,
     } for index, operation in enumerate(operations, start=1)]
 
@@ -214,6 +224,13 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
     }
     fixed["files"].append({"path": "include/Grid3D.h", "original_sha256": "5" * 64,
                            "patched_sha256": "6" * 64, "original_commit": thread_metadata["core_commit"]})
+    icp = {"id": "icp-mesh-grid-reuse-v1", "file": "patches/icp_mesh_grid_reuse.patch", "sha256": "7" * 64,
+           "files": [{"path": "src/RegistrationTools.cpp", "original_sha256": safety["patched_sha256"], "patched_sha256": "8" * 64},
+                     {"path": "include/RegistrationTools.h", "original_commit": thread_metadata["core_commit"], "original_sha256": "9" * 64, "patched_sha256": "a" * 64}]}
+    icp["files"].extend({"path": name, "original_sha256": "4" * 64, "patched_sha256": "b" * 64}
+                        for name in ("include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp"))
+    icp["files"].append({"path": "src/GridAndMeshIntersection.cpp", "original_sha256": "2" * 64, "patched_sha256": "c" * 64})
+    thread_metadata["core_patch"] += "+" + icp["id"]
     thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"] + "+" + reuse["id"] + "+" + fixed["id"]
     manifest = {
         "protocol_version": contract.CC_NATIVE_PROTOCOL_VERSION,
@@ -223,7 +240,10 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
         "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
                          "cccore": {"commit": thread_metadata["core_commit"],
                                     "registration_safety_patch": safety, "mesh_grid_memory_patch": grid,
-                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed}},
+                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed, "icp_mesh_grid_reuse_patch": icp}},
+        "icp_mesh_grid_reuse_patch": icp["id"],
+        "icp_mesh_grid_reuse_patch_sha256": icp["sha256"],
+        "icp_mesh_grid_reuse_source_sha256": {item["path"]: item["patched_sha256"] for item in icp["files"]},
         "mesh_grid_fixed_domain_patch": fixed["id"],
         "mesh_grid_fixed_domain_patch_sha256": fixed["sha256"],
         "mesh_grid_fixed_domain_source_sha256": {item["path"]: item["patched_sha256"] for item in fixed["files"]},
@@ -381,6 +401,46 @@ class PureContractTests(unittest.TestCase):
                 if mesh_domains:
                     self.assertTrue(all(domain == mesh_domains[0] for domain in mesh_domains))
 
+    def test_native_identity_requires_icp_grid_patch(self) -> None:
+        """내부 ICP 패치의 누락·원문 연결·코어 신원·헤더 커밋 변조를 거부합니다."""
+        for case in ("missing", "hash", "source", "chain", "header_commit", "core", "old_protocol"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                executable, manifest = make_native_runtime(Path(temporary))
+                identity = solver.native_build_identity(executable)
+                self.assertEqual(identity["icp_mesh_grid_reuse_patch"], "icp-mesh-grid-reuse-v1")
+                if case == "missing":
+                    manifest.pop("icp_mesh_grid_reuse_patch")
+                elif case == "hash":
+                    manifest["icp_mesh_grid_reuse_patch_sha256"] = "0" * 64
+                elif case == "source":
+                    manifest["icp_mesh_grid_reuse_source_sha256"]["src/RegistrationTools.cpp"] = "0" * 64
+                elif case == "chain":
+                    manifest["dependencies"]["cccore"]["icp_mesh_grid_reuse_patch"]["files"][0]["original_sha256"] = "0" * 64
+                elif case == "header_commit":
+                    manifest["dependencies"]["cccore"]["icp_mesh_grid_reuse_patch"]["files"][1]["original_commit"] = "0" * 40
+                elif case == "core":
+                    manifest["core_patch"] = manifest["core_patch"].replace("+icp-mesh-grid-reuse-v1", "")
+                else:
+                    manifest["protocol_version"] = "cccore-native-v5"
+                contract.write_json_atomic(executable.with_name("runtime_manifest.json"), manifest)
+                with self.assertRaises(contract.CcCoreEnvironmentError):
+                    solver.native_build_identity(executable)
+
+    def test_physical_icp_statistics_matches_logical_and_rejects_boolean(self) -> None:
+        """실제 명령의 내부 통계가 논리 기록과 다르거나 불리언이면 거부합니다."""
+        logical = contract.validate_native_call_summaries(
+            native_call_summaries("POINT_TO_MESH"), geometry_mode="POINT_TO_MESH",
+            requested_max_threads=8, effective_max_threads=6,
+        )
+        for value in (True, 0):
+            physical = copy.deepcopy(physical_native_call_summaries(logical))
+            register = next(item for item in physical if item["operation"] == "register")
+            register["icp_statistics"]["iterations_accepted"] = value
+            with self.subTest(value=value), self.assertRaises(contract.CcCoreEnvironmentError):
+                contract.validate_physical_native_call_summaries(
+                    physical, logical, requested_max_threads=8, effective_max_threads=6,
+                )
+
     def test_native_identity_requires_fixed_domain_patch(self) -> None:
         """고정 범위 패치의 누락·지문·소스 연결과 경계 원문 커밋 변조를 거부합니다."""
         for case in ("missing", "hash", "source", "chain", "core", "grid_commit", "missing_grid_commit", "old_protocol"):
@@ -423,11 +483,11 @@ class PureContractTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first, evaluation))
         self.assertTrue(np.all(first[:, 2] == 0.0))
 
-    def test_v5_protocol_and_thread_limit_contract(self) -> None:
+    def test_v6_protocol_and_thread_limit_contract(self) -> None:
         """표본 정책 v5·작업 v4·네이티브 v5와 1..1024 범위의 스레드 요청만 허용합니다."""
         self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v5")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v6")
         self.assertEqual(contract.resolve_parameters({"cc_max_threads": 1024})["max_threads"], 1024)
         for value in (0, -1, 1025, True, 1.5):
             with self.subTest(value=value), self.assertRaises(contract.CcCoreInputError):

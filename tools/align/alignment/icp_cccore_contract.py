@@ -16,7 +16,7 @@ import numpy as np
 CC_BACKEND_ID = "CCCORELIB"
 CC_ALGORITHM_VERSION = "cccore-icp-v5"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
-CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v5"
+CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v6"
 CC_NATIVE_COORDINATE_MAX = float(np.finfo(np.float32).max)
 CC_LEGACY_NATIVE_PROTOCOL_VERSION = "cccore-native-v2"
 CC_THREAD_BACKEND = "oneTBB"
@@ -62,6 +62,17 @@ CC_NATIVE_COUNTER_FIELDS = (
     "geometry_load_count", "geometry_cache_hits", "octree_build_count", "octree_cache_hits",
     "mesh_grid_build_count", "mesh_grid_cache_hits",
 )
+CC_ICP_COUNTER_FIELDS = (
+    "iterations_attempted", "iterations_accepted", "distance_call_count",
+    "mesh_grid_build_count", "mesh_grid_cache_hits", "mesh_grid_expansion_count",
+    "mesh_grid_level_reduction_count", "query_octree_build_count", "mesh_grid_peak_estimated_bytes",
+)
+CC_ICP_TIMING_FIELDS = (
+    "model_level_seconds", "query_octree_seconds", "mesh_grid_seconds", "closest_point_seconds",
+    "filter_rms_seconds", "transform_solve_seconds", "transform_apply_seconds", "total_seconds",
+)
+
+
 CC_MIN_SCALE = 0.9
 CC_MAX_SCALE = 1.1
 CC_OPTIMIZER_SEED = 1729
@@ -349,6 +360,66 @@ def validate_native_timings(value: Any) -> dict[str, float]:
     }
 
 
+def validate_icp_statistics(value: Any, *, mesh_registration: bool, kernel_seconds: float,
+                            max_iterations: int | None = None) -> dict[str, Any] | None:
+    """등록 내부 통계를 외부 세션 합계와 분리하여 횟수·시간·종료 사유를 검증합니다."""
+    if not mesh_registration:
+        if value is not None:
+            raise CcCoreEnvironmentError("CC 거리·점군 등록에는 내부 메시 통계를 기록할 수 없습니다.")
+        return None
+    if not isinstance(value, Mapping) or set(value) != {*CC_ICP_COUNTER_FIELDS, *CC_ICP_TIMING_FIELDS, "stop_reason"}:
+        raise CcCoreEnvironmentError("CC 내부 ICP 통계가 고정 계약과 다릅니다.")
+    result = {name: nonnegative_integer(value[name], f"CC 내부 ICP {name}") for name in CC_ICP_COUNTER_FIELDS}
+    result.update({name: finite_nonnegative_number(value[name], f"CC 내부 ICP {name}") for name in CC_ICP_TIMING_FIELDS})
+    reason = value["stop_reason"]
+    if not isinstance(reason, str) or reason not in {"MAX_ITERATIONS", "RMS_INCREASE", "NOTHING_TO_DO", "ERROR", "CANCELLED"}:
+        raise CcCoreEnvironmentError("CC 내부 ICP 종료 사유가 올바르지 않습니다.")
+    result["stop_reason"] = reason
+    if result["iterations_accepted"] > result["iterations_attempted"]:
+        raise CcCoreEnvironmentError("CC 내부 ICP 채택 반복 수가 시도 수보다 큽니다.")
+    if max_iterations is not None and result["iterations_attempted"] > max_iterations:
+        raise CcCoreEnvironmentError("CC 내부 ICP 시도 수가 요청 반복 상한보다 큽니다.")
+    if reason not in {"ERROR", "CANCELLED"}:
+        if result["distance_call_count"] != result["mesh_grid_build_count"] + result["mesh_grid_cache_hits"]:
+            raise CcCoreEnvironmentError("CC 내부 ICP 거리 호출과 격자 생성·재사용 합계가 다릅니다.")
+        if result["query_octree_build_count"] != result["distance_call_count"]:
+            raise CcCoreEnvironmentError("CC 내부 ICP 질의 옥트리 생성 수가 거리 호출 수와 다릅니다.")
+        if result["distance_call_count"] < 1 or result["mesh_grid_build_count"] < 1:
+            raise CcCoreEnvironmentError("CC 내부 ICP에 초기 거리 계산 또는 격자 생성이 없습니다.")
+    attempted = result["iterations_attempted"]
+    accepted = result["iterations_accepted"]
+    if reason not in {"ERROR", "CANCELLED"} and result["distance_call_count"] != attempted + 1:
+        raise CcCoreEnvironmentError("CC 내부 ICP 거리 호출 수가 초기 조회와 반복 시도 수의 합계와 다릅니다.")
+    if reason == "MAX_ITERATIONS" and (
+        attempted < 1 or accepted != attempted or (max_iterations is not None and attempted != max_iterations)
+    ):
+        raise CcCoreEnvironmentError("CC 내부 ICP 반복 상한 종료가 요청 상한 또는 채택 횟수와 다릅니다.")
+    if reason == "RMS_INCREASE" and attempted != accepted + 1:
+        raise CcCoreEnvironmentError("CC 내부 ICP RMS 증가 종료에 마지막 미채택 반복이 없습니다.")
+    if reason == "NOTHING_TO_DO" and attempted != 0:
+        raise CcCoreEnvironmentError("CC 내부 ICP 초기 종료에 반복 시도가 기록되었습니다.")
+    if result["mesh_grid_expansion_count"] > result["mesh_grid_build_count"]:
+        raise CcCoreEnvironmentError("CC 내부 ICP 격자 확장 수가 생성 수보다 큽니다.")
+    total = result["total_seconds"]
+    subtotal = math.fsum(result[name] for name in CC_ICP_TIMING_FIELDS if name != "total_seconds")
+    if subtotal > total and not math.isclose(subtotal, total, rel_tol=1e-6, abs_tol=1e-8):
+        raise CcCoreEnvironmentError("CC 내부 ICP 부분 시간 합계가 전체 시간보다 큽니다.")
+    if total > kernel_seconds and not math.isclose(total, kernel_seconds, rel_tol=1e-6, abs_tol=1e-8):
+        raise CcCoreEnvironmentError("CC 내부 ICP 시간이 네이티브 커널 시간보다 큽니다.")
+    return result
+
+
+def validate_icp_native_result(statistics: Mapping[str, Any] | None, native_code: Any) -> None:
+    """메시 등록의 성공 코드를 실제 채택 변환과 종료 사유에 맞춰 검증합니다."""
+    if statistics is None:
+        return
+    if type(native_code) is not int or native_code not in (0, 1):
+        raise CcCoreEnvironmentError("CC 내부 ICP 성공 코드가 올바르지 않습니다.")
+    expected = 1 if statistics["iterations_accepted"] > 0 else 0
+    if native_code != expected:
+        raise CcCoreEnvironmentError("CC 내부 ICP 성공 코드가 실제 채택 반복과 다릅니다.")
+
+
 def validate_native_session_statistics(value: Any) -> dict[str, int]:
     """세션 전체 캐시·가속구조 횟수와 메모리 최고값을 검증합니다."""
     expected_keys = set(CC_NATIVE_COUNTER_FIELDS) | {
@@ -538,7 +609,7 @@ def validate_native_call_summaries(
         "source_logical_index", "stage", "execution_source", "evaluation_key_sha256",
         "elapsed_seconds", "roundtrip_seconds", "protocol_overhead_seconds",
         "requested_max_threads", "effective_max_threads",
-        "data_geometry_id", "model_geometry_id", "timings", *CC_NATIVE_COUNTER_FIELDS,
+        "data_geometry_id", "model_geometry_id", "timings", "icp_statistics", *CC_NATIVE_COUNTER_FIELDS,
     }
     expected_operations = CC_NATIVE_OPERATION_SEQUENCES.get(geometry_mode)
     expected_stages = CC_NATIVE_OPERATION_STAGES.get(geometry_mode)
@@ -603,6 +674,12 @@ def validate_native_call_summaries(
             item.get("protocol_overhead_seconds"), "CC 논리 연산 프로토콜 오버헤드",
         )
         timings = validate_native_timings(item.get("timings"))
+        icp_statistics = validate_icp_statistics(
+            item.get("icp_statistics"), mesh_registration=operation == "register" and geometry_mode != "POINT_TO_POINT",
+            kernel_seconds=timings["kernel_seconds"],
+        )
+        if icp_statistics is not None and icp_statistics["stop_reason"] in {"ERROR", "CANCELLED"}:
+            raise CcCoreEnvironmentError("CC 성공 결과에 실패·취소된 내부 ICP 통계가 있습니다.")
         counters = {
             name: nonnegative_integer(item.get(name), f"CC 논리 연산 {name}")
             for name in CC_NATIVE_COUNTER_FIELDS
@@ -651,6 +728,7 @@ def validate_native_call_summaries(
             "data_geometry_id": item["data_geometry_id"],
             "model_geometry_id": item["model_geometry_id"],
             "timings": timings,
+            "icp_statistics": icp_statistics,
             **counters,
         })
     for item in summaries:
@@ -684,7 +762,7 @@ def validate_physical_native_call_summaries(
         "operation", "index", "sequence", "logical_index", "stage", "execution_source",
         "evaluation_key_sha256", "elapsed_seconds", "roundtrip_seconds",
         "protocol_overhead_seconds", "requested_max_threads", "effective_max_threads",
-        "data_geometry_id", "model_geometry_id", "timings", *CC_NATIVE_COUNTER_FIELDS,
+        "data_geometry_id", "model_geometry_id", "timings", "icp_statistics", *CC_NATIVE_COUNTER_FIELDS,
     }
     native_logical = [item for item in logical_operations if item["execution_source"] == "native_session"]
     if len(value) != len(native_logical):
@@ -718,6 +796,12 @@ def validate_physical_native_call_summaries(
         )
         if item.get("execution_source") != "native_session" or any(item.get(name) != logical[name] for name in comparable):
             raise CcCoreEnvironmentError("CC 실제 네이티브 명령이 연결된 논리 연산과 다릅니다.")
+        icp_statistics = validate_icp_statistics(
+            item.get("icp_statistics"), mesh_registration=logical["icp_statistics"] is not None,
+            kernel_seconds=timings["kernel_seconds"],
+        )
+        if icp_statistics != logical["icp_statistics"]:
+            raise CcCoreEnvironmentError("CC 실제 명령의 내부 ICP 통계가 논리 연산과 다릅니다.")
         if timings != logical["timings"] or any(counters[name] != logical[name] for name in CC_NATIVE_COUNTER_FIELDS):
             raise CcCoreEnvironmentError("CC 실제 네이티브 명령의 시간·통계가 연결된 논리 연산과 다릅니다.")
         elapsed = finite_nonnegative_number(item.get("elapsed_seconds"), "CC 실제 명령 시간")
@@ -740,7 +824,7 @@ def validate_physical_native_call_summaries(
             "protocol_overhead_seconds": protocol_overhead,
             "requested_max_threads": requested, "effective_max_threads": effective,
             "data_geometry_id": item["data_geometry_id"], "model_geometry_id": item["model_geometry_id"],
-            "timings": timings, **counters,
+            "timings": timings, "icp_statistics": logical["icp_statistics"], **counters,
         })
     return tuple(summaries)
 

@@ -180,14 +180,14 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 등록·격자 고정 범위까지의 패치와 최종 원문·배포 해시를 연결하는지 검사합니다. #>
+    <# Manifest가 ICP 내부 격자까지의 패치와 최종 원문·배포 해시를 연결하는지 검사합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.protocol_version -ne $Lock.protocol_version -or $manifest.tbb_version -ne $Lock.tbb.version) {
         throw "Runtime Manifest의 프로토콜 또는 oneTBB 버전이 잠금 정보와 다릅니다."
     }
-    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)"
+    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)+$($Lock.cccore.icp_mesh_grid_reuse_patch.id)"
     if ($manifest.core_patch -ne $expectedCorePatch -or $manifest.self_test.core_patch -ne $expectedCorePatch -or
         $manifest.registration_safety_patch -ne $Lock.cccore.registration_safety_patch.id -or
         $manifest.registration_safety_patch_sha256 -ne $Lock.cccore.registration_safety_patch.sha256 -or
@@ -238,6 +238,21 @@ function Assert-RuntimeManifest {
             throw "Runtime Manifest의 격자 고정 범위 최종 원문 해시가 다릅니다."
         }
     }
+    $icpPatch = $Lock.cccore.icp_mesh_grid_reuse_patch
+    if ($manifest.icp_mesh_grid_reuse_patch -ne $icpPatch.id -or
+        $manifest.icp_mesh_grid_reuse_patch_sha256 -ne $icpPatch.sha256) {
+        throw "Runtime Manifest의 ICP 내부 격자 패치가 잠금 정보와 다릅니다."
+    }
+    $icpNames = @($manifest.icp_mesh_grid_reuse_source_sha256.PSObject.Properties.Name | Sort-Object)
+    $expectedIcpNames = @($icpPatch.files | ForEach-Object { $_.path } | Sort-Object)
+    if (@(Compare-Object -ReferenceObject $expectedIcpNames -DifferenceObject $icpNames).Count -ne 0) {
+        throw "Runtime Manifest의 ICP 내부 격자 원문 목록이 다릅니다."
+    }
+    foreach ($source in $icpPatch.files) {
+        if ($manifest.icp_mesh_grid_reuse_source_sha256.($source.path) -ne $source.patched_sha256) {
+            throw "Runtime Manifest의 ICP 내부 격자 최종 원문 해시가 다릅니다."
+        }
+    }
     $manifestFiles = @($manifest.runtime_files | ForEach-Object { [string]$_ } | Sort-Object)
     if (@(Compare-Object -ReferenceObject @($ExpectedRuntimeFiles | Sort-Object) -DifferenceObject $manifestFiles).Count -ne 0) {
         throw "Runtime Manifest의 파일 허용 목록이 빌드 계약과 다릅니다."
@@ -286,12 +301,28 @@ $NanoSource = Join-Path $CoreSource "extern\nanoflann"
 $actualNanoCommit = (& git -C $NanoSource rev-parse HEAD).Trim()
 if ($actualNanoCommit -ne $Lock.nanoflann.commit) { throw "nanoflann 커밋이 잠금 파일과 다릅니다." }
 if ((& git -C $NanoSource status --porcelain)) { throw "nanoflann 원문에 예상하지 않은 변경이 있습니다." }
-$allowedChangedFiles = @('CMakeLists.txt','src/RegistrationTools.cpp','include/DgmOctree.h','src/DgmOctree.cpp','src/DistanceComputationTools.cpp','include/DistanceComputationTools.h','include/GridAndMeshIntersection.h','src/GridAndMeshIntersection.cpp','include/Grid3D.h')
+$allowedChangedFiles = @('CMakeLists.txt','src/RegistrationTools.cpp','include/RegistrationTools.h','include/DgmOctree.h','src/DgmOctree.cpp','src/DistanceComputationTools.cpp','include/DistanceComputationTools.h','include/GridAndMeshIntersection.h','src/GridAndMeshIntersection.cpp','include/Grid3D.h')
 $changedFiles = @(& git -C $CoreSource diff --name-only HEAD)
 foreach ($changedFile in $changedFiles) {
     if ($changedFile -notin $allowedChangedFiles) { throw "CCCoreLib 원문에 예상하지 않은 변경이 있습니다: $changedFile" }
 }
 if ((& git -C $CoreSource ls-files --others --exclude-standard)) { throw "CCCoreLib 캐시에 추적되지 않은 파일이 있습니다." }
+# 완전히 검증된 마지막 패치만 되돌려 기존 패치 단계의 입력 해시를 순서대로 재검증합니다.
+$IcpMeshGridPatch = $Lock.cccore.icp_mesh_grid_reuse_patch
+$IcpMeshGridPatchFile = Join-Path $NativeSource $IcpMeshGridPatch.file
+Assert-Hash $IcpMeshGridPatchFile $IcpMeshGridPatch.sha256
+$icpPatchedCount = 0
+foreach ($source in $IcpMeshGridPatch.files) {
+    if ((Get-NormalizedSha256 (Join-Path $CoreSource $source.path)) -eq $source.patched_sha256) { $icpPatchedCount++ }
+}
+if ($icpPatchedCount -and $icpPatchedCount -ne $IcpMeshGridPatch.files.Count) {
+    throw "ICP 내부 격자 패치가 일부 파일에만 적용되어 있습니다."
+}
+if ($icpPatchedCount -eq $IcpMeshGridPatch.files.Count) {
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--reverse', '--check', $IcpMeshGridPatchFile)
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--reverse', $IcpMeshGridPatchFile)
+    foreach ($source in $IcpMeshGridPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.original_sha256 }
+}
 $PatchFile = Join-Path $NativeSource $Lock.cccore.patch_file
 Assert-Hash $PatchFile $Lock.cccore.patch_sha256
 $RegistrationSafetyPatch = $Lock.cccore.registration_safety_patch
@@ -461,6 +492,21 @@ if ($originalDomainFiles -eq $MeshGridDomainPatch.files.Count) {
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $MeshGridDomainPatchFile)
 }
 foreach ($source in $MeshGridDomainPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
+# 새 패치의 모든 입력을 직전 단계 또는 고정 커밋에 연결한 뒤 한 번에 적용합니다.
+foreach ($source in $IcpMeshGridPatch.files) {
+    $expectedInput = if ($source.path -eq 'src/RegistrationTools.cpp') { $RegistrationSafetyPatch.patched_sha256 }
+        elseif ($MeshGridDomainSources.ContainsKey($source.path)) { $MeshGridDomainSources[$source.path].patched_sha256 }
+        elseif ($MeshGridReuseSources.ContainsKey($source.path)) { $MeshGridReuseSources[$source.path].patched_sha256 }
+        elseif ($MeshGridSources.ContainsKey($source.path)) { $MeshGridSources[$source.path].patched_sha256 }
+        else { Get-PinnedSourceSha256 $source.path }
+    if ($source.original_sha256 -ne $expectedInput) {
+        throw "ICP 내부 격자 패치의 입력 원문이 이전 패치와 연결되지 않습니다: $($source.path)"
+    }
+    Assert-Hash (Join-Path $CoreSource $source.path) $source.original_sha256
+}
+Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $IcpMeshGridPatchFile)
+Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $IcpMeshGridPatchFile)
+foreach ($source in $IcpMeshGridPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
 Get-PinnedFile $Lock.json.header_url (Join-Path $Dependencies 'json.hpp') $Lock.json.header_sha256
 Get-PinnedFile $Lock.json.license_url (Join-Path $Dependencies 'json-LICENSE.MIT') $Lock.json.license_sha256
 Get-PinnedFile $Lock.tbb.archive_url $TbbArchive $Lock.tbb.archive_sha256
@@ -482,7 +528,7 @@ $CMake = Join-Path $VisualStudio "Common7\IDE\CommonExtensions\Microsoft\CMake\C
 if (!(Test-Path -LiteralPath $CMake)) { throw "Visual Studio에 포함된 CMake를 찾지 못했습니다." }
 Invoke-Checked $CMake @('-S',$NativeSource,'-B',$BuildPath,'-G','Visual Studio 17 2022','-A','x64',
     "-DCCCORE_SOURCE=$CoreSource","-DJSON_INCLUDE_DIR=$Dependencies","-DTBB_DIR=$TbbCMake","-DCORE_COMMIT=$($Lock.cccore.commit)",
-    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)")
+    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)")
 Invoke-Checked $CMake @('--build',$BuildPath,'--config','Release','--parallel','8')
 foreach ($binary in @('colmap_cccore_worker.exe','CCCoreLib.dll')) {
     Copy-Item -LiteralPath (Join-Path $BuildPath "bin\$binary") -Destination (Join-Path $StagedRuntime $binary) -Force
@@ -553,11 +599,13 @@ $MeshGridReuseSourceHashes = [ordered]@{}
 foreach ($source in $MeshGridReusePatch.files) { $MeshGridReuseSourceHashes[$source.path] = $source.patched_sha256 }
 $MeshGridDomainSourceHashes = [ordered]@{}
 foreach ($source in $MeshGridDomainPatch.files) { $MeshGridDomainSourceHashes[$source.path] = $source.patched_sha256 }
+$IcpMeshGridSourceHashes = [ordered]@{}
+foreach ($source in $IcpMeshGridPatch.files) { $IcpMeshGridSourceHashes[$source.path] = $source.patched_sha256 }
 $Manifest = [ordered]@{
     protocol_version = $Lock.protocol_version
     platform = 'windows-x64'
     core_commit = $Lock.cccore.commit
-    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)"
+    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)"
     core_patch_sha256 = $Lock.cccore.patch_sha256
     concurrency_patch = $ConcurrencyPatch.patch_id
     concurrency_patch_sha256 = $ConcurrencyPatch.patch_sha256
@@ -573,6 +621,9 @@ $Manifest = [ordered]@{
     mesh_grid_fixed_domain_patch = $MeshGridDomainPatch.id
     mesh_grid_fixed_domain_patch_sha256 = $MeshGridDomainPatch.sha256
     mesh_grid_fixed_domain_source_sha256 = $MeshGridDomainSourceHashes
+    icp_mesh_grid_reuse_patch = $IcpMeshGridPatch.id
+    icp_mesh_grid_reuse_patch_sha256 = $IcpMeshGridPatch.sha256
+    icp_mesh_grid_reuse_source_sha256 = $IcpMeshGridSourceHashes
     dependencies = $Lock
     build_options = @{ CCCORELIB_SHARED=$true; CCCORELIB_USE_QT_CONCURRENT=$false; CCCORELIB_USE_TBB=$true; CCCORELIB_USE_CGAL=$false; configuration='Release' }
     cmake_version = ((& $CMake --version) | Select-Object -First 1)

@@ -39,7 +39,7 @@ def array_hash(array):
 
 
 def main():
-    """전체 ICP를 호출하지 않고 실제 표본 준비와 네이티브 세션을 측정합니다."""
+    """전체 ICP 없이 v5·v6 고정 범위를 포함한 실제 표본 준비를 측정합니다."""
     args = arguments()
     source_directory = args.solver_directory.resolve(strict=True)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -98,7 +98,7 @@ def main():
             sample_started = time.perf_counter()
             full_samples = {}
             options = {'full_samples': full_samples}
-            if contract.CC_NATIVE_PROTOCOL_VERSION == 'cccore-native-v5':
+            if contract.CC_NATIVE_PROTOCOL_VERSION in ('cccore-native-v5', 'cccore-native-v6'):
                 options['normalization'] = normalization.to_mapping()
             registration, moving_evaluation, reference_evaluation, sampling = solver.prepare_candidate_samples(
                 runner, normalized['moving'], normalized['reference'], policy,

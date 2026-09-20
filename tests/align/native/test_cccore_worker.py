@@ -90,12 +90,12 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def start_session(self, *, max_threads=4):
-        """v5 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
+        """v6 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
         root = self.root / "session-job"
         native = root / "native"
         native.mkdir(parents=True)
         identity = {
-            "protocol_version": "cccore-native-v5",
+            "protocol_version": "cccore-native-v6",
             "session_id": "0123456789abcdef0123456789abcdef",
             "job_id": root.name,
             "input_fingerprint": "fedcba9876543210fedcba9876543210",
@@ -166,11 +166,13 @@ class NativeContractTest(unittest.TestCase):
             result.update(triangles_file=triangles_name, triangle_count=len(triangles) // 3)
         return result
 
-    def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None):
-        """고정 순번 v5 명령을 제출하고 응답 또는 세션 실패를 기다립니다."""
+    def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None, parameters=None):
+        """고정 순번 v6 명령과 명시적 등록 조건을 제출하고 응답을 기다립니다."""
         command = self.session_command_payload(
             identity, sequence, operation, data=data, model=model, stage=stage, max_threads=max_threads, search_domain=search_domain,
         )
+        if parameters is not None:
+            command["parameters"].update(parameters)
         stem = f"native/command-{sequence:04d}"
         request_path = root / f"{stem}.request.json"
         response_path = root / f"{stem}.response.json"
@@ -183,7 +185,7 @@ class NativeContractTest(unittest.TestCase):
         self.fail("세션 명령 응답이 제한 시간 안에 생성되지 않았습니다.")
 
     def session_command_payload(self, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None):
-        """오류 계약 검사에도 재사용할 순번별 v5 명령 객체를 만듭니다."""
+        """오류 계약 검사에도 재사용할 순번별 v6 명령 객체를 만듭니다."""
         stem = f"native/command-{sequence:04d}"
         command = {
             **identity, "sequence": sequence, "operation": operation, "stage": stage,
@@ -345,7 +347,7 @@ class NativeContractTest(unittest.TestCase):
         process = subprocess.run([str(WORKER),"--check-environment"],capture_output=True,text=True,encoding="utf-8",timeout=30)
         self.assertEqual(process.returncode,0,process.stdout)
         result=json.loads(process.stdout)
-        self.assertEqual(result["protocol_version"],"cccore-native-v5")
+        self.assertEqual(result["protocol_version"],"cccore-native-v6")
         self.assertEqual(result["self_test"],"passed")
         self.assertTrue(Path(result["library_path"]).is_file())
         self.assertTrue(Path(result["tbb_library_path"]).is_file())
@@ -355,6 +357,170 @@ class NativeContractTest(unittest.TestCase):
         self.assertTrue(result["octree_multithread_support"])
         self.assertEqual(result["requested_max_threads"],result["hardware_thread_count"])
         self.assertEqual(result["effective_max_threads"],result["hardware_thread_count"])
+
+    def assert_icp_statistics(self, result):
+        """메시 ICP 내부 실제 호출 횟수와 겹치지 않는 시간 계측 계약을 검증합니다."""
+        statistics = result["icp_statistics"]
+        counters = ("iterations_attempted", "iterations_accepted", "distance_call_count",
+                    "mesh_grid_build_count", "mesh_grid_cache_hits", "mesh_grid_expansion_count",
+                    "mesh_grid_level_reduction_count", "query_octree_build_count", "mesh_grid_peak_estimated_bytes")
+        timings = ("model_level_seconds", "query_octree_seconds", "mesh_grid_seconds", "closest_point_seconds",
+                   "filter_rms_seconds", "transform_solve_seconds", "transform_apply_seconds")
+        self.assertEqual(set(statistics), set(counters + timings + ("total_seconds", "stop_reason")))
+        for key in counters:
+            self.assertIs(type(statistics[key]), int, key)
+            self.assertGreaterEqual(statistics[key], 0, key)
+        for key in timings + ("total_seconds",):
+            self.assertTrue(math.isfinite(statistics[key]), key)
+            self.assertGreaterEqual(statistics[key], 0, key)
+        self.assertEqual(statistics["distance_call_count"], statistics["mesh_grid_build_count"] + statistics["mesh_grid_cache_hits"])
+        self.assertEqual(statistics["query_octree_build_count"], statistics["distance_call_count"])
+        self.assertLessEqual(statistics["iterations_accepted"], statistics["iterations_attempted"])
+        self.assertGreaterEqual(statistics["mesh_grid_build_count"], 1)
+        self.assertLessEqual(sum(statistics[key] for key in timings), statistics["total_seconds"] + 1e-6)
+        self.assertLessEqual(statistics["total_seconds"], result["timings"]["kernel_seconds"] + 1e-6)
+        self.assertIn(statistics["stop_reason"], ("MAX_ITERATIONS", "RMS_INCREASE", "NOTHING_TO_DO"))
+        return statistics
+
+    def test_icp_mesh_context_matches_legacy_and_reuses_each_registration(self):
+        """비대칭 메시의 강체·배율·필터·경계 확장을 기존 공개 API 및 스레드 수별로 비교합니다."""
+        vertices = [(0, 0, 0), (3, 0, 0), (.3, 2, 0), (.2, .5, 4)]
+        triangles = [(0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)]
+        rng = random.Random(9812)
+        points = []
+        for face in triangles:
+            for _ in range(100):
+                u, v = rng.random(), rng.random()
+                if u + v > 1:
+                    u, v = 1 - u, 1 - v
+                points.append(tuple(vertices[face[0]][axis] * (1-u-v) + vertices[face[1]][axis] * u
+                                    + vertices[face[2]][axis] * v for axis in range(3)))
+        for threads in (1, 4):
+            for scale, filtered, expand in ((1.0, False, False), (1.025, False, False),
+                                             (1.0, True, False), (1.025, True, False), (1.025, False, True)):
+                with self.subTest(threads=threads, scale=scale, filtered=filtered, expand=expand):
+                    target = transform_points(vertices, scale=scale, angle=.012, translation=(.014, -.009, .011))
+                    # 부분 겹침 필터만 사용하면 먼 점이 변환 전에 복원되어 배율 증가로 초기 경계를 넘습니다.
+                    # 먼 점과 근거리점의 병렬 거리 기록은 최초 스칼라 오프셋 초기화 경쟁으로 인한 정밀도 손실도 검출합니다.
+                    registration_points = points + ([(100, 120, 150)] if expand else [])
+                    request = self.request(data=registration_points, model=target, triangles=triangles, scale=scale != 1, max_threads=threads)
+                    request['parameters'].update(filter_out_farthest_points=filtered, overlap_ratio=.9 if filtered or expand else 1.0)
+                    legacy = self.run_request(request)
+                    root, identity, process, _ = self.start_session(max_threads=threads)
+                    try:
+                        data = self.session_geometry(root, 'data', registration_points)
+                        model = self.session_geometry(root, 'model', target, triangles)
+                        for sequence in (1, 2):
+                            current = self.session_command(root, identity, sequence, 'register', data=data, model=model,
+                                stage='RIGID', max_threads=threads, parameters=request['parameters'])
+                            self.assertEqual(current['status'], 'completed', current)
+                            stats = self.assert_icp_statistics(current)
+                            self.assertEqual(stats['mesh_grid_build_count'], 1 + stats['mesh_grid_expansion_count'])
+                            self.assertGreater(stats['mesh_grid_cache_hits'], 0)
+                            if expand:
+                                self.assertGreater(stats['mesh_grid_expansion_count'], 0, current)
+                            for actual, expected in zip(sum(current['matrix_4x4'], []), sum(legacy['matrix_4x4'], [])):
+                                self.assertAlmostEqual(actual, expected, delta=2e-5)
+                            self.assertAlmostEqual(current['final_rms'], legacy['final_rms'], delta=2e-6)
+                            self.assertEqual(current['final_point_count'], legacy['final_point_count'])
+                        self.session_command(root, identity, 3, 'close')
+                        self.finish_session(root, process)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+                        shutil.rmtree(root)
+
+    def test_icp_planar_and_thin_mesh_registration_statistics(self):
+        """평면과 매우 얇은 메시의 경계 부근 이동을 기존 등록 결과와 비교합니다."""
+        for thickness in (0.0, 1e-5):
+            with self.subTest(thickness=thickness):
+                vertices = [(-2, -1, 0), (3, -1, 0), (3, 2, thickness), (-2, 2, thickness)]
+                faces = [(0, 1, 2), (0, 2, 3)]
+                points = [(x / 10, y / 10, .03 + thickness * (y / 10 + 1) / 3)
+                          for x in range(-19, 30, 2) for y in range(-9, 20, 2)]
+                request = self.request(data=points, model=vertices, triangles=faces)
+                legacy = self.run_request(request)
+                root, identity, process, _ = self.start_session()
+                try:
+                    data = self.session_geometry(root, 'data', points)
+                    model = self.session_geometry(root, 'model', vertices, faces)
+                    current = self.session_command(root, identity, 1, 'register', data=data, model=model,
+                                                   parameters=request['parameters'])
+                    self.assert_icp_statistics(current)
+                    self.assertLess(current['final_rms'], 1e-5)
+                    for actual, expected in zip(sum(current['matrix_4x4'], []), sum(legacy['matrix_4x4'], [])):
+                        self.assertAlmostEqual(actual, expected, delta=2e-5)
+                    distance = self.session_command(root, identity, 2, 'distance', data=data, model=model)
+                    self.assertIsNone(distance['icp_statistics'])
+                    self.session_command(root, identity, 3, 'close')
+                    self.finish_session(root, process)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
+                    shutil.rmtree(root)
+
+    def test_fixed_domain_small_mesh_large_cube_preserves_parallel_distances(self):
+        """큰 검색 큐브의 한 셀에 들어가는 작은 평면도 단일·다중 스레드에서 정확한 거리를 반환합니다."""
+        points = [(.2, .3, .02), (.7, .8, -.03), (-.1, .5, .04), (1.1, 1.2, .1), (100, 120, 150)]
+        expected = [math.sqrt(max(-x, 0, x-1)**2 + max(-y, 0, y-1)**2 + z*z) for x, y, z in points]
+        for threads in (1, 4):
+            with self.subTest(threads=threads):
+                root, identity, process, _ = self.start_session(max_threads=threads)
+                try:
+                    model = self.session_geometry(root, 'plane', [(0,0,0), (1,0,0), (1,1,0), (0,1,0)], [(0,1,2), (0,2,3)])
+                    data = self.session_geometry(root, 'points', points)
+                    for sequence in (1, 2):
+                        result = self.session_command(root, identity, sequence, 'distance', data=data, model=model,
+                            stage='PREPARING', max_threads=threads,
+                            search_domain={'domain_id': 'large-cube', 'min': [-100,-100,-100], 'max': [200,200,200]})
+                        self.assertEqual(result['status'], 'completed', result)
+                        distances = struct.unpack('<' + 'd' * len(points), (root / result['distances_file']).read_bytes())
+                        for actual, analytic in zip(distances, expected):
+                            self.assertAlmostEqual(actual, analytic, delta=2e-5)
+                        self.assertEqual(result['operation_statistics']['mesh_grid_build_count'], int(sequence == 1))
+                        self.assertEqual(result['operation_statistics']['mesh_grid_cache_hits'], int(sequence == 2))
+                    self.session_command(root, identity, 3, 'close')
+                    self.finish_session(root, process)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    shutil.rmtree(root)
+
+    def test_icp_mesh_context_cancel_releases_process_without_success(self):
+        """메시 등록의 내부 거리 계산에서 취소하면 성공 결과 없이 세션 프로세스가 종료됩니다."""
+        root, identity, process, _ = self.start_session(max_threads=4)
+        try:
+            data = self.session_grid_geometry(root, 'data', 450, .025)
+            model = self.session_grid_geometry(root, 'model', 450, 0, mesh=True)
+            command = self.session_command_payload(identity, 1, 'register', data=data, model=model, stage='RIGID')
+            (root / 'native/command-0001.request.json').write_text(json.dumps(command), encoding='utf-8')
+            progress_path = root / 'native/command-0001.progress.json'
+            deadline = time.monotonic() + 20
+            observed = False
+            while process.poll() is None and time.monotonic() < deadline:
+                try:
+                    progress = json.loads(progress_path.read_text(encoding='utf-8'))
+                    observed = progress.get('substage') == 'KERNEL'
+                except (OSError, json.JSONDecodeError):
+                    pass
+                if observed:
+                    break
+                time.sleep(.002)
+            self.assertTrue(observed, '메시 등록 커널을 취소 전에 관측하지 못했습니다.')
+            (root / 'cancel.request').write_text('취소', encoding='utf-8')
+            result = self.assert_failed_session(root, process, 'CANCELLED', expected_code=2)
+            self.assertEqual(result['status'], 'cancelled')
+            response_path = root / 'native/command-0001.response.json'
+            if response_path.is_file():
+                self.assertNotEqual(json.loads(response_path.read_text(encoding='utf-8'))['status'], 'completed')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     def test_mesh_grid_reuses_different_queries_and_preserves_distances(self):
         """검색 단계·격자를 한 번만 준비하고 새 조회점의 정확 거리를 단발 결과와 비교합니다."""
@@ -617,6 +783,7 @@ class NativeContractTest(unittest.TestCase):
             data = self.session_geometry(root, "data", BASE)
             model = self.session_geometry(root, "model", model_points)
             current = self.session_command(root, identity, 1, "register", data=data, model=model, stage="RIGID")
+            self.assertIsNone(current["icp_statistics"])
             self.session_command(root, identity, 2, "close", stage="CLOSE")
             self.finish_session(root, process)
             for actual_row, expected_row in zip(current["matrix_4x4"], baseline["matrix_4x4"]):
@@ -924,7 +1091,7 @@ class NativeContractTest(unittest.TestCase):
         self.assertEqual((self.root / result["distances_file"]).read_bytes(), expected_bytes)
 
     def test_large_mesh_auto_grid_registration_preserves_identity(self):
-        """등록 내부의 동일 고단계 격자도 정상 표면의 항등 변환과 영 잔차를 보존합니다."""
+        """큰 메시의 예산 하향 격자가 기존 API와 v6 모두 항등 변환과 영 잔차를 보존합니다."""
         request, data = self.large_mesh_grid_request("register")
         result = self.run_request(request)
         for actual, expected in zip(apply_matrix(data, result["matrix_4x4"]), data):
@@ -932,6 +1099,26 @@ class NativeContractTest(unittest.TestCase):
                 self.assertAlmostEqual(coordinate, target, delta=1e-7)
         self.assertAlmostEqual(result["scale"], 1.0, delta=1e-7)
         self.assertLess(result["final_rms"], 1e-7)
+        root, identity, process, _ = self.start_session()
+        try:
+            for filename in ('data.bin', 'model.bin', 'triangles.bin'):
+                shutil.copyfile(self.root / filename, root / filename)
+            data_descriptor = dict(request['data'], geometry_id='data', cache_scope='SESSION')
+            model_descriptor = dict(request['model'], geometry_id='model', cache_scope='SESSION')
+            current = self.session_command(root, identity, 1, 'register', data=data_descriptor, model=model_descriptor,
+                                           parameters=request['parameters'])
+            self.assertEqual(current['status'], 'completed', current)
+            statistics = self.assert_icp_statistics(current)
+            self.assertGreater(statistics['mesh_grid_level_reduction_count'], 0)
+            self.assertLess(current['final_rms'], 1e-7)
+            for actual, expected in zip(sum(current['matrix_4x4'], []), sum(result['matrix_4x4'], [])):
+                self.assertAlmostEqual(actual, expected, delta=1e-7)
+            self.session_command(root, identity, 2, 'close')
+            self.finish_session(root, process)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
     def test_point_and_mesh_distance_single_and_parallel_equivalence(self):
         """C2C·C2M 거리 배열이 단일·병렬 실행에서 같은 값을 유지하는지 확인합니다."""

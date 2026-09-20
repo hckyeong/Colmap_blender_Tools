@@ -40,7 +40,7 @@ using Clock = std::chrono::steady_clock;
 using Cloud = CCCoreLib::PointCloud;
 using Transform = CCCoreLib::PointProjectionTools::Transformation;
 constexpr const char* kProtocol = "cccore-native-v2";
-constexpr const char* kSessionProtocol = "cccore-native-v5";
+constexpr const char* kSessionProtocol = "cccore-native-v6";
 constexpr const char* kThreadBackend = "oneTBB";
 constexpr const char* kTbbVersion = TBB_VERSION_PIN;
 
@@ -672,6 +672,28 @@ Json baseResult(const ThreadSettings& threads, const char* protocol = kProtocol)
             {"coordinate_type", "float32"}, {"matrix_scalar_type", "float64"}};
 }
 
+// 메시 등록의 내부 누적 계측만 응답으로 변환합니다.
+Json icpStatisticsJson(const CCCoreLib::ICPMeshRegistrationContext::Statistics& stats) {
+    return {{"iterations_attempted", stats.iterations_attempted},
+            {"iterations_accepted", stats.iterations_accepted},
+            {"distance_call_count", stats.distance_call_count},
+            {"mesh_grid_build_count", stats.mesh_grid_build_count},
+            {"mesh_grid_cache_hits", stats.mesh_grid_cache_hits},
+            {"mesh_grid_expansion_count", stats.mesh_grid_expansion_count},
+            {"mesh_grid_level_reduction_count", stats.mesh_grid_level_reduction_count},
+            {"query_octree_build_count", stats.query_octree_build_count},
+            {"mesh_grid_peak_estimated_bytes", stats.mesh_grid_peak_estimated_bytes},
+            {"model_level_seconds", stats.model_level_seconds},
+            {"query_octree_seconds", stats.query_octree_seconds},
+            {"mesh_grid_seconds", stats.mesh_grid_seconds},
+            {"closest_point_seconds", stats.closest_point_seconds},
+            {"filter_rms_seconds", stats.filter_rms_seconds},
+            {"transform_solve_seconds", stats.transform_solve_seconds},
+            {"transform_apply_seconds", stats.transform_apply_seconds},
+            {"total_seconds", stats.total_seconds},
+            {"stop_reason", stats.stop_reason}};
+}
+
 // 작업 계약에 따라 한 번의 등록 또는 거리 평가를 수행합니다.
 Json execute(const Json& request, const fs::path& root, Progress& progress, const ThreadSettings& threads) {
     require(request.at("protocol_version") == kProtocol, "PROTOCOL_MISMATCH", "지원하지 않는 네이티브 프로토콜입니다.");
@@ -1061,6 +1083,7 @@ Json executeSessionOperation(
     Json identity = {{"protocol_version", kSessionProtocol}, {"session_id", request.at("session_id")},
                      {"job_id", request.at("job_id")}, {"input_fingerprint", request.at("input_fingerprint")}};
     Json result = sessionResultBase(identity, threads);
+    result["icp_statistics"] = nullptr;
     result["status"] = "completed";
     result["operation"] = operation;
     result["stage"] = request.at("stage");
@@ -1075,8 +1098,12 @@ Json executeSessionOperation(
         unsigned count = 0;
         progress.setSubstage("KERNEL");
         const auto kernelStarted = Clock::now();
-        const auto code = CCCoreLib::ICPRegistrationTools::Register(
-            model.cloud.get(), model.mesh.get(), data.cloud.get(), params, transform, rms, count, &progress);
+        CCCoreLib::ICPMeshRegistrationContext icpContext;
+        const auto code = model.mesh
+            ? CCCoreLib::ICPRegistrationTools::RegisterWithMeshContext(
+                model.cloud.get(), model.mesh.get(), data.cloud.get(), params, transform, rms, count, icpContext, &progress)
+            : CCCoreLib::ICPRegistrationTools::Register(
+                model.cloud.get(), nullptr, data.cloud.get(), params, transform, rms, count, &progress);
         timings.kernelSeconds += elapsedSeconds(kernelStarted);
         progress.check();
         if (code >= CCCoreLib::ICPRegistrationTools::ICP_ERROR)
@@ -1091,6 +1118,7 @@ Json executeSessionOperation(
         result["scale"] = transform.s;
         result["final_rms"] = rms;
         result["final_point_count"] = count;
+        if (model.mesh) result["icp_statistics"] = icpStatisticsJson(icpContext.statistics);
         result["native_code"] = code;
         timings.serializationSeconds += elapsedSeconds(serializationStarted);
     } else {

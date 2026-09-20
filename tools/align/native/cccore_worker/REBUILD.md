@@ -64,7 +64,7 @@ Expand-Archive -LiteralPath .\tbb\oneapi-tbb-2022.0.0-win.zip -DestinationPath .
   "-DCCCORE_SOURCE=$PWD\cccore-src" "-DJSON_INCLUDE_DIR=$PWD\json" `
   "-DTBB_DIR=$PWD\tbb\oneapi-tbb-2022.0.0\lib\cmake\tbb" `
   -DCORE_COMMIT=dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 `
-  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1+mesh-grid-reuse-v1+mesh-grid-fixed-domain-v1
+  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1+mesh-grid-reuse-v1+mesh-grid-fixed-domain-v1+icp-mesh-grid-reuse-v1
 & $cmake --build .\build --config Release --parallel 8
 Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -Destination .\build\bin\tbb12.dll
 & .\build\bin\colmap_cccore_worker.exe --check-environment
@@ -106,7 +106,17 @@ v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비
 
 `search_domain`은 준비 단계의 메시 거리 명령에서만 유효하며 다른 계산 명령은 `null`을 보냅니다. 범위 식별자의 재정의, 비유한 경계와 범위 밖 점·메시는 오류입니다. 대상 변경·등록 시작·기본 거리 경로 전환 때 고정 범위 캐시를 초기화합니다. 메모리 예산을 매 명령 검사하고 하향된 단계는 해당 대상에서 유지합니다. 격자는 동시에 한 개만 보관합니다.
 
-잠금 파일의 `mesh_grid_fixed_domain_patch`에 이전 재사용 패치 결과와 새 패치 적용 후 해시를 기록합니다. 이전 패치에서 변경하지 않은 `include/Grid3D.h`는 고정 코어 커밋 원문과 직접 대조합니다. 이 파일의 수정은 셀 경계에 닿은 삼각형을 제거하지 않도록 평면 부호 0을 중립으로 처리하며, 최종 상자 교차 검사는 그대로 사용합니다. Manifest의 `mesh_grid_fixed_domain_source_sha256`는 해당 세 파일의 최종 원문 해시이며 이전 단계의 해시도 별도 보존합니다. 현재 실행은 v5 워커와 DLL·Manifest 조합만 허용하며 과거 저장된 정렬 결과는 자동 재계산하지 않습니다.
+잠금 파일의 `mesh_grid_fixed_domain_patch`에 이전 재사용 패치 결과와 새 패치 적용 후 해시를 기록합니다. 이전 패치에서 변경하지 않은 `include/Grid3D.h`는 고정 코어 커밋 원문과 직접 대조합니다. 이 파일의 수정은 셀 경계에 닿은 삼각형을 제거하지 않도록 평면 부호 0을 중립으로 처리하며, 최종 상자 교차 검사는 그대로 사용합니다. Manifest의 `mesh_grid_fixed_domain_source_sha256`는 이 패치 단계의 세 파일 해시이며 이후 ICP 패치에서 변경한 파일의 최종 해시는 별도로 기록합니다. 과거 저장된 정렬 결과는 자동 재계산하지 않습니다.
+
+## ICP 내부 격자 재사용 패치
+
+`icp-mesh-grid-reuse-v1`은 기존 `Register` 및 `Parameters`를 보존하고 `RegisterWithMeshContext`를 추가합니다. 메시 등록은 호출별 문맥의 단일 격자를 재사용하며, 이동한 질의 점의 옥트리·거리·최근접점을 다시 계산합니다. 범위를 벗어나면 고정 중심에서 선언 범위를 확대하고 이전 격자를 해제한 뒤 재생성합니다. 단계 하향·취소·실패·등록 종료의 수명과 기존 메모리 예산을 유지합니다.
+
+현재 실행 계약은 `cccore-native-v6`입니다. 메시 등록의 `icp_statistics`는 실제 반복·거리 호출·격자 생성/재사용 횟수, 내부 시간과 종료 사유를 담습니다. 거리 명령과 점군 기준 등록의 해당 필드는 `null`입니다. 내부 시간은 상위 커널 시간의 일부이므로 합산하지 않습니다. 검증용 C++ 관찰자만 회차별 정보를 수집하며 제품은 디버그 로그를 작성하지 않습니다.
+
+잠금 파일의 `icp_mesh_grid_reuse_patch`와 Manifest의 `icp_mesh_grid_reuse_source_sha256`에 등록·거리 계산 헤더 및 본문과 `GridAndMeshIntersection.cpp`, 총 다섯 파일의 최종 해시를 기록합니다. 기존 패치의 해시는 중간 단계 증거로 유지합니다. 빌드는 검증된 최종 패치가 이미 적용된 경우에만 해당 패치를 역적용하여 앞 단계부터 해시 연결을 다시 검사한 뒤 정식 순서로 재적용합니다. 일부 적용 상태나 알 수 없는 원문 변경은 거부합니다. 재빌드 ZIP의 원문에는 모든 패치가 적용되어 있습니다.
+
+확장 시에는 물리 셀 크기를 유지하도록 검색 단계를 보정합니다. 한 셀인 축의 여유 영역을 만들 때 공통 원점을 보존하도록 점유 인덱스를 보정하고, 정확 거리 계산의 미설정 스칼라 오프셋을 병렬 진입 전에 직렬로 초기화합니다. 작은 고정 메시·큰 조회 범위·먼 점을 함께 사용하는 단일/다중 스레드 검증에서 발견한 좌표계 불일치와 거리 정밀도 손실을 수정한 것입니다.
 
 ## 메시 최원거리점 필터의 대응 식별자 보존
 

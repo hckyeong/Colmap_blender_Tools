@@ -185,8 +185,9 @@ def _verified_thread_metadata(
     *,
     geometry_mode: str | None = None,
     require_calls: bool = True,
+    contract_module: Any = None,
 ) -> dict[str, Any]:
-    """설치본의 안전 패치·oneTBB 값·v4 준비 접두부와 고정 호출 골격을 검증합니다."""
+    """설치본의 스레드·고정 호출 골격과 v6 내부 ICP 통계·성공 코드의 정합성을 검증합니다."""
     assert "farthest-mesh-correspondence-v1" in metadata["core_patch"].split("+")
     assert metadata["thread_backend"] == "oneTBB"
     assert metadata["tbb_version"] == "2022.0.0"
@@ -198,6 +199,7 @@ def _verified_thread_metadata(
     assert hardware >= 1 and effective == min(expected_requested, hardware)
     calls = metadata.get("logical_operations")
     if require_calls:
+        assert contract_module is not None, "설치본의 v6 통계 검증 모듈이 필요합니다."
         assert metadata["native_process_count"] == 1
         assert metadata.get("native_calls") == calls
         assert isinstance(calls, list) and calls
@@ -221,7 +223,7 @@ def _verified_thread_metadata(
                 "source_logical_index", "stage", "execution_source", "evaluation_key_sha256",
                 "elapsed_seconds", "roundtrip_seconds", "protocol_overhead_seconds",
                 "requested_max_threads", "effective_max_threads", "data_geometry_id", "model_geometry_id",
-                "timings", "geometry_load_count", "geometry_cache_hits", "octree_build_count",
+                "timings", "icp_statistics", "geometry_load_count", "geometry_cache_hits", "octree_build_count",
                 "octree_cache_hits", "mesh_grid_build_count", "mesh_grid_cache_hits",
             }
             assert call["operation"] in {"register", "distance"}
@@ -232,6 +234,20 @@ def _verified_thread_metadata(
             assert call["protocol_overhead_seconds"] >= 0.0
             assert call["requested_max_threads"] == expected_requested
             assert call["effective_max_threads"] == effective
+            mesh_registration = call["operation"] == "register" and geometry_mode != "POINT_TO_POINT"
+            limit_key = "max_iterations" if call["stage"] == "RIGID" else "scale_refine_max_iterations"
+            statistics = contract_module.validate_icp_statistics(
+                call["icp_statistics"], mesh_registration=mesh_registration,
+                kernel_seconds=call["timings"]["kernel_seconds"],
+                max_iterations=metadata["parameters"][limit_key] if mesh_registration else None,
+            )
+            if mesh_registration:
+                assert statistics["stop_reason"] not in {"ERROR", "CANCELLED"}
+                stages = [stage for stage in metadata["registration_stages"] if stage["stage"] == call["stage"].lower()]
+                assert len(stages) == 1 and stages[0]["icp_statistics"] == statistics
+                contract_module.validate_icp_native_result(statistics, stages[0]["native_code"])
+        for physical in physical_calls:
+            assert physical["icp_statistics"] == calls[physical["logical_index"] - 1]["icp_statistics"]
         assert [call["logical_index"] for call in physical_calls] == [
             call["index"] for call in calls if call["execution_source"] == "native_session"
         ]
@@ -272,11 +288,11 @@ def _verified_thread_metadata(
 
 def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, reference_mesh: bool,
                                 native_path: Path) -> dict[str, Any]:
-    """설치본의 고정 범위 패치와 표본 목표·방향별 평가 분모·주지표를 검증합니다."""
+    """설치본의 ICP 재사용 패치·통계와 표본·독립 평가 계약을 검증합니다."""
     assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v5"
     assert metadata["job_protocol_version"] == "cccore-job-v4"
     identity = metadata["native_build_identity"]
-    assert identity["protocol_version"] == "cccore-native-v5"
+    assert identity["protocol_version"] == "cccore-native-v6"
     assert identity["registration_safety_patch"] == "farthest-mesh-correspondence-v1"
     runtime_manifest = json.loads(native_path.with_name("runtime_manifest.json").read_text(encoding="utf-8"))
     safety = runtime_manifest["dependencies"]["cccore"]["registration_safety_patch"]
@@ -305,6 +321,21 @@ def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, ref
     assert identity["mesh_grid_fixed_domain_source_sha256"] == {
         item["path"]: item["patched_sha256"] for item in domain["files"]
     }
+    icp = runtime_manifest["dependencies"]["cccore"]["icp_mesh_grid_reuse_patch"]
+    assert identity["icp_mesh_grid_reuse_patch"] == icp["id"] == "icp-mesh-grid-reuse-v1"
+    assert icp["id"] in identity["core_patch"].split("+")
+    assert identity["icp_mesh_grid_reuse_patch_sha256"] == icp["sha256"]
+    assert identity["icp_mesh_grid_reuse_source_sha256"] == {
+        item["path"]: item["patched_sha256"] for item in icp["files"]
+    }
+    for stage in metadata["registration_stages"]:
+        statistics = stage["icp_statistics"]
+        if moving_mesh or reference_mesh:
+            assert statistics["mesh_grid_build_count"] >= 1
+            assert statistics["iterations_accepted"] <= statistics["iterations_attempted"] <= stage["max_iterations"]
+            assert statistics["distance_call_count"] == statistics["mesh_grid_build_count"] + statistics["mesh_grid_cache_hits"]
+        else:
+            assert statistics is None
     parameters = metadata["parameters"]
     assert parameters["point_sample_count"] == parameters["mesh_sample_count"] == 50000
     assert parameters["evaluation_sample_count"] == 30000
@@ -365,7 +396,7 @@ def _wait_for_result(runtime_module, runtime, *, timeout_seconds: float = 180.0)
 
 def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
               moving_mesh: bool, reference_mesh: bool, python_path: Path, native_path: Path) -> dict[str, Any]:
-    """실제 v4 정렬의 고정 표본·겹침 RMS와 기존 정답 행렬·승인·Undo/Redo를 검증합니다."""
+    """설치본 v6 계약으로 정렬 기록을 검사하고 고정 표본·정답 행렬·승인·Undo/Redo를 검증합니다."""
     runtime, expected = _runtime_fixture(modules, output_root, mode, moving_mesh, reference_mesh)
     api = modules["runtime"]
     repository = runtime.model_repository
@@ -391,6 +422,7 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
             dict(result.metadata),
             expected_threads,
             geometry_mode=mode,
+            contract_module=import_module(".icp_cccore_contract", modules["cccore"].__package__),
         )
         sampling_metadata = _verified_sampling_metadata(dict(result.metadata), moving_mesh, reference_mesh, native_path)
         np.testing.assert_allclose(actual, expected, atol=_MATRIX_TOLERANCE, rtol=0.0)

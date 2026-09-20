@@ -1,5 +1,5 @@
 {
-  "protocol_version": "cccore-native-v5",
+  "protocol_version": "cccore-native-v6",
   "cccore": {
     "repository": "https://github.com/CloudCompare/CCCoreLib.git",
     "commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432",
@@ -102,6 +102,39 @@
           "original_sha256": "df3afb7fa8f166a8a38efd933be80516e73a744ae88eb278cb0459880cd1e7e7",
           "patched_sha256": "51e8ff375b36ca8f9a307083e816b4a4c9282b9b1088f6686d7b70d4612667bc",
           "original_commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432"
+        }
+      ]
+    },
+    "icp_mesh_grid_reuse_patch": {
+      "id": "icp-mesh-grid-reuse-v1",
+      "file": "patches/icp_mesh_grid_reuse.patch",
+      "sha256": "54c2ec1cf7022f8e652b04415a4c350b414e0452c02b64fb307ce14e8b8389be",
+      "files": [
+        {
+          "path": "include/RegistrationTools.h",
+          "original_sha256": "78d26e9426e65e9b4655a4e9972fc82922b9903b6fc1159aa72777b3ea327b40",
+          "patched_sha256": "744a66edf80fc29741146f0965a075b6952037c6859533119f5716db8d43c1b7",
+          "original_commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432"
+        },
+        {
+          "path": "src/RegistrationTools.cpp",
+          "original_sha256": "b0e06492f3e1082ec5f27edb884e5c52b48385b8e9286d9c8c1f378fa330b08a",
+          "patched_sha256": "b37a859e27369d0c620a263b027845bfbeca639f480e422bf0e01d718abba0be"
+        },
+        {
+          "path": "include/DistanceComputationTools.h",
+          "original_sha256": "523b1684c85bb259c84293c7827b3976a0d5e4d3f1bc571c5674648d87af5894",
+          "patched_sha256": "78d89546269458c1ef1b5d610df6437df53ac9db294bfdb0f7897ebe3a19a3c0"
+        },
+        {
+          "path": "src/DistanceComputationTools.cpp",
+          "original_sha256": "58d1cc48741a3ca8c64eebcd03ff39cd9af3338832ecbb66696e02e8ea9abf12",
+          "patched_sha256": "24b9dd8ce522a3c785d70deac7ac968a5926eec474a74488f878bfc504a1c4cd"
+        },
+        {
+          "path": "src/GridAndMeshIntersection.cpp",
+          "original_sha256": "55082c89aaf4bf0c72068523ebc1657dad0e4e7aa3c496b9fff6bb25f867891f",
+          "patched_sha256": "89266a3fcb90567fbe30c940646b1335718187f770f8b46d7a3a273222f06d4b"
         }
       ]
     }

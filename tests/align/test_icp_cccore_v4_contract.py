@@ -10,6 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/align/alignm
 import icp_cccore_contract as contract
 
 
+def mesh_icp_statistics():
+    """초기 거리와 한 번의 채택 반복을 가진 내부 ICP 통계를 만듭니다."""
+    return {**dict.fromkeys(contract.CC_ICP_COUNTER_FIELDS, 0),
+            **dict.fromkeys(contract.CC_ICP_TIMING_FIELDS, 0.0),
+            "iterations_attempted": 1, "iterations_accepted": 1, "distance_call_count": 2,
+            "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 1,
+            "query_octree_build_count": 2, "stop_reason": "MAX_ITERATIONS"}
+
+
 def operation_summaries(mode, preparing_count=2):
     """실제 세션 계측을 가진 후보 준비·등록·평가 연산 목록을 만듭니다."""
     sequence = [("distance", "PREPARING")] * preparing_count + list(zip(
@@ -28,6 +37,7 @@ def operation_summaries(mode, preparing_count=2):
             "requested_max_threads": 1, "effective_max_threads": 1,
             "data_geometry_id": f"data-{index}", "model_geometry_id": "model",
             "timings": {name: 0.0 for name in contract.CC_NATIVE_TIMING_FIELDS},
+            "icp_statistics": mesh_icp_statistics() if operation == "register" and mode != "POINT_TO_POINT" else None,
             **{name: 0 for name in contract.CC_NATIVE_COUNTER_FIELDS},
         })
     return summaries
@@ -41,6 +51,62 @@ class V4ContractTest(unittest.TestCase):
         return contract.validate_native_call_summaries(
             summaries, geometry_mode=mode, requested_max_threads=1, effective_max_threads=1,
         )
+
+    def test_icp_statistics_rejects_missing_and_inconsistent_values(self):
+        """내부 통계의 누락·형식·합계·시간·반복 상한 변조를 거부합니다."""
+        valid = mesh_icp_statistics()
+        self.assertEqual(contract.validate_icp_statistics(valid, mesh_registration=True, kernel_seconds=1), valid)
+        changes = [{"iterations_accepted": 2}, {"iterations_attempted": True},
+                   {"distance_call_count": 3}, {"mesh_grid_expansion_count": 2}, {"query_octree_build_count": 1},
+                   {"mesh_grid_seconds": 0.5}, {"total_seconds": 2},
+                   {"stop_reason": "STABLE_CONVERGENCE"}, {"total_seconds": float("nan")}]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(contract.CcCoreEnvironmentError):
+                contract.validate_icp_statistics({**valid, **change}, mesh_registration=True, kernel_seconds=1)
+        for value in (None, {}, {key: item for key, item in valid.items() if key != "stop_reason"}):
+            with self.subTest(value=value), self.assertRaises(contract.CcCoreEnvironmentError):
+                contract.validate_icp_statistics(value, mesh_registration=True, kernel_seconds=1)
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            contract.validate_icp_statistics(valid, mesh_registration=False, kernel_seconds=1)
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            contract.validate_icp_statistics(valid, mesh_registration=True, kernel_seconds=1, max_iterations=0)
+        self.assertIsNone(contract.validate_icp_statistics(None, mesh_registration=False, kernel_seconds=1))
+
+    def test_icp_stop_reason_matches_actual_iterations_and_native_code(self):
+        """종료 사유가 실제 반복·거리 호출·네이티브 성공 코드와 모순되면 거부합니다."""
+        valid = mesh_icp_statistics()
+        contract.validate_icp_statistics(valid, mesh_registration=True, kernel_seconds=1, max_iterations=1)
+        contract.validate_icp_native_result(valid, 1)
+        for changed in ({**valid, "stop_reason": "RMS_INCREASE"},
+                        {**valid, "stop_reason": "NOTHING_TO_DO"},
+                        {**valid, "stop_reason": []},
+                        {**valid, "iterations_attempted": 2, "iterations_accepted": 2}):
+            with self.subTest(changed=changed), self.assertRaises(contract.CcCoreEnvironmentError):
+                contract.validate_icp_statistics(changed, mesh_registration=True, kernel_seconds=1)
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            contract.validate_icp_statistics(valid, mesh_registration=True, kernel_seconds=1, max_iterations=2)
+        for code in (None, True, 0, 2):
+            with self.subTest(code=code), self.assertRaises(contract.CcCoreEnvironmentError):
+                contract.validate_icp_native_result(valid, code)
+        rejected = {**valid, "stop_reason": "RMS_INCREASE", "iterations_accepted": 0}
+        contract.validate_icp_statistics(rejected, mesh_registration=True, kernel_seconds=1)
+        contract.validate_icp_native_result(rejected, 0)
+        initial = {**valid, "stop_reason": "NOTHING_TO_DO", "iterations_attempted": 0,
+                   "iterations_accepted": 0, "distance_call_count": 1,
+                   "query_octree_build_count": 1, "mesh_grid_cache_hits": 0}
+        contract.validate_icp_statistics(initial, mesh_registration=True, kernel_seconds=1)
+        contract.validate_icp_native_result(initial, 0)
+
+    def test_mesh_registration_summaries_require_internal_statistics(self):
+        """메시 등록의 내부 통계를 물리·논리 연결에 보존하고 누락을 거부합니다."""
+        summaries = operation_summaries("POINT_TO_MESH")
+        validated = self.validate(summaries, "POINT_TO_MESH")
+        self.assertEqual([item["icp_statistics"] for item in validated if item["operation"] == "register"],
+                         [mesh_icp_statistics(), mesh_icp_statistics()])
+        register = next(item for item in summaries if item["operation"] == "register")
+        register["icp_statistics"] = None
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            self.validate(summaries, "POINT_TO_MESH")
 
     def test_fixed_domain_rejects_nonfinite_and_malformed_bounds(self):
         """유한하지 않은 수치와 잘못된 경계 구조를 직렬화 전에 거부합니다."""
@@ -122,7 +188,7 @@ class V4ContractTest(unittest.TestCase):
             from tools.align.project_persistence.codec import _decode_provenance
         finally:
             sys.path.pop(0)
-        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4"):
+        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5"):
             metadata = {"native_build_identity": {"protocol_version": version,
                         "core_patch": "mesh-grid-reuse-v1", "native_worker_sha256": "a" * 64},
                         "quality": "PASS"}
@@ -150,12 +216,12 @@ class V4ContractTest(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(contract.CcCoreInputError):
                 contract.surface_preparing_operation_limit(*arguments)
 
-    def test_surface_policy_preserves_sampling_with_native_v5(self):
+    def test_surface_policy_preserves_sampling_with_native_v6(self):
         """표면 정책과 세 독립 시드를 고정하고 준비 범위 통신 버전을 확인합니다."""
         parameters = contract.resolve_parameters({})
         self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v5")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v6")
         self.assertEqual(parameters["mesh_sampling_policy"], "MESH_SURFACE_AREA_REJECTION_V1")
         self.assertEqual(parameters["mesh_probe_counts"], (8192, 32768, 131072))
         self.assertEqual(contract.surface_proposal_limit(50000), 10000000)
@@ -236,11 +302,11 @@ class V4ContractTest(unittest.TestCase):
     def test_prior_native_session_version_is_rejected(self):
         """이전 세션 버전을 새 작업의 성공 응답으로 수용하지 않습니다."""
         identity = {"session_id": "session", "job_id": "job", "input_fingerprint": "input"}
-        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4"):
+        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5"):
             with self.subTest(version=version), self.assertRaises(contract.CcCoreEnvironmentError):
                 contract.validate_native_session_identity({"protocol_version": version, **identity}, **identity)
         contract.validate_native_session_identity(
-            {"protocol_version": "cccore-native-v5", **identity}, **identity,
+            {"protocol_version": "cccore-native-v6", **identity}, **identity,
         )
 
 

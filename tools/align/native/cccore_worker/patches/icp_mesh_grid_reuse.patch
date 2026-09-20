@@ -1,0 +1,515 @@
+--- a/include/RegistrationTools.h
++++ b/include/RegistrationTools.h
+@@ -5,6 +5,7 @@
+ 
+ //Local
+ #include "PointProjectionTools.h"
++#include <cstddef>
+ 
+ 
+ namespace CCCoreLib
+@@ -116,6 +117,38 @@
+ 											GenericCloud* referencePoints,
+ 											ScaledTransformation& trans,
+ 											bool fixedScale = false);
++	};
++
++
++	// 한 번의 메시 등록 결과와 검증 전용 반복 관찰자를 보관하며 격자를 외부에 남기지 않습니다.
++	struct ICPMeshRegistrationContext
++	{
++		struct Statistics
++		{
++			std::size_t iterations_attempted = 0;
++			std::size_t iterations_accepted = 0;
++			std::size_t distance_call_count = 0;
++			std::size_t mesh_grid_build_count = 0;
++			std::size_t mesh_grid_cache_hits = 0;
++			std::size_t mesh_grid_expansion_count = 0;
++			std::size_t mesh_grid_level_reduction_count = 0;
++			std::size_t query_octree_build_count = 0;
++			std::size_t mesh_grid_peak_estimated_bytes = 0;
++			double model_level_seconds = 0;
++			double query_octree_seconds = 0;
++			double mesh_grid_seconds = 0;
++			double closest_point_seconds = 0;
++			double filter_rms_seconds = 0;
++			double transform_solve_seconds = 0;
++			double transform_apply_seconds = 0;
++			double total_seconds = 0;
++			const char* stop_reason = "ERROR";
++		} statistics;
++		// 관찰자는 초기 평가와 각 변환 평가에서 점수, RMS, 단계 변환 및 채택 여부를 받습니다.
++		using Observer = void (*)(void*, unsigned, unsigned, double, const RegistrationTools::ScaledTransformation&, bool);
++		Observer observer = nullptr;
++		void* observerData = nullptr;
++		bool reuseMeshGrid = true;
+ 	};
+ 
+ 	//! ICP point cloud registration algorithm (Besl et al.).
+@@ -249,6 +282,20 @@
+ 										unsigned& finalPointCount,
+ 										GenericProgressCallback* progressCb = nullptr);
+ 
++		// 기존 매개변수 구조를 유지하면서 호출별 메시 격자와 계측 문맥을 사용합니다.
++		static RESULT_TYPE RegisterWithMeshContext(
++			GenericIndexedCloudPersist* modelCloud, GenericIndexedMesh* modelMesh,
++			GenericIndexedCloudPersist* dataCloud, const Parameters& params,
++			ScaledTransformation& totalTrans, double& finalRMS, unsigned& finalPointCount,
++			ICPMeshRegistrationContext& context, GenericProgressCallback* progressCb = nullptr);
++	private:
++		// 공개 등록 경로의 알고리듬을 공유하고 선택 문맥에만 격자 재사용을 적용합니다.
++		static RESULT_TYPE RegisterInternal(
++			GenericIndexedCloudPersist* modelCloud, GenericIndexedMesh* modelMesh,
++			GenericIndexedCloudPersist* dataCloud, const Parameters& params,
++			ScaledTransformation& totalTrans, double& finalRMS, unsigned& finalPointCount,
++			GenericProgressCallback* progressCb, ICPMeshRegistrationContext* context);
++
+ 
+ 	};
+ 
+--- a/src/RegistrationTools.cpp
++++ b/src/RegistrationTools.cpp
+@@ -22,6 +22,9 @@
+ 
+ //system
+ #include <ctime>
++#include <chrono>
++#include <string>
++#include <CCMiscTools.h>
+ 
+ using namespace CCCoreLib;
+ 
+@@ -144,16 +147,204 @@
+ 	PointCloud* CPSetPlain;
+ };
+ 
++// 기존 공개 진입점은 문맥과 재사용 없이 원래 알고리듬을 실행합니다.
++ICPRegistrationTools::RESULT_TYPE ICPRegistrationTools::Register(
++	GenericIndexedCloudPersist* model, GenericIndexedMesh* mesh, GenericIndexedCloudPersist* data,
++	const Parameters& params, ScaledTransformation& transform, double& rms, unsigned& count,
++	GenericProgressCallback* progress)
++{
++	return RegisterInternal(model, mesh, data, params, transform, rms, count, progress, nullptr);
++}
++
++// 호출 범위의 계측과 격자 수명을 끝내고 오류와 취소 사유를 확정합니다.
++ICPRegistrationTools::RESULT_TYPE ICPRegistrationTools::RegisterWithMeshContext(
++	GenericIndexedCloudPersist* model, GenericIndexedMesh* mesh, GenericIndexedCloudPersist* data,
++	const Parameters& params, ScaledTransformation& transform, double& rms, unsigned& count,
++	ICPMeshRegistrationContext& context, GenericProgressCallback* progress)
++{
++	context.statistics = ICPMeshRegistrationContext::Statistics();
++	const auto started = std::chrono::steady_clock::now();
++	const RESULT_TYPE result = (!mesh || params.useC2MSignedDistances)
++		? ICP_ERROR_INVALID_INPUT : RegisterInternal(model, mesh, data, params, transform, rms, count, progress, &context);
++	context.statistics.total_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
++	if (result == ICP_ERROR_CANCELED_BY_USER || (progress && progress->isCancelRequested()))
++		context.statistics.stop_reason = "CANCELLED";
++	else if (result >= ICP_ERROR)
++		context.statistics.stop_reason = "ERROR";
++	else if (result == ICP_NOTHING_TO_DO && context.statistics.stop_reason == std::string("ERROR"))
++		context.statistics.stop_reason = "NOTHING_TO_DO";
++	return result;
++}
++
++namespace
++{
++	// 거리 하위 작업의 진행 표시를 차단하고 원래 등록의 취소 요청만 전달합니다.
++	class ICPCancelOnlyProgress : public GenericProgressCallback
++	{
++		GenericProgressCallback* source;
++	public:
++		// 등록 진행 콜백의 비소유 참조를 보관합니다.
++		explicit ICPCancelOnlyProgress(GenericProgressCallback* progress) : source(progress) {}
++		// 하위 거리 계산의 백분율을 표시하지 않습니다.
++		void update(float) override {}
++		// 등록 제목을 보존합니다.
++		void setMethodTitle(const char*) override {}
++		// 등록 안내 문구를 보존합니다.
++		void setInfo(const char*) override {}
++		// 하위 계산이 등록 진행 표시를 시작하지 않게 합니다.
++		void start() override {}
++		// 하위 계산이 등록 진행 표시를 끝내지 않게 합니다.
++		void stop() override {}
++		// 원래 등록의 취소 여부만 조회합니다.
++		bool isCancelRequested() override { return source && source->isCancelRequested(); }
++		// 하위 계산의 제목과 안내 갱신을 금지합니다.
++		bool textCanBeEdited() const override { return false; }
++	};
++
++	// 서로 겹치지 않는 현재 작업 구간을 선택하고 조기 반환에서도 시간을 누적합니다.
++	struct ICPStageTimer
++	{
++		double* destination = nullptr;
++		std::chrono::steady_clock::time_point started;
++		// 이전 구간을 닫은 뒤 다음 구간의 계측을 시작합니다.
++		void select(double* next)
++		{
++			const auto now = std::chrono::steady_clock::now();
++			if (destination) *destination += std::chrono::duration<double>(now - started).count();
++			destination = next;
++			started = now;
++		}
++		// 열린 마지막 구간을 조기 반환 시에도 반영합니다.
++		~ICPStageTimer() { select(nullptr); }
++	};
++}
++
+ // 공개 ICP 등록을 수행하며 단계 배율 경계를 실제 점군과 반환 변환에 동일하게 적용합니다.
+-ICPRegistrationTools::RESULT_TYPE ICPRegistrationTools::Register(	GenericIndexedCloudPersist* inputModelCloud,
++ICPRegistrationTools::RESULT_TYPE ICPRegistrationTools::RegisterInternal(	GenericIndexedCloudPersist* inputModelCloud,
+ 																	GenericIndexedMesh* inputModelMesh,
+ 																	GenericIndexedCloudPersist* inputDataCloud,
+ 																	const Parameters& params,
+ 																	ScaledTransformation& transform,
+ 																	double& finalRMS,
+ 																	unsigned& finalPointCount,
+-																	GenericProgressCallback* progressCb/*=nullptr*/)
++																	GenericProgressCallback* progressCb, ICPMeshRegistrationContext* context)
+ {
++	ICPMeshRegistrationContext::Statistics* stats = context ? &context->statistics : nullptr;
++	ICPStageTimer stageTimer;
++	DistanceComputationTools::Cloud2MeshDistancesCache meshCache;
++	CCVector3 domainMin, domainMax;
++	CCVector3d domainCenter;
++	double domainHalfSize = 0;
++	bool domainReady = false;
++	unsigned char levelCeiling = DgmOctree::MAX_OCTREE_LEVEL;
++	unsigned domainExpansionLevel = 0;
++	// 초기 전체 입력 경계를 고정하고 이동한 전체 조회점이 벗어날 때만 중심을 유지하며 확장합니다.
++	auto meshDistances = [&](GenericIndexedCloudPersist* cloud, GenericIndexedMesh* mesh,
++		DistanceComputationTools::Cloud2MeshDistancesComputationParams& distanceParams,
++		GenericProgressCallback* progress) -> int
++	{
++		if (!context)
++			return DistanceComputationTools::computeCloud2MeshDistances(cloud, mesh, distanceParams, progress);
++		ICPCancelOnlyProgress cancelOnly(progress);
++		GenericProgressCallback* distanceProgress = progress ? &cancelOnly : nullptr;
++		stageTimer.select(nullptr);
++		++stats->distance_call_count;
++		CCVector3 low, high, meshLow, meshHigh;
++		cloud->getBoundingBox(low, high);
++		mesh->getBoundingBox(meshLow, meshHigh);
++		// 배정도 중심에서 경계를 계산하고 단정도 반올림이 입력을 잘라내지 않게 합니다.
++		auto updateDomainBounds = [&]() -> bool
++		{
++			for (unsigned k = 0; k < 3; ++k)
++			{
++				const double minimum = domainCenter.u[k] - domainHalfSize;
++				const double maximum = domainCenter.u[k] + domainHalfSize;
++				domainMin.u[k] = static_cast<PointCoordinateType>(minimum);
++				domainMax.u[k] = static_cast<PointCoordinateType>(maximum);
++				if (domainMin.u[k] > minimum)
++					domainMin.u[k] = std::nextafter(domainMin.u[k], -std::numeric_limits<PointCoordinateType>::infinity());
++				if (domainMax.u[k] < maximum)
++					domainMax.u[k] = std::nextafter(domainMax.u[k], std::numeric_limits<PointCoordinateType>::infinity());
++				if (!std::isfinite(domainMin.u[k]) || !std::isfinite(domainMax.u[k]) || domainMin.u[k] >= domainMax.u[k])
++					return false;
++			}
++			return true;
++		};
++		if (!domainReady)
++		{
++			inputDataCloud->getBoundingBox(domainMin, domainMax);
++			for (unsigned k = 0; k < 3; ++k)
++			{
++				domainMin.u[k] = std::min(domainMin.u[k], meshLow.u[k]);
++				domainMax.u[k] = std::max(domainMax.u[k], meshHigh.u[k]);
++			}
++			for (unsigned k = 0; k < 3; ++k)
++			{
++				const double span = double(domainMax.u[k]) - domainMin.u[k];
++				domainCenter.u[k] = double(domainMin.u[k]) + span / 2;
++				domainHalfSize = std::max(domainHalfSize, span / 2);
++			}
++			if (!updateDomainBounds()) return DistanceComputationTools::INVALID_INPUT;
++			domainReady = true;
++		}
++		if (context->reuseMeshGrid)
++		{
++			bool expanded = false;
++			for (;;)
++			{
++				bool contained = true;
++				for (unsigned k = 0; k < 3; ++k)
++					contained = contained && low.u[k] >= domainMin.u[k] && high.u[k] <= domainMax.u[k];
++				if (contained) break;
++				domainHalfSize *= 2;
++				if (!std::isfinite(domainHalfSize) || domainHalfSize <= 0)
++					return DistanceComputationTools::INVALID_INPUT;
++				if (!updateDomainBounds()) return DistanceComputationTools::INVALID_INPUT;
++				// 큐브를 두 배 키울 때 단계도 하나 올려 이전 물리 셀 크기와 예산 상한을 보존합니다.
++				domainExpansionLevel = std::min<unsigned>(domainExpansionLevel + 1, DgmOctree::MAX_OCTREE_LEVEL);
++				levelCeiling = static_cast<unsigned char>(std::min<unsigned>(unsigned(levelCeiling) + 1, DgmOctree::MAX_OCTREE_LEVEL));
++				expanded = true;
++			}
++			if (expanded) { meshCache.clear(); ++stats->mesh_grid_expansion_count; }
++			low = domainMin;
++			high = domainMax;
++			const unsigned domainLevel = std::min<unsigned>(unsigned(distanceParams.octreeLevel) + domainExpansionLevel, DgmOctree::MAX_OCTREE_LEVEL);
++			distanceParams.octreeLevel = static_cast<unsigned char>(std::min<unsigned>(domainLevel, levelCeiling));
++		}
++		else
++		{
++			meshCache.clear();
++			for (unsigned k = 0; k < 3; ++k)
++			{
++				low.u[k] = std::min(low.u[k], meshLow.u[k]);
++				high.u[k] = std::max(high.u[k], meshHigh.u[k]);
++			}
++		}
++		CCMiscTools::MakeMinAndMaxCubical(low, high, 0.001);
++		DgmOctree queryOctree(cloud);
++		stageTimer.select(&stats->query_octree_seconds);
++		++stats->query_octree_build_count;
++		if (queryOctree.build(low, high, nullptr, nullptr, distanceProgress) != static_cast<int>(cloud->size()))
++			return DistanceComputationTools::ERROR_BUILD_OCTREE_FAILURE;
++		stageTimer.select(nullptr);
++		meshCache.buildSeconds = 0;
++		meshCache.closestPointSeconds = 0;
++		const int result = context->reuseMeshGrid
++			? DistanceComputationTools::computeCloud2MeshDistancesWithCacheAndBounds(cloud, mesh, distanceParams, distanceProgress, &queryOctree, &meshCache, domainMin, domainMax)
++			: DistanceComputationTools::computeCloud2MeshDistancesWithCache(cloud, mesh, distanceParams, distanceProgress, &queryOctree, &meshCache);
++		stats->mesh_grid_seconds += meshCache.buildSeconds;
++		stats->closest_point_seconds += meshCache.closestPointSeconds;
++		if (result >= DistanceComputationTools::SUCCESS)
++		{
++			if (meshCache.cacheHit) ++stats->mesh_grid_cache_hits;
++			else ++stats->mesh_grid_build_count;
++			if (meshCache.level < distanceParams.octreeLevel) ++stats->mesh_grid_level_reduction_count;
++			levelCeiling = std::min(levelCeiling, meshCache.level);
++			stats->mesh_grid_peak_estimated_bytes = std::max(stats->mesh_grid_peak_estimated_bytes, meshCache.estimatedBytes);
++		}
++		return result;
++	};
++
+ 	if (!inputModelCloud || !inputDataCloud)
+ 	{
+ 		assert(false);
+@@ -255,6 +446,7 @@
+ 			return ICP_ERROR_INVALID_INPUT;
+ 		}
+ 
++		stageTimer.select(stats ? &stats->model_level_seconds : nullptr);
+ 		//we'll use the mesh vertices to estimate the right octree level
+ 		DgmOctree dataOctree(data.cloud);
+ 		DgmOctree modelOctree(inputModelCloud);
+@@ -265,6 +457,7 @@
+ 		}
+ 
+ 		meshDistOctreeLevel = dataOctree.findBestLevelForComparisonWithOctree(&modelOctree);
++		stageTimer.select(nullptr);
+ 
+ 		//we need normals to register with normals ;)
+ 		registerWithNormals &= inputModelMesh->normalsAvailable();
+@@ -372,7 +565,7 @@
+ 		c2mDistParams.CPSet = data.CPSetPlain;
+ 		c2mDistParams.maxThreadCount = params.maxThreadCount;
+ 		c2mDistParams.robust = params.robustC2MSignedDistances;
+-		if (DistanceComputationTools::computeCloud2MeshDistances(data.cloud, inputModelMesh, c2mDistParams, progressCb) <
++		if (meshDistances(data.cloud, inputModelMesh, c2mDistParams, progressCb) <
+ 				DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 		{
+ 			//an error occurred during distances computation...
+@@ -419,6 +612,7 @@
+ 			break;
+ 		}
+ 
++		stageTimer.select(stats ? &stats->filter_rms_seconds : nullptr);
+ 		//shall we remove the farthest points?
+ 		bool pointOrderHasBeenChanged = false;
+ 		if (params.filterOutFarthestPoints)
+@@ -754,6 +948,12 @@
+ 			double meanSquareError = (wiSum != 0 ? static_cast<ScalarType>(meanSquareValue / wiSum) : 0);
+ 
+ 			double rms = sqrt(meanSquareError);
++			if (context && context->observer)
++			{
++				stageTimer.select(nullptr);
++				context->observer(context->observerData, iteration, data.cloud->size(), rms, currentTrans, iteration > 0 && rms <= lastStepRMS);
++				stageTimer.select(&stats->filter_rms_seconds);
++			}
+ 
+ 			if (fTraceFile)
+ 			{
+@@ -783,6 +983,7 @@
+ 				if (LessThanEpsilon(rms))
+ 				{
+ 					//nothing to do
++					if (stats) stats->stop_reason = "NOTHING_TO_DO";
+ 					result = ICP_NOTHING_TO_DO;
+ 					break;
+ 				}
+@@ -793,10 +994,12 @@
+ 
+ 				if (rms > lastStepRMS) //error increase!
+ 				{
++					if (stats) stats->stop_reason = "RMS_INCREASE";
+ 					result = iteration == 1 ? ICP_NOTHING_TO_DO : ICP_APPLY_TRANSFO;
+ 					break;
+ 				}
+ 
++				if (stats) ++stats->iterations_accepted;
+ 				//error update (RMS)
+ 				double deltaRMS = lastStepRMS - rms;
+ 				//should be better!
+@@ -830,6 +1033,7 @@
+ 						||	(params.convType == MAX_ITER_CONVERGENCE && iteration >= params.nbMaxIterations) //max iteration reached
+ 						)
+ 				{
++					if (stats) stats->stop_reason = params.convType == MAX_ITER_CONVERGENCE ? "MAX_ITERATIONS" : "STABLE_CONVERGENCE";
+ 					result = ICP_APPLY_TRANSFO;
+ 					break;
+ 				}
+@@ -860,6 +1064,8 @@
+ 			lastStepRMS = rms;
+ 		}
+ 
++		stageTimer.select(stats ? &stats->transform_solve_seconds : nullptr);
++		if (stats) ++stats->iterations_attempted;
+ 		//single iteration of the registration procedure
+ 		currentTrans = ScaledTransformation();
+ 		CCVector3 dataGravityCenter, modelGravityCenter;
+@@ -919,6 +1125,7 @@
+ 									currentTrans);
+ 		}
+ 
++		stageTimer.select(stats ? &stats->transform_apply_seconds : nullptr);
+ 		//get rotated data cloud
+ 		if (!data.rotatedCloud || pointOrderHasBeenChanged)
+ 		{
+@@ -956,6 +1163,7 @@
+ 			data.cloud->invalidateBoundingBox();
+ 		}
+ 
++		stageTimer.select(nullptr);
+ 		//compute (new) distances to model
+ 		if (inputModelMesh)
+ 		{
+@@ -965,7 +1173,7 @@
+ 			c2mDistParams.CPSet = data.CPSetPlain;
+ 			c2mDistParams.maxThreadCount = params.maxThreadCount;
+ 			c2mDistParams.robust = params.robustC2MSignedDistances;
+-			if (DistanceComputationTools::computeCloud2MeshDistances(data.cloud, inputModelMesh, c2mDistParams)
++			if (meshDistances(data.cloud, inputModelMesh, c2mDistParams, context ? progressCb : nullptr)
+ 					< DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 			{
+ 				//an error occurred during distances computation...
+@@ -992,6 +1200,7 @@
+ 		}
+ 	}
+ 
++	stageTimer.select(nullptr);
+ 	//end of tracefile
+ 	if (fTraceFile)
+ 	{
+--- a/include/DistanceComputationTools.h
++++ b/include/DistanceComputationTools.h
+@@ -231,6 +231,8 @@
+ 			std::size_t estimatedBytes = 0;
+ 			bool cacheHit = false;
+ 			double buildSeconds = 0;
++			// 직전 호출의 거리 초기화, 최근접점 검색과 거리 확정 시간을 보관합니다.
++			double closestPointSeconds = 0;
+ 
+ 			// 격자 소유권을 복사하지 않도록 기본 생성만 허용합니다.
+ 			Cloud2MeshDistancesCache() = default;
+@@ -244,6 +246,7 @@
+ 				estimatedBytes = 0;
+ 				cacheHit = false;
+ 				buildSeconds = 0;
++				closestPointSeconds = 0;
+ 			}
+ 		};
+ 
+--- a/src/DistanceComputationTools.cpp
++++ b/src/DistanceComputationTools.cpp
+@@ -1919,8 +1919,8 @@
+ 			return false;
+ 		if (dimension == 1)
+ 		{
+-			if (last > (std::numeric_limits<int>::max)() - 2
+-				|| !std::isfinite(gridMin.u[axis] - cellSize))
++			if (first < (std::numeric_limits<int>::min)() + 1
++				|| last > (std::numeric_limits<int>::max)() - 1)
+ 				return false;
+ 			dimension = 3;
+ 		}
+@@ -1993,6 +1993,9 @@
+ 	DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache,
+ 	const CCVector3* domainMin, const CCVector3* domainMax)
+ {
++	// 재사용 적중에서도 이전 호출의 거리 시간을 남기지 않습니다.
++	if (cache) cache->closestPointSeconds = 0;
++
+ 
+ 	// 기본값 0은 단일 셀로 유지하고 배열 조회의 상한만 검사합니다.
+ 	if (params.octreeLevel > DgmOctree::MAX_OCTREE_LEVEL)
+@@ -2179,9 +2182,17 @@
+ 		}
+ 	}
+ 
++	const auto closestPointStarted = std::chrono::steady_clock::now();
+ 	//reset the output distances
+ 	pointCloud->enableScalarField();
+ 	pointCloud->setPointScalarValues(CCCoreLib::NAN_VALUE);
++	// 최초 유한값이 공유 스칼라 오프셋을 정하므로 병렬 검색 전에 0으로 초기화합니다.
++	// 즉시 무효값으로 되돌려 모든 조회점이 실제 최근접 검색을 거치게 합니다.
++	if (!params.useDistanceMap)
++	{
++		pointCloud->setPointScalarValue(0, 0);
++		pointCloud->setPointScalarValue(0, CCCoreLib::NAN_VALUE);
++	}
+ 
+ 	//WE CAN EVENTUALLY COMPUTE THE DISTANCES!
+ 	int result = computeCloud2MeshDistancesWithOctree(octree, intersection, effectiveParams, progressCb);
+@@ -2201,6 +2212,9 @@
+ 			pointCloud->setPointScalarValue(i, sqrt(std::abs(pointCloud->getPointScalarValue(i)))); // std::abs, in case the input value is negative by mistake or because of a numerical accuracy issue
+ 		}
+ 	}
++
++	// 격자 생성과 겹치지 않는 실제 최근접점 계산 구간만 계측합니다.
++	if (cache) cache->closestPointSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - closestPointStarted).count();
+ 
+ 	if (result < DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 	{
+--- a/src/GridAndMeshIntersection.cpp
++++ b/src/GridAndMeshIntersection.cpp
+@@ -12,6 +12,7 @@
+ //system
+ #include <algorithm>
+ #include <cassert>
++#include <limits>
+ 
+ namespace CCCoreLib
+ {
+@@ -138,6 +139,7 @@
+ 	}
+ }
+ 
++// 한 셀인 축의 양쪽에 여유 셀을 더하되 옥트리와 같은 전역 원점을 유지합니다.
+ bool GridAndMeshIntersection::computeMeshIntersection(	GenericIndexedMesh* mesh,
+ 														const CCVector3& minGridBB,
+ 														const CCVector3& maxGridBB,
+@@ -174,10 +176,16 @@
+ 			gridSize.u[k] = static_cast<unsigned>(m_maxFillIndexes.u[k] - m_minFillIndexes.u[k] + 1);
+ 			if (gridSize.u[k] == 1)
+ 			{
+-				// to avoid corner cases (with flat triangles on a border of the unique cell)
+-				// we prefer to increase the intersection grid by one cell on each side
+-				m_minGridBB.u[k] -= m_cellSize;
+-				m_maxFillIndexes.u[k] += 2;
++				// 직접 호출도 여유 셀 확장 시 정수 경계를 넘지 않게 합니다.
++				if (m_minFillIndexes.u[k] == (std::numeric_limits<int>::min)()
++					|| m_maxFillIndexes.u[k] == (std::numeric_limits<int>::max)())
++				{
++					clear();
++					return false;
++				}
++				// 원점을 이동하면 옥트리 셀 번호와 삼각형 격자가 어긋나므로 점유 인덱스만 확장합니다.
++				--m_minFillIndexes.u[k];
++				++m_maxFillIndexes.u[k];
+ 				gridSize.u[k] = 3;
+ 			}
+ 		}
