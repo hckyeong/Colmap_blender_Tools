@@ -1,0 +1,482 @@
+--- a/include/RegistrationTools.h
++++ b/include/RegistrationTools.h
+@@ -127,6 +127,11 @@
+ 	{
+ 		struct Statistics
+ 		{
++			const char* registration_method = "POINT_TO_POINT";
++			bool normal_filter_enabled = false;
++			std::size_t normal_filter_rejected_count = 0;
++			std::size_t point_to_plane_solve_count = 0;
++			unsigned minimum_linear_rank = 0;
+ 			std::size_t iterations_attempted = 0;
+ 			std::size_t iterations_accepted = 0;
+ 			std::size_t distance_call_count = 0;
+@@ -153,6 +158,9 @@
+ 		Observer observer = nullptr;
+ 		void* observerData = nullptr;
+ 		bool reuseMeshGrid = true;
++		// 메시 면 노말 목적함수와 양쪽 노말의 무방향 대응 필터를 명시적으로 선택합니다.
++		bool pointToPlane = false;
++		double normalCosineThreshold = -1.0;
+ 		// 선택적 정확 표면 검색은 거리와 최근접 좌표·삼각형 식별자를 함께 기록합니다.
+ 		using ExactMeshDistances = int (*)(void*, GenericIndexedCloudPersist*, PointCloud*, unsigned, GenericProgressCallback*);
+ 		ExactMeshDistances exactMeshDistances = nullptr;
+--- a/src/RegistrationTools.cpp
++++ b/src/RegistrationTools.cpp
+@@ -24,6 +24,8 @@
+ #include <ctime>
+ #include <chrono>
+ #include <string>
++#include <array>
++#include <limits>
+ #include <CCMiscTools.h>
+ 
+ using namespace CCCoreLib;
+@@ -219,7 +221,218 @@
+ 	};
+ }
+ 
+-// 공개 ICP 등록을 수행하며 단계 배율 경계를 실제 점군과 반환 변환에 동일하게 적용합니다.
++
++namespace
++{
++	// 최근접 삼각형 번호를 검증하고 원본 면의 배정도 단위 노말을 계산합니다.
++	bool ICPFaceNormal(GenericIndexedMesh* mesh, PointCloud* closest, unsigned index, CCVector3d& normal)
++	{
++		const double triangle = closest->getPointScalarValue(index);
++		if (!std::isfinite(triangle) || triangle < 0 || triangle >= mesh->size() || std::floor(triangle) != triangle)
++			return false;
++		CCVector3 a, b, c;
++		mesh->getTriangleVertices(static_cast<unsigned>(triangle), a, b, c);
++		normal = (CCVector3d(b) - CCVector3d(a)).cross(CCVector3d(c) - CCVector3d(a));
++		const double length = normal.norm();
++		if (!std::isfinite(length) || length <= 0) return false;
++		normal /= length;
++		return true;
++	}
++
++	// 점평면 증분의 실제 오차 감소를 확인하고 좌표 표현 정밀도에 도달하면 누적을 끝냅니다.
++	bool ICPPointToPlaneStep(GenericIndexedCloudPersist* data, PointCloud* closest, GenericIndexedMesh* mesh,
++		ScalarField* weights, bool adjustScale, double minimumScale, double maximumScale,
++		RegistrationTools::ScaledTransformation& output, CCVector3& dataCenter, CCVector3& modelCenter,
++		ICPMeshRegistrationContext::Statistics& statistics, GenericProgressCallback* progress,
++		bool& improved, double& fixedRmsDecrease)
++	{
++		improved = false;
++		fixedRmsDecrease = 0;
++		if (!data || !closest || data->size() != closest->size() || data->size() < 3) return false;
++		CCVector3d center(0, 0, 0), targetCenter(0, 0, 0);
++		double weightSum = 0;
++		double maximumAbsoluteCoordinate = 0;
++		unsigned validCount = 0;
++		for (unsigned i = 0; i < data->size(); ++i)
++		{
++			if ((i & 4095u) == 0 && progress && progress->isCancelRequested()) return false;
++			const double w = weights ? weights->getValue(i) : 1.0;
++			if (!std::isfinite(w)) return false;
++			if (w == 0) continue;
++			const double squaredWeight = w * w;
++			const CCVector3d point(*data->getPoint(i));
++			for (unsigned axis = 0; axis < 3; ++axis)
++				maximumAbsoluteCoordinate = std::max(maximumAbsoluteCoordinate, std::abs(point.u[axis]));
++			center += point * squaredWeight;
++			targetCenter += CCVector3d(*closest->getPoint(i)) * squaredWeight;
++			weightSum += squaredWeight;
++			++validCount;
++		}
++		if (validCount < 3 || !std::isfinite(weightSum) || weightSum <= 0) return false;
++		center /= weightSum;
++		targetCenter /= weightSum;
++		double radiusSquared = 0;
++		for (unsigned i = 0; i < data->size(); ++i)
++		{
++			if ((i & 4095u) == 0 && progress && progress->isCancelRequested()) return false;
++			const double w = weights ? weights->getValue(i) : 1.0;
++			if (w != 0) radiusSquared += w * w * (CCVector3d(*data->getPoint(i)) - center).norm2();
++		}
++		const double radius = std::sqrt(radiusSquared / weightSum);
++		if (!std::isfinite(radius) || radius <= 0) return false;
++		std::array<double, 7> solution{};
++		// 고정 배율 재풀이에서도 같은 유효 대응과 같은 중심 좌표계를 사용합니다.
++		auto solve = [&](bool solveScale, double fixedScale) -> bool
++		{
++			const unsigned dimension = solveScale ? 7u : 6u;
++			SquareMatrixd normalMatrix(dimension);
++			if (!normalMatrix.isValid()) return false;
++			normalMatrix.clear();
++			std::array<double, 7> rhs{};
++			for (unsigned i = 0; i < data->size(); ++i)
++			{
++				if ((i & 4095u) == 0 && progress && progress->isCancelRequested()) return false;
++				const double w = weights ? weights->getValue(i) : 1.0;
++				if (w == 0) continue;
++				CCVector3d n;
++				if (!ICPFaceNormal(mesh, closest, i, n)) return false;
++				const CCVector3d p = CCVector3d(*data->getPoint(i)) - center;
++				const CCVector3d q = CCVector3d(*closest->getPoint(i)) - center;
++				const CCVector3d rotation = p.cross(n) * (fixedScale / radius);
++				const std::array<double, 7> row{rotation.x, rotation.y, rotation.z, n.x, n.y, n.z, n.dot(p) / radius};
++				const double residual = n.dot(q - p * fixedScale);
++				const double squaredWeight = w * w;
++				if (!std::isfinite(residual)) return false;
++				for (unsigned r = 0; r < dimension; ++r)
++				{
++					rhs[r] += squaredWeight * row[r] * residual;
++					for (unsigned c = 0; c < dimension; ++c)
++						normalMatrix.setValue(r, c, normalMatrix.getValue(r, c) + squaredWeight * row[r] * row[c]);
++				}
++			}
++			for (unsigned r = 0; r < dimension; ++r)
++			{
++				if (!std::isfinite(rhs[r])) return false;
++				for (unsigned c = 0; c < dimension; ++c)
++					if (!std::isfinite(normalMatrix.getValue(r, c))) return false;
++			}
++			SquareMatrixd singular, left, right;
++			if (!normalMatrix.svd(singular, left, right)) return false;
++			const double largest = singular.getValue(0, 0);
++			if (!std::isfinite(largest) || largest <= 0) return false;
++			solution.fill(0);
++			unsigned rank = 0;
++			for (unsigned k = 0; k < dimension; ++k)
++			{
++				const double value = singular.getValue(k, k);
++				if (!std::isfinite(value)) return false;
++				if (value <= largest * 1.0e-10) continue;
++				++rank;
++				double projection = 0;
++				for (unsigned j = 0; j < dimension; ++j) projection += left.getValue(j, k) * rhs[j];
++				for (unsigned j = 0; j < dimension; ++j) solution[j] += right.getValue(j, k) * (projection / value);
++			}
++			if (rank == 0) return false;
++			for (double value : solution) if (!std::isfinite(value)) return false;
++			statistics.minimum_linear_rank = statistics.minimum_linear_rank == 0
++				? rank : std::min(statistics.minimum_linear_rank, rank);
++			++statistics.point_to_plane_solve_count;
++			return true;
++		};
++		if (!solve(adjustScale, 1.0)) return false;
++		double scale = adjustScale ? 1.0 + solution[6] / radius : 1.0;
++		if (!std::isfinite(scale)) return false;
++		if (adjustScale)
++		{
++			const double bounded = std::max(minimumScale, std::min(maximumScale, scale));
++			if (bounded != scale)
++			{
++				scale = bounded;
++				if (!solve(false, scale)) return false;
++			}
++		}
++		if (scale <= 0) return false;
++		const CCVector3d fullOmega(solution[0] / radius, solution[1] / radius, solution[2] / radius);
++		const CCVector3d fullTranslation(solution[3], solution[4], solution[5]);
++		dataCenter = center.toPC();
++		modelCenter = targetCenter.toPC();
++		// 유효 입력 좌표가 실제로 표현할 수 있는 한 단계보다 작은 변위는 수렴으로 판정합니다.
++		const double coordinateResolution = std::numeric_limits<PointCoordinateType>::epsilon()
++			* std::max(maximumAbsoluteCoordinate, radius);
++		const double coordinateResolutionSquared = coordinateResolution * coordinateResolution;
++		// 실제 좌표 반올림 후의 고정 대응 오차와 최대 점 변위를 함께 계산합니다.
++		auto objective = [&](const RegistrationTools::ScaledTransformation* trial, double& error, double& maximumDisplacementSquared) -> bool
++		{
++			error = 0;
++			maximumDisplacementSquared = 0;
++			for (unsigned i = 0; i < data->size(); ++i)
++			{
++				if ((i & 4095u) == 0 && progress && progress->isCancelRequested()) return false;
++				const double w = weights ? weights->getValue(i) : 1.0;
++				if (w == 0) continue;
++				CCVector3d n;
++				if (!ICPFaceNormal(mesh, closest, i, n)) return false;
++				const CCVector3 original = *data->getPoint(i);
++				const CCVector3 point = trial ? trial->apply(original) : original;
++				const double displacementSquared = (CCVector3d(point) - CCVector3d(original)).norm2();
++				if (!std::isfinite(displacementSquared)) return false;
++				maximumDisplacementSquared = std::max(maximumDisplacementSquared, displacementSquared);
++				const double residual = n.dot(CCVector3d(point) - CCVector3d(*closest->getPoint(i)));
++				if (!std::isfinite(residual)) return false;
++				error += w * w * residual * residual;
++			}
++			return std::isfinite(error);
++		};
++		double initialError = 0, initialDisplacementSquared = 0;
++		if (!objective(nullptr, initialError, initialDisplacementSquared)) return false;
++		if (initialError == 0 || (fullOmega.norm2() == 0 && fullTranslation.norm2() == 0 && scale == 1.0)) return true;
++		// 배율·중심 이동·회전 증분을 함께 줄여 같은 양의 배율 경계 안에서 감소를 찾습니다.
++		double alpha = 1.0;
++		for (unsigned attempt = 0; attempt <= std::numeric_limits<double>::digits; ++attempt, alpha *= 0.5)
++		{
++			if (progress && progress->isCancelRequested()) return false;
++			const CCVector3d omega = fullOmega * alpha;
++			const double angleSquared = omega.norm2();
++			if (!std::isfinite(angleSquared)) return false;
++			const double angle = std::sqrt(angleSquared);
++			const double a = angle < 1.0e-6 ? 1.0 - angleSquared / 6.0 : std::sin(angle) / angle;
++			const double b = angle < 1.0e-6 ? 0.5 - angleSquared / 24.0 : (1.0 - std::cos(angle)) / angleSquared;
++			const double skew[3][3] = {{0, -omega.z, omega.y}, {omega.z, 0, -omega.x}, {-omega.y, omega.x, 0}};
++			output.R = SquareMatrixd(3);
++			if (!output.R.isValid()) return false;
++			for (unsigned r = 0; r < 3; ++r)
++				for (unsigned c = 0; c < 3; ++c)
++				{
++					double squared = 0;
++					for (unsigned k = 0; k < 3; ++k) squared += skew[r][k] * skew[k][c];
++					output.R.setValue(r, c, (r == c ? 1.0 : 0.0) + a * skew[r][c] + b * squared);
++				}
++			output.s = adjustScale ? std::max(minimumScale, std::min(maximumScale, 1.0 + alpha * (scale - 1.0))) : 1.0;
++			output.T = center + fullTranslation * alpha - (output.R * center) * output.s;
++			if (!std::isfinite(output.s) || output.s <= 0
++				|| !std::isfinite(output.T.x) || !std::isfinite(output.T.y) || !std::isfinite(output.T.z)) return false;
++			double candidateError = 0, maximumDisplacementSquared = 0;
++			if (!objective(&output, candidateError, maximumDisplacementSquared)) return false;
++			// 이미 좌표 표현 정밀도에 도달한 단계는 더 줄이거나 누적하지 않습니다.
++			if (maximumDisplacementSquared <= coordinateResolutionSquared)
++			{
++				output = RegistrationTools::ScaledTransformation();
++				return true;
++			}
++			if (candidateError < initialError)
++			{
++				improved = true;
++				fixedRmsDecrease = std::sqrt(initialError / weightSum) - std::sqrt(candidateError / weightSum);
++				return std::isfinite(fixedRmsDecrease) && fixedRmsDecrease >= 0;
++			}
++		}
++		// 표현 가능한 감소가 없으면 호출자가 직전 누적 변환을 그대로 반환합니다.
++		output = RegistrationTools::ScaledTransformation();
++		return true;
++	}
++}
++
++// 등록 목적함수별 수락·수렴을 분리하고 외부 유클리드 거리·취소·배율 계약을 보존합니다.
+ ICPRegistrationTools::RESULT_TYPE ICPRegistrationTools::RegisterInternal(	GenericIndexedCloudPersist* inputModelCloud,
+ 																	GenericIndexedMesh* inputModelMesh,
+ 																	GenericIndexedCloudPersist* inputDataCloud,
+@@ -230,6 +443,19 @@
+ 																	GenericProgressCallback* progressCb, ICPMeshRegistrationContext* context)
+ {
+ 	ICPMeshRegistrationContext::Statistics* stats = context ? &context->statistics : nullptr;
++	const bool pointToPlane = context && context->pointToPlane;
++	const bool normalFilter = context && context->normalCosineThreshold >= 0;
++	if (context && (!std::isfinite(context->normalCosineThreshold)
++		|| (context->normalCosineThreshold != -1.0 && (context->normalCosineThreshold < 0 || context->normalCosineThreshold > 1))))
++		return ICP_ERROR_INVALID_INPUT;
++	if ((pointToPlane || normalFilter) && (!inputModelMesh || !inputDataCloud
++		|| (normalFilter && !inputDataCloud->normalsAvailable()) || params.transformationFilters != SKIP_NONE))
++		return ICP_ERROR_INVALID_INPUT;
++	if (stats)
++	{
++		stats->registration_method = pointToPlane ? "POINT_TO_PLANE" : "POINT_TO_POINT";
++		stats->normal_filter_enabled = normalFilter;
++	}
+ 	ICPStageTimer stageTimer;
+ 	DistanceComputationTools::Cloud2MeshDistancesCache meshCache;
+ 	CCVector3 domainMin, domainMax;
+@@ -562,7 +788,7 @@
+ 
+ 	//per-point couple weights
+ 	ScalarField* coupleWeights = nullptr;
+-	if (model.weights || data.weights || registerWithNormals)
++	if (model.weights || data.weights || registerWithNormals || normalFilter)
+ 	{
+ 		coupleWeights = new ScalarField("CoupleWeights");
+ 		sfGarbage.add(coupleWeights);
+@@ -616,6 +842,7 @@
+ 	double lastStepRMS = -1.0;
+ 	double initialDeltaRMS = -1.0;
+ 	ScaledTransformation currentTrans;
++	double fixedPlaneRmsDecrease = 0;
+ 	RESULT_TYPE result = ICP_ERROR;
+ 
+ 	for (unsigned iteration = 0;; ++iteration)
+@@ -847,11 +1074,15 @@
+ 			data = filteredData;
+ 		}
+ 
++		unsigned effectivePointCount = data.cloud->size();
++		bool invalidNormal = false;
++		bool normalFilterCancelled = false;
++		// 양쪽 노말의 무방향 임계값을 기존 가중치와 결합해 대응을 제외합니다.
+ 		//update couple weights (if any)
+ 		if (coupleWeights)
+ 		{
+ 			unsigned count = data.cloud->size();
+-			assert(model.weights || data.weights || registerWithNormals);
++			assert(model.weights || data.weights || registerWithNormals || normalFilter);
+ 			assert(!model.weights || (data.CPSetRef && data.CPSetRef->size() == count));
+ 
+ 			if (coupleWeights->currentSize() != count && !coupleWeights->resizeSafe(count))
+@@ -927,11 +1158,42 @@
+ 					ScalarType wm = model.weights->getValue(data.CPSetRef->getPointGlobalIndex(i));
+ 					w *= wm;
+ 				}
++				if (normalFilter)
++				{
++					if ((i & 4095u) == 0 && progressCb && progressCb->isCancelRequested())
++					{
++						normalFilterCancelled = true;
++						break;
++					}
++					CCVector3d faceNormal;
++					const CCVector3d sourceNormal(*data.cloud->getNormal(i));
++					const double length = sourceNormal.norm();
++					if (!ICPFaceNormal(inputModelMesh, data.CPSetPlain, i, faceNormal) || !std::isfinite(length) || length <= 0)
++					{
++						invalidNormal = true;
++						break;
++					}
++					if (std::abs(sourceNormal.dot(faceNormal) / length) < context->normalCosineThreshold)
++					{
++						w = 0;
++						++stats->normal_filter_rejected_count;
++					}
++				}
++				if (pointToPlane || normalFilter)
++				{
++					if (!std::isfinite(w)) { invalidNormal = true; break; }
++					if (w == 0) --effectivePointCount;
++				}
+ 				coupleWeights->setValue(i, static_cast<ScalarType>(w));
+ 			}
+ 			coupleWeights->computeMinAndMax();
+ 		}
+ 
++		if (normalFilterCancelled || invalidNormal || ((pointToPlane || normalFilter) && effectivePointCount < 3))
++		{
++			result = normalFilterCancelled ? ICP_ERROR_CANCELED_BY_USER : ICP_ERROR_REGISTRATION_STEP;
++			break;
++		}
+ 		//we can now compute the best registration transformation for this step
+ 		//(now that we have selected the points that will be used for registration!)
+ 		{
+@@ -942,6 +1204,11 @@
+ 			for (unsigned i = 0; i < data.cloud->size(); ++i)
+ 			{
+ 				ScalarType V = data.cloud->getPointScalarValue(i);
++				if ((pointToPlane || normalFilter) && !ScalarField::ValidValue(V))
++				{
++					invalidNormal = true;
++					break;
++				}
+ 				if (ScalarField::ValidValue(V))
+ 				{
+ 					double wi = 1.0;
+@@ -958,6 +1225,11 @@
+ 				}
+ 			}
+ 
++			if ((pointToPlane || normalFilter) && (invalidNormal || !std::isfinite(wiSum) || wiSum <= 0 || !std::isfinite(meanSquareValue)))
++			{
++				result = ICP_ERROR_REGISTRATION_STEP;
++				break;
++			}
+ 			//12/11/2008 - A.BEY: ICP guarantees only the decrease of the squared distances sum (not the distances sum)
+ 			double meanSquareError = (wiSum != 0 ? static_cast<ScalarType>(meanSquareValue / wiSum) : 0);
+ 
+@@ -965,7 +1237,7 @@
+ 			if (context && context->observer)
+ 			{
+ 				stageTimer.select(nullptr);
+-				context->observer(context->observerData, iteration, data.cloud->size(), rms, currentTrans, iteration > 0 && rms <= lastStepRMS);
++				context->observer(context->observerData, iteration, effectivePointCount, rms, currentTrans, iteration > 0 && (pointToPlane || rms <= lastStepRMS));
+ 				stageTimer.select(&stats->filter_rms_seconds);
+ 			}
+ 
+@@ -992,7 +1264,7 @@
+ 				}
+ 
+ 				finalRMS = rms;
+-				finalPointCount = data.cloud->size();
++				finalPointCount = effectivePointCount;
+ 
+ 				if (LessThanEpsilon(rms))
+ 				{
+@@ -1006,7 +1278,7 @@
+ 			{
+ 				assert(lastStepRMS >= 0.0);
+ 
+-				if (rms > lastStepRMS) //error increase!
++				if (!pointToPlane && rms > lastStepRMS) // 기존 점점 목적함수의 증가만 거절합니다.
+ 				{
+ 					if (stats) stats->stop_reason = "RMS_INCREASE";
+ 					result = iteration == 1 ? ICP_NOTHING_TO_DO : ICP_APPLY_TRANSFO;
+@@ -1015,7 +1287,7 @@
+ 
+ 				if (stats) ++stats->iterations_accepted;
+ 				//error update (RMS)
+-				double deltaRMS = lastStepRMS - rms;
++				double deltaRMS = pointToPlane ? fixedPlaneRmsDecrease : lastStepRMS - rms;
+ 				//should be better!
+ 				assert(deltaRMS >= 0.0);
+ 
+@@ -1040,14 +1312,14 @@
+ 				transform.T += currentTrans.T;
+ 
+ 				finalRMS = rms;
+-				finalPointCount = data.cloud->size();
++				finalPointCount = effectivePointCount;
+ 
+ 				//stop criterion
+-				if (	(params.convType == MAX_ERROR_CONVERGENCE && deltaRMS < params.minRMSDecrease) //convergence reached
+-						||	(params.convType == MAX_ITER_CONVERGENCE && iteration >= params.nbMaxIterations) //max iteration reached
+-						)
+-				{
+-					if (stats) stats->stop_reason = params.convType == MAX_ITER_CONVERGENCE ? "MAX_ITERATIONS" : "STABLE_CONVERGENCE";
++				const bool reachedIterationLimit = (pointToPlane || params.convType == MAX_ITER_CONVERGENCE) && iteration >= params.nbMaxIterations;
++				const bool reachedObjectiveConvergence = params.convType == MAX_ERROR_CONVERGENCE && deltaRMS < params.minRMSDecrease;
++				if (reachedIterationLimit || reachedObjectiveConvergence)
++				{
++					if (stats) stats->stop_reason = reachedIterationLimit ? "MAX_ITERATIONS" : "STABLE_CONVERGENCE";
+ 					result = ICP_APPLY_TRANSFO;
+ 					break;
+ 				}
+@@ -1083,21 +1355,37 @@
+ 		//single iteration of the registration procedure
+ 		currentTrans = ScaledTransformation();
+ 		CCVector3 dataGravityCenter, modelGravityCenter;
+-		if (!RegistrationTools::RegistrationProcedure(	data.cloud,
+-														data.CPSetRef ? static_cast<GenericCloud*>(data.CPSetRef) : static_cast<GenericCloud*>(data.CPSetPlain),
+-														currentTrans,
+-														params.adjustScale,
+-														coupleWeights,
+-														PC_ONE,
+-														&dataGravityCenter,
+-														&modelGravityCenter))
+-		{
+-			result = ICP_ERROR_REGISTRATION_STEP;
++		bool solved = false;
++		bool planeStepImproved = false;
++		if (pointToPlane)
++		{
++			solved = ICPPointToPlaneStep(data.cloud, data.CPSetPlain, inputModelMesh, coupleWeights,
++				params.adjustScale,
++				std::isfinite(params.minScale) ? params.minScale / transform.s : std::numeric_limits<double>::min(),
++				std::isfinite(params.maxScale) ? params.maxScale / transform.s : std::numeric_limits<double>::max(),
++				currentTrans, dataGravityCenter, modelGravityCenter, *stats, progressCb, planeStepImproved, fixedPlaneRmsDecrease);
++		}
++		else
++		{
++			solved = RegistrationTools::RegistrationProcedure(data.cloud,
++				data.CPSetRef ? static_cast<GenericCloud*>(data.CPSetRef) : static_cast<GenericCloud*>(data.CPSetPlain),
++				currentTrans, params.adjustScale, coupleWeights, PC_ONE, &dataGravityCenter, &modelGravityCenter);
++		}
++		if (!solved)
++		{
++			result = progressCb && progressCb->isCancelRequested() ? ICP_ERROR_CANCELED_BY_USER : ICP_ERROR_REGISTRATION_STEP;
+ 			break;
+ 		}
+ 
++		if (pointToPlane && !planeStepImproved)
++		{
++			stats->stop_reason = "STABLE_CONVERGENCE";
++			result = stats->iterations_accepted == 0 ? ICP_NOTHING_TO_DO : ICP_APPLY_TRANSFO;
++			break;
++		}
++
+ 		// 점군을 바꾸기 전에 누적 배율 경계와 대응점 중심을 함께 보존합니다.
+-		if (params.adjustScale)
++		if (params.adjustScale && !pointToPlane)
+ 		{
+ 			double boundedScale = transform.s * currentTrans.s;
+ 			if (std::isfinite(params.minScale))

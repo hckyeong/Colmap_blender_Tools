@@ -34,7 +34,7 @@ def test_defaults_and_legacy_profiles() -> None:
     from tools.align import distribution_profile
     from tools.align.alignment.icp_solver_backend import backend_algorithm_version
 
-    assert backend_algorithm_version("CCCORELIB") == "cccore-icp-v5"
+    assert backend_algorithm_version("CCCORELIB") == "cccore-icp-v7"
     for profile in ("CCCORELIB", "SMALL_GICP", "FULL"):
         with patch.object(distribution_profile, "DISTRIBUTION_PROFILE", profile):
             expected = "SMALL_GICP" if profile == "SMALL_GICP" else "CCCORELIB"

@@ -41,7 +41,7 @@ using Clock = std::chrono::steady_clock;
 using Cloud = CCCoreLib::PointCloud;
 using Transform = CCCoreLib::PointProjectionTools::Transformation;
 constexpr const char* kProtocol = "cccore-native-v2";
-constexpr const char* kSessionProtocol = "cccore-native-v7";
+constexpr const char* kSessionProtocol = "cccore-native-v8";
 constexpr const char* kThreadBackend = "oneTBB";
 constexpr const char* kTbbVersion = TBB_VERSION_PIN;
 
@@ -429,7 +429,7 @@ void validateRank(Cloud& cloud) {
             "DEGENERATE_INPUT", "점군이 한 점 또는 직선으로 퇴화했습니다.");
 }
 
-// 배정도 파일 좌표를 검사한 뒤 코어의 단정도 좌표로 명시적으로 변환합니다.
+// 배정도 좌표·선택적 단위 노말을 검증한 뒤 코어의 단정도 저장소로 변환합니다.
 std::unique_ptr<Cloud> loadCloud(
     const Json& entity, const fs::path& root, bool registration, Progress& progress,
     NativeTimings* timings = nullptr
@@ -438,6 +438,8 @@ std::unique_ptr<Cloud> loadCloud(
     progress.setSubstage("LOAD");
     const auto readStarted = Clock::now();
     auto coordinates = readBinary<double>(childPath(root, entity.at("positions_file")), size_t(count) * 3);
+    const auto normals = entity.contains("normals_file")
+        ? readBinary<double>(childPath(root, entity.at("normals_file")), size_t(count) * 3) : std::vector<double>{};
     if (timings) timings->binaryReadSeconds += elapsedSeconds(readStarted);
     progress.setSubstage("VALIDATE");
     const auto conversionStarted = Clock::now();
@@ -456,6 +458,22 @@ std::unique_ptr<Cloud> loadCloud(
     }
     require(cloud->enableScalarField(), "OUT_OF_MEMORY", "거리 필드 메모리를 확보하지 못했습니다.");
     cloud->setCurrentScalarField(0);
+    if (entity.contains("normals_file")) {
+        require(cloud->reserveNormals(count), "OUT_OF_MEMORY", "노말 메모리를 확보하지 못했습니다.");
+        for (unsigned i = 0; i < count; ++i) {
+            CCVector3 normal;
+            double squared = 0;
+            for (unsigned axis = 0; axis < 3; ++axis) {
+                const double value = normals[size_t(i) * 3 + axis];
+                require(std::isfinite(value), "INVALID_NORMAL", "노말 성분이 유한하지 않습니다.");
+                squared += value * value;
+                normal.u[axis] = static_cast<PointCoordinateType>(value);
+            }
+            require(std::abs(squared - 1.0) <= 2.1e-6, "INVALID_NORMAL", "노말은 단위 벡터여야 합니다.");
+            cloud->addNormal(normal);
+            if ((i & 65535u) == 0) progress.check();
+        }
+    }
     if (registration) validateRank(*cloud);
     if (timings) timings->conversionValidationSeconds += elapsedSeconds(conversionStarted);
     return cloud;
@@ -679,7 +697,12 @@ Json baseResult(const ThreadSettings& threads, const char* protocol = kProtocol)
 
 // 메시 등록의 내부 누적 계측만 응답으로 변환합니다.
 Json icpStatisticsJson(const CCCoreLib::ICPMeshRegistrationContext::Statistics& stats) {
-    return {{"iterations_attempted", stats.iterations_attempted},
+    return {{"registration_method", stats.registration_method},
+            {"normal_filter_enabled", stats.normal_filter_enabled},
+            {"normal_filter_rejected_count", stats.normal_filter_rejected_count},
+            {"point_to_plane_solve_count", stats.point_to_plane_solve_count},
+            {"minimum_linear_rank", stats.minimum_linear_rank},
+            {"iterations_attempted", stats.iterations_attempted},
             {"iterations_accepted", stats.iterations_accepted},
             {"distance_call_count", stats.distance_call_count},
             {"surface_search_backend", stats.surface_search_backend},
@@ -890,15 +913,18 @@ class GeometryRegistry {
     std::map<std::string, Json> domainDeclarations;
     std::uint64_t bvhClock = 0;
 
-    // 지오메트리 설명의 필수 필드와 메시 필드 쌍을 검사합니다.
+    // 지오메트리 설명의 필수 필드와 선택적 면·노말 파일 계약을 검사합니다.
     static void validateDescriptor(const Json& entity) {
         require(entity.is_object(), "INVALID_GEOMETRY", "지오메트리 설명은 객체여야 합니다.");
         const bool mesh = entity.contains("triangles_file") || entity.contains("triangle_count");
+        Json descriptor = entity;
+        descriptor.erase("normals_file");
+        if (entity.contains("normals_file")) requiredText(entity, "normals_file", 4096);
         if (mesh) {
-            requireExactKeys(entity, {"geometry_id", "positions_file", "point_count", "triangles_file", "triangle_count", "cache_scope"},
+            requireExactKeys(descriptor, {"geometry_id", "positions_file", "point_count", "triangles_file", "triangle_count", "cache_scope"},
                              "메시 지오메트리 설명 필드가 고정 계약과 다릅니다.");
         } else {
-            requireExactKeys(entity, {"geometry_id", "positions_file", "point_count", "cache_scope"},
+            requireExactKeys(descriptor, {"geometry_id", "positions_file", "point_count", "cache_scope"},
                              "점 지오메트리 설명 필드가 고정 계약과 다릅니다.");
         }
         const auto scope = requiredText(entity, "cache_scope", 16);
@@ -933,6 +959,7 @@ class GeometryRegistry {
             result->mesh = loadMesh(entity, root, *result->cloud, progress, &result->loadTimings);
         result->estimatedBytes = std::uint64_t(points) *
             (3u * sizeof(PointCoordinateType) + sizeof(ScalarType));
+        if (entity.contains("normals_file")) result->estimatedBytes += std::uint64_t(points) * 3u * sizeof(PointCoordinateType);
         if (entity.contains("triangle_count"))
             result->estimatedBytes += std::uint64_t(unsignedField(entity, "triangle_count", 1, 0x7fffffffu))
                 * 3u * sizeof(std::uint32_t);
@@ -1140,6 +1167,14 @@ Json executeSessionOperation(
         progress.setSubstage("KERNEL");
         const auto kernelStarted = Clock::now();
         CCCoreLib::ICPMeshRegistrationContext icpContext;
+        const auto method = requiredText(request.at("parameters"), "registration_method", 32);
+        const double normalThreshold = finiteField(request.at("parameters"), "normal_cosine_threshold");
+        require(method == "POINT_TO_POINT" || (method == "POINT_TO_PLANE" && model.mesh),
+                "INVALID_PARAMETER", "등록 방식이 기준 형상과 일치하지 않습니다.");
+        require(normalThreshold == -1 || (normalThreshold >= 0 && normalThreshold <= 1 && method == "POINT_TO_PLANE" && model.mesh && data.descriptor.contains("normals_file")),
+                "INVALID_PARAMETER", "노말 필터 임계값 또는 출처면 노말이 올바르지 않습니다.");
+        icpContext.pointToPlane = method == "POINT_TO_PLANE";
+        icpContext.normalCosineThreshold = normalThreshold;
         struct QueryContext { GeometryRegistry* registry; CachedGeometry* model; OperationCounters* counters; };
         QueryContext queryContext { &registry, &model, &counters };
         // CCCoreLib가 관리하는 표본과 최근접 점 저장소를 레지스트리의 동일 트리로 조회합니다.
@@ -1271,6 +1306,9 @@ void validateSessionCommandPaths(const Json& command, const fs::path& root, unsi
         const auto& entity = command.at(role);
         require(paths.insert(childPath(root, entity.at("positions_file"))).second,
                 "PATH_COLLISION", "명령 입력·출력 파일 경로가 서로 겹칩니다.");
+        if (entity.contains("normals_file"))
+            require(paths.insert(childPath(root, entity.at("normals_file"))).second,
+                    "PATH_COLLISION", "명령 노말 입력 경로가 다른 입력·출력과 겹칩니다.");
         if (entity.contains("triangles_file"))
             require(paths.insert(childPath(root, entity.at("triangles_file"))).second,
                     "PATH_COLLISION", "명령 입력·출력 파일 경로가 서로 겹칩니다.");

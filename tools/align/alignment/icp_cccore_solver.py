@@ -20,10 +20,12 @@ if __package__:
     from . import icp_cccore_contract as contract
     from . import icp_cccore_overlap as overlap
     from .icp_mesh_cleanup import prepare_mesh_alignment_geometry
+    from .icp_mesh_cleanup_native import NativeMeshCleaner
 else:
     import icp_cccore_contract as contract
     import icp_cccore_overlap as overlap
     from icp_mesh_cleanup import prepare_mesh_alignment_geometry
+    from icp_mesh_cleanup_native import NativeMeshCleaner
 
 ProgressSink = Callable[[Mapping[str, Any]], None] | None
 CancelProbe = Callable[[], bool] | None
@@ -84,12 +86,13 @@ class Normalization:
 
 def _clean_mesh_geometry(
     geometry: contract.CcCoreGeometry, label: str, *, native_precision: bool = False,
+    cleaner: Callable[..., tuple[np.ndarray, np.ndarray]] = prepare_mesh_alignment_geometry,
 ) -> contract.CcCoreGeometry:
-    """원본 출처를 유지하며 계산 메시의 퇴화면을 제외하고 오류에 형상 맥락을 붙입니다."""
+    """지정한 검사기로 계산 메시의 퇴화면을 제외하고 출처와 오류 맥락을 보존합니다."""
     if geometry.triangles is None:
         return geometry
     try:
-        positions, triangles = prepare_mesh_alignment_geometry(
+        positions, triangles = cleaner(
             geometry.positions, geometry.triangles, native_precision=native_precision,
         )
     except ValueError as error:
@@ -235,7 +238,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 v7 배포 지문과 기존 패치·정확 BVH 검색 원문을 검증합니다."""
+    """네이티브 v8 배포 지문과 메시 검사·BVH·점–평면 원문을 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -261,14 +264,16 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
         "icp_mesh_grid_reuse_patch", "icp_mesh_grid_reuse_patch_sha256", "icp_mesh_grid_reuse_source_sha256",
         "mesh_bvh_search_patch", "mesh_bvh_search_patch_sha256", "mesh_bvh_search_source_sha256", "bvh_source_sha256",
+        "point_to_plane_patch", "point_to_plane_patch_sha256", "point_to_plane_source_sha256",
     }
+    required_fields.update({"mesh_cleanup_abi", "mesh_cleanup_source_sha256"})
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
         raise contract.CcCoreEnvironmentError(
             f"CC Runtime Manifest의 필수 필드가 없습니다: {', '.join(missing_fields)}"
         )
     if manifest.get("protocol_version") != contract.CC_NATIVE_PROTOCOL_VERSION:
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v7 네이티브 계약이 아닙니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v8 네이티브 계약이 아닙니다.")
     if manifest.get("platform") != "windows-x64":
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 플랫폼이 windows-x64가 아닙니다.")
     if manifest.get("coordinate_type") != "float32" or manifest.get("matrix_scalar_type") != "float64":
@@ -437,6 +442,26 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             source.get("patched_sha256"), "BVH 패치 의존성 원문",
         ):
             raise contract.CcCoreEnvironmentError("CC BVH 패치의 최종 원문 해시가 다릅니다.")
+    plane_patch = core_dependency.get("point_to_plane_patch")
+    if (not isinstance(plane_patch, Mapping) or plane_patch.get("id") != "point-to-plane-v1"
+        or plane_patch.get("file") != "patches/point_to_plane.patch"
+        or manifest["point_to_plane_patch"] != plane_patch["id"]
+        or plane_patch["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["point_to_plane_patch_sha256"], "점–평면 패치")
+        != _manifest_sha256(plane_patch.get("sha256"), "점–평면 의존성 패치")):
+        raise contract.CcCoreEnvironmentError("CC 점–평면 패치가 검증되지 않았습니다.")
+    plane_files = plane_patch.get("files")
+    plane_sources = manifest["point_to_plane_source_sha256"]
+    if (not isinstance(plane_files, list) or len(plane_files) != 2
+        or any(not isinstance(item, Mapping) for item in plane_files)
+        or {item.get("path") for item in plane_files} != bvh_names
+        or not isinstance(plane_sources, Mapping) or set(plane_sources) != bvh_names):
+        raise contract.CcCoreEnvironmentError("CC 점–평면 패치의 원문 목록이 올바르지 않습니다.")
+    for source in plane_files:
+        if _manifest_sha256(source.get("original_sha256"), "점–평면 패치 이전 원문") != bvh_sources[source["path"]]:
+            raise contract.CcCoreEnvironmentError("CC 점–평면 패치의 이전 원문 연결이 다릅니다.")
+        if _manifest_sha256(plane_sources[source["path"]], "점–평면 패치 최종 원문") != _manifest_sha256(source.get("patched_sha256"), "점–평면 의존성 원문"):
+            raise contract.CcCoreEnvironmentError("CC 점–평면 패치의 최종 원문 해시가 다릅니다.")
     bvh_implementation = manifest["bvh_source_sha256"]
     if not isinstance(bvh_implementation, Mapping) or set(bvh_implementation) != {"mesh_bvh.h", "mesh_bvh.cpp"}:
         raise contract.CcCoreEnvironmentError("CC BVH 구현 원문 목록이 올바르지 않습니다.")
@@ -458,7 +483,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         or self_test.get("coordinate_type") != "float32"
         or self_test.get("matrix_scalar_type") != "float64"
     ):
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v7 계약과 다릅니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v8 계약과 다릅니다.")
     expected_self_test_libraries = {
         "library_path": "CCCoreLib.dll",
         "tbb_library_path": "tbb12.dll",
@@ -470,7 +495,15 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         requested_max_threads=manifest_identity["requested_max_threads"],
         expected_identity=manifest_identity,
     )
+    cleanup_sources = manifest["mesh_cleanup_source_sha256"]
+    if (type(manifest["mesh_cleanup_abi"]) is not int or manifest["mesh_cleanup_abi"] != 1
+        or not isinstance(cleanup_sources, Mapping)
+        or set(cleanup_sources) != {"mesh_cleanup.h", "mesh_cleanup.cpp"}):
+        raise contract.CcCoreEnvironmentError("CC 메시 검사 ABI 또는 구현 원문 목록이 올바르지 않습니다.")
+    for name, digest in cleanup_sources.items():
+        _manifest_sha256(digest, name)
     required_paths = {
+        "colmap_mesh_cleanup.dll": executable.with_name("colmap_mesh_cleanup.dll"),
         "colmap_cccore_worker.exe": executable,
         "CCCoreLib.dll": executable.with_name("CCCoreLib.dll"),
         "tbb12.dll": executable.with_name("tbb12.dll"),
@@ -501,6 +534,8 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "cccore_dll_sha256": verified_hashes["CCCoreLib.dll"],
         "tbb_dll_sha256": verified_hashes["tbb12.dll"],
         "binary_sha256": verified_hashes,
+        "mesh_cleanup_abi": manifest["mesh_cleanup_abi"],
+        "mesh_cleanup_source_sha256": dict(cleanup_sources),
     }
     for key in (
         "protocol_version", "core_commit", "core_patch", "coordinate_type",
@@ -512,6 +547,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
         "icp_mesh_grid_reuse_patch", "icp_mesh_grid_reuse_patch_sha256", "icp_mesh_grid_reuse_source_sha256",
         "mesh_bvh_search_patch", "mesh_bvh_search_patch_sha256", "mesh_bvh_search_source_sha256", "bvh_source_sha256",
+        "point_to_plane_patch", "point_to_plane_patch_sha256", "point_to_plane_source_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",
@@ -628,7 +664,7 @@ class NativeRunner:
         cancel_probe: CancelProbe = None, progress_sink: ProgressSink = None,
         session_identity: Mapping[str, Any] | None = None,
     ) -> None:
-        """실행 파일·작업 식별자·고정 취소 경로를 검증하고 세션을 구성합니다."""
+        """실행 파일·메시 검사기·작업 식별자·고정 취소 경로를 검증해 세션을 구성합니다."""
         self.directory = Path(directory).resolve(strict=True)
         contract.job_path(self.directory, "cancel.request")
         self._cancel_path = self.directory / "cancel.request"
@@ -640,6 +676,10 @@ class NativeRunner:
         self.native_worker_sha256 = self.runtime_manifest["native_worker_sha256"]
         self.parameters = parameters
         self.cancel_probe = cancel_probe
+        self.mesh_cleaner = NativeMeshCleaner(
+            self.executable, self.runtime_manifest, max_threads=parameters["max_threads"],
+            check_cancelled=self.check_cancelled,
+        )
         self.progress_sink = progress_sink
         self.counter = 0
         self.core_commit = None
@@ -649,6 +689,7 @@ class NativeRunner:
         self.physical_native_calls: list[dict[str, Any]] = []
         self.last_call_reference: tuple[int, int] | None = None
         self.files: dict[str, Mapping[str, Any]] = {}
+        self.normal_fingerprints: dict[str, str | None] = {}
         self.native_root = contract.job_path(self.directory, "native")
         self.native_root.mkdir(exist_ok=True)
         identity = dict(session_identity or {})
@@ -818,9 +859,9 @@ class NativeRunner:
 
     def geometry(
         self, label: str, positions: np.ndarray, triangles: np.ndarray | None = None,
-        *, cache_scope: str = "SESSION",
+        *, cache_scope: str = "SESSION", normals: np.ndarray | None = None,
     ) -> Mapping[str, Any]:
-        """입력 배열과 세션·명령 수명 범위를 최초 한 번만 전용 바이너리로 기록합니다."""
+        """좌표·선택적 단위 노말과 캐시 수명을 검증하고 전용 바이너리로 기록합니다."""
         self.check_cancelled()
         if not isinstance(label, str) or not label or any(
             character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in label
@@ -828,7 +869,17 @@ class NativeRunner:
             raise contract.CcCoreInputError("CC 지오메트리 이름은 영문·숫자·하이픈·밑줄만 사용할 수 있습니다.")
         if cache_scope not in {"SESSION", "COMMAND"}:
             raise contract.CcCoreInputError("CC 지오메트리 캐시 범위가 올바르지 않습니다.")
+        normal_values = None if normals is None else np.ascontiguousarray(normals, dtype="<f8")
+        if normal_values is not None and (
+            normal_values.ndim != 2 or normal_values.shape[1] != 3
+            or normal_values.shape != np.shape(positions) or not np.isfinite(normal_values).all()
+            or not np.allclose(np.linalg.norm(normal_values, axis=1), 1.0, rtol=0, atol=1e-6)
+        ):
+            raise contract.CcCoreInputError("CC 출처면 노말은 좌표와 같은 개수의 유한 단위 벡터여야 합니다.")
+        normal_fingerprint = None if normal_values is None else hashlib.sha256(normal_values.tobytes()).hexdigest()
         if label in self.files:
+            if self.normal_fingerprints.get(label) != normal_fingerprint:
+                raise contract.CcCoreInputError("같은 CC 지오메트리 ID의 출처면 노말을 변경할 수 없습니다.")
             if self.files[label].get("cache_scope") != cache_scope:
                 raise contract.CcCoreInputError("같은 CC 지오메트리 ID의 캐시 범위를 변경할 수 없습니다.")
             return self.files[label]
@@ -846,6 +897,11 @@ class NativeRunner:
             triangle_values = np.ascontiguousarray(triangles, dtype="<u4")
             _write_array_atomic(contract.job_path(self.directory, triangle_name), triangle_values)
             entry.update({"triangles_file": triangle_name, "triangle_count": int(triangle_values.shape[0])})
+        if normal_values is not None:
+            normal_name = f"native/{label}-normals.bin"
+            _write_array_atomic(contract.job_path(self.directory, normal_name), normal_values)
+            entry["normals_file"] = normal_name
+        self.normal_fingerprints[label] = normal_fingerprint
         self.files[label] = entry
         return entry
 
@@ -933,8 +989,10 @@ class NativeRunner:
         evaluation_key_sha256: str = "",
         overlap_ratio: float = 1.0,
         search_domain: Mapping[str, Any] | None = None,
+        registration_method: str | None = None,
+        normal_cosine_threshold: float | None = None,
     ) -> dict[str, Any]:
-        """겹침 비율·준비 범위를 전달하고 응답·거리 파일·내부 ICP 통계를 검증합니다."""
+        """등록 방식·노말 필터와 겹침 비율을 전달하고 응답·거리·ICP 통계를 검증합니다."""
         self.check_cancelled()
         self._validate_runtime_unchanged("CC 호출 전에 실행 파일이나 라이브러리 배포 정보가 변경되었습니다.")
         self.start()
@@ -968,6 +1026,16 @@ class NativeRunner:
             "sampling_limit": sampling_limit,
             "max_threads": self.parameters["max_threads"],
         }
+        if operation == "register":
+            method = ("POINT_TO_PLANE" if "triangles_file" in model else "POINT_TO_POINT") if registration_method is None else registration_method
+            threshold = (0.5 if method == "POINT_TO_PLANE" and "triangles_file" in model and "normals_file" in data else -1.0) if normal_cosine_threshold is None else normal_cosine_threshold
+            if method not in {"POINT_TO_PLANE", "POINT_TO_POINT"} or (method == "POINT_TO_PLANE" and "triangles_file" not in model):
+                raise contract.CcCoreInputError("CC 등록 방식과 기준 형상 종류가 일치하지 않습니다.")
+            if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool) or not math.isfinite(threshold)
+                    or (threshold != -1 and not 0 <= threshold <= 1)
+                    or (threshold >= 0 and (method != "POINT_TO_PLANE" or "triangles_file" not in model or "normals_file" not in data))):
+                raise contract.CcCoreInputError("CC 노말 필터 임계값 또는 출처면 노말이 올바르지 않습니다.")
+            parameters.update(registration_method=method, normal_cosine_threshold=float(threshold))
         request = {
             **self._session_payload(), "sequence": number, "operation": operation, "stage": stage,
             "data": dict(data), "model": dict(model), "parameters": parameters,
@@ -1006,6 +1074,11 @@ class NativeRunner:
             result["icp_statistics"], mesh_registration=operation == "register" and "triangles_file" in model,
             kernel_seconds=timings["kernel_seconds"], max_iterations=parameters.get("max_iterations"),
         )
+        if icp_statistics is not None and (
+            icp_statistics["registration_method"] != parameters["registration_method"]
+            or icp_statistics["normal_filter_enabled"] != (parameters["normal_cosine_threshold"] >= 0)
+        ):
+            raise contract.CcCoreEnvironmentError("CC 등록 방식 또는 노말 필터 응답이 요청과 다릅니다.")
         if icp_statistics is not None and icp_statistics["stop_reason"] in {"ERROR", "CANCELLED"}:
             raise contract.CcCoreEnvironmentError("CC 성공 응답에 실패·취소된 내부 ICP 통계가 있습니다.")
         contract.validate_icp_native_result(icp_statistics, result.get("native_code"))
@@ -1314,11 +1387,12 @@ def prepare_candidate_samples(
     runner: NativeRunner, moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry,
     policy: Mapping[str, Any], reverse: bool,
     *, full_samples: dict[str, np.ndarray] | None = None,
+    registration_attributes: dict[str, np.ndarray] | None = None,
     preparation_progress: Callable[[str], None] | None = None,
     normalization: Mapping[str, Any] | None = None,
     geometry_bounds: tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """최종 형상 범위를 재사용하며 고정 검색 범위에서 독립 등록·평가 표본을 준비합니다."""
+    """독립 등록·평가 표본을 준비하고 요청된 등록 표본의 출처면 노말만 계산합니다."""
     parameters = runner.parameters
     search_domain = None
     if moving.triangles is not None or reference.triangles is not None:
@@ -1411,6 +1485,13 @@ def prepare_candidate_samples(
                         acceptance_hint=probe["candidate_acceptance_fraction"], progress=sample_progress,
                     )
                     registration = chosen.positions
+                    if registration_attributes is not None:
+                        faces = source.positions[source.triangles[chosen.source_indices]]
+                        normals = np.cross(faces[:, 1] - faces[:, 0], faces[:, 2] - faces[:, 0])
+                        lengths = np.linalg.norm(normals, axis=1)
+                        if not np.isfinite(lengths).all() or np.any(lengths <= 0):
+                            raise contract.CcCoreInputError("CC 등록 표본의 출처면 노말을 계산할 수 없습니다.")
+                        registration_attributes["normals"] = np.ascontiguousarray(normals / lengths[:, None])
                     diagnostics.update(registration=chosen.metadata, registration_sample_fingerprint=chosen.fingerprint,
                                        registration_sampling_seconds=float(monotonic() - registration_started))
                 full_started = monotonic()
@@ -1825,12 +1906,16 @@ def solve_cccore_job(
     )
 
     def execute_session() -> CcCoreSolverResult:
-        """정제 완료 형상의 범위를 공유하며 표본·등록·평가를 한 네이티브 세션에서 실행합니다."""
+        """네이티브 메시 검사 뒤 형상 범위를 공유하며 표본·등록·평가를 한 세션에서 실행합니다."""
         runner.start()
         progress("PREPARING", 0.02, "현재 초기 정렬에서 겹침 후보와 독립 평가 표본을 준비합니다.")
         runner.check_cancelled()
-        moving_world = _clean_mesh_geometry(contract.load_geometry(root, manifest["geometry"]["moving"]), "이동")
-        reference_world = _clean_mesh_geometry(contract.load_geometry(root, manifest["geometry"]["reference"]), "기준")
+        moving_world = _clean_mesh_geometry(
+            contract.load_geometry(root, manifest["geometry"]["moving"]), "이동", cleaner=runner.mesh_cleaner,
+        )
+        reference_world = _clean_mesh_geometry(
+            contract.load_geometry(root, manifest["geometry"]["reference"]), "기준", cleaner=runner.mesh_cleaner,
+        )
         normalization = make_normalization(moving_world.positions, reference_world.positions)
         moving = contract.CcCoreGeometry(
             moving_world.kind, normalization.apply(moving_world.positions), moving_world.triangles, moving_world.provenance
@@ -1838,8 +1923,8 @@ def solve_cccore_job(
         reference = contract.CcCoreGeometry(
             reference_world.kind, normalization.apply(reference_world.positions), reference_world.triangles, reference_world.provenance
         )
-        moving = _clean_mesh_geometry(moving, "이동", native_precision=True)
-        reference = _clean_mesh_geometry(reference, "기준", native_precision=True)
+        moving = _clean_mesh_geometry(moving, "이동", native_precision=True, cleaner=runner.mesh_cleaner)
+        reference = _clean_mesh_geometry(reference, "기준", native_precision=True, cleaner=runner.mesh_cleaner)
         geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
                                 for item in (moving, reference))
         mode = contract.GEOMETRY_MODES[(moving.kind, reference.kind)]
@@ -1856,9 +1941,10 @@ def solve_cccore_job(
             progress("PREPARING", 0.02, message)
 
         full_samples: dict[str, np.ndarray] = {}
+        registration_attributes: dict[str, np.ndarray] = {}
         data_positions, moving_overlap, reference_overlap, sampling_diagnostics = prepare_candidate_samples(
             runner, moving, reference, overlap_policy, reverse,
-            full_samples=full_samples, preparation_progress=preparation_progress,
+            full_samples=full_samples, registration_attributes=registration_attributes, preparation_progress=preparation_progress,
             normalization=normalization.to_mapping(),
             geometry_bounds=geometry_bounds,
         )
@@ -1895,12 +1981,16 @@ def solve_cccore_job(
         assess_correspondence_coverage(metrics["baseline"], overlap_policy)
         model_geometry = moving if reverse else reference
         # 등록 전 거리 조회와 등록이 같은 불변 표본을 사용하므로 세션 동안 유지합니다.
-        data = runner.geometry("registration-data", data_positions)
+        data_normals = registration_attributes.get("normals")
+        data = runner.geometry("registration-data", data_positions, normals=data_normals)
         model_label = "moving-model" if reverse else "reference-model"
         model = runner.geometry(model_label, model_geometry.positions, model_geometry.triangles)
         progress("RIGID", 0.20, "크기를 고정한 CC 정밀 정렬을 계산합니다.")
         rigid_ratio = registration_overlap_ratio(runner, data, model, overlap_policy, stage="RIGID")
-        rigid = runner.call("register", data, model, adjust_scale=False, reverse=reverse, stage="RIGID", overlap_ratio=rigid_ratio)
+        # 배율 오차가 남은 좁은 겹침에서도 기존 강체 후보와 독립 평가 정책을 보존합니다.
+        rigid = runner.call("register", data, model, adjust_scale=False, reverse=reverse, stage="RIGID",
+                            overlap_ratio=rigid_ratio, registration_method="POINT_TO_POINT",
+                            normal_cosine_threshold=-1.0)
         rigid_native = rigid["matrix_4x4"]
         deltas["rigid"] = np.linalg.inv(rigid_native) if reverse else rigid_native
         progress("RIGID_EVALUATION", 0.43, "크기 고정 결과를 같은 겹침 표본으로 평가합니다.")
@@ -1912,6 +2002,7 @@ def solve_cccore_job(
         # 두 번째 등록은 첫 번째 결과를 좌표에 반영하고 같은 원본 모델을 유지합니다.
         refined_data = runner.geometry(
             "registration-rigid-data", transform_positions(data_positions, rigid_native),
+            normals=None if data_normals is None else data_normals @ rigid_native[:3, :3].T,
         )
         progress("SCALE_REFINE", 0.57, "추가 배율 ±10퍼센트 안에서 CC 정렬을 정밀 보정합니다.")
         refined_ratio = registration_overlap_ratio(runner, refined_data, model, overlap_policy, stage="SCALE_REFINE")

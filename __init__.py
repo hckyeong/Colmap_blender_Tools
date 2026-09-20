@@ -1,6 +1,6 @@
 """세 독립 COLMAP 도구를 하나의 Blender Extension으로 등록합니다."""
 
-__version__ = "0.3.65"
+__version__ = "0.3.68"
 
 
 def register() -> None:

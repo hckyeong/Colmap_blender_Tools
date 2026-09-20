@@ -40,6 +40,19 @@ if(MSVC)
 endif()
 install(TARGETS colmap_cccore_worker RUNTIME DESTINATION .)
 
+# 메시 검사는 기존 정렬 엔진과 독립된 호출 규약과 라이브러리로 제공합니다.
+add_library(colmap_mesh_cleanup SHARED mesh_cleanup.cpp)
+target_compile_features(colmap_mesh_cleanup PRIVATE cxx_std_17)
+target_link_libraries(colmap_mesh_cleanup PRIVATE TBB::tbb)
+target_compile_definitions(colmap_mesh_cleanup PRIVATE NOMINMAX)
+set_target_properties(colmap_mesh_cleanup PROPERTIES PREFIX "" OUTPUT_NAME "colmap_mesh_cleanup")
+if(MSVC)
+  target_compile_options(colmap_mesh_cleanup PRIVATE /utf-8 /W4 /permissive- /fp:strict)
+else()
+  target_compile_options(colmap_mesh_cleanup PRIVATE -fno-fast-math -ffp-contract=off)
+endif()
+install(TARGETS colmap_mesh_cleanup RUNTIME DESTINATION . LIBRARY DESTINATION .)
+
 # 개발 검증에서만 정확 표면 검색의 독립 실행 시험을 빌드합니다.
 option(COLMAP_BUILD_BVH_TESTS "BVH 정확 표면 검색 단위 시험 빌드" OFF)
 if(COLMAP_BUILD_BVH_TESTS)

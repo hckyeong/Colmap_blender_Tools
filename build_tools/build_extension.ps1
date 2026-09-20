@@ -287,8 +287,8 @@ function Add-CcCoreEmbeddedRuntime {
     if ($LASTEXITCODE -ne 0) { throw "스테이징 CC 정렬 환경 검사가 실패했습니다." }
     $environment = $result | ConvertFrom-Json
     if (!$environment.ok -or $environment.backend_id -ne "CCCORELIB" -or
-        $environment.algorithm_version -ne "cccore-icp-v6" -or $environment.job_protocol_version -ne "cccore-job-v4" -or
-        $environment.native_environment.protocol_version -ne "cccore-native-v7" -or
+        $environment.algorithm_version -ne "cccore-icp-v7" -or $environment.job_protocol_version -ne "cccore-job-v4" -or
+        $environment.native_environment.protocol_version -ne "cccore-native-v8" -or
         $environment.native_environment.self_test -ne "passed") {
         throw "스테이징 CC 엔진 또는 최소 정렬 결과가 배포 계약과 다릅니다."
     }

@@ -11,9 +11,11 @@ import icp_cccore_contract as contract
 
 
 def mesh_icp_statistics():
-    """초기 거리와 한 번의 채택 반복을 가진 내부 ICP 통계를 만듭니다."""
+    """초기 거리와 한 번의 채택 반복을 가진 v8 점–평면 통계를 만듭니다."""
     return {**dict.fromkeys(contract.CC_ICP_COUNTER_FIELDS, 0),
             **dict.fromkeys(contract.CC_ICP_TIMING_FIELDS, 0.0),
+            "registration_method": "POINT_TO_PLANE", "normal_filter_enabled": False,
+            "normal_filter_rejected_count": 0, "point_to_plane_solve_count": 1, "minimum_linear_rank": 6,
             "iterations_attempted": 1, "iterations_accepted": 1, "distance_call_count": 2,
             "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 1,
             "query_octree_build_count": 2, "surface_search_backend": "GRID", "stop_reason": "MAX_ITERATIONS"}
@@ -76,7 +78,7 @@ class V4ContractTest(unittest.TestCase):
         changes = [{"iterations_accepted": 2}, {"iterations_attempted": True},
                    {"distance_call_count": 3}, {"mesh_grid_expansion_count": 2}, {"query_octree_build_count": 1},
                    {"mesh_grid_seconds": 0.5}, {"total_seconds": 2},
-                   {"stop_reason": "STABLE_CONVERGENCE"}, {"total_seconds": float("nan")}]
+                   {"stop_reason": "UNKNOWN_CONVERGENCE"}, {"total_seconds": float("nan")}]
         for change in changes:
             with self.subTest(change=change), self.assertRaises(contract.CcCoreEnvironmentError):
                 contract.validate_icp_statistics({**valid, **change}, mesh_registration=True, kernel_seconds=1)
@@ -110,9 +112,40 @@ class V4ContractTest(unittest.TestCase):
         contract.validate_icp_native_result(rejected, 0)
         initial = {**valid, "stop_reason": "NOTHING_TO_DO", "iterations_attempted": 0,
                    "iterations_accepted": 0, "distance_call_count": 1,
-                   "query_octree_build_count": 1, "mesh_grid_cache_hits": 0}
+                   "query_octree_build_count": 1, "mesh_grid_cache_hits": 0,
+                   "point_to_plane_solve_count": 0, "minimum_linear_rank": 0}
         contract.validate_icp_statistics(initial, mesh_registration=True, kernel_seconds=1)
         contract.validate_icp_native_result(initial, 0)
+
+    def test_point_to_plane_stable_convergence_counts(self):
+        """점–평면의 채택 수렴·미채택 수렴만 허용하고 점–점·과거 계약은 보존합니다."""
+        base = {**mesh_icp_statistics(), "stop_reason": "STABLE_CONVERGENCE",
+                "surface_search_backend": "BVH", "mesh_grid_build_count": 0,
+                "mesh_grid_cache_hits": 0, "query_octree_build_count": 0}
+        for attempted, accepted, distance in ((1, 1, 2), (1, 0, 1), (3, 3, 4), (3, 2, 3)):
+            with self.subTest(attempted=attempted, accepted=accepted, distance=distance):
+                stats = {**base, "iterations_attempted": attempted, "iterations_accepted": accepted,
+                         "distance_call_count": distance, "bvh_query_count": distance,
+                         "point_to_plane_solve_count": attempted}
+                self.assertEqual(contract.validate_icp_statistics(stats, mesh_registration=True,
+                                                                  kernel_seconds=1), stats)
+                contract.validate_icp_native_result(stats, 1 if accepted else 0)
+        for attempted, accepted, distance in ((0, 0, 1), (1, 0, 2), (1, 1, 1), (3, 1, 3), (3, 2, 4)):
+            with self.subTest(attempted=attempted, accepted=accepted, distance=distance):
+                stats = {**base, "iterations_attempted": attempted, "iterations_accepted": accepted,
+                         "distance_call_count": distance, "bvh_query_count": distance}
+                with self.assertRaises(contract.CcCoreEnvironmentError):
+                    contract.validate_icp_statistics(stats, mesh_registration=True, kernel_seconds=1)
+        point = {**base, "registration_method": "POINT_TO_POINT", "point_to_plane_solve_count": 0,
+                 "minimum_linear_rank": 0, "bvh_query_count": 2}
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            contract.validate_icp_statistics(point, mesh_registration=True, kernel_seconds=1)
+        legacy = {key: item for key, item in point.items() if key not in {
+            "registration_method", "normal_filter_enabled", "normal_filter_rejected_count",
+            "point_to_plane_solve_count", "minimum_linear_rank"}}
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            contract.validate_icp_statistics(legacy, mesh_registration=True, kernel_seconds=1,
+                                             native_protocol_version="cccore-native-v7")
 
     def test_mesh_registration_summaries_require_internal_statistics(self):
         """메시 등록의 내부 통계를 물리·논리 연결에 보존하고 누락을 거부합니다."""
@@ -205,13 +238,13 @@ class V4ContractTest(unittest.TestCase):
             from tools.align.project_persistence.codec import _decode_provenance
         finally:
             sys.path.pop(0)
-        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5", "cccore-native-v6"):
+        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5", "cccore-native-v6", "cccore-native-v7"):
             metadata = {"native_build_identity": {"protocol_version": version,
                         "core_patch": "mesh-grid-reuse-v1", "native_worker_sha256": "a" * 64},
                         "quality": "PASS"}
             original = AlignmentProvenanceRecord(
                 model_id="moving", method="ICP", backend_id="CCCORELIB",
-                algorithm_version="cccore-icp-v6", icp_status="PASS",
+                algorithm_version="cccore-icp-v7", icp_status="PASS",
                 engine_metadata_json=json.dumps(metadata),
             )
             for schema in (7, 8):
@@ -233,12 +266,12 @@ class V4ContractTest(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(contract.CcCoreInputError):
                 contract.surface_preparing_operation_limit(*arguments)
 
-    def test_surface_policy_preserves_sampling_with_native_v6(self):
-        """표면 정책과 세 독립 시드를 고정하고 준비 범위 통신 버전을 확인합니다."""
+    def test_surface_policy_preserves_sampling_with_native_v8(self):
+        """표면 정책과 독립 시드를 보존하면서 점–평면 알고리즘·통신 버전을 확인합니다."""
         parameters = contract.resolve_parameters({})
-        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v6")
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v7")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v7")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v8")
         self.assertEqual(parameters["mesh_sampling_policy"], "MESH_SURFACE_AREA_REJECTION_V1")
         self.assertEqual(parameters["mesh_probe_counts"], (8192, 32768, 131072))
         self.assertEqual(contract.surface_proposal_limit(50000), 10000000)
@@ -319,11 +352,11 @@ class V4ContractTest(unittest.TestCase):
     def test_prior_native_session_version_is_rejected(self):
         """이전 세션 버전을 새 작업의 성공 응답으로 수용하지 않습니다."""
         identity = {"session_id": "session", "job_id": "job", "input_fingerprint": "input"}
-        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5", "cccore-native-v6"):
+        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5", "cccore-native-v6", "cccore-native-v7"):
             with self.subTest(version=version), self.assertRaises(contract.CcCoreEnvironmentError):
                 contract.validate_native_session_identity({"protocol_version": version, **identity}, **identity)
         contract.validate_native_session_identity(
-            {"protocol_version": "cccore-native-v7", **identity}, **identity,
+            {"protocol_version": "cccore-native-v8", **identity}, **identity,
         )
 
 

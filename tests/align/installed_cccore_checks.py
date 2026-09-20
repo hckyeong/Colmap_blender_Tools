@@ -187,7 +187,7 @@ def _verified_thread_metadata(
     require_calls: bool = True,
     contract_module: Any = None,
 ) -> dict[str, Any]:
-    """설치본의 스레드·고정 호출 골격과 v7 BVH 내부 ICP 통계·성공 코드의 정합성을 검증합니다."""
+    """설치본의 스레드·고정 호출 골격과 v8 점–평면 내부 ICP 통계·성공 코드의 정합성을 검증합니다."""
     assert "farthest-mesh-correspondence-v1" in metadata["core_patch"].split("+")
     assert metadata["thread_backend"] == "oneTBB"
     assert metadata["tbb_version"] == "2022.0.0"
@@ -199,7 +199,7 @@ def _verified_thread_metadata(
     assert hardware >= 1 and effective == min(expected_requested, hardware)
     calls = metadata.get("logical_operations")
     if require_calls:
-        assert contract_module is not None, "설치본의 v7 통계 검증 모듈이 필요합니다."
+        assert contract_module is not None, "설치본의 v8 통계 검증 모듈이 필요합니다."
         assert metadata["native_process_count"] == 1
         assert metadata.get("native_calls") == calls
         assert isinstance(calls, list) and calls
@@ -289,13 +289,18 @@ def _verified_thread_metadata(
 
 def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, reference_mesh: bool,
                                 native_path: Path) -> dict[str, Any]:
-    """설치본의 기존 패치·BVH 신원·검색 통계와 표본·독립 평가 계약을 검증합니다."""
-    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v6"
+    """설치본의 메시 검사·점평면 패치와 단계별 풀이·고정 표본·독립 평가를 검증합니다."""
+    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v7"
     assert metadata["job_protocol_version"] == "cccore-job-v4"
     identity = metadata["native_build_identity"]
-    assert identity["protocol_version"] == "cccore-native-v7"
+    assert identity["protocol_version"] == "cccore-native-v8"
     assert identity["registration_safety_patch"] == "farthest-mesh-correspondence-v1"
     runtime_manifest = json.loads(native_path.with_name("runtime_manifest.json").read_text(encoding="utf-8"))
+    assert identity["mesh_cleanup_abi"] == runtime_manifest["mesh_cleanup_abi"] == 1
+    assert identity["mesh_cleanup_source_sha256"] == runtime_manifest["mesh_cleanup_source_sha256"]
+    assert set(identity["mesh_cleanup_source_sha256"]) == {"mesh_cleanup.h", "mesh_cleanup.cpp"}
+    assert identity["binary_sha256"]["colmap_mesh_cleanup.dll"] == hashlib.sha256(
+        native_path.with_name("colmap_mesh_cleanup.dll").read_bytes()).hexdigest()
     safety = runtime_manifest["dependencies"]["cccore"]["registration_safety_patch"]
     assert safety["id"] == identity["registration_safety_patch"]
     assert identity["registration_safety_patch_sha256"] == safety["sha256"]
@@ -344,8 +349,19 @@ def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, ref
     assert set(identity["bvh_source_sha256"]) == {"mesh_bvh.h", "mesh_bvh.cpp"}
     assert all(len(value) == 64 and all(char in "0123456789abcdef" for char in value)
                for value in identity["bvh_source_sha256"].values())
+    plane = runtime_manifest["dependencies"]["cccore"]["point_to_plane_patch"]
+    assert identity["point_to_plane_patch"] == plane["id"] == "point-to-plane-v1"
+    assert identity["point_to_plane_patch_sha256"] == plane["sha256"]
+    assert identity["point_to_plane_source_sha256"] == {
+        item["path"]: item["patched_sha256"] for item in plane["files"]
+    }
+    assert set(identity["point_to_plane_source_sha256"]) == {
+        "include/RegistrationTools.h", "src/RegistrationTools.cpp",
+    }
+    assert all(item["original_sha256"] == identity["mesh_bvh_search_source_sha256"][item["path"]]
+               for item in plane["files"])
     expected_patches = {"bounded-scale-v1", "multithread-state-race-v1", safety["id"], grid["id"],
-                        reuse["id"], domain["id"], icp["id"], bvh["id"]}
+                        reuse["id"], domain["id"], icp["id"], bvh["id"], plane["id"]}
     assert set(identity["core_patch"].split("+")) == expected_patches
     assert set(metadata["core_patch"].split("+")) == expected_patches
     for stage in metadata["registration_stages"]:
@@ -359,7 +375,27 @@ def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, ref
                 "query_octree_build_count", "model_level_seconds", "query_octree_seconds", "mesh_grid_seconds",
             ))
             assert statistics["iterations_accepted"] <= statistics["iterations_attempted"] <= stage["max_iterations"]
-            assert statistics["distance_call_count"] == statistics["bvh_query_count"] == statistics["iterations_attempted"] + 1
+            point_to_plane = stage["stage"] == "scale_refine"
+            normal_filter = point_to_plane and moving_mesh and reference_mesh
+            assert statistics["registration_method"] == ("POINT_TO_PLANE" if point_to_plane else "POINT_TO_POINT")
+            assert statistics["normal_filter_enabled"] is normal_filter
+            assert type(statistics["normal_filter_rejected_count"]) is int and statistics["normal_filter_rejected_count"] >= 0
+            assert normal_filter or statistics["normal_filter_rejected_count"] == 0
+            assert type(statistics["point_to_plane_solve_count"]) is int
+            assert 0 <= statistics["point_to_plane_solve_count"] <= statistics["iterations_attempted"]
+            assert type(statistics["minimum_linear_rank"]) is int and 0 <= statistics["minimum_linear_rank"] <= 7
+            if not point_to_plane:
+                assert statistics["point_to_plane_solve_count"] == statistics["minimum_linear_rank"] == 0
+            attempted = statistics["iterations_attempted"]
+            accepted = statistics["iterations_accepted"]
+            distance_count = statistics["distance_call_count"]
+            assert distance_count == statistics["bvh_query_count"]
+            if statistics["stop_reason"] == "STABLE_CONVERGENCE":
+                assert point_to_plane and attempted >= 1
+                assert (accepted == attempted and distance_count == attempted + 1) or (
+                    accepted + 1 == attempted and distance_count == attempted)
+            else:
+                assert distance_count == attempted + 1
         else:
             assert statistics is None
     parameters = metadata["parameters"]
@@ -422,7 +458,7 @@ def _wait_for_result(runtime_module, runtime, *, timeout_seconds: float = 180.0)
 
 def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
               moving_mesh: bool, reference_mesh: bool, python_path: Path, native_path: Path) -> dict[str, Any]:
-    """설치본 v7 BVH 계약으로 정렬 기록을 검사하고 고정 표본·정답 행렬·승인·Undo/Redo를 검증합니다."""
+    """설치본 v8 점–평면 계약으로 정렬 기록을 검사하고 고정 표본·정답 행렬·승인·Undo/Redo를 검증합니다."""
     runtime, expected = _runtime_fixture(modules, output_root, mode, moving_mesh, reference_mesh)
     api = modules["runtime"]
     repository = runtime.model_repository
@@ -466,7 +502,7 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
         commit = api.approve_icp_result(runtime)
         provenance = runtime.model_catalog.models["moving"].alignment_provenance
         assert provenance.backend_id == "CCCORELIB"
-        assert provenance.algorithm_version == "cccore-icp-v6"
+        assert provenance.algorithm_version == "cccore-icp-v7"
         assert provenance.icp_rmse == metrics["overlap_mean_rms"]
         assert runtime.model_catalog.models["moving"].registration_status == "REGISTERED"
         expected_dependencies = tuple(sorted((("moving", "COMPANION" if moving_mesh else "MAIN"),

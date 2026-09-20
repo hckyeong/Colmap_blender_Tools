@@ -33,7 +33,7 @@ $TbbCMake = Join-Path $TbbRoot $Lock.tbb.cmake_dir
 $TbbRuntime = Join-Path $TbbRoot $Lock.tbb.runtime_file
 $TbbLicense = Join-Path $TbbRoot $Lock.tbb.license_source
 $TbbThirdParty = Join-Path $TbbRoot $Lock.tbb.third_party_source
-$RuntimeBinaries = @('colmap_cccore_worker.exe','CCCoreLib.dll','tbb12.dll','msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','concrt140.dll')
+$RuntimeBinaries = @('colmap_cccore_worker.exe','colmap_mesh_cleanup.dll','CCCoreLib.dll','tbb12.dll','msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','concrt140.dll')
 $RuntimeLicenses = @('CCCoreLib-LGPL-2.0.txt','CCCoreLib-build-MIT.txt','nanoflann-BSD.txt','json-MIT.txt','oneTBB-Apache-2.0.txt','oneTBB-third-party-programs.txt','COLMAP-Tools-GPL.txt')
 $ExpectedRuntimeFiles = @($RuntimeBinaries) + @($RuntimeLicenses | ForEach-Object { "licenses\$_" }) + @(
     'cccore_rebuild_sources.zip','native_test_report.json','REBUILD.md','THIRD_PARTY_NOTICES.md','runtime_manifest.json'
@@ -180,14 +180,14 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 BVH 검색까지의 패치와 최종 원문·배포 해시를 연결하는지 검사합니다. #>
+    <# Manifest가 메시 검사와 점평면까지의 원문·배포 해시를 연결하는지 검사합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.protocol_version -ne $Lock.protocol_version -or $manifest.tbb_version -ne $Lock.tbb.version) {
         throw "Runtime Manifest의 프로토콜 또는 oneTBB 버전이 잠금 정보와 다릅니다."
     }
-    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)+$($Lock.cccore.icp_mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_bvh_search_patch.id)"
+    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)+$($Lock.cccore.icp_mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_bvh_search_patch.id)+$($Lock.cccore.point_to_plane_patch.id)"
     if ($manifest.core_patch -ne $expectedCorePatch -or $manifest.self_test.core_patch -ne $expectedCorePatch -or
         $manifest.registration_safety_patch -ne $Lock.cccore.registration_safety_patch.id -or
         $manifest.registration_safety_patch_sha256 -ne $Lock.cccore.registration_safety_patch.sha256 -or
@@ -268,6 +268,30 @@ function Assert-RuntimeManifest {
             throw "Runtime Manifest의 BVH 패치 최종 원문 해시가 다릅니다."
         }
     }
+    $planePatch = $Lock.cccore.point_to_plane_patch
+    if ($manifest.point_to_plane_patch -ne $planePatch.id -or
+        $manifest.point_to_plane_patch_sha256 -ne $planePatch.sha256) {
+        throw "Runtime Manifest의 점평면 패치가 잠금 정보와 다릅니다."
+    }
+    $planeNames = @($manifest.point_to_plane_source_sha256.PSObject.Properties.Name | Sort-Object)
+    $expectedPlaneNames = @($planePatch.files | ForEach-Object { $_.path } | Sort-Object)
+    if (@(Compare-Object -ReferenceObject $expectedPlaneNames -DifferenceObject $planeNames).Count -ne 0) {
+        throw "Runtime Manifest의 점평면 원문 목록이 다릅니다."
+    }
+    foreach ($source in $planePatch.files) {
+        if ($manifest.point_to_plane_source_sha256.($source.path) -ne $source.patched_sha256) {
+            throw "Runtime Manifest의 점평면 최종 원문 해시가 다릅니다: $($source.path)"
+        }
+    }
+    # 메시 검사 ABI와 실제 컴파일 원문을 같은 배포 단위로 확인합니다.
+    if ($manifest.mesh_cleanup_abi -ne 1) { throw "Runtime Manifest의 메시 검사 ABI가 다릅니다." }
+    $cleanupNames = @($manifest.mesh_cleanup_source_sha256.PSObject.Properties.Name | Sort-Object)
+    if (@(Compare-Object -ReferenceObject @('mesh_cleanup.cpp', 'mesh_cleanup.h') -DifferenceObject $cleanupNames).Count -ne 0) {
+        throw "Runtime Manifest의 메시 검사 원문 목록이 다릅니다."
+    }
+    foreach ($name in $cleanupNames) {
+        Assert-Hash (Join-Path $NativeSource $name) $manifest.mesh_cleanup_source_sha256.$name
+    }
     $bvhImplementationNames = @($manifest.bvh_source_sha256.PSObject.Properties.Name | Sort-Object)
     if (@(Compare-Object -ReferenceObject @('mesh_bvh.cpp', 'mesh_bvh.h') -DifferenceObject $bvhImplementationNames).Count -ne 0) {
         throw "Runtime Manifest의 BVH 구현 원문 목록이 다릅니다."
@@ -331,6 +355,25 @@ foreach ($changedFile in $changedFiles) {
 if ((& git -C $CoreSource ls-files --others --exclude-standard)) { throw "CCCoreLib 캐시에 추적되지 않은 파일이 있습니다." }
 # 완전히 검증된 마지막 패치만 되돌려 기존 패치 단계의 입력 해시를 순서대로 재검증합니다.
 # 기존 캐시의 BVH 최종 패치를 먼저 해제하여 기존 일곱 패치의 검증을 그대로 유지합니다.
+$PointToPlanePatch = $Lock.cccore.point_to_plane_patch
+$PointToPlanePatchFile = Join-Path $NativeSource $PointToPlanePatch.file
+Assert-Hash $PointToPlanePatchFile $PointToPlanePatch.sha256
+$planePatchedCount = 0
+foreach ($source in $PointToPlanePatch.files) {
+    if ((Get-NormalizedSha256 (Join-Path $CoreSource $source.path)) -eq $source.patched_sha256) { $planePatchedCount++ }
+}
+if ($planePatchedCount -and $planePatchedCount -ne $PointToPlanePatch.files.Count) {
+    throw "점평면 패치가 일부 파일에만 적용되어 있습니다."
+}
+if ($planePatchedCount -eq $PointToPlanePatch.files.Count) {
+    foreach ($source in $PointToPlanePatch.files) {
+        $sourcePath = Join-Path $CoreSource $source.path
+        [IO.File]::WriteAllText($sourcePath, [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+    }
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--reverse', '--check', $PointToPlanePatchFile)
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--reverse', $PointToPlanePatchFile)
+    foreach ($source in $PointToPlanePatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.original_sha256 }
+}
 $MeshBvhPatch = $Lock.cccore.mesh_bvh_search_patch
 $MeshBvhPatchFile = Join-Path $NativeSource $MeshBvhPatch.file
 Assert-Hash $MeshBvhPatchFile $MeshBvhPatch.sha256
@@ -561,6 +604,18 @@ Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '-
 Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $MeshBvhPatchFile)
 foreach ($source in $MeshBvhPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
 
+# 점평면 후행 패치는 검증된 BVH 등록 원문에만 연결합니다.
+foreach ($source in $PointToPlanePatch.files) {
+    $previous = @($MeshBvhPatch.files | Where-Object { $_.path -eq $source.path })
+    if ($previous.Count -ne 1 -or $previous[0].patched_sha256 -ne $source.original_sha256) {
+        throw "점평면 패치의 입력 원문이 BVH 패치와 연결되지 않습니다: $($source.path)"
+    }
+    Assert-Hash (Join-Path $CoreSource $source.path) $source.original_sha256
+}
+Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $PointToPlanePatchFile)
+Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $PointToPlanePatchFile)
+foreach ($source in $PointToPlanePatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
+
 Get-PinnedFile $Lock.json.header_url (Join-Path $Dependencies 'json.hpp') $Lock.json.header_sha256
 Get-PinnedFile $Lock.json.license_url (Join-Path $Dependencies 'json-LICENSE.MIT') $Lock.json.license_sha256
 Get-PinnedFile $Lock.tbb.archive_url $TbbArchive $Lock.tbb.archive_sha256
@@ -582,9 +637,9 @@ $CMake = Join-Path $VisualStudio "Common7\IDE\CommonExtensions\Microsoft\CMake\C
 if (!(Test-Path -LiteralPath $CMake)) { throw "Visual Studio에 포함된 CMake를 찾지 못했습니다." }
 Invoke-Checked $CMake @('-S',$NativeSource,'-B',$BuildPath,'-G','Visual Studio 17 2022','-A','x64',
     "-DCCCORE_SOURCE=$CoreSource","-DJSON_INCLUDE_DIR=$Dependencies","-DTBB_DIR=$TbbCMake","-DCORE_COMMIT=$($Lock.cccore.commit)",
-    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)+$($MeshBvhPatch.id)")
+    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)+$($MeshBvhPatch.id)+$($PointToPlanePatch.id)")
 Invoke-Checked $CMake @('--build',$BuildPath,'--config','Release','--parallel','8')
-foreach ($binary in @('colmap_cccore_worker.exe','CCCoreLib.dll')) {
+foreach ($binary in @('colmap_cccore_worker.exe','colmap_mesh_cleanup.dll','CCCoreLib.dll')) {
     Copy-Item -LiteralPath (Join-Path $BuildPath "bin\$binary") -Destination (Join-Path $StagedRuntime $binary) -Force
 }
 Copy-Item -LiteralPath $TbbRuntime -Destination (Join-Path $StagedRuntime 'tbb12.dll') -Force
@@ -613,6 +668,7 @@ Copy-SourceTree $NanoSource (Join-Path $SourcePackage 'cccore-src\extern\nanofla
 $PackagedNative = Join-Path $SourcePackage 'native'
 New-Item -ItemType Directory -Path $PackagedNative, (Join-Path $SourcePackage 'json') -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $NativeSource 'main.cpp'), (Join-Path $NativeSource 'mesh_bvh.h'), (Join-Path $NativeSource 'mesh_bvh.cpp'), (Join-Path $NativeSource 'CMakeLists.txt'), (Join-Path $NativeSource 'dependencies.lock.json'), (Join-Path $NativeSource 'REBUILD.md') -Destination $PackagedNative -Force
+Copy-Item -LiteralPath (Join-Path $NativeSource 'mesh_cleanup.h'), (Join-Path $NativeSource 'mesh_cleanup.cpp') -Destination $PackagedNative -Force
 Copy-Item -LiteralPath (Join-Path $NativeSource 'patches') -Destination $PackagedNative -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $Dependencies 'json.hpp'), (Join-Path $Dependencies 'json-LICENSE.MIT') -Destination (Join-Path $SourcePackage 'json') -Force
 $PackagedTbb = Join-Path $SourcePackage 'tbb'
@@ -623,6 +679,7 @@ if (Test-Path -LiteralPath $PackagedTbb) {
 New-Item -ItemType Directory -Path $PackagedTbb -Force | Out-Null
 Copy-Item -LiteralPath $TbbArchive -Destination (Join-Path $PackagedTbb $Lock.tbb.archive_name) -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\native\test_cccore_worker.py') -Destination $SourcePackage -Force
+Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\native\test_point_to_plane.py') -Destination $SourcePackage -Force
 # Python 회귀와 선택적 C++ 시험이 같은 고정 입력을 원문 묶음에서 읽도록 보존합니다.
 $NativeTests = Join-Path $ProjectRoot 'tests\align\native'
 $PackagedTests = Join-Path $SourcePackage 'tests\align\native'
@@ -630,6 +687,13 @@ $PackagedFixtures = Join-Path $SourcePackage 'fixtures'
 New-Item -ItemType Directory -Path $PackagedTests, $PackagedFixtures -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $NativeTests 'test_mesh_bvh.cpp'), (Join-Path $NativeTests 'test_bvh_icp.cpp') -Destination $PackagedTests -Force
 Copy-Item -LiteralPath (Join-Path $NativeTests 'fixtures\bvh_tetra_surface.json') -Destination $PackagedFixtures -Force
+# 메시 검사 비교 시험에 필요한 순수 파이썬 원문을 동일한 상대 경로로 보존합니다.
+$PackagedAlignment = Join-Path $SourcePackage 'tools\align\alignment'
+New-Item -ItemType Directory -Path $PackagedAlignment -Force | Out-Null
+foreach ($name in @('icp_cccore_solver.py', 'icp_cccore_contract.py', 'icp_cccore_overlap.py', 'icp_mesh_cleanup.py', 'icp_mesh_cleanup_native.py')) {
+    Copy-Item -LiteralPath (Join-Path $ProjectRoot "tools\align\alignment\$name") -Destination $PackagedAlignment -Force
+}
+Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\test_icp_mesh_cleanup_native.py') -Destination (Join-Path $SourcePackage 'tests\align') -Force
 
 $SourceArchive = Join-Path $StagedRuntime 'cccore_rebuild_sources.zip'
 Compress-Archive -Path (Join-Path $SourcePackage '*') -DestinationPath $SourceArchive -Force
@@ -640,6 +704,7 @@ $oldWorker = $env:COLMAP_CCCORE_WORKER
 try {
     $env:COLMAP_CCCORE_WORKER = Join-Path $StagedRuntime 'colmap_cccore_worker.exe'
     Invoke-Checked $TestPython @('-X','utf8','-I',(Join-Path $ProjectRoot 'tests\align\native\test_cccore_worker.py'),'--report',(Join-Path $StagedRuntime 'native_test_report.json'))
+    Invoke-Checked $TestPython @('-X','utf8',(Join-Path $ProjectRoot 'tests\align\native\test_point_to_plane.py'))
 }
 finally { $env:COLMAP_CCCORE_WORKER = $oldWorker }
 # 배포 보고서가 폐기되는 staging 경로 대신 런타임 내부 상대 경로를 기록하게 합니다.
@@ -665,15 +730,22 @@ $IcpMeshGridSourceHashes = [ordered]@{}
 foreach ($source in $IcpMeshGridPatch.files) { $IcpMeshGridSourceHashes[$source.path] = $source.patched_sha256 }
 $MeshBvhSourceHashes = [ordered]@{}
 foreach ($source in $MeshBvhPatch.files) { $MeshBvhSourceHashes[$source.path] = $source.patched_sha256 }
+$PointToPlaneSourceHashes = [ordered]@{}
+foreach ($source in $PointToPlanePatch.files) { $PointToPlaneSourceHashes[$source.path] = $source.patched_sha256 }
 $BvhImplementationHashes = [ordered]@{}
 foreach ($name in @('mesh_bvh.h', 'mesh_bvh.cpp')) {
     $BvhImplementationHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $NativeSource $name) -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 $Manifest = [ordered]@{
+    mesh_cleanup_abi = 1
+    mesh_cleanup_source_sha256 = [ordered]@{
+        'mesh_cleanup.h' = (Get-FileHash -LiteralPath (Join-Path $NativeSource 'mesh_cleanup.h') -Algorithm SHA256).Hash.ToLowerInvariant()
+        'mesh_cleanup.cpp' = (Get-FileHash -LiteralPath (Join-Path $NativeSource 'mesh_cleanup.cpp') -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
     protocol_version = $Lock.protocol_version
     platform = 'windows-x64'
     core_commit = $Lock.cccore.commit
-    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)+$($MeshBvhPatch.id)"
+    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)+$($MeshBvhPatch.id)+$($PointToPlanePatch.id)"
     core_patch_sha256 = $Lock.cccore.patch_sha256
     concurrency_patch = $ConcurrencyPatch.patch_id
     concurrency_patch_sha256 = $ConcurrencyPatch.patch_sha256
@@ -695,6 +767,9 @@ $Manifest = [ordered]@{
     mesh_bvh_search_patch = $MeshBvhPatch.id
     mesh_bvh_search_patch_sha256 = $MeshBvhPatch.sha256
     mesh_bvh_search_source_sha256 = $MeshBvhSourceHashes
+    point_to_plane_patch = $PointToPlanePatch.id
+    point_to_plane_patch_sha256 = $PointToPlanePatch.sha256
+    point_to_plane_source_sha256 = $PointToPlaneSourceHashes
     bvh_source_sha256 = $BvhImplementationHashes
     dependencies = $Lock
     build_options = @{ CCCORELIB_SHARED=$true; CCCORELIB_USE_QT_CONCURRENT=$false; CCCORELIB_USE_TBB=$true; CCCORELIB_USE_CGAL=$false; configuration='Release' }
@@ -727,6 +802,12 @@ $Manifest = [ordered]@{
 $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $StagedRuntime 'runtime_manifest.json') -Encoding utf8
 Assert-ExactFileSet $StagedRuntime $ExpectedRuntimeFiles
 Assert-RuntimeManifest $StagedRuntime
+$oldCleanupWorker = $env:COLMAP_CCCORE_WORKER
+try {
+    $env:COLMAP_CCCORE_WORKER = Join-Path $StagedRuntime 'colmap_cccore_worker.exe'
+    Invoke-Checked $TestPython @('-X','utf8',(Join-Path $ProjectRoot 'tests\align\test_icp_mesh_cleanup_native.py'))
+}
+finally { $env:COLMAP_CCCORE_WORKER = $oldCleanupWorker }
 
 $hadRuntime = Test-Path -LiteralPath $RuntimePath
 $stagePublished = $false

@@ -14,9 +14,9 @@ from typing import Any, Mapping
 import numpy as np
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v6"
+CC_ALGORITHM_VERSION = "cccore-icp-v7"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
-CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v7"
+CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v8"
 CC_NATIVE_COORDINATE_MAX = float(np.finfo(np.float32).max)
 CC_LEGACY_NATIVE_PROTOCOL_VERSION = "cccore-native-v2"
 CC_THREAD_BACKEND = "oneTBB"
@@ -362,18 +362,37 @@ def validate_native_timings(value: Any) -> dict[str, float]:
 
 
 def validate_icp_statistics(value: Any, *, mesh_registration: bool, kernel_seconds: float,
-                            max_iterations: int | None = None) -> dict[str, Any] | None:
-    """등록 내부 통계를 외부 세션 합계와 분리하여 횟수·시간·종료 사유를 검증합니다."""
+                            max_iterations: int | None = None,
+                            native_protocol_version: str = CC_NATIVE_PROTOCOL_VERSION) -> dict[str, Any] | None:
+    """등록 통계와 점–평면 수렴의 채택·재조회 경계를 정확한 반복 횟수로 검증합니다."""
     if not mesh_registration:
         if value is not None:
             raise CcCoreEnvironmentError("CC 거리·점군 등록에는 내부 메시 통계를 기록할 수 없습니다.")
         return None
-    if not isinstance(value, Mapping) or set(value) != {*CC_ICP_COUNTER_FIELDS, *CC_ICP_TIMING_FIELDS, "stop_reason", "surface_search_backend"}:
+    plane_fields = {"registration_method", "normal_filter_enabled", "normal_filter_rejected_count",
+                    "point_to_plane_solve_count", "minimum_linear_rank"} if native_protocol_version == CC_NATIVE_PROTOCOL_VERSION else set()
+    if native_protocol_version not in {CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v7"}:
+        raise CcCoreEnvironmentError("CC 내부 ICP 통계의 네이티브 버전이 지원되지 않습니다.")
+    if not isinstance(value, Mapping) or set(value) != {*CC_ICP_COUNTER_FIELDS, *CC_ICP_TIMING_FIELDS, "stop_reason", "surface_search_backend", *plane_fields}:
         raise CcCoreEnvironmentError("CC 내부 ICP 통계가 고정 계약과 다릅니다.")
     result = {name: nonnegative_integer(value[name], f"CC 내부 ICP {name}") for name in CC_ICP_COUNTER_FIELDS}
     result.update({name: finite_nonnegative_number(value[name], f"CC 내부 ICP {name}") for name in CC_ICP_TIMING_FIELDS})
+    if plane_fields:
+        method = value["registration_method"]
+        if method not in {"POINT_TO_PLANE", "POINT_TO_POINT"} or type(value["normal_filter_enabled"]) is not bool:
+            raise CcCoreEnvironmentError("CC 등록 방식 또는 노말 필터 상태가 올바르지 않습니다.")
+        result.update(registration_method=method, normal_filter_enabled=value["normal_filter_enabled"])
+        for name in ("normal_filter_rejected_count", "point_to_plane_solve_count", "minimum_linear_rank"):
+            result[name] = nonnegative_integer(value[name], f"CC 내부 ICP {name}")
+        if (result["minimum_linear_rank"] > 7
+                or (not result["normal_filter_enabled"] and result["normal_filter_rejected_count"] != 0)
+                or (method == "POINT_TO_POINT" and (result["point_to_plane_solve_count"] != 0 or result["minimum_linear_rank"] != 0))):
+            raise CcCoreEnvironmentError("CC 노말 필터 또는 점–평면 풀이 진단이 등록 방식과 다릅니다.")
     reason = value["stop_reason"]
-    if not isinstance(reason, str) or reason not in {"MAX_ITERATIONS", "RMS_INCREASE", "NOTHING_TO_DO", "ERROR", "CANCELLED"}:
+    allowed_reasons = {"MAX_ITERATIONS", "RMS_INCREASE", "NOTHING_TO_DO", "ERROR", "CANCELLED"}
+    if result.get("registration_method") == "POINT_TO_PLANE":
+        allowed_reasons.add("STABLE_CONVERGENCE")
+    if not isinstance(reason, str) or reason not in allowed_reasons:
         raise CcCoreEnvironmentError("CC 내부 ICP 종료 사유가 올바르지 않습니다.")
     result["stop_reason"] = reason
     if result["iterations_accepted"] > result["iterations_attempted"]:
@@ -404,7 +423,15 @@ def validate_icp_statistics(value: Any, *, mesh_registration: bool, kernel_secon
                 raise CcCoreEnvironmentError("CC 내부 ICP 격자 또는 질의 옥트리 생성 수가 거리 호출과 다릅니다.")
     attempted = result["iterations_attempted"]
     accepted = result["iterations_accepted"]
-    if reason not in {"ERROR", "CANCELLED"} and result["distance_call_count"] != attempted + 1:
+    if reason == "STABLE_CONVERGENCE":
+        # 감소 없는 마지막 풀이는 변환·최근접 재조회 없이 종료합니다.
+        valid_stable = attempted >= 1 and (
+            (accepted == attempted and result["distance_call_count"] == attempted + 1)
+            or (accepted + 1 == attempted and result["distance_call_count"] == attempted)
+        )
+        if not valid_stable:
+            raise CcCoreEnvironmentError("CC 점–평면 수렴의 채택 반복과 최근접 재조회 수가 일치하지 않습니다.")
+    elif reason not in {"ERROR", "CANCELLED"} and result["distance_call_count"] != attempted + 1:
         raise CcCoreEnvironmentError("CC 내부 ICP 거리 호출 수가 초기 조회와 반복 시도 수의 합계와 다릅니다.")
     if reason == "MAX_ITERATIONS" and (
         attempted < 1 or accepted != attempted or (max_iterations is not None and attempted != max_iterations)

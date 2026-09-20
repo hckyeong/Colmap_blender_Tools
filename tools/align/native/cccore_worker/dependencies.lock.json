@@ -1,5 +1,5 @@
 {
-  "protocol_version": "cccore-native-v7",
+  "protocol_version": "cccore-native-v8",
   "cccore": {
     "repository": "https://github.com/CloudCompare/CCCoreLib.git",
     "commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432",
@@ -152,6 +152,23 @@
           "path": "src/RegistrationTools.cpp",
           "original_sha256": "b37a859e27369d0c620a263b027845bfbeca639f480e422bf0e01d718abba0be",
           "patched_sha256": "c10ba35c31daf457cc277187d31ea3a7b8a7aba0f068aacb18a1bdbcc9cf8193"
+        }
+      ]
+    },
+    "point_to_plane_patch": {
+      "id": "point-to-plane-v1",
+      "file": "patches/point_to_plane.patch",
+      "sha256": "b7906031cd8b1370e2afb873e2828db22d6829e50f5e37ff6bdfbeeb420d77ef",
+      "files": [
+        {
+          "path": "include/RegistrationTools.h",
+          "original_sha256": "4aba9aad129da5b8d491f61f593ce17076cf121e318c3a25ee408a325fa75a51",
+          "patched_sha256": "ad051d90553e83aba5f4a473880c98d2722028d95a3234f4dbb7c44ca24f95e5"
+        },
+        {
+          "path": "src/RegistrationTools.cpp",
+          "original_sha256": "c10ba35c31daf457cc277187d31ea3a7b8a7aba0f068aacb18a1bdbcc9cf8193",
+          "patched_sha256": "ee04e6b21d9f66273089fdb8e7ab0fd547bc69682309aa98cd36f37b19e7fdce"
         }
       ]
     }

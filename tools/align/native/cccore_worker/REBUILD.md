@@ -1,5 +1,7 @@
 # 재빌드와 변경 원문
 
+0.3.68은 같은 CMake 빌드에 자체 메시 검사 대상 `colmap_mesh_cleanup`을 추가합니다. 이 DLL은 oneTBB만 연결하며 CCCoreLib를 수정하지 않습니다. MSVC `/fp:strict`로 기존 면 판정의 연산 순서를 유지하고, ABI 1과 원문·바이너리 해시를 Runtime Manifest에서 검사합니다. 재빌드 ZIP의 `tests/align/test_icp_mesh_cleanup_native.py`와 `tools/align/alignment/` 순수 모듈은 실제 DLL을 기존 NumPy 판정과 비교하는 재현 자료입니다. 시험은 NumPy가 있는 Python에서 `COLMAP_CCCORE_WORKER`를 재빌드 실행 파일의 절대경로로 지정하여 실행합니다.
+
 2026-09-04 기준 Windows x64, Visual Studio 2022 C++ 도구와 해당 설치본의 CMake로 빌드했습니다. 준비 스크립트가 고정 oneTBB `2022.0.0` 정확한 버전을 검증해 사용하므로 별도 Qt·CGAL 설치는 필요하지 않습니다.
 
 ## 고정 원문
@@ -163,3 +165,11 @@ CMake는 배포 묶음과 저장소의 시험 경로를 자동 구분합니다. 
 변경 대상은 자체 워커의 `mesh_bvh.h`, `mesh_bvh.cpp`와 CPU 상한을 전달하는 `main.cpp`입니다. 기존 CCCoreLib 패치와 고정 의존성은 바꾸지 않습니다. 노드 선할당과 독립 구간 병렬 생성은 같은 중앙 분할·원본 삼각형 번호·정확 검색을 유지하며, 최초 생성 이후에는 기존 세션 트리를 재사용합니다.
 
 생성·사전 메모리 산정은 동일한 스레드 상한을 받습니다. 생성 최고 추정치에는 배열과 oneTBB의 실제 스택 설정 및 태스크 여유가 포함되므로 이전 버전의 배열 위주 추정치와 구분합니다. 소스 묶음의 C++ 시험은 1·2·4·자동 스레드 생성, 전수 최근접점·면 번호, 예산 경계·취소·콜백 예외·실패 후 재생성을 검사합니다. Release 빌드 방법과 실행 계약은 동일합니다.
+
+## 0.3.67 점–평면과 노말 대응 필터
+
+기존 BVH 패치 다음에 `patches/point_to_plane.patch`의 `point-to-plane-v1`을 적용합니다. 대상은 `include/RegistrationTools.h`와 `src/RegistrationTools.cpp`이며 잠금 정보의 `point_to_plane_patch`에 직전·적용 후·패치 원문 해시를 보존합니다. 원문 ZIP에는 모든 패치가 적용된 코어와 새 회귀 `test_point_to_plane.py`를 포함합니다.
+
+Manifest의 `point_to_plane_patch`, `point_to_plane_patch_sha256`, `point_to_plane_source_sha256`가 최종 코드와 연결됩니다. 기존 패치의 원문·해시는 중간 단계 증거로 유지합니다. 네이티브 계약은 v8이며 이전 워커와 혼용하지 않습니다. 새 외부 의존성은 없습니다.
+
+위와 같은 재빌드 후, 전용 Python에서 `test_cccore_worker.py`와 `test_point_to_plane.py`를 실행합니다. `COLMAP_CCCORE_WORKER`는 재빌드된 실행 파일 절대 경로를 가리켜야 합니다. 정상·부분 대응·배율 경계·노말 오류·수치 퇴화·취소를 검사하며, 실패하면 런타임을 게시하지 않습니다.

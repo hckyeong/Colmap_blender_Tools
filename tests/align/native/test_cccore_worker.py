@@ -89,13 +89,13 @@ class NativeContractTest(unittest.TestCase):
             self.assertEqual(json.loads((self.root/"result.json").read_text(encoding="utf-8")),result)
         return result
 
-    def start_session(self, *, max_threads=4):
-        """v7 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
+    def start_session(self, *, max_threads=4, protocol_version="cccore-native-v8"):
+        """지정 버전 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
         root = self.root / "session-job"
         native = root / "native"
         native.mkdir(parents=True)
         identity = {
-            "protocol_version": "cccore-native-v7",
+            "protocol_version": protocol_version,
             "session_id": "0123456789abcdef0123456789abcdef",
             "job_id": root.name,
             "input_fingerprint": "fedcba9876543210fedcba9876543210",
@@ -167,7 +167,7 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None, parameters=None):
-        """고정 순번 v7 명령을 제출하고 메시 응답의 BVH 전용 계측까지 검증합니다."""
+        """완성된 v8 명령을 원자 제출하고 응답 계측 또는 세션 실패 원인을 검증합니다."""
         command = self.session_command_payload(
             identity, sequence, operation, data=data, model=model, stage=stage, max_threads=max_threads, search_domain=search_domain,
         )
@@ -176,7 +176,9 @@ class NativeContractTest(unittest.TestCase):
         stem = f"native/command-{sequence:04d}"
         request_path = root / f"{stem}.request.json"
         response_path = root / f"{stem}.response.json"
-        request_path.write_text(json.dumps(command), encoding="utf-8")
+        temporary_path = request_path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(command), encoding="utf-8")
+        temporary_path.replace(request_path)
         deadline = time.monotonic() + 30
         while not response_path.is_file() and not (root / "native/session-result.json").is_file() and time.monotonic() < deadline:
             time.sleep(.005)
@@ -192,10 +194,13 @@ class NativeContractTest(unittest.TestCase):
                 if result["operation_statistics"]["bvh_cache_hits"]:
                     self.assertEqual(result["timings"]["bvh_build_seconds"], 0)
             return result
+        terminal_path = root / "native/session-result.json"
+        if terminal_path.is_file():
+            self.fail(f"명령 응답 전에 세션이 종료됐습니다: {terminal_path.read_text(encoding='utf-8')}")
         self.fail("세션 명령 응답이 제한 시간 안에 생성되지 않았습니다.")
 
     def session_command_payload(self, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None):
-        """오류 계약 검사에도 재사용할 순번별 v7 명령 객체를 만듭니다."""
+        """오류 계약 검사에도 재사용할 순번별 v8 명령 객체를 만듭니다."""
         stem = f"native/command-{sequence:04d}"
         command = {
             **identity, "sequence": sequence, "operation": operation, "stage": stage,
@@ -205,6 +210,7 @@ class NativeContractTest(unittest.TestCase):
             command.update({
                 "data": data, "model": model, "search_domain": search_domain,
                 "parameters": {
+                    "registration_method": "POINT_TO_POINT", "normal_cosine_threshold": -1,
                     "adjust_scale": False, "min_scale": 1.0, "max_scale": 1.0,
                     "overlap_ratio": 1.0, "filter_out_farthest_points": True, "max_iterations": 100,
                     "sampling_limit": max(int(data["point_count"]), int(model["point_count"])),
@@ -359,7 +365,7 @@ class NativeContractTest(unittest.TestCase):
         process = subprocess.run([str(WORKER),"--check-environment"],capture_output=True,text=True,encoding="utf-8",timeout=30)
         self.assertEqual(process.returncode,0,process.stdout)
         result=json.loads(process.stdout)
-        self.assertEqual(result["protocol_version"],"cccore-native-v7")
+        self.assertEqual(result["protocol_version"],"cccore-native-v8")
         self.assertEqual(result["self_test"],"passed")
         self.assertTrue(Path(result["library_path"]).is_file())
         self.assertTrue(Path(result["tbb_library_path"]).is_file())
@@ -378,7 +384,13 @@ class NativeContractTest(unittest.TestCase):
                     "mesh_grid_level_reduction_count", "query_octree_build_count", "mesh_grid_peak_estimated_bytes")
         timings = ("model_level_seconds", "query_octree_seconds", "mesh_grid_seconds", "closest_point_seconds",
                    "filter_rms_seconds", "transform_solve_seconds", "transform_apply_seconds")
-        self.assertEqual(set(statistics), set(counters + timings + ("total_seconds", "stop_reason", "surface_search_backend")))
+        extra = ("registration_method", "normal_filter_enabled", "normal_filter_rejected_count",
+                 "point_to_plane_solve_count", "minimum_linear_rank")
+        self.assertEqual(set(statistics), set(counters + timings + ("total_seconds", "stop_reason", "surface_search_backend") + extra))
+        self.assertEqual(statistics["registration_method"], "POINT_TO_POINT")
+        self.assertFalse(statistics["normal_filter_enabled"])
+        for key in ("normal_filter_rejected_count", "point_to_plane_solve_count", "minimum_linear_rank"):
+            self.assertEqual(statistics[key], 0)
         for key in counters:
             self.assertIs(type(statistics[key]), int, key)
             self.assertGreaterEqual(statistics[key], 0, key)
@@ -1107,7 +1119,7 @@ class NativeContractTest(unittest.TestCase):
         self.assertEqual((self.root / result["distances_file"]).read_bytes(), expected_bytes)
 
     def test_large_mesh_auto_grid_registration_preserves_identity(self):
-        """큰 메시에서 기존 격자 API와 v7 BVH 모두 항등 변환과 영 잔차를 보존합니다."""
+        """큰 메시에서 기존 격자 API와 v8 BVH 모두 항등 변환과 영 잔차를 보존합니다."""
         request, data = self.large_mesh_grid_request("register")
         result = self.run_request(request)
         for actual, expected in zip(apply_matrix(data, result["matrix_4x4"]), data):

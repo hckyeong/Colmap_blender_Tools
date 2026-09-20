@@ -75,7 +75,7 @@ def _direct_runtime(count=12000):
 
 
 def test_real_direct_cccore_approve_undo_redo() -> None:
-    """실제 점군 정렬을 승인하고 행렬·그룹·CC 출처를 함께 되돌립니다."""
+    """실제 점군 정렬의 v8 통계를 검증하고 승인 행렬·그룹·출처를 함께 되돌립니다."""
     from tools.align.alignment.icp_runtime import approve_icp_result, restore_icp_commit_snapshot
     from tools.align.project_persistence.codec import _decode_provenance
     runtime, expected = _direct_runtime()
@@ -85,7 +85,7 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
     result = _finish(runtime)
     assert not handle.files.job_directory.exists()
     assert result.solver_backend == "CCCORELIB" and result.metadata["geometry_mode"] == "POINT_TO_POINT"
-    assert result.algorithm_version == "cccore-icp-v5"
+    assert result.algorithm_version == "cccore-icp-v7"
     requested_threads = min(1024, max(1, (os.cpu_count() or 1) - 1))
     assert result.metadata["parameters"]["max_threads"] == requested_threads
     assert result.metadata["requested_max_threads"] == requested_threads
@@ -117,7 +117,9 @@ def test_real_direct_cccore_approve_undo_redo() -> None:
             "requested_max_threads", "effective_max_threads", "data_geometry_id", "model_geometry_id",
             "timings", "geometry_load_count", "geometry_cache_hits", "octree_build_count",
             "octree_cache_hits", "mesh_grid_build_count", "mesh_grid_cache_hits",
+            "bvh_build_count", "bvh_cache_hits", "bvh_eviction_count", "icp_statistics",
         }
+        assert call["icp_statistics"] is None
         assert call["index"] == index and call["sequence"] == index
         assert call["execution_source"] == "native_session"
         assert call["physical_sequence"] == index and call["source_sequence"] == index
@@ -324,14 +326,15 @@ def test_actual_job_cancel_preserves_model() -> None:
 
 
 def test_legacy_provenance_without_cc_fields_roundtrip() -> None:
-    """스키마 8에서 이전 Small GICP와 CCCoreLib v1·v2·v3 감사 기록을 그대로 복원합니다."""
+    """스키마 8에서 이전 Small GICP와 CCCoreLib v1부터 v6까지의 감사 기록을 그대로 복원합니다."""
     from tools.align.alignment.types import AlignmentProvenanceRecord
     from tools.align.project_persistence.codec import _decode_provenance
     original = AlignmentProvenanceRecord(model_id="old", method="ICP", backend_id="SMALL_GICP",
                                          algorithm_version="small-gicp-v6", icp_status="PASS", icp_rmse=0.25)
     decoded = _decode_provenance(original.to_mapping(), "old", 6)
     assert decoded == original and not decoded.engine_metadata_json and not decoded.solver_geometry_dependencies
-    for version in ("cccore-icp-v1", "cccore-icp-v2", "cccore-icp-v3"):
+    for version in ("cccore-icp-v1", "cccore-icp-v2", "cccore-icp-v3",
+                    "cccore-icp-v4", "cccore-icp-v5", "cccore-icp-v6"):
         legacy_cc = AlignmentProvenanceRecord(
             model_id="cc-old",
             method="ICP",

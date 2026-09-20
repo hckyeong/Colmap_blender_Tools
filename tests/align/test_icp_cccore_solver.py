@@ -36,6 +36,8 @@ def mesh_icp_statistics():
     """초기 거리와 한 번의 채택 반복을 가진 내부 ICP 통계를 만듭니다."""
     return {**dict.fromkeys(contract.CC_ICP_COUNTER_FIELDS, 0),
             **dict.fromkeys(contract.CC_ICP_TIMING_FIELDS, 0.0),
+            "registration_method": "POINT_TO_PLANE", "normal_filter_enabled": False,
+            "normal_filter_rejected_count": 0, "point_to_plane_solve_count": 1, "minimum_linear_rank": 6,
             "iterations_attempted": 1, "iterations_accepted": 1, "distance_call_count": 2,
             "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 1,
             "query_octree_build_count": 2, "surface_search_backend": "GRID", "stop_reason": "MAX_ITERATIONS"}
@@ -189,12 +191,13 @@ def physical_native_call_summaries(logical_operations: list[dict]) -> list[dict]
 
 
 def make_native_runtime(directory: Path) -> tuple[Path, dict]:
-    """등록 안전·메모리·재사용·고정 범위 패치 지문을 포함하는 최소 v5 실행 환경을 만듭니다."""
+    """등록 안전·격자·BVH·점–평면·메시 검사 지문을 포함하는 최소 v8 실행 환경을 만듭니다."""
     directory.mkdir(parents=True, exist_ok=True)
     binary_contents = {
         "colmap_cccore_worker.exe": b"worker-v5",
         "CCCoreLib.dll": b"cccore-v5",
         "tbb12.dll": b"tbb-v5",
+        "colmap_mesh_cleanup.dll": b"mesh-cleanup-v1",
     }
     binary_hashes = {}
     for filename, contents in binary_contents.items():
@@ -233,18 +236,27 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
     bvh = {"id": "mesh-bvh-search-v1", "file": "patches/mesh_bvh_search.patch", "sha256": "e" * 64,
            "files": [{"path": item["path"], "original_sha256": item["patched_sha256"], "patched_sha256": "f" * 64}
                      for item in icp["files"] if "RegistrationTools" in item["path"]]}
+    plane = {"id": "point-to-plane-v1", "file": "patches/point_to_plane.patch", "sha256": "1" * 64,
+             "files": [{"path": item["path"], "original_sha256": item["patched_sha256"], "patched_sha256": "2" * 64}
+                       for item in bvh["files"]]}
+    thread_metadata["core_patch"] += "+" + plane["id"]
     thread_metadata["core_patch"] += "+" + bvh["id"]
     thread_metadata["core_patch"] += "+" + icp["id"]
     thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"] + "+" + reuse["id"] + "+" + fixed["id"]
     manifest = {
         "protocol_version": contract.CC_NATIVE_PROTOCOL_VERSION,
         "platform": "windows-x64",
+        "mesh_cleanup_abi": 1,
+        "mesh_cleanup_source_sha256": {name: "a" * 64 for name in ("mesh_cleanup.cpp", "mesh_cleanup.h")},
         "core_commit": thread_metadata["core_commit"],
         "core_patch": thread_metadata["core_patch"],
         "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
                          "cccore": {"commit": thread_metadata["core_commit"],
                                     "registration_safety_patch": safety, "mesh_grid_memory_patch": grid,
-                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed, "icp_mesh_grid_reuse_patch": icp, "mesh_bvh_search_patch": bvh}},
+                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed, "icp_mesh_grid_reuse_patch": icp, "mesh_bvh_search_patch": bvh, "point_to_plane_patch": plane}},
+        "point_to_plane_patch": plane["id"],
+        "point_to_plane_patch_sha256": plane["sha256"],
+        "point_to_plane_source_sha256": {item["path"]: item["patched_sha256"] for item in plane["files"]},
         "mesh_bvh_search_patch": bvh["id"],
         "mesh_bvh_search_patch_sha256": bvh["sha256"],
         "mesh_bvh_search_source_sha256": {item["path"]: item["patched_sha256"] for item in bvh["files"]},
@@ -511,11 +523,11 @@ class PureContractTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first, evaluation))
         self.assertTrue(np.all(first[:, 2] == 0.0))
 
-    def test_v7_protocol_and_thread_limit_contract(self) -> None:
-        """알고리즘 v6·작업 v4·네이티브 v7과 1..1024 범위의 스레드 요청만 허용합니다."""
-        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v6")
+    def test_v8_protocol_and_thread_limit_contract(self) -> None:
+        """알고리즘 v7·작업 v4·네이티브 v8과 1..1024 범위의 스레드 요청만 허용합니다."""
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v7")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v7")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v8")
         self.assertEqual(contract.resolve_parameters({"cc_max_threads": 1024})["max_threads"], 1024)
         for value in (0, -1, 1025, True, 1.5):
             with self.subTest(value=value), self.assertRaises(contract.CcCoreInputError):
@@ -1051,12 +1063,16 @@ class PureContractTests(unittest.TestCase):
                     )
 
     def test_native_runner_requires_manifest_dlls_and_matching_binary_hashes(self) -> None:
-        """시작 시 Manifest·필수 DLL 누락과 세 필수 바이너리 해시 불일치를 거부합니다."""
+        """시작 시 Manifest·필수 DLL 누락과 네 필수 바이너리 해시 불일치를 거부합니다."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable, _manifest = make_native_runtime(root / "runtime")
             (root / "job").mkdir()
-            runner = solver.NativeRunner(root / "job", executable, contract.resolve_parameters({"cc_max_threads": 4}))
+            with mock.patch.object(solver, "NativeMeshCleaner") as cleaner_type:
+                runner = solver.NativeRunner(root / "job", executable, contract.resolve_parameters({"cc_max_threads": 4}))
+                cleaner_type.assert_called_once_with(
+                    executable, runner.runtime_manifest, max_threads=4, check_cancelled=runner.check_cancelled,
+                )
             self.assertEqual(runner.runtime_manifest["native_worker_sha256"], solver.file_sha256(executable))
             self.assertEqual(
                 runner.runtime_manifest["runtime_manifest_sha256"],
@@ -1094,9 +1110,11 @@ class PureContractTests(unittest.TestCase):
             ("Manifest 누락", "runtime_manifest.json", "missing"),
             ("CCCoreLib DLL 누락", "CCCoreLib.dll", "missing"),
             ("oneTBB DLL 누락", "tbb12.dll", "missing"),
+            ("메시 검사 DLL 누락", "colmap_mesh_cleanup.dll", "missing"),
             ("워커 해시 불일치", "colmap_cccore_worker.exe", "changed"),
             ("CCCoreLib 해시 불일치", "CCCoreLib.dll", "changed"),
             ("oneTBB 해시 불일치", "tbb12.dll", "changed"),
+            ("메시 검사 해시 불일치", "colmap_mesh_cleanup.dll", "changed"),
         )
         for label, filename, mutation in failure_cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
@@ -1118,11 +1136,12 @@ class PureContractTests(unittest.TestCase):
                 root = Path(temporary)
                 executable, _manifest = make_native_runtime(root / "runtime")
                 (root / "job").mkdir()
-                runner = solver.NativeRunner(
-                    root / "job",
-                    executable,
-                    contract.resolve_parameters({"cc_max_threads": 4}),
-                )
+                with mock.patch.object(solver, "NativeMeshCleaner"):
+                    runner = solver.NativeRunner(
+                        root / "job",
+                        executable,
+                        contract.resolve_parameters({"cc_max_threads": 4}),
+                    )
                 target = executable.with_name(filename)
                 target.write_bytes(target.read_bytes() + b" ")
                 with self.assertRaises(contract.CcCoreEnvironmentError):
@@ -1643,7 +1662,7 @@ class NativeIntegrationTests(unittest.TestCase):
             )
 
     def test_all_four_geometry_combinations(self) -> None:
-        """네 조합의 정밀도와 유한한 후보 준비·고정 등록 골격·단일 합성을 확인합니다."""
+        """네 조합의 정밀도와 강체 점–점·배율 점–평면 정책 및 노말 적용을 확인합니다."""
         for moving_kind, reference_kind in contract.GEOMETRY_MODES:
             with self.subTest(moving=moving_kind, reference=reference_kind), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
@@ -1727,6 +1746,18 @@ class NativeIntegrationTests(unittest.TestCase):
                         if item["cache_scope"] == "SESSION"
                     ),
                 )
+                registrations = [item for item in result["logical_operations"] if item["operation"] == "register"]
+                for call in registrations:
+                    request = contract.read_json_object(directory / f"native/command-{call['physical_sequence']:04d}.accepted.json")
+                    plane = call["stage"] == "SCALE_REFINE" and result["geometry_mode"] != "POINT_TO_POINT"
+                    normals = plane and result["geometry_mode"] == "MESH_TO_MESH"
+                    self.assertEqual(request["parameters"]["registration_method"], "POINT_TO_PLANE" if plane else "POINT_TO_POINT")
+                    self.assertEqual(request["parameters"]["normal_cosine_threshold"], 0.5 if normals else -1.0)
+                    if result["geometry_mode"] == "POINT_TO_POINT":
+                        self.assertIsNone(call["icp_statistics"])
+                    else:
+                        self.assertEqual(call["icp_statistics"]["registration_method"], "POINT_TO_PLANE" if plane else "POINT_TO_POINT")
+                        self.assertEqual(call["icp_statistics"]["normal_filter_enabled"], normals)
                 if result["geometry_mode"] == "POINT_TO_POINT":
                     by_id = {item["geometry_id"]: item for item in result["geometry_statistics"]}
                     self.assertEqual(by_id["spacing-query"]["cache_scope"], "COMMAND")

@@ -192,11 +192,12 @@ def install_timers(timers, solver, contract, overlap):
 
 
 def main():
-    """동일 제품 함수의 전처리 완료 경계에서 멈추고 계측·동일성 보고서를 저장합니다."""
+    """명시한 빌드와 입력으로 전처리 경계에서 멈추고 계측·동일성 보고서를 저장합니다."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('solver-directory', 'worker', 'input-directory', 'manifest', 'expected-result', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--mode', choices=('control', 'functions', 'lines'), required=True)
+    parser.add_argument('--allow-worker-change', action='store_true', help='네이티브 재빌드 비교를 명시적으로 허용')
     args = parser.parse_args()
     source_directory = args.solver_directory.resolve(strict=True)
     sys.path.insert(0, str(source_directory))
@@ -214,7 +215,9 @@ def main():
     expected = read_json(args.expected_result)
     assert source['input_fingerprint'] == manifest['geometry']['input_fingerprint'] == expected['geometry_input_fingerprint']
     worker = args.worker.resolve(strict=True)
-    assert hashlib.sha256(worker.read_bytes()).hexdigest() == expected['native_worker_sha256']
+    worker_sha256 = hashlib.sha256(worker.read_bytes()).hexdigest()
+    if not args.allow_worker_change:
+        assert worker_sha256 == expected['native_worker_sha256']
     input_hashes = {}
     for role in ('moving', 'reference'):
         assert source['geometry'][role] == manifest['geometry'][role]
@@ -300,6 +303,8 @@ def main():
                   host_process_memory=captured['host_process_memory'],
                   input_fingerprint=manifest['input_fingerprint'], geometry_fingerprint=source['input_fingerprint'],
                   native_worker_sha256=runner.native_worker_sha256, input_hashes=input_hashes,
+                  worker_change_allowed=args.allow_worker_change,
+                  expected_native_worker_sha256=expected['native_worker_sha256'],
                   solver_file=str(Path(solver.__file__)), solver_sha256=hashlib.sha256(Path(solver.__file__).read_bytes()).hexdigest(),
                   sample_hashes={name: array_hash(value) for name, value in captured['arrays'].items()},
                   sample_counts={name: len(value) for name, value in captured['arrays'].items()},
