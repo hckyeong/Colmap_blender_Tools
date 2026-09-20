@@ -16,7 +16,7 @@ def mesh_icp_statistics():
             **dict.fromkeys(contract.CC_ICP_TIMING_FIELDS, 0.0),
             "iterations_attempted": 1, "iterations_accepted": 1, "distance_call_count": 2,
             "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 1,
-            "query_octree_build_count": 2, "stop_reason": "MAX_ITERATIONS"}
+            "query_octree_build_count": 2, "surface_search_backend": "GRID", "stop_reason": "MAX_ITERATIONS"}
 
 
 def operation_summaries(mode, preparing_count=2):
@@ -51,6 +51,23 @@ class V4ContractTest(unittest.TestCase):
         return contract.validate_native_call_summaries(
             summaries, geometry_mode=mode, requested_max_threads=1, effective_max_threads=1,
         )
+
+    def test_bvh_statistics_reject_mixed_grid_and_query_counts(self):
+        """정확 표면 BVH 통계가 격자 계측과 섞이거나 호출 수가 어긋나면 거부합니다."""
+        stats = mesh_icp_statistics()
+        stats.update(surface_search_backend="BVH", bvh_query_count=2,
+                     mesh_grid_build_count=0, mesh_grid_cache_hits=0, query_octree_build_count=0)
+        self.assertEqual(contract.validate_icp_statistics(stats, mesh_registration=True, kernel_seconds=1), stats)
+        for change in ({"bvh_query_count": 1}, {"model_level_seconds": .01},
+                       {"mesh_grid_build_count": 1}, {"query_octree_build_count": 1},
+                       {"surface_search_backend": "UNKNOWN"}):
+            with self.subTest(change=change), self.assertRaises(contract.CcCoreEnvironmentError):
+                contract.validate_icp_statistics({**stats, **change}, mesh_registration=True, kernel_seconds=1)
+        legacy = dict(stats)
+        legacy.pop("surface_search_backend")
+        legacy.pop("bvh_query_count")
+        with self.assertRaises(contract.CcCoreEnvironmentError):
+            contract.validate_icp_statistics(legacy, mesh_registration=True, kernel_seconds=1)
 
     def test_icp_statistics_rejects_missing_and_inconsistent_values(self):
         """내부 통계의 누락·형식·합계·시간·반복 상한 변조를 거부합니다."""
@@ -188,13 +205,13 @@ class V4ContractTest(unittest.TestCase):
             from tools.align.project_persistence.codec import _decode_provenance
         finally:
             sys.path.pop(0)
-        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5"):
+        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5", "cccore-native-v6"):
             metadata = {"native_build_identity": {"protocol_version": version,
                         "core_patch": "mesh-grid-reuse-v1", "native_worker_sha256": "a" * 64},
                         "quality": "PASS"}
             original = AlignmentProvenanceRecord(
                 model_id="moving", method="ICP", backend_id="CCCORELIB",
-                algorithm_version="cccore-icp-v5", icp_status="PASS",
+                algorithm_version="cccore-icp-v6", icp_status="PASS",
                 engine_metadata_json=json.dumps(metadata),
             )
             for schema in (7, 8):
@@ -219,9 +236,9 @@ class V4ContractTest(unittest.TestCase):
     def test_surface_policy_preserves_sampling_with_native_v6(self):
         """표면 정책과 세 독립 시드를 고정하고 준비 범위 통신 버전을 확인합니다."""
         parameters = contract.resolve_parameters({})
-        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v6")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v6")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v7")
         self.assertEqual(parameters["mesh_sampling_policy"], "MESH_SURFACE_AREA_REJECTION_V1")
         self.assertEqual(parameters["mesh_probe_counts"], (8192, 32768, 131072))
         self.assertEqual(contract.surface_proposal_limit(50000), 10000000)
@@ -302,11 +319,11 @@ class V4ContractTest(unittest.TestCase):
     def test_prior_native_session_version_is_rejected(self):
         """이전 세션 버전을 새 작업의 성공 응답으로 수용하지 않습니다."""
         identity = {"session_id": "session", "job_id": "job", "input_fingerprint": "input"}
-        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5"):
+        for version in ("cccore-native-v2", "cccore-native-v3", "cccore-native-v4", "cccore-native-v5", "cccore-native-v6"):
             with self.subTest(version=version), self.assertRaises(contract.CcCoreEnvironmentError):
                 contract.validate_native_session_identity({"protocol_version": version, **identity}, **identity)
         contract.validate_native_session_identity(
-            {"protocol_version": "cccore-native-v6", **identity}, **identity,
+            {"protocol_version": "cccore-native-v7", **identity}, **identity,
         )
 
 

@@ -7,6 +7,7 @@
 #include <RegistrationTools.h>
 #include <SimpleMesh.h>
 #include <json.hpp>
+#include "mesh_bvh.h"
 #include <windows.h>
 #include <psapi.h>
 #include <concrt.h>
@@ -40,7 +41,7 @@ using Clock = std::chrono::steady_clock;
 using Cloud = CCCoreLib::PointCloud;
 using Transform = CCCoreLib::PointProjectionTools::Transformation;
 constexpr const char* kProtocol = "cccore-native-v2";
-constexpr const char* kSessionProtocol = "cccore-native-v6";
+constexpr const char* kSessionProtocol = "cccore-native-v7";
 constexpr const char* kThreadBackend = "oneTBB";
 constexpr const char* kTbbVersion = TBB_VERSION_PIN;
 
@@ -56,6 +57,7 @@ struct NativeTimings {
     double meshLoadSeconds = 0;
     double octreeSeconds = 0;
     double meshGridSeconds = 0;
+    double bvhBuildSeconds = 0;
     double kernelSeconds = 0;
     double serializationSeconds = 0;
 };
@@ -67,6 +69,9 @@ struct OperationCounters {
     std::uint64_t octreeCacheHits = 0;
     std::uint64_t meshGridBuildCount = 0;
     std::uint64_t meshGridCacheHits = 0;
+    std::uint64_t bvhBuildCount = 0;
+    std::uint64_t bvhCacheHits = 0;
+    std::uint64_t bvhEvictionCount = 0;
 };
 
 struct WorkerError : std::runtime_error {
@@ -677,6 +682,8 @@ Json icpStatisticsJson(const CCCoreLib::ICPMeshRegistrationContext::Statistics& 
     return {{"iterations_attempted", stats.iterations_attempted},
             {"iterations_accepted", stats.iterations_accepted},
             {"distance_call_count", stats.distance_call_count},
+            {"surface_search_backend", stats.surface_search_backend},
+            {"bvh_query_count", stats.bvh_query_count},
             {"mesh_grid_build_count", stats.mesh_grid_build_count},
             {"mesh_grid_cache_hits", stats.mesh_grid_cache_hits},
             {"mesh_grid_expansion_count", stats.mesh_grid_expansion_count},
@@ -811,7 +818,7 @@ Json timingJson(const NativeTimings& timings) {
     return {{"binary_read_seconds", timings.binaryReadSeconds},
             {"conversion_validation_seconds", timings.conversionValidationSeconds},
             {"mesh_load_seconds", timings.meshLoadSeconds}, {"octree_seconds", timings.octreeSeconds},
-            {"mesh_grid_seconds", timings.meshGridSeconds}, {"kernel_seconds", timings.kernelSeconds},
+            {"bvh_build_seconds", timings.bvhBuildSeconds}, {"mesh_grid_seconds", timings.meshGridSeconds}, {"kernel_seconds", timings.kernelSeconds},
             {"serialization_seconds", timings.serializationSeconds}};
 }
 
@@ -822,7 +829,9 @@ Json counterJson(const OperationCounters& counters) {
             {"octree_build_count", counters.octreeBuildCount},
             {"octree_cache_hits", counters.octreeCacheHits},
             {"mesh_grid_build_count", counters.meshGridBuildCount},
-            {"mesh_grid_cache_hits", counters.meshGridCacheHits}};
+            {"mesh_grid_cache_hits", counters.meshGridCacheHits},
+            {"bvh_build_count", counters.bvhBuildCount}, {"bvh_cache_hits", counters.bvhCacheHits},
+            {"bvh_eviction_count", counters.bvhEvictionCount}};
 }
 
 struct SessionStatistics {
@@ -830,6 +839,8 @@ struct SessionStatistics {
     std::uint64_t peakWorkingSet = 0;
     std::uint64_t cachePeakEstimated = 0;
     std::uint64_t cacheResidentEstimated = 0;
+    std::uint64_t bvhResidentBytes = 0;
+    std::uint64_t bvhPeakBuildBytes = 0;
 
     // 직접 계측한 명령 가속구조 횟수를 세션 합계에 더합니다.
     void addOperation(const OperationCounters& operation) {
@@ -837,6 +848,9 @@ struct SessionStatistics {
         counters.octreeCacheHits += operation.octreeCacheHits;
         counters.meshGridBuildCount += operation.meshGridBuildCount;
         counters.meshGridCacheHits += operation.meshGridCacheHits;
+        counters.bvhBuildCount += operation.bvhBuildCount;
+        counters.bvhCacheHits += operation.bvhCacheHits;
+        counters.bvhEvictionCount += operation.bvhEvictionCount;
         peakWorkingSet = std::max(peakWorkingSet, peakWorkingSetBytes());
     }
 
@@ -846,6 +860,8 @@ struct SessionStatistics {
         result["peak_working_set_bytes"] = peakWorkingSet;
         result["cache_peak_estimated_bytes"] = cachePeakEstimated;
         result["cache_resident_estimated_bytes"] = cacheResidentEstimated;
+        result["bvh_resident_bytes"] = bvhResidentBytes;
+        result["bvh_peak_build_bytes"] = bvhPeakBuildBytes;
         return result;
     }
 };
@@ -855,6 +871,8 @@ struct CachedGeometry {
     // PointCloud를 먼저 선언해 뒤의 SimpleMesh가 먼저 파괴되도록 수명을 보장합니다.
     std::unique_ptr<Cloud> cloud;
     std::unique_ptr<CCCoreLib::SimpleMesh> mesh;
+    std::unique_ptr<ccalign::MeshBvh> bvh;
+    std::uint64_t bvhLastUse = 0;
     bool rankValidated = false;
     std::uint64_t estimatedBytes = 0;
     std::uint64_t cacheHits = 0;
@@ -869,13 +887,8 @@ class GeometryRegistry {
     std::set<std::string> releasedIdentifiers;
     Json releasedStatistics = Json::array();
     std::uint64_t estimatedBytes = 0;
-    // 한 세션에는 격자 한 개만 보관하며 메시 항목보다 먼저 파괴합니다.
-    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache meshGrid;
-    std::optional<unsigned char> meshLevel;
-    CachedGeometry* meshGridOwner = nullptr;
-    std::uint64_t meshGridBytes = 0;
-    std::string meshGridDomainId;
     std::map<std::string, Json> domainDeclarations;
+    std::uint64_t bvhClock = 0;
 
     // 지오메트리 설명의 필수 필드와 메시 필드 쌍을 검사합니다.
     static void validateDescriptor(const Json& entity) {
@@ -936,52 +949,80 @@ public:
     GeometryRegistry(fs::path jobRoot, SessionStatistics& sessionStatistics)
         : root(std::move(jobRoot)), statistics(sessionStatistics) {}
 
-    // 다른 대상 또는 내부 ICP 격자를 만들기 전에 캐시와 상주 통계를 해제합니다.
-    void clearMeshGrid() {
-        meshGrid.clear();
-        meshLevel.reset();
-        meshGridDomainId.clear();
-        if (meshGridOwner) meshGridOwner->estimatedBytes -= meshGridBytes;
-        estimatedBytes -= meshGridBytes;
-        meshGridBytes = 0;
-        meshGridOwner = nullptr;
-        statistics.cacheResidentEstimated = estimatedBytes;
+    // 물리 메모리와 커밋 잔여량의 작은 값으로 전체 BVH 예산을 제한합니다.
+    static std::uint64_t bvhBudget() {
+        MEMORYSTATUSEX status {};
+        status.dwLength = sizeof(status);
+        require(GlobalMemoryStatusEx(&status) != FALSE, "BVH_MEMORY_BUDGET", "가용 메모리를 확인하지 못했습니다.");
+        return std::min<std::uint64_t>(1ull << 30, std::min(status.ullAvailPhys, status.ullAvailPageFile) / 4);
     }
 
-    // 대상과 검색 범위가 같을 때만 한 개의 기존 격자를 다음 명령에 전달합니다.
-    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* prepareMeshGrid(
-        CachedGeometry& model, const SearchDomain* domain
-    ) {
-        const std::string domainId = domain ? domain->id : std::string();
+    // 현재 대상의 트리를 보호하면서 가장 오래 사용하지 않은 트리부터 해제합니다.
+    std::uint64_t reserveBvh(std::uint64_t extraBytes, CachedGeometry& protectedModel, OperationCounters& counters) {
+        const auto budget = bvhBudget();
+        while (statistics.bvhResidentBytes > budget || extraBytes > budget - statistics.bvhResidentBytes) {
+            CachedGeometry* oldest = nullptr;
+            for (auto& item : entries) {
+                auto* candidate = item.second.get();
+                if (candidate != &protectedModel && candidate->bvh && (!oldest || candidate->bvhLastUse < oldest->bvhLastUse))
+                    oldest = candidate;
+            }
+            require(oldest != nullptr, "BVH_MEMORY_BUDGET", "정확 표면 검색에 필요한 BVH 메모리 예산이 부족합니다.");
+            const auto bytes = oldest->bvh->residentBytes();
+            oldest->bvh.reset();
+            oldest->estimatedBytes -= bytes;
+            estimatedBytes -= bytes;
+            statistics.bvhResidentBytes -= bytes;
+            statistics.cacheResidentEstimated = estimatedBytes;
+            ++counters.bvhEvictionCount;
+        }
+        return budget - statistics.bvhResidentBytes;
+    }
+
+    // 검색 범위와 재사용을 유지하며 생성·예산 산정에 같은 CPU 상한을 적용합니다.
+    ccalign::MeshBvh* prepareBvh(CachedGeometry& model, const SearchDomain* domain,
+                               NativeTimings& timings, OperationCounters& counters, Progress& progress,
+                               unsigned maxThreads) {
         if (domain) {
-            const auto known = domainDeclarations.find(domainId);
+            const auto known = domainDeclarations.find(domain->id);
             require(known == domainDeclarations.end() || known->second == domain->declaration,
                     "INVALID_SEARCH_DOMAIN", "같은 검색 범위 식별자에 다른 경계를 지정할 수 없습니다.");
-            domainDeclarations.emplace(domainId, domain->declaration);
+            domainDeclarations.emplace(domain->id, domain->declaration);
         }
-        if (meshGridOwner != &model || !model.mesh || meshGridDomainId != domainId) clearMeshGrid();
         if (!model.mesh) return nullptr;
-        meshGridOwner = &model;
-        meshGridDomainId = domainId;
-        return &meshGrid;
-    }
-
-    // 격자 소유 메시의 검색 단계만 보관하여 전체 대상 옥트리의 상주 메모리를 추가하지 않습니다.
-    std::optional<unsigned char>* meshLevelCache() {
-        return &meshLevel;
-    }
-
-    // 완성된 격자의 실제 목록 용량을 소유 메시와 세션 메모리 추정치에 반영합니다.
-    void accountMeshGrid() {
-        if (!meshGridOwner) return;
-        meshGridOwner->estimatedBytes -= meshGridBytes;
-        estimatedBytes -= meshGridBytes;
-        meshGridBytes = meshGrid.estimatedBytes;
-        meshGridOwner->estimatedBytes += meshGridBytes;
-        estimatedBytes += meshGridBytes;
+        model.bvhLastUse = ++bvhClock;
+        if (model.bvh) {
+            ++counters.bvhCacheHits;
+            return model.bvh.get();
+        }
+        const auto peak = ccalign::MeshBvh::estimatePeakBuildBytes(model.mesh->size(), maxThreads);
+        const auto availableBytes = reserveBvh(peak, model, counters);
+        auto tree = std::make_unique<ccalign::MeshBvh>();
+        progress.setSubstage("BVH");
+        const auto started = Clock::now();
+        const bool built = tree->build(*model.mesh, *model.cloud, availableBytes, &progress, maxThreads);
+        timings.bvhBuildSeconds += elapsedSeconds(started);
+        progress.check();
+        if (!built) throw WorkerError("BVH_BUILD_FAILED", "정확 표면 검색 트리 생성 실패: " + tree->lastError());
+        statistics.bvhPeakBuildBytes = std::max(statistics.bvhPeakBuildBytes,
+                                                statistics.bvhResidentBytes + tree->peakBuildBytes());
+        const auto bytes = tree->residentBytes();
+        model.estimatedBytes += bytes;
+        estimatedBytes += bytes;
+        statistics.bvhResidentBytes += bytes;
         statistics.cacheResidentEstimated = estimatedBytes;
         statistics.cachePeakEstimated = std::max(statistics.cachePeakEstimated, estimatedBytes);
-        statistics.peakWorkingSet = std::max(statistics.peakWorkingSet, peakWorkingSetBytes());
+        model.bvh = std::move(tree);
+        ++counters.bvhBuildCount;
+        return model.bvh.get();
+    }
+
+    // 원래 조회 순서와 최근접 점 계약을 유지하며 메모리 예산 안에서 BVH 거리를 계산합니다.
+    int queryBvh(CachedGeometry& model, CCCoreLib::GenericIndexedCloudPersist& data, Cloud* cpSet,
+                 unsigned threads, CCCoreLib::GenericProgressCallback* progress, OperationCounters& counters) {
+        const auto availableBytes = reserveBvh(ccalign::MeshBvh::estimateQueryBytes(data.size(), threads, cpSet != nullptr), model, counters);
+        model.bvhLastUse = ++bvhClock;
+        return model.bvh->computeDistances(data, cpSet, threads, progress, model.bvh->residentBytes() + availableBytes);
     }
 
     // 같은 ID·설명은 캐시하고 같은 ID의 다른 설명은 세션 오류로 거부합니다.
@@ -1028,9 +1069,9 @@ public:
                 ++iterator;
                 continue;
             }
-            if (meshGridOwner == iterator->second.get()) clearMeshGrid();
             releasedStatistics.push_back(statistic(iterator->first, *iterator->second, true));
             releasedIdentifiers.insert(iterator->first);
+            if (iterator->second->bvh) statistics.bvhResidentBytes -= iterator->second->bvh->residentBytes();
             estimatedBytes -= iterator->second->estimatedBytes;
             statistics.cacheResidentEstimated = estimatedBytes;
             iterator = entries.erase(iterator);
@@ -1090,8 +1131,8 @@ Json executeSessionOperation(
     result["sequence"] = request.at("sequence");
     result["data_geometry_id"] = request.at("data").at("geometry_id");
     result["model_geometry_id"] = request.at("model").at("geometry_id");
+    registry.prepareBvh(model, domain ? &*domain : nullptr, timings, counters, progress, threads.effective);
     if (operation == "register") {
-        registry.clearMeshGrid();
         auto params = parameters(request.at("parameters"), data.cloud->size(), model.cloud->size(), bool(model.mesh), threads.effective);
         Transform transform;
         double rms = -1;
@@ -1099,6 +1140,15 @@ Json executeSessionOperation(
         progress.setSubstage("KERNEL");
         const auto kernelStarted = Clock::now();
         CCCoreLib::ICPMeshRegistrationContext icpContext;
+        struct QueryContext { GeometryRegistry* registry; CachedGeometry* model; OperationCounters* counters; };
+        QueryContext queryContext { &registry, &model, &counters };
+        // CCCoreLib가 관리하는 표본과 최근접 점 저장소를 레지스트리의 동일 트리로 조회합니다.
+        icpContext.exactMeshDistances = [](void* opaque, CCCoreLib::GenericIndexedCloudPersist* query,
+                                          Cloud* cpSet, unsigned threadCount, CCCoreLib::GenericProgressCallback* callback) -> int {
+            auto& state = *static_cast<QueryContext*>(opaque);
+            return state.registry->queryBvh(*state.model, *query, cpSet, threadCount, callback, *state.counters);
+        };
+        icpContext.exactMeshDistancesData = &queryContext;
         const auto code = model.mesh
             ? CCCoreLib::ICPRegistrationTools::RegisterWithMeshContext(
                 model.cloud.get(), model.mesh.get(), data.cloud.get(), params, transform, rms, count, icpContext, &progress)
@@ -1122,11 +1172,12 @@ Json executeSessionOperation(
         result["native_code"] = code;
         timings.serializationSeconds += elapsedSeconds(serializationStarted);
     } else {
-        auto* meshGrid = registry.prepareMeshGrid(model, domain ? &*domain : nullptr);
-        const auto code = computeDistances(*data.cloud, *model.cloud, model.mesh.get(), &progress,
-                                           threads.effective, &timings, &counters, meshGrid, registry.meshLevelCache(),
-                                           domain ? &*domain : nullptr);
-        registry.accountMeshGrid();
+        progress.setSubstage("KERNEL");
+        const auto kernelStarted = Clock::now();
+        const auto code = model.mesh
+            ? registry.queryBvh(model, *data.cloud, nullptr, threads.effective, &progress, counters)
+            : computeDistances(*data.cloud, *model.cloud, nullptr, &progress, threads.effective);
+        timings.kernelSeconds += elapsedSeconds(kernelStarted);
         progress.check();
         if (code < CCCoreLib::DistanceComputationTools::SUCCESS)
             throw WorkerError("NATIVE_DISTANCE_ERROR", "CCCoreLib 거리 평가가 실패했습니다.", code);

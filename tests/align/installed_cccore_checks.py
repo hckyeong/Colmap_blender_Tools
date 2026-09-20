@@ -187,7 +187,7 @@ def _verified_thread_metadata(
     require_calls: bool = True,
     contract_module: Any = None,
 ) -> dict[str, Any]:
-    """설치본의 스레드·고정 호출 골격과 v6 내부 ICP 통계·성공 코드의 정합성을 검증합니다."""
+    """설치본의 스레드·고정 호출 골격과 v7 BVH 내부 ICP 통계·성공 코드의 정합성을 검증합니다."""
     assert "farthest-mesh-correspondence-v1" in metadata["core_patch"].split("+")
     assert metadata["thread_backend"] == "oneTBB"
     assert metadata["tbb_version"] == "2022.0.0"
@@ -199,7 +199,7 @@ def _verified_thread_metadata(
     assert hardware >= 1 and effective == min(expected_requested, hardware)
     calls = metadata.get("logical_operations")
     if require_calls:
-        assert contract_module is not None, "설치본의 v6 통계 검증 모듈이 필요합니다."
+        assert contract_module is not None, "설치본의 v7 통계 검증 모듈이 필요합니다."
         assert metadata["native_process_count"] == 1
         assert metadata.get("native_calls") == calls
         assert isinstance(calls, list) and calls
@@ -225,6 +225,7 @@ def _verified_thread_metadata(
                 "requested_max_threads", "effective_max_threads", "data_geometry_id", "model_geometry_id",
                 "timings", "icp_statistics", "geometry_load_count", "geometry_cache_hits", "octree_build_count",
                 "octree_cache_hits", "mesh_grid_build_count", "mesh_grid_cache_hits",
+                "bvh_build_count", "bvh_cache_hits", "bvh_eviction_count",
             }
             assert call["operation"] in {"register", "distance"}
             assert call["index"] == index and call["sequence"] == index
@@ -288,11 +289,11 @@ def _verified_thread_metadata(
 
 def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, reference_mesh: bool,
                                 native_path: Path) -> dict[str, Any]:
-    """설치본의 ICP 재사용 패치·통계와 표본·독립 평가 계약을 검증합니다."""
-    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v5"
+    """설치본의 기존 패치·BVH 신원·검색 통계와 표본·독립 평가 계약을 검증합니다."""
+    assert metadata["algorithm_version"] == metadata["backend_algorithm_version"] == "cccore-icp-v6"
     assert metadata["job_protocol_version"] == "cccore-job-v4"
     identity = metadata["native_build_identity"]
-    assert identity["protocol_version"] == "cccore-native-v6"
+    assert identity["protocol_version"] == "cccore-native-v7"
     assert identity["registration_safety_patch"] == "farthest-mesh-correspondence-v1"
     runtime_manifest = json.loads(native_path.with_name("runtime_manifest.json").read_text(encoding="utf-8"))
     safety = runtime_manifest["dependencies"]["cccore"]["registration_safety_patch"]
@@ -328,12 +329,37 @@ def _verified_sampling_metadata(metadata: dict[str, Any], moving_mesh: bool, ref
     assert identity["icp_mesh_grid_reuse_source_sha256"] == {
         item["path"]: item["patched_sha256"] for item in icp["files"]
     }
+    bvh = runtime_manifest["dependencies"]["cccore"]["mesh_bvh_search_patch"]
+    assert identity["mesh_bvh_search_patch"] == bvh["id"] == "mesh-bvh-search-v1"
+    assert identity["mesh_bvh_search_patch_sha256"] == bvh["sha256"]
+    assert identity["mesh_bvh_search_source_sha256"] == {
+        item["path"]: item["patched_sha256"] for item in bvh["files"]
+    }
+    assert set(identity["mesh_bvh_search_source_sha256"]) == {
+        "include/RegistrationTools.h", "src/RegistrationTools.cpp",
+    }
+    assert all(item["original_sha256"] == identity["icp_mesh_grid_reuse_source_sha256"][item["path"]]
+               for item in bvh["files"])
+    assert identity["bvh_source_sha256"] == runtime_manifest["bvh_source_sha256"]
+    assert set(identity["bvh_source_sha256"]) == {"mesh_bvh.h", "mesh_bvh.cpp"}
+    assert all(len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+               for value in identity["bvh_source_sha256"].values())
+    expected_patches = {"bounded-scale-v1", "multithread-state-race-v1", safety["id"], grid["id"],
+                        reuse["id"], domain["id"], icp["id"], bvh["id"]}
+    assert set(identity["core_patch"].split("+")) == expected_patches
+    assert set(metadata["core_patch"].split("+")) == expected_patches
     for stage in metadata["registration_stages"]:
         statistics = stage["icp_statistics"]
         if moving_mesh or reference_mesh:
-            assert statistics["mesh_grid_build_count"] >= 1
+            assert statistics["surface_search_backend"] == "BVH"
+            assert statistics["bvh_query_count"] >= 1
+            assert all(statistics[name] == 0 for name in (
+                "mesh_grid_build_count", "mesh_grid_cache_hits", "mesh_grid_expansion_count",
+                "mesh_grid_level_reduction_count", "mesh_grid_peak_estimated_bytes",
+                "query_octree_build_count", "model_level_seconds", "query_octree_seconds", "mesh_grid_seconds",
+            ))
             assert statistics["iterations_accepted"] <= statistics["iterations_attempted"] <= stage["max_iterations"]
-            assert statistics["distance_call_count"] == statistics["mesh_grid_build_count"] + statistics["mesh_grid_cache_hits"]
+            assert statistics["distance_call_count"] == statistics["bvh_query_count"] == statistics["iterations_attempted"] + 1
         else:
             assert statistics is None
     parameters = metadata["parameters"]
@@ -396,7 +422,7 @@ def _wait_for_result(runtime_module, runtime, *, timeout_seconds: float = 180.0)
 
 def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
               moving_mesh: bool, reference_mesh: bool, python_path: Path, native_path: Path) -> dict[str, Any]:
-    """설치본 v6 계약으로 정렬 기록을 검사하고 고정 표본·정답 행렬·승인·Undo/Redo를 검증합니다."""
+    """설치본 v7 BVH 계약으로 정렬 기록을 검사하고 고정 표본·정답 행렬·승인·Undo/Redo를 검증합니다."""
     runtime, expected = _runtime_fixture(modules, output_root, mode, moving_mesh, reference_mesh)
     api = modules["runtime"]
     repository = runtime.model_repository
@@ -440,7 +466,7 @@ def _run_case(modules: dict[str, Any], output_root: Path, mode: str,
         commit = api.approve_icp_result(runtime)
         provenance = runtime.model_catalog.models["moving"].alignment_provenance
         assert provenance.backend_id == "CCCORELIB"
-        assert provenance.algorithm_version == "cccore-icp-v5"
+        assert provenance.algorithm_version == "cccore-icp-v6"
         assert provenance.icp_rmse == metrics["overlap_mean_rms"]
         assert runtime.model_catalog.models["moving"].registration_status == "REGISTERED"
         expected_dependencies = tuple(sorted((("moving", "COMPANION" if moving_mesh else "MAIN"),

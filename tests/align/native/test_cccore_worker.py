@@ -90,12 +90,12 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def start_session(self, *, max_threads=4):
-        """v6 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
+        """v7 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
         root = self.root / "session-job"
         native = root / "native"
         native.mkdir(parents=True)
         identity = {
-            "protocol_version": "cccore-native-v6",
+            "protocol_version": "cccore-native-v7",
             "session_id": "0123456789abcdef0123456789abcdef",
             "job_id": root.name,
             "input_fingerprint": "fedcba9876543210fedcba9876543210",
@@ -167,7 +167,7 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None, parameters=None):
-        """고정 순번 v6 명령과 명시적 등록 조건을 제출하고 응답을 기다립니다."""
+        """고정 순번 v7 명령을 제출하고 메시 응답의 BVH 전용 계측까지 검증합니다."""
         command = self.session_command_payload(
             identity, sequence, operation, data=data, model=model, stage=stage, max_threads=max_threads, search_domain=search_domain,
         )
@@ -181,11 +181,21 @@ class NativeContractTest(unittest.TestCase):
         while not response_path.is_file() and not (root / "native/session-result.json").is_file() and time.monotonic() < deadline:
             time.sleep(.005)
         if response_path.is_file():
-            return json.loads(response_path.read_text(encoding="utf-8"))
+            result = json.loads(response_path.read_text(encoding="utf-8"))
+            if model and "triangles_file" in model and result.get("status") == "completed":
+                for key in ("mesh_grid_build_count", "mesh_grid_cache_hits", "octree_build_count", "octree_cache_hits"):
+                    self.assertEqual(result["operation_statistics"][key], 0, key)
+                for key in ("mesh_grid_seconds", "octree_seconds"):
+                    self.assertEqual(result["timings"][key], 0, key)
+                self.assertGreaterEqual(result["timings"]["bvh_build_seconds"], 0)
+                self.assertEqual(result["operation_statistics"]["bvh_eviction_count"], 0)
+                if result["operation_statistics"]["bvh_cache_hits"]:
+                    self.assertEqual(result["timings"]["bvh_build_seconds"], 0)
+            return result
         self.fail("세션 명령 응답이 제한 시간 안에 생성되지 않았습니다.")
 
     def session_command_payload(self, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None):
-        """오류 계약 검사에도 재사용할 순번별 v6 명령 객체를 만듭니다."""
+        """오류 계약 검사에도 재사용할 순번별 v7 명령 객체를 만듭니다."""
         stem = f"native/command-{sequence:04d}"
         command = {
             **identity, "sequence": sequence, "operation": operation, "stage": stage,
@@ -232,7 +242,7 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def test_fixed_domain_varied_batches_preserve_analytic_distances(self):
-        """서로 다른 조회 경계와 얇은 평면에서도 고정 격자 재사용과 임계값 판정을 보존합니다."""
+        """서로 다른 조회 경계와 얇은 평면에서도 BVH 재사용과 임계값 판정을 보존합니다."""
         root, identity, process, _ = self.start_session(max_threads=1)
         try:
             model = self.session_geometry(root, "plane", [(0,0,0), (1,0,0), (1,1,0), (0,1,0)], [(0,1,2),(0,2,3)])
@@ -245,8 +255,8 @@ class NativeContractTest(unittest.TestCase):
                 result = self.session_command(root, identity, sequence, "distance", data=data, model=model,
                                               stage="PREPARING", max_threads=1, search_domain=domain)
                 self.assertEqual(result["status"], "completed", result)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
-                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
+                self.assertEqual(result["operation_statistics"]["bvh_build_count"], int(sequence == 1))
+                self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], int(sequence > 1))
                 values = struct.unpack("<" + "d" * len(points), (root / result["distances_file"]).read_bytes())
                 for (x,y,z), value in zip(points, values):
                     expected = math.sqrt(max(-x,0,x-1)**2 + max(-y,0,y-1)**2 + z*z)
@@ -256,8 +266,8 @@ class NativeContractTest(unittest.TestCase):
                     self.assertGreater(values[1], .1)
             closed = self.session_command(root, identity, 4, "close")
             self.finish_session(root, process)
-            self.assertEqual(closed["statistics"]["mesh_grid_build_count"], 1)
-            self.assertEqual(closed["statistics"]["mesh_grid_cache_hits"], 2)
+            self.assertEqual(closed["statistics"]["bvh_build_count"], 1)
+            self.assertEqual(closed["statistics"]["bvh_cache_hits"], 2)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -311,8 +321,8 @@ class NativeContractTest(unittest.TestCase):
                         process.wait()
                     shutil.rmtree(root)
 
-    def test_fixed_domain_null_model_and_registration_invalidate_grid(self):
-        """동일 경계에서도 null 전환·모델 교체·등록 뒤에는 고정 격자를 새로 생성합니다."""
+    def test_fixed_domain_null_model_and_registration_reuse_bvh(self):
+        """범위 null 전환·모델 교체·등록 뒤에도 각 모델의 BVH를 재사용합니다."""
         root, identity, process, _ = self.start_session()
         try:
             points = [(0,0,0),(1,0,0),(0,1,0),(0,0,1)]
@@ -321,20 +331,22 @@ class NativeContractTest(unittest.TestCase):
             data = self.session_geometry(root, "query", [(.2,.2,.2),(.1,.1,.1),(.3,.2,.1)])
             domain = {"domain_id": "fixed", "min": [0,0,0], "max": [1,1,1]}
             sequence = 0
-            for model_index, search_domain, build in ((0,domain,1),(0,domain,0),(0,None,1),
-                                                      (0,domain,1),(1,domain,1),(0,domain,1)):
+            for model_index, search_domain, build in ((0,domain,1),(0,domain,0),(0,None,0),
+                                                      (0,domain,0),(1,domain,1),(0,domain,0)):
                 sequence += 1
                 result = self.session_command(root, identity, sequence, "distance", data=data, model=models[model_index],
                                               stage="PREPARING", search_domain=search_domain)
                 self.assertEqual(result["status"], "completed", result)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], build)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 1-build)
+                self.assertEqual(result["operation_statistics"]["bvh_build_count"], build)
+                self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], 1-build)
             registration = self.session_geometry(root, "registration", points)
             result = self.session_command(root, identity, 7, "register", data=registration, model=models[0])
             self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(result["operation_statistics"]["bvh_build_count"], 0)
+            self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], 1)
             result = self.session_command(root, identity, 8, "distance", data=data, model=models[0],
                                           stage="PREPARING", search_domain=domain)
-            self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
+            self.assertEqual(result["operation_statistics"]["bvh_build_count"], 0)
             self.session_command(root, identity, 9, "close")
             self.finish_session(root, process)
         finally:
@@ -347,7 +359,7 @@ class NativeContractTest(unittest.TestCase):
         process = subprocess.run([str(WORKER),"--check-environment"],capture_output=True,text=True,encoding="utf-8",timeout=30)
         self.assertEqual(process.returncode,0,process.stdout)
         result=json.loads(process.stdout)
-        self.assertEqual(result["protocol_version"],"cccore-native-v6")
+        self.assertEqual(result["protocol_version"],"cccore-native-v7")
         self.assertEqual(result["self_test"],"passed")
         self.assertTrue(Path(result["library_path"]).is_file())
         self.assertTrue(Path(result["tbb_library_path"]).is_file())
@@ -361,22 +373,25 @@ class NativeContractTest(unittest.TestCase):
     def assert_icp_statistics(self, result):
         """메시 ICP 내부 실제 호출 횟수와 겹치지 않는 시간 계측 계약을 검증합니다."""
         statistics = result["icp_statistics"]
-        counters = ("iterations_attempted", "iterations_accepted", "distance_call_count",
+        counters = ("iterations_attempted", "iterations_accepted", "distance_call_count", "bvh_query_count",
                     "mesh_grid_build_count", "mesh_grid_cache_hits", "mesh_grid_expansion_count",
                     "mesh_grid_level_reduction_count", "query_octree_build_count", "mesh_grid_peak_estimated_bytes")
         timings = ("model_level_seconds", "query_octree_seconds", "mesh_grid_seconds", "closest_point_seconds",
                    "filter_rms_seconds", "transform_solve_seconds", "transform_apply_seconds")
-        self.assertEqual(set(statistics), set(counters + timings + ("total_seconds", "stop_reason")))
+        self.assertEqual(set(statistics), set(counters + timings + ("total_seconds", "stop_reason", "surface_search_backend")))
         for key in counters:
             self.assertIs(type(statistics[key]), int, key)
             self.assertGreaterEqual(statistics[key], 0, key)
         for key in timings + ("total_seconds",):
             self.assertTrue(math.isfinite(statistics[key]), key)
             self.assertGreaterEqual(statistics[key], 0, key)
-        self.assertEqual(statistics["distance_call_count"], statistics["mesh_grid_build_count"] + statistics["mesh_grid_cache_hits"])
-        self.assertEqual(statistics["query_octree_build_count"], statistics["distance_call_count"])
+        self.assertEqual(statistics["surface_search_backend"], "BVH")
+        self.assertEqual(statistics["distance_call_count"], statistics["bvh_query_count"])
+        self.assertGreaterEqual(statistics["bvh_query_count"], 1)
+        for key in counters + timings:
+            if key.startswith(("mesh_grid_", "query_octree_", "model_level_")):
+                self.assertEqual(statistics[key], 0, key)
         self.assertLessEqual(statistics["iterations_accepted"], statistics["iterations_attempted"])
-        self.assertGreaterEqual(statistics["mesh_grid_build_count"], 1)
         self.assertLessEqual(sum(statistics[key] for key in timings), statistics["total_seconds"] + 1e-6)
         self.assertLessEqual(statistics["total_seconds"], result["timings"]["kernel_seconds"] + 1e-6)
         self.assertIn(statistics["stop_reason"], ("MAX_ITERATIONS", "RMS_INCREASE", "NOTHING_TO_DO"))
@@ -384,17 +399,11 @@ class NativeContractTest(unittest.TestCase):
 
     def test_icp_mesh_context_matches_legacy_and_reuses_each_registration(self):
         """비대칭 메시의 강체·배율·필터·경계 확장을 기존 공개 API 및 스레드 수별로 비교합니다."""
-        vertices = [(0, 0, 0), (3, 0, 0), (.3, 2, 0), (.2, .5, 4)]
-        triangles = [(0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)]
-        rng = random.Random(9812)
-        points = []
-        for face in triangles:
-            for _ in range(100):
-                u, v = rng.random(), rng.random()
-                if u + v > 1:
-                    u, v = 1 - u, 1 - v
-                points.append(tuple(vertices[face[0]][axis] * (1-u-v) + vertices[face[1]][axis] * u
-                                    + vertices[face[2]][axis] * v for axis in range(3)))
+        # 독립 전수검색 C++ 시험과 같은 원본 400점으로 비교 기준의 분리를 방지합니다.
+        fixture = json.loads((Path(__file__).parent / "fixtures/bvh_tetra_surface.json").read_text(encoding="utf-8"))
+        vertices = fixture["vertices"]
+        triangles = fixture["faces"]
+        points = fixture["points"]
         for threads in (1, 4):
             for scale, filtered, expand in ((1.0, False, False), (1.025, False, False),
                                              (1.0, True, False), (1.025, True, False), (1.025, False, True)):
@@ -415,14 +424,15 @@ class NativeContractTest(unittest.TestCase):
                                 stage='RIGID', max_threads=threads, parameters=request['parameters'])
                             self.assertEqual(current['status'], 'completed', current)
                             stats = self.assert_icp_statistics(current)
-                            self.assertEqual(stats['mesh_grid_build_count'], 1 + stats['mesh_grid_expansion_count'])
-                            self.assertGreater(stats['mesh_grid_cache_hits'], 0)
-                            if expand:
-                                self.assertGreater(stats['mesh_grid_expansion_count'], 0, current)
+                            self.assertEqual(current['operation_statistics']['bvh_build_count'], int(sequence == 1))
+                            self.assertEqual(current['operation_statistics']['bvh_cache_hits'], int(sequence == 2))
                             for actual, expected in zip(sum(current['matrix_4x4'], []), sum(legacy['matrix_4x4'], [])):
                                 self.assertAlmostEqual(actual, expected, delta=2e-5)
                             self.assertAlmostEqual(current['final_rms'], legacy['final_rms'], delta=2e-6)
-                            self.assertEqual(current['final_point_count'], legacy['final_point_count'])
+                            # 공유 모서리의 격자 float 비교는 다른 최근접 좌표를 선택할 수 있습니다.
+                            # 강체 필터 조합의 정확 점수·행렬·RMS는 test_bvh_icp의 독립 전수검색으로 검사합니다.
+                            if not (scale == 1.0 and filtered):
+                                self.assertEqual(current['final_point_count'], legacy['final_point_count'])
                         self.session_command(root, identity, 3, 'close')
                         self.finish_session(root, process)
                     finally:
@@ -480,8 +490,8 @@ class NativeContractTest(unittest.TestCase):
                         distances = struct.unpack('<' + 'd' * len(points), (root / result['distances_file']).read_bytes())
                         for actual, analytic in zip(distances, expected):
                             self.assertAlmostEqual(actual, analytic, delta=2e-5)
-                        self.assertEqual(result['operation_statistics']['mesh_grid_build_count'], int(sequence == 1))
-                        self.assertEqual(result['operation_statistics']['mesh_grid_cache_hits'], int(sequence == 2))
+                        self.assertEqual(result['operation_statistics']['bvh_build_count'], int(sequence == 1))
+                        self.assertEqual(result['operation_statistics']['bvh_cache_hits'], int(sequence == 2))
                     self.session_command(root, identity, 3, 'close')
                     self.finish_session(root, process)
                 finally:
@@ -522,8 +532,8 @@ class NativeContractTest(unittest.TestCase):
                 process.kill()
                 process.wait()
 
-    def test_mesh_grid_reuses_different_queries_and_preserves_distances(self):
-        """검색 단계·격자를 한 번만 준비하고 새 조회점의 정확 거리를 단발 결과와 비교합니다."""
+    def test_bvh_reuses_different_queries_and_preserves_distances(self):
+        """BVH를 한 번만 준비하고 새 조회점의 정확 거리를 단발 격자 결과와 비교합니다."""
         for flat in (False, True):
             for threads in (1, 4):
                 with self.subTest(flat=flat, threads=threads):
@@ -544,9 +554,9 @@ class NativeContractTest(unittest.TestCase):
                             data = self.session_geometry(root, f"query-{sequence}", query, cache_scope="COMMAND")
                             result = self.session_command(root, identity, sequence, "distance", data=data, model=model, max_threads=threads)
                             self.assertEqual(result["status"], "completed", result)
-                            self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
-                            self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
-                            self.assertEqual(result["operation_statistics"]["octree_build_count"], 2 if sequence == 1 else 0)
+                            self.assertEqual(result["operation_statistics"]["bvh_build_count"], int(sequence == 1))
+                            self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], int(sequence > 1))
+                            self.assertEqual(result["operation_statistics"]["octree_build_count"], 0)
                             self.assertEqual((root / result["distances_file"]).read_bytes(), expected)
                             if sequence > 1:
                                 self.assertEqual(result["timings"]["mesh_grid_seconds"], 0)
@@ -555,11 +565,14 @@ class NativeContractTest(unittest.TestCase):
                             expected = expected[8:] + expected[:8]
                         closed = self.session_command(root, identity, 4, "close")
                         self.finish_session(root, process)
-                        self.assertEqual(closed["statistics"]["mesh_grid_build_count"], 1)
-                        self.assertEqual(closed["statistics"]["mesh_grid_cache_hits"], 2)
+                        self.assertEqual(closed["statistics"]["bvh_build_count"], 1)
+                        self.assertEqual(closed["statistics"]["bvh_cache_hits"], 2)
                         geometry = {item["geometry_id"]: item for item in closed["geometry_statistics"]}
                         self.assertGreater(geometry["mesh"]["estimated_bytes"], len(model_points)*20 + len(triangles)*12)
                         self.assertEqual(closed["statistics"]["cache_resident_estimated_bytes"], geometry["mesh"]["estimated_bytes"])
+                        self.assertEqual(closed["statistics"]["bvh_resident_bytes"],
+                                         geometry["mesh"]["estimated_bytes"] - len(model_points)*20 - len(triangles)*12)
+                        self.assertGreaterEqual(closed["statistics"]["bvh_peak_build_bytes"], closed["statistics"]["bvh_resident_bytes"])
                     finally:
                         if process.poll() is None:
                             process.kill()
@@ -567,8 +580,8 @@ class NativeContractTest(unittest.TestCase):
                         # 다음 하위 검사는 독립 세션 파일과 동일한 경로 계약으로 시작합니다.
                         shutil.rmtree(root)
 
-    def test_mesh_grid_keeps_selected_level_when_query_density_changes(self):
-        """조회 밀도가 바뀌어도 검색 단계와 격자를 유지하며 해석적 거리 정답을 보존합니다."""
+    def test_bvh_reuses_tree_when_query_density_changes(self):
+        """조회 밀도가 바뀌어도 BVH를 유지하며 해석적 거리 정답을 보존합니다."""
         root, identity, process, _ = self.start_session()
         try:
             corners = [(0,0,0),(1,0,0),(1,1,0),(0,1,0), (0,0,1),(1,0,1),(1,1,1),(0,1,1)]
@@ -582,9 +595,9 @@ class NativeContractTest(unittest.TestCase):
             for sequence, data in enumerate((small, dense, dense, small), 1):
                 result = self.session_command(root, identity, sequence, "distance", data=data, model=model)
                 self.assertEqual(result["status"], "completed", result)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
-                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
-                self.assertEqual(result["operation_statistics"]["octree_build_count"], 2 if sequence == 1 else 0)
+                self.assertEqual(result["operation_statistics"]["bvh_build_count"], int(sequence == 1))
+                self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], int(sequence > 1))
+                self.assertEqual(result["operation_statistics"]["octree_build_count"], 0)
                 values = array("d")
                 values.frombytes((root / result["distances_file"]).read_bytes())
                 points = small_points if data is small else dense_points
@@ -597,8 +610,8 @@ class NativeContractTest(unittest.TestCase):
                 process.kill()
                 process.wait()
 
-    def test_mesh_grid_invalidates_bounds_model_and_registration(self):
-        """조회 경계·모델 교체·등록 후에는 격자를 다시 만들고 독립 거리 결과를 유지합니다."""
+    def test_bvh_reuses_bounds_model_and_registration(self):
+        """조회 경계·모델 교체·등록 후에도 각 BVH와 독립 거리 결과를 유지합니다."""
         points = [(0, 0, 0), (3, 0, 0), (0, 3, 0), (0, 0, 3)]
         triangles = [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
         query = [(.2, .2, .2), (.7, .2, .3), (.2, .7, .4)]
@@ -609,8 +622,8 @@ class NativeContractTest(unittest.TestCase):
             for sequence, (batch, model_index) in enumerate(zip(queries, (0, 0, 0, 1, 0)), 1):
                 data = self.session_geometry(root, f"query-{sequence}", batch, cache_scope="COMMAND")
                 result = self.session_command(root, identity, sequence, "distance", data=data, model=models[model_index])
-                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1, result)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 0)
+                self.assertEqual(result["operation_statistics"]["bvh_build_count"], int(sequence in (1, 4)), result)
+                self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], int(sequence not in (1, 4)))
                 self.run_request(self.request(data=batch, model=points, triangles=triangles, operation="distance"))
                 self.assertEqual((root / result["distances_file"]).read_bytes(), (self.root / "distances.bin").read_bytes())
             registration_data = self.session_geometry(root, "registration", points, cache_scope="COMMAND")
@@ -618,22 +631,22 @@ class NativeContractTest(unittest.TestCase):
             self.assertEqual(result["status"], "completed", result)
             data = self.session_geometry(root, "after-register", query, cache_scope="COMMAND")
             result = self.session_command(root, identity, 7, "distance", data=data, model=models[0])
-            self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
+            self.assertEqual(result["operation_statistics"]["bvh_build_count"], 0)
             closed = self.session_command(root, identity, 8, "close")
             self.finish_session(root, process)
-            self.assertEqual(closed["statistics"]["mesh_grid_build_count"], 6)
-            self.assertEqual(closed["statistics"]["mesh_grid_cache_hits"], 0)
+            self.assertEqual(closed["statistics"]["bvh_build_count"], 2)
+            self.assertEqual(closed["statistics"]["bvh_cache_hits"], 5)
             geometry = {item["geometry_id"]: item for item in closed["geometry_statistics"]}
             base_bytes = len(points)*20 + len(triangles)*12
-            self.assertEqual(geometry["mesh-1"]["estimated_bytes"], base_bytes)
+            self.assertGreater(geometry["mesh-1"]["estimated_bytes"], base_bytes)
             self.assertGreater(geometry["mesh-0"]["estimated_bytes"], base_bytes)
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
 
-    def test_mesh_grid_command_model_releases_all_resident_memory(self):
-        """명령 전용 메시의 격자는 모델보다 먼저 해제되어 다음 명령에 재사용되지 않습니다."""
+    def test_bvh_command_model_releases_all_resident_memory(self):
+        """명령 전용 메시의 BVH는 모델보다 먼저 해제되어 다음 명령에 재사용되지 않습니다."""
         root, identity, process, _ = self.start_session()
         try:
             for sequence in (1, 2):
@@ -641,11 +654,12 @@ class NativeContractTest(unittest.TestCase):
                 model = self.session_geometry(root, f"model-{sequence}", [(0,0,0), (1,0,0), (0,1,0)], [(0,1,2)], cache_scope="COMMAND")
                 result = self.session_command(root, identity, sequence, "distance", data=data, model=model, stage="PREPARING",
                                               search_domain={"domain_id": "command-domain", "min": [0,0,0], "max": [1,1,1]})
-                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
-                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 0)
+                self.assertEqual(result["operation_statistics"]["bvh_build_count"], 1)
+                self.assertEqual(result["operation_statistics"]["bvh_cache_hits"], 0)
             closed = self.session_command(root, identity, 3, "close")
             self.finish_session(root, process)
             self.assertEqual(closed["statistics"]["cache_resident_estimated_bytes"], 0)
+            self.assertEqual(closed["statistics"]["bvh_resident_bytes"], 0)
             self.assertTrue(all(item["released_after_command"] for item in closed["geometry_statistics"]))
         finally:
             if process.poll() is None:
@@ -933,7 +947,7 @@ class NativeContractTest(unittest.TestCase):
                 process.wait()
 
     def test_session_parallel_cancel_probe_race(self):
-        """검색 준비를 재사용하는 병렬 거리 명령에서도 취소 조회 경쟁이 오류를 만들지 않는지 확인합니다."""
+        """BVH를 재사용하는 병렬 거리 명령에서도 취소 조회 경쟁과 중복 생성을 방지합니다."""
         root, identity, process, _ = self.start_session(max_threads=8)
         try:
             data = self.session_grid_geometry(root, "race-data", 100, .005)
@@ -951,7 +965,9 @@ class NativeContractTest(unittest.TestCase):
             self.assertEqual(closed["status"], "closed")
             self.assertEqual(closed["statistics"]["geometry_load_count"], 2)
             self.assertEqual(closed["statistics"]["geometry_cache_hits"], 14)
-            self.assertEqual(closed["statistics"]["octree_build_count"], 2)
+            self.assertEqual(closed["statistics"]["octree_build_count"], 0)
+            self.assertEqual(closed["statistics"]["bvh_build_count"], 1)
+            self.assertEqual(closed["statistics"]["bvh_cache_hits"], 7)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -1091,7 +1107,7 @@ class NativeContractTest(unittest.TestCase):
         self.assertEqual((self.root / result["distances_file"]).read_bytes(), expected_bytes)
 
     def test_large_mesh_auto_grid_registration_preserves_identity(self):
-        """큰 메시의 예산 하향 격자가 기존 API와 v6 모두 항등 변환과 영 잔차를 보존합니다."""
+        """큰 메시에서 기존 격자 API와 v7 BVH 모두 항등 변환과 영 잔차를 보존합니다."""
         request, data = self.large_mesh_grid_request("register")
         result = self.run_request(request)
         for actual, expected in zip(apply_matrix(data, result["matrix_4x4"]), data):
@@ -1109,7 +1125,7 @@ class NativeContractTest(unittest.TestCase):
                                            parameters=request['parameters'])
             self.assertEqual(current['status'], 'completed', current)
             statistics = self.assert_icp_statistics(current)
-            self.assertGreater(statistics['mesh_grid_level_reduction_count'], 0)
+            self.assertEqual(current['operation_statistics']['bvh_build_count'], 1)
             self.assertLess(current['final_rms'], 1e-7)
             for actual, expected in zip(sum(current['matrix_4x4'], []), sum(result['matrix_4x4'], [])):
                 self.assertAlmostEqual(actual, expected, delta=1e-7)

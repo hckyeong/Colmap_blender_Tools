@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$EnvironmentRoot = "",
     [string]$RuntimePath = "",
@@ -180,14 +180,14 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 ICP 내부 격자까지의 패치와 최종 원문·배포 해시를 연결하는지 검사합니다. #>
+    <# Manifest가 BVH 검색까지의 패치와 최종 원문·배포 해시를 연결하는지 검사합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.protocol_version -ne $Lock.protocol_version -or $manifest.tbb_version -ne $Lock.tbb.version) {
         throw "Runtime Manifest의 프로토콜 또는 oneTBB 버전이 잠금 정보와 다릅니다."
     }
-    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)+$($Lock.cccore.icp_mesh_grid_reuse_patch.id)"
+    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)+$($Lock.cccore.icp_mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_bvh_search_patch.id)"
     if ($manifest.core_patch -ne $expectedCorePatch -or $manifest.self_test.core_patch -ne $expectedCorePatch -or
         $manifest.registration_safety_patch -ne $Lock.cccore.registration_safety_patch.id -or
         $manifest.registration_safety_patch_sha256 -ne $Lock.cccore.registration_safety_patch.sha256 -or
@@ -253,6 +253,28 @@ function Assert-RuntimeManifest {
             throw "Runtime Manifest의 ICP 내부 격자 최종 원문 해시가 다릅니다."
         }
     }
+    $bvhPatch = $Lock.cccore.mesh_bvh_search_patch
+    if ($manifest.mesh_bvh_search_patch -ne $bvhPatch.id -or
+        $manifest.mesh_bvh_search_patch_sha256 -ne $bvhPatch.sha256) {
+        throw "Runtime Manifest의 BVH 검색 패치가 잠금 정보와 다릅니다."
+    }
+    $bvhNames = @($manifest.mesh_bvh_search_source_sha256.PSObject.Properties.Name | Sort-Object)
+    $expectedBvhNames = @($bvhPatch.files | ForEach-Object { $_.path } | Sort-Object)
+    if (@(Compare-Object -ReferenceObject $expectedBvhNames -DifferenceObject $bvhNames).Count -ne 0) {
+        throw "Runtime Manifest의 BVH 패치 원문 목록이 다릅니다."
+    }
+    foreach ($source in $bvhPatch.files) {
+        if ($manifest.mesh_bvh_search_source_sha256.($source.path) -ne $source.patched_sha256) {
+            throw "Runtime Manifest의 BVH 패치 최종 원문 해시가 다릅니다."
+        }
+    }
+    $bvhImplementationNames = @($manifest.bvh_source_sha256.PSObject.Properties.Name | Sort-Object)
+    if (@(Compare-Object -ReferenceObject @('mesh_bvh.cpp', 'mesh_bvh.h') -DifferenceObject $bvhImplementationNames).Count -ne 0) {
+        throw "Runtime Manifest의 BVH 구현 원문 목록이 다릅니다."
+    }
+    foreach ($name in $bvhImplementationNames) {
+        Assert-Hash (Join-Path $NativeSource $name) $manifest.bvh_source_sha256.$name
+    }
     $manifestFiles = @($manifest.runtime_files | ForEach-Object { [string]$_ } | Sort-Object)
     if (@(Compare-Object -ReferenceObject @($ExpectedRuntimeFiles | Sort-Object) -DifferenceObject $manifestFiles).Count -ne 0) {
         throw "Runtime Manifest의 파일 허용 목록이 빌드 계약과 다릅니다."
@@ -308,6 +330,26 @@ foreach ($changedFile in $changedFiles) {
 }
 if ((& git -C $CoreSource ls-files --others --exclude-standard)) { throw "CCCoreLib 캐시에 추적되지 않은 파일이 있습니다." }
 # 완전히 검증된 마지막 패치만 되돌려 기존 패치 단계의 입력 해시를 순서대로 재검증합니다.
+# 기존 캐시의 BVH 최종 패치를 먼저 해제하여 기존 일곱 패치의 검증을 그대로 유지합니다.
+$MeshBvhPatch = $Lock.cccore.mesh_bvh_search_patch
+$MeshBvhPatchFile = Join-Path $NativeSource $MeshBvhPatch.file
+Assert-Hash $MeshBvhPatchFile $MeshBvhPatch.sha256
+$bvhPatchedCount = 0
+foreach ($source in $MeshBvhPatch.files) {
+    if ((Get-NormalizedSha256 (Join-Path $CoreSource $source.path)) -eq $source.patched_sha256) { $bvhPatchedCount++ }
+}
+if ($bvhPatchedCount -and $bvhPatchedCount -ne $MeshBvhPatch.files.Count) {
+    throw "BVH 표면 검색 패치가 일부 파일에만 적용되어 있습니다."
+}
+if ($bvhPatchedCount -eq $MeshBvhPatch.files.Count) {
+    foreach ($source in $MeshBvhPatch.files) {
+        $sourcePath = Join-Path $CoreSource $source.path
+        [IO.File]::WriteAllText($sourcePath, [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+    }
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--reverse', '--check', $MeshBvhPatchFile)
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--reverse', $MeshBvhPatchFile)
+    foreach ($source in $MeshBvhPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.original_sha256 }
+}
 $IcpMeshGridPatch = $Lock.cccore.icp_mesh_grid_reuse_patch
 $IcpMeshGridPatchFile = Join-Path $NativeSource $IcpMeshGridPatch.file
 Assert-Hash $IcpMeshGridPatchFile $IcpMeshGridPatch.sha256
@@ -507,6 +549,18 @@ foreach ($source in $IcpMeshGridPatch.files) {
 Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $IcpMeshGridPatchFile)
 Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $IcpMeshGridPatchFile)
 foreach ($source in $IcpMeshGridPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
+# BVH 콜백 패치는 기존 ICP 패치가 만든 두 등록 원문에만 연결합니다.
+foreach ($source in $MeshBvhPatch.files) {
+    $previous = @($IcpMeshGridPatch.files | Where-Object { $_.path -eq $source.path })
+    if ($previous.Count -ne 1 -or $previous[0].patched_sha256 -ne $source.original_sha256) {
+        throw "BVH 패치의 입력 원문이 ICP 패치와 연결되지 않습니다: $($source.path)"
+    }
+    Assert-Hash (Join-Path $CoreSource $source.path) $source.original_sha256
+}
+Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $MeshBvhPatchFile)
+Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $MeshBvhPatchFile)
+foreach ($source in $MeshBvhPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
+
 Get-PinnedFile $Lock.json.header_url (Join-Path $Dependencies 'json.hpp') $Lock.json.header_sha256
 Get-PinnedFile $Lock.json.license_url (Join-Path $Dependencies 'json-LICENSE.MIT') $Lock.json.license_sha256
 Get-PinnedFile $Lock.tbb.archive_url $TbbArchive $Lock.tbb.archive_sha256
@@ -528,7 +582,7 @@ $CMake = Join-Path $VisualStudio "Common7\IDE\CommonExtensions\Microsoft\CMake\C
 if (!(Test-Path -LiteralPath $CMake)) { throw "Visual Studio에 포함된 CMake를 찾지 못했습니다." }
 Invoke-Checked $CMake @('-S',$NativeSource,'-B',$BuildPath,'-G','Visual Studio 17 2022','-A','x64',
     "-DCCCORE_SOURCE=$CoreSource","-DJSON_INCLUDE_DIR=$Dependencies","-DTBB_DIR=$TbbCMake","-DCORE_COMMIT=$($Lock.cccore.commit)",
-    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)")
+    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)+$($MeshBvhPatch.id)")
 Invoke-Checked $CMake @('--build',$BuildPath,'--config','Release','--parallel','8')
 foreach ($binary in @('colmap_cccore_worker.exe','CCCoreLib.dll')) {
     Copy-Item -LiteralPath (Join-Path $BuildPath "bin\$binary") -Destination (Join-Path $StagedRuntime $binary) -Force
@@ -558,7 +612,7 @@ Copy-SourceTree $CoreSource (Join-Path $SourcePackage 'cccore-src')
 Copy-SourceTree $NanoSource (Join-Path $SourcePackage 'cccore-src\extern\nanoflann')
 $PackagedNative = Join-Path $SourcePackage 'native'
 New-Item -ItemType Directory -Path $PackagedNative, (Join-Path $SourcePackage 'json') -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $NativeSource 'main.cpp'), (Join-Path $NativeSource 'CMakeLists.txt'), (Join-Path $NativeSource 'dependencies.lock.json'), (Join-Path $NativeSource 'REBUILD.md') -Destination $PackagedNative -Force
+Copy-Item -LiteralPath (Join-Path $NativeSource 'main.cpp'), (Join-Path $NativeSource 'mesh_bvh.h'), (Join-Path $NativeSource 'mesh_bvh.cpp'), (Join-Path $NativeSource 'CMakeLists.txt'), (Join-Path $NativeSource 'dependencies.lock.json'), (Join-Path $NativeSource 'REBUILD.md') -Destination $PackagedNative -Force
 Copy-Item -LiteralPath (Join-Path $NativeSource 'patches') -Destination $PackagedNative -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $Dependencies 'json.hpp'), (Join-Path $Dependencies 'json-LICENSE.MIT') -Destination (Join-Path $SourcePackage 'json') -Force
 $PackagedTbb = Join-Path $SourcePackage 'tbb'
@@ -569,6 +623,14 @@ if (Test-Path -LiteralPath $PackagedTbb) {
 New-Item -ItemType Directory -Path $PackagedTbb -Force | Out-Null
 Copy-Item -LiteralPath $TbbArchive -Destination (Join-Path $PackagedTbb $Lock.tbb.archive_name) -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\native\test_cccore_worker.py') -Destination $SourcePackage -Force
+# Python 회귀와 선택적 C++ 시험이 같은 고정 입력을 원문 묶음에서 읽도록 보존합니다.
+$NativeTests = Join-Path $ProjectRoot 'tests\align\native'
+$PackagedTests = Join-Path $SourcePackage 'tests\align\native'
+$PackagedFixtures = Join-Path $SourcePackage 'fixtures'
+New-Item -ItemType Directory -Path $PackagedTests, $PackagedFixtures -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $NativeTests 'test_mesh_bvh.cpp'), (Join-Path $NativeTests 'test_bvh_icp.cpp') -Destination $PackagedTests -Force
+Copy-Item -LiteralPath (Join-Path $NativeTests 'fixtures\bvh_tetra_surface.json') -Destination $PackagedFixtures -Force
+
 $SourceArchive = Join-Path $StagedRuntime 'cccore_rebuild_sources.zip'
 Compress-Archive -Path (Join-Path $SourcePackage '*') -DestinationPath $SourceArchive -Force
 $SelfTestResult = ConvertTo-PortableSelfTestResult (Invoke-NativeEnvironmentCheck $StagedRuntime)
@@ -601,11 +663,17 @@ $MeshGridDomainSourceHashes = [ordered]@{}
 foreach ($source in $MeshGridDomainPatch.files) { $MeshGridDomainSourceHashes[$source.path] = $source.patched_sha256 }
 $IcpMeshGridSourceHashes = [ordered]@{}
 foreach ($source in $IcpMeshGridPatch.files) { $IcpMeshGridSourceHashes[$source.path] = $source.patched_sha256 }
+$MeshBvhSourceHashes = [ordered]@{}
+foreach ($source in $MeshBvhPatch.files) { $MeshBvhSourceHashes[$source.path] = $source.patched_sha256 }
+$BvhImplementationHashes = [ordered]@{}
+foreach ($name in @('mesh_bvh.h', 'mesh_bvh.cpp')) {
+    $BvhImplementationHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $NativeSource $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+}
 $Manifest = [ordered]@{
     protocol_version = $Lock.protocol_version
     platform = 'windows-x64'
     core_commit = $Lock.cccore.commit
-    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)"
+    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)+$($IcpMeshGridPatch.id)+$($MeshBvhPatch.id)"
     core_patch_sha256 = $Lock.cccore.patch_sha256
     concurrency_patch = $ConcurrencyPatch.patch_id
     concurrency_patch_sha256 = $ConcurrencyPatch.patch_sha256
@@ -624,6 +692,10 @@ $Manifest = [ordered]@{
     icp_mesh_grid_reuse_patch = $IcpMeshGridPatch.id
     icp_mesh_grid_reuse_patch_sha256 = $IcpMeshGridPatch.sha256
     icp_mesh_grid_reuse_source_sha256 = $IcpMeshGridSourceHashes
+    mesh_bvh_search_patch = $MeshBvhPatch.id
+    mesh_bvh_search_patch_sha256 = $MeshBvhPatch.sha256
+    mesh_bvh_search_source_sha256 = $MeshBvhSourceHashes
+    bvh_source_sha256 = $BvhImplementationHashes
     dependencies = $Lock
     build_options = @{ CCCORELIB_SHARED=$true; CCCORELIB_USE_QT_CONCURRENT=$false; CCCORELIB_USE_TBB=$true; CCCORELIB_USE_CGAL=$false; configuration='Release' }
     cmake_version = ((& $CMake --version) | Select-Object -First 1)

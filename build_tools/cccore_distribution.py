@@ -87,14 +87,14 @@ def validate_package_archive(path):
 
 
 def validate_cccore_runtime(runtime_root):
-    """CC 런타임의 v6 ICP 통계·단일 세션 Manifest와 파일 해시를 검사합니다."""
+    """CC 런타임의 v7 BVH 통계·단일 세션 Manifest와 파일 해시를 검사합니다."""
     root = Path(runtime_root).resolve()
     manifest_path = root / "runtime_manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError("CC Runtime Manifest가 없습니다.")
     manifest = read_json(manifest_path)
-    if manifest.get("protocol_version") != "cccore-native-v6":
-        raise RuntimeError("CC Runtime Manifest가 v6 네이티브 계약이 아닙니다.")
+    if manifest.get("protocol_version") != "cccore-native-v7":
+        raise RuntimeError("CC Runtime Manifest가 v7 네이티브 계약이 아닙니다.")
     options = manifest.get("build_options")
     if not isinstance(options, dict) or options.get("CCCORELIB_USE_TBB") is not True:
         raise RuntimeError("CC Runtime Manifest에서 oneTBB 빌드가 활성화되지 않았습니다.")
@@ -139,8 +139,8 @@ def validate_cccore_runtime(runtime_root):
     if file_hash(license_path).lower() != expected_license_hash.lower():
         raise RuntimeError("CC 런타임의 oneTBB 라이선스 해시가 Manifest와 다릅니다.")
     self_test = manifest.get("self_test")
-    if not isinstance(self_test, dict) or self_test.get("protocol_version") != "cccore-native-v6":
-        raise RuntimeError("CC Runtime Manifest의 자체 검사 결과가 v6 계약이 아닙니다.")
+    if not isinstance(self_test, dict) or self_test.get("protocol_version") != "cccore-native-v7":
+        raise RuntimeError("CC Runtime Manifest의 자체 검사 결과가 v7 계약이 아닙니다.")
     expected_libraries = {"library_path": "CCCoreLib.dll", "tbb_library_path": "tbb12.dll"}
     for name, expected in expected_libraries.items():
         if self_test.get(name) != expected:
@@ -163,9 +163,10 @@ def validate_cccore_distribution(runtime_root):
     reuse = lock["cccore"]["mesh_grid_reuse_patch"]
     domain = lock["cccore"]["mesh_grid_fixed_domain_patch"]
     icp = lock["cccore"]["icp_mesh_grid_reuse_patch"]
+    bvh = lock["cccore"]["mesh_bvh_search_patch"]
     expected_core_patch = "+".join((
         lock["cccore"]["patch_id"], lock["cccore"]["concurrency_patch"]["patch_id"], safety["id"],
-        grid["id"], reuse["id"], domain["id"], icp["id"],
+        grid["id"], reuse["id"], domain["id"], icp["id"], bvh["id"],
     ))
     expected_safety = {
         "core_patch": expected_core_patch, "registration_safety_patch": safety["id"],
@@ -180,6 +181,9 @@ def validate_cccore_distribution(runtime_root):
         "icp_mesh_grid_reuse_patch": icp["id"],
         "icp_mesh_grid_reuse_patch_sha256": icp["sha256"],
         "icp_mesh_grid_reuse_source_sha256": {source["path"]: source["patched_sha256"] for source in icp["files"]},
+        "mesh_bvh_search_patch": bvh["id"],
+        "mesh_bvh_search_patch_sha256": bvh["sha256"],
+        "mesh_bvh_search_source_sha256": {source["path"]: source["patched_sha256"] for source in bvh["files"]},
         "mesh_grid_memory_patch": grid["id"],
         "mesh_grid_memory_patch_sha256": grid["sha256"],
         "mesh_grid_source_sha256": {source["path"]: source["patched_sha256"] for source in grid["files"]},
@@ -227,12 +231,34 @@ def validate_cccore_distribution(runtime_root):
             **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in domain["files"]},
             "native/" + icp["file"]: icp["sha256"],
             **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in icp["files"]},
+            "native/" + bvh["file"]: bvh["sha256"],
+            **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in bvh["files"]},
         }
         for name, expected_hash in source_hashes.items():
             if hashlib.sha256(archive.read(name)).hexdigest() != expected_hash:
                 raise RuntimeError(f"CC 배포 원문의 등록·격자 메모리 패치 해시가 다릅니다: {name}")
         if json.loads(archive.read("native/dependencies.lock.json")) != lock:
             raise RuntimeError("CC 배포 원문의 의존성 잠금 정보가 현재 소스와 다릅니다.")
+        # 원문 ZIP 전체 지문 외에도 현재 회귀 소스와 공통 입력의 포함·내용을 대조합니다.
+        test_files = {
+            "test_cccore_worker.py": "test_cccore_worker.py",
+            "tests/align/native/test_mesh_bvh.cpp": "test_mesh_bvh.cpp",
+            "tests/align/native/test_bvh_icp.cpp": "test_bvh_icp.cpp",
+            "fixtures/bvh_tetra_surface.json": "fixtures/bvh_tetra_surface.json",
+        }
+        for packaged, source in test_files.items():
+            content = archive.read(packaged).decode("utf-8").replace("\r\n", "\n")
+            if content != (ROOT / "tests/align/native" / source).read_text(encoding="utf-8"):
+                raise RuntimeError(f"CC 재빌드 시험 원문 또는 고정 입력이 현재 소스와 다릅니다: {packaged}")
+        bvh_hashes = manifest.get("bvh_source_sha256")
+        if not isinstance(bvh_hashes, dict) or set(bvh_hashes) != {"mesh_bvh.h", "mesh_bvh.cpp"}:
+            raise RuntimeError("CC 배포의 BVH 구현 원문 지문 목록이 올바르지 않습니다.")
+        for name, digest in bvh_hashes.items():
+            built_source = archive.read("native/" + name)
+            if hashlib.sha256(built_source).hexdigest() != digest:
+                raise RuntimeError(f"CC BVH 빌드 원문의 해시가 Manifest와 다릅니다: {name}")
+            if built_source.decode("utf-8").replace("\r\n", "\n") != (native_source / name).read_text(encoding="utf-8"):
+                raise RuntimeError(f"CC BVH 빌드 원문이 현재 소스와 다릅니다: {name}")
         for field, name in (("worker_source_sha256", "main.cpp"), ("cmake_source_sha256", "CMakeLists.txt")):
             built_source = archive.read("native/" + name)
             if hashlib.sha256(built_source).hexdigest() != manifest.get(field):

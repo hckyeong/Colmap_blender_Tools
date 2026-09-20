@@ -335,11 +335,26 @@ def _surface_radius(value):
     return _radius(value)
 
 
+def _candidate_face_mask(patches, areas, lower, upper, maximum, minimum):
+    """재사용 배열로 세 정점을 직접 비교해 기존 경계 포함 후보 판정을 보존합니다."""
+    maximum, minimum = maximum[:len(patches)], minimum[:len(patches)]
+    eligible = areas > 0
+    for axis in range(3):
+        np.maximum(patches[:, 0, axis], patches[:, 1, axis], out=maximum)
+        np.maximum(maximum, patches[:, 2, axis], out=maximum)
+        np.minimum(patches[:, 0, axis], patches[:, 1, axis], out=minimum)
+        np.minimum(minimum, patches[:, 2, axis], out=minimum)
+        eligible &= maximum >= lower[axis]
+        eligible &= minimum <= upper[axis]
+    return eligible
+
+
 class MeshSurfaceSampler:
     """원본 면적 누적 색인을 디스크에 보관하며 독립 표면 표본을 생성합니다."""
 
-    def __init__(self, geometry, model_bounds, radius, directory, *, cancel_probe=None, batch_size=8192):
-        """한정된 묶음으로 전체 및 보수적 후보 면적 색인을 작성합니다."""
+    def __init__(self, geometry, model_bounds, radius, directory, *, cancel_probe=None, batch_size=8192,
+                 source_bounds=None):
+        """같은 최종 형상의 선택적 범위를 재사용하며 제한된 묶음으로 면적 색인을 작성합니다."""
         import os
         import tempfile
         from pathlib import Path
@@ -357,10 +372,16 @@ class MeshSurfaceSampler:
             raise CcCoreInputError("CC 표면 삼각면 인덱스가 올바르지 않습니다.")
         if bounds.shape != (2, 3) or not np.isfinite(bounds).all() or np.any(bounds[0] > bounds[1]):
             raise CcCoreInputError("CC 대상 경계가 올바르지 않습니다.")
+        if source_bounds is not None:
+            source_bounds = np.asarray(source_bounds, dtype=np.float64)
+            if (source_bounds.shape != (2, 3) or not np.isfinite(source_bounds).all()
+                    or np.any(source_bounds[0] > source_bounds[1])):
+                raise CcCoreInputError("CC 원본 표면 경계가 올바르지 않습니다.")
         lower, upper = bounds[0] - self.radius, bounds[1] + self.radius
         if not np.isfinite([lower, upper]).all():
             raise CcCoreInputError("CC 확장 대상 경계가 유한하지 않습니다.")
-        original_lower, original_upper = np.full(3, np.inf), np.full(3, -np.inf)
+        original_lower, original_upper = (source_bounds.copy() if source_bounds is not None
+                                          else (np.full(3, np.inf), np.full(3, -np.inf)))
         try:
             root = Path(directory).resolve(strict=True)
             for _ in range(2):
@@ -373,10 +394,13 @@ class MeshSurfaceSampler:
                 vertices = self.points[start:start + self.batch_size]
                 if not np.isfinite(vertices).all():
                     raise CcCoreInputError("CC 원본 표면 좌표가 유한하지 않습니다.")
-                original_lower = np.minimum(original_lower, vertices.min(axis=0))
-                original_upper = np.maximum(original_upper, vertices.max(axis=0))
+                if source_bounds is None:
+                    original_lower = np.minimum(original_lower, vertices.min(axis=0))
+                    original_upper = np.maximum(original_upper, vertices.max(axis=0))
             totals = [0.0, 0.0]
             eligible_faces = 0
+            maximum = np.empty(min(self.batch_size, len(self.faces)), dtype=np.float64)
+            minimum = np.empty_like(maximum)
             for start in range(0, len(self.faces), self.batch_size):
                 _cancel(cancel_probe)
                 faces = self.faces[start:start + self.batch_size]
@@ -386,7 +410,7 @@ class MeshSurfaceSampler:
                 areas = _areas(patches)
                 if not np.isfinite(areas).all():
                     raise CcCoreInputError("CC 표면 면적이 유한하지 않습니다.")
-                eligible = (areas > 0) & np.all(patches.max(axis=1) >= lower, axis=1) & np.all(patches.min(axis=1) <= upper, axis=1)
+                eligible = _candidate_face_mask(patches, areas, lower, upper, maximum, minimum)
                 eligible_faces += int(eligible.sum())
                 for index, weights in enumerate((areas, np.where(eligible, areas, 0.0))):
                     cumulative = np.cumsum(weights, dtype=np.float64) + totals[index]
@@ -571,6 +595,8 @@ class MeshSurfaceSampler:
         return CandidateSamples(points, values, sources, metadata, digest.hexdigest())
 
 
-def build_surface_sampler(geometry, model_bounds, radius, directory, *, cancel_probe=None, batch_size=8192):
-    """원본 전체와 보수적 후보의 면적 색인을 가진 표면 샘플러를 만듭니다."""
-    return MeshSurfaceSampler(geometry, model_bounds, radius, directory, cancel_probe=cancel_probe, batch_size=batch_size)
+def build_surface_sampler(geometry, model_bounds, radius, directory, *, cancel_probe=None, batch_size=8192,
+                          source_bounds=None):
+    """같은 최종 형상의 선택적 범위를 전달받아 전체·후보 면적 샘플러를 만듭니다."""
+    return MeshSurfaceSampler(geometry, model_bounds, radius, directory, cancel_probe=cancel_probe,
+                              batch_size=batch_size, source_bounds=source_bounds)

@@ -82,6 +82,9 @@ def _v3_engine_metadata(source: str) -> dict:
         evaluation_keys[5] = evaluation_keys[2]
         evaluation_keys[7] = evaluation_keys[1]
         evaluation_keys[8] = evaluation_keys[2]
+    # 과거 저장의 계측 집합은 현재 실행 스키마 확장과 독립적으로 고정합니다.
+    CC_NATIVE_TIMING_FIELDS = tuple(name for name in CC_NATIVE_TIMING_FIELDS if name != "bvh_build_seconds")
+    CC_NATIVE_COUNTER_FIELDS = tuple(name for name in CC_NATIVE_COUNTER_FIELDS if not name.startswith("bvh_"))
     timings_zero = {name: 0.0 for name in CC_NATIVE_TIMING_FIELDS}
     counters_zero = {name: 0 for name in CC_NATIVE_COUNTER_FIELDS}
     seen = set()
@@ -342,8 +345,9 @@ def test_cc_mesh_approval_roundtrip_uses_real_project_snapshot() -> None:
         physical = tuple(audit["physical_native_calls"])
         assert all("icp_statistics" not in item for item in physical)
         assert len(physical) == sum(item["execution_source"] == "native_session" for item in logical)
-        contract.validate_native_session_aggregates(
-            audit["session_statistics"], audit["geometry_statistics"], physical,
+        assert not any(name.startswith("bvh_") for name in audit["session_statistics"])
+        assert audit["session_statistics"]["cache_resident_estimated_bytes"] == sum(
+            item["estimated_bytes"] for item in audit["geometry_statistics"] if item["cache_scope"] == "SESSION"
         )
         contract.validate_session_protocol_statistics(
             audit["session_protocol_statistics"], physical,

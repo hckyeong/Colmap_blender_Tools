@@ -2,11 +2,11 @@
 
 이 디렉터리는 Blender 또는 CloudCompare GUI를 불러오지 않는 Windows x64 실행 파일의 소스입니다. 상위 Python 조정자가 공통 좌표 정규화, 결정적 표본화, 강체→유사변환 두 단계와 독립 평가를 담당합니다.
 
-`colmap_cccore_worker.exe --session <JSON 절대경로>`는 Align 작업 하나의 등록·거리 명령을 단일 프로세스에서 순차 처리합니다. 세션의 요청·응답·진행·취소·종료 결과는 작업 폴더의 원자 파일로만 교환하며 표준 입출력 파이프를 사용하지 않습니다. 기존 `--request` v2는 수치 기준선과 호환 검사에만 유지하며 v6 세션과 혼용하지 않습니다. `--check-environment`는 실제로 로드한 공유 DLL 경로와 비대칭 점군 합성 등록 검사를 반환합니다.
+`colmap_cccore_worker.exe --session <JSON 절대경로>`는 Align 작업 하나의 등록·거리 명령을 단일 프로세스에서 순차 처리합니다. 세션의 요청·응답·진행·취소·종료 결과는 작업 폴더의 원자 파일로만 교환하며 표준 입출력 파이프를 사용하지 않습니다. 기존 `--request` v2는 수치 기준선과 호환 검사에만 유지하며 v7 세션과 혼용하지 않습니다. `--check-environment`는 실제로 로드한 공유 DLL 경로와 비대칭 점군 합성 등록 검사를 반환합니다.
 
 ## 파일 계약
 
-- 세션 `protocol_version`: `cccore-native-v6`
+- 세션 `protocol_version`: `cccore-native-v7`
 - 시작 요청은 `session_id`, `job_id`, `input_fingerprint`, `parameters.max_threads`와 고정된 ready·result·cancel·command 경로를 포함합니다.
 - 각 명령은 1부터 단조 증가하는 `sequence`, `operation`, `stage`, 동일한 세션 식별자와 순번별 고정 response·progress·distance 경로를 포함합니다.
 - `operation`: `register`, `distance`, 세션 종료용 `close`
@@ -70,3 +70,15 @@ v4의 `farthest-mesh-correspondence-v1`은 최원거리점 제거 뒤에도 메�
 채택 원문과 수정 원인은 [재빌드 안내](REBUILD.md)에 기록했습니다. 배율 일관성 수정은 `src/RegistrationTools.cpp`만 바꾸는 `bounded-scale-v1`로 유지합니다. v4 세션은 명령을 순차 실행하며, 별도 `multithread-state-race-v1` 패치는 각 명령 내부 TBB 태스크가 공유하는 옥트리 성공 플래그와 C2M 성공·오류 상태만 원자화합니다. 두 패치는 각각 원문·패치·적용 결과 SHA-256을 잠금 파일로 검증하며, 결과 행렬의 배율을 사후에 잘라 맞추는 보정은 수행하지 않습니다.
 
 Windows에서 읽기 핸들이 파일 교체를 잠시 막을 때 시스템 오류 5·32·33에만 20ms 간격, 최대 240ms의 원자 교체 재시도를 수행합니다. 한도를 넘으면 해당 시스템 번호를 `native_code`로 보존한 `OUTPUT_IO_ERROR`를 반환합니다. v4 진행 파일 기록 실패는 명령 응답 또는 `session-result.json`의 오류로 남고, v2 단발 요청은 같은 오류를 stdout 결과에도 반환합니다.
+
+## 정확 표면 BVH 검색
+
+v7 세션은 준비·등록·평가의 메시 대상 검색에 동일한 정확 삼각형 BVH를 사용합니다. 표본, 반복 상한, 겹침·수렴·배율 정책은 유지하며 알고리즘 식별자는 `cccore-icp-v6`, 작업 계약은 `cccore-job-v4`입니다. 기존 공개 GRID API와 이전 승인 이력 읽기는 유지합니다.
+
+`bvh_build_seconds`와 생성·적중·퇴거 횟수를 명령 및 세션에 기록합니다. `bvh_resident_bytes`와 `bvh_peak_build_bytes`는 별도 감사값이며 BVH 상주량은 기존 형상·캐시 메모리 합계에 이미 포함됩니다. 메시 등록 내부 통계는 `surface_search_backend=BVH`, `bvh_query_count=distance_call_count`이며 격자·검사점 옥트리·격자 단계 선택 계측은 0입니다. 점 대상 등록과 거리 명령의 `icp_statistics`는 null입니다. 내부 시간은 kernel에 포함되어 다시 더하지 않습니다.
+
+`mesh-bvh-search-v1` 패치와 워커의 `mesh_bvh.h`, `mesh_bvh.cpp` 원문을 재빌드 묶음에 포함합니다. C++17 자체 구현으로 새 외부 의존성을 추가하지 않습니다.
+
+0.3.64는 BVH 최초 생성을 병렬화합니다. 정확한 노드 수를 선할당하고 삼각면 경계·큰 구간의 경계 집계·독립 하위 트리를 기존 CPU 상한 안에서 생성합니다. 중앙 분할·잎 크기·정확 검색·원본 삼각형 번호와 메시별 세션 재사용은 유지합니다. 생성 메모리 예산에는 기존 배열 외에 oneTBB 작업자 스택과 태스크 여유를 포함합니다. 진행·취소 콜백은 호출 스레드에서만 실행하고 실패한 작업은 합류 후 정리합니다.
+
+외부 프로토콜과 알고리즘 계약은 v7/v6로 유지합니다. 실행 파일 SHA-256과 `bvh_source_sha256`가 생성 구현을 구별하며, 기존 계산 결과 캐시의 실행 파일 식별 검증을 계속 적용합니다.

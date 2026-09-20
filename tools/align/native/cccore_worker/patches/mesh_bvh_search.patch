@@ -1,0 +1,103 @@
+--- a/include/RegistrationTools.h
++++ b/include/RegistrationTools.h
+@@ -12,6 +12,8 @@
+ {
+ 	class GenericProgressCallback;
+ 	class GenericCloud;
++	class PointCloud;
++	class GenericIndexedCloudPersist;
+ 	class GenericIndexedMesh;
+ 	class GenericIndexedCloud;
+ 	class KDTree;
+@@ -128,6 +130,8 @@
+ 			std::size_t iterations_attempted = 0;
+ 			std::size_t iterations_accepted = 0;
+ 			std::size_t distance_call_count = 0;
++			std::size_t bvh_query_count = 0;
++			const char* surface_search_backend = "GRID";
+ 			std::size_t mesh_grid_build_count = 0;
+ 			std::size_t mesh_grid_cache_hits = 0;
+ 			std::size_t mesh_grid_expansion_count = 0;
+@@ -149,6 +153,10 @@
+ 		Observer observer = nullptr;
+ 		void* observerData = nullptr;
+ 		bool reuseMeshGrid = true;
++		// 선택적 정확 표면 검색은 거리와 최근접 좌표·삼각형 식별자를 함께 기록합니다.
++		using ExactMeshDistances = int (*)(void*, GenericIndexedCloudPersist*, PointCloud*, unsigned, GenericProgressCallback*);
++		ExactMeshDistances exactMeshDistances = nullptr;
++		void* exactMeshDistancesData = nullptr;
+ 	};
+ 
+ 	//! ICP point cloud registration algorithm (Besl et al.).
+--- a/src/RegistrationTools.cpp
++++ b/src/RegistrationTools.cpp
+@@ -249,6 +249,16 @@
+ 		GenericProgressCallback* distanceProgress = progress ? &cancelOnly : nullptr;
+ 		stageTimer.select(nullptr);
+ 		++stats->distance_call_count;
++		if (context->exactMeshDistances)
++		{
++			stats->surface_search_backend = "BVH";
++			++stats->bvh_query_count;
++			stageTimer.select(&stats->closest_point_seconds);
++			const int result = context->exactMeshDistances(context->exactMeshDistancesData, cloud,
++				distanceParams.CPSet, static_cast<unsigned>(std::max(1, distanceParams.maxThreadCount)), distanceProgress);
++			stageTimer.select(nullptr);
++			return result;
++		}
+ 		CCVector3 low, high, meshLow, meshHigh;
+ 		cloud->getBoundingBox(low, high);
+ 		mesh->getBoundingBox(meshLow, meshHigh);
+@@ -446,18 +456,22 @@
+ 			return ICP_ERROR_INVALID_INPUT;
+ 		}
+ 
+-		stageTimer.select(stats ? &stats->model_level_seconds : nullptr);
+-		//we'll use the mesh vertices to estimate the right octree level
+-		DgmOctree dataOctree(data.cloud);
+-		DgmOctree modelOctree(inputModelCloud);
+-		if (dataOctree.build() < static_cast<int>(data.cloud->size()) || modelOctree.build() < static_cast<int>(inputModelCloud->size()))
+-		{
+-			//an error occurred during the octree computation: probably there's not enough memory
+-			return ICP_ERROR_NOT_ENOUGH_MEMORY;
+-		}
+-
+-		meshDistOctreeLevel = dataOctree.findBestLevelForComparisonWithOctree(&modelOctree);
+-		stageTimer.select(nullptr);
++		// 정확 표면 검색은 격자 단계 선택용 옥트리를 만들지 않습니다.
++		if (!context || !context->exactMeshDistances)
++		{
++			stageTimer.select(stats ? &stats->model_level_seconds : nullptr);
++			//we'll use the mesh vertices to estimate the right octree level
++			DgmOctree dataOctree(data.cloud);
++			DgmOctree modelOctree(inputModelCloud);
++			if (dataOctree.build() < static_cast<int>(data.cloud->size()) || modelOctree.build() < static_cast<int>(inputModelCloud->size()))
++			{
++				//an error occurred during the octree computation: probably there's not enough memory
++				return ICP_ERROR_NOT_ENOUGH_MEMORY;
++			}
++	
++			meshDistOctreeLevel = dataOctree.findBestLevelForComparisonWithOctree(&modelOctree);
++			stageTimer.select(nullptr);
++		}
+ 
+ 		//we need normals to register with normals ;)
+ 		registerWithNormals &= inputModelMesh->normalsAvailable();
+@@ -569,7 +583,7 @@
+ 				DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 		{
+ 			//an error occurred during distances computation...
+-			return ICP_ERROR_DIST_COMPUTATION;
++			return context && progressCb && progressCb->isCancelRequested() ? ICP_ERROR_CANCELED_BY_USER : ICP_ERROR_DIST_COMPUTATION;
+ 		}
+ 	}
+ 	else if (inputModelCloud)
+@@ -1177,7 +1191,7 @@
+ 					< DistanceComputationTools::DISTANCE_COMPUTATION_RESULTS::SUCCESS)
+ 			{
+ 				//an error occurred during distances computation...
+-				result = ICP_ERROR_REGISTRATION_STEP;
++				result = context && progressCb && progressCb->isCancelRequested() ? ICP_ERROR_CANCELED_BY_USER : ICP_ERROR_REGISTRATION_STEP;
+ 				break;
+ 			}
+ 		}

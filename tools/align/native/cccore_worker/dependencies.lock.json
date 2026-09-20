@@ -1,5 +1,5 @@
 {
-  "protocol_version": "cccore-native-v6",
+  "protocol_version": "cccore-native-v7",
   "cccore": {
     "repository": "https://github.com/CloudCompare/CCCoreLib.git",
     "commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432",
@@ -135,6 +135,23 @@
           "path": "src/GridAndMeshIntersection.cpp",
           "original_sha256": "55082c89aaf4bf0c72068523ebc1657dad0e4e7aa3c496b9fff6bb25f867891f",
           "patched_sha256": "89266a3fcb90567fbe30c940646b1335718187f770f8b46d7a3a273222f06d4b"
+        }
+      ]
+    },
+    "mesh_bvh_search_patch": {
+      "id": "mesh-bvh-search-v1",
+      "file": "patches/mesh_bvh_search.patch",
+      "sha256": "ee94c4260748b1bcf9a76c18d93a8e8c93dbd7b51f72c4a9221f0f0b317527b4",
+      "files": [
+        {
+          "path": "include/RegistrationTools.h",
+          "original_sha256": "744a66edf80fc29741146f0965a075b6952037c6859533119f5716db8d43c1b7",
+          "patched_sha256": "4aba9aad129da5b8d491f61f593ce17076cf121e318c3a25ee408a325fa75a51"
+        },
+        {
+          "path": "src/RegistrationTools.cpp",
+          "original_sha256": "b37a859e27369d0c620a263b027845bfbeca639f480e422bf0e01d718abba0be",
+          "patched_sha256": "c10ba35c31daf457cc277187d31ea3a7b8a7aba0f068aacb18a1bdbcc9cf8193"
         }
       ]
     }

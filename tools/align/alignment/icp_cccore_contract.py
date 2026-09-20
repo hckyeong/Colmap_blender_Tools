@@ -14,9 +14,9 @@ from typing import Any, Mapping
 import numpy as np
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v5"
+CC_ALGORITHM_VERSION = "cccore-icp-v6"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
-CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v6"
+CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v7"
 CC_NATIVE_COORDINATE_MAX = float(np.finfo(np.float32).max)
 CC_LEGACY_NATIVE_PROTOCOL_VERSION = "cccore-native-v2"
 CC_THREAD_BACKEND = "oneTBB"
@@ -56,14 +56,15 @@ CC_NATIVE_OPERATION_STAGES = {
 }
 CC_NATIVE_TIMING_FIELDS = (
     "binary_read_seconds", "conversion_validation_seconds", "mesh_load_seconds",
-    "octree_seconds", "mesh_grid_seconds", "kernel_seconds", "serialization_seconds",
+    "octree_seconds", "mesh_grid_seconds", "bvh_build_seconds", "kernel_seconds", "serialization_seconds",
 )
 CC_NATIVE_COUNTER_FIELDS = (
     "geometry_load_count", "geometry_cache_hits", "octree_build_count", "octree_cache_hits",
     "mesh_grid_build_count", "mesh_grid_cache_hits",
+    "bvh_build_count", "bvh_cache_hits", "bvh_eviction_count",
 )
 CC_ICP_COUNTER_FIELDS = (
-    "iterations_attempted", "iterations_accepted", "distance_call_count",
+    "iterations_attempted", "iterations_accepted", "distance_call_count", "bvh_query_count",
     "mesh_grid_build_count", "mesh_grid_cache_hits", "mesh_grid_expansion_count",
     "mesh_grid_level_reduction_count", "query_octree_build_count", "mesh_grid_peak_estimated_bytes",
 )
@@ -367,7 +368,7 @@ def validate_icp_statistics(value: Any, *, mesh_registration: bool, kernel_secon
         if value is not None:
             raise CcCoreEnvironmentError("CC 거리·점군 등록에는 내부 메시 통계를 기록할 수 없습니다.")
         return None
-    if not isinstance(value, Mapping) or set(value) != {*CC_ICP_COUNTER_FIELDS, *CC_ICP_TIMING_FIELDS, "stop_reason"}:
+    if not isinstance(value, Mapping) or set(value) != {*CC_ICP_COUNTER_FIELDS, *CC_ICP_TIMING_FIELDS, "stop_reason", "surface_search_backend"}:
         raise CcCoreEnvironmentError("CC 내부 ICP 통계가 고정 계약과 다릅니다.")
     result = {name: nonnegative_integer(value[name], f"CC 내부 ICP {name}") for name in CC_ICP_COUNTER_FIELDS}
     result.update({name: finite_nonnegative_number(value[name], f"CC 내부 ICP {name}") for name in CC_ICP_TIMING_FIELDS})
@@ -379,13 +380,28 @@ def validate_icp_statistics(value: Any, *, mesh_registration: bool, kernel_secon
         raise CcCoreEnvironmentError("CC 내부 ICP 채택 반복 수가 시도 수보다 큽니다.")
     if max_iterations is not None and result["iterations_attempted"] > max_iterations:
         raise CcCoreEnvironmentError("CC 내부 ICP 시도 수가 요청 반복 상한보다 큽니다.")
+    backend = value["surface_search_backend"]
+    if not isinstance(backend, str) or backend not in {"BVH", "GRID"}:
+        raise CcCoreEnvironmentError("CC 내부 ICP 표면 검색 백엔드가 올바르지 않습니다.")
+    result["surface_search_backend"] = backend
+    if backend == "BVH":
+        grid_fields = ("mesh_grid_build_count", "mesh_grid_cache_hits", "mesh_grid_expansion_count",
+                       "mesh_grid_level_reduction_count", "query_octree_build_count", "mesh_grid_peak_estimated_bytes",
+                       "model_level_seconds", "query_octree_seconds", "mesh_grid_seconds")
+        if any(result[name] != 0 for name in grid_fields):
+            raise CcCoreEnvironmentError("CC BVH 등록에 격자 또는 옥트리 작업이 기록되었습니다.")
+        if result["distance_call_count"] != result["bvh_query_count"]:
+            raise CcCoreEnvironmentError("CC BVH 조회 수가 내부 ICP 거리 호출 수와 다릅니다.")
+    elif result["bvh_query_count"] != 0:
+        raise CcCoreEnvironmentError("CC 격자 등록에 BVH 조회가 기록되었습니다.")
     if reason not in {"ERROR", "CANCELLED"}:
-        if result["distance_call_count"] != result["mesh_grid_build_count"] + result["mesh_grid_cache_hits"]:
-            raise CcCoreEnvironmentError("CC 내부 ICP 거리 호출과 격자 생성·재사용 합계가 다릅니다.")
-        if result["query_octree_build_count"] != result["distance_call_count"]:
-            raise CcCoreEnvironmentError("CC 내부 ICP 질의 옥트리 생성 수가 거리 호출 수와 다릅니다.")
-        if result["distance_call_count"] < 1 or result["mesh_grid_build_count"] < 1:
-            raise CcCoreEnvironmentError("CC 내부 ICP에 초기 거리 계산 또는 격자 생성이 없습니다.")
+        if result["distance_call_count"] < 1:
+            raise CcCoreEnvironmentError("CC 내부 ICP에 초기 거리 계산이 없습니다.")
+        if backend == "GRID":
+            if result["distance_call_count"] != result["mesh_grid_build_count"] + result["mesh_grid_cache_hits"]:
+                raise CcCoreEnvironmentError("CC 내부 ICP 거리 호출과 격자 생성·재사용 합계가 다릅니다.")
+            if result["query_octree_build_count"] != result["distance_call_count"] or result["mesh_grid_build_count"] < 1:
+                raise CcCoreEnvironmentError("CC 내부 ICP 격자 또는 질의 옥트리 생성 수가 거리 호출과 다릅니다.")
     attempted = result["iterations_attempted"]
     accepted = result["iterations_accepted"]
     if reason not in {"ERROR", "CANCELLED"} and result["distance_call_count"] != attempted + 1:
@@ -424,6 +440,7 @@ def validate_native_session_statistics(value: Any) -> dict[str, int]:
     """세션 전체 캐시·가속구조 횟수와 메모리 최고값을 검증합니다."""
     expected_keys = set(CC_NATIVE_COUNTER_FIELDS) | {
         "peak_working_set_bytes", "cache_peak_estimated_bytes", "cache_resident_estimated_bytes",
+        "bvh_resident_bytes", "bvh_peak_build_bytes",
     }
     if not isinstance(value, Mapping) or set(value) != expected_keys:
         raise CcCoreEnvironmentError("CC 네이티브 세션 통계가 고정 계약과 다릅니다.")
@@ -517,6 +534,14 @@ def validate_native_session_aggregates(
         raise CcCoreEnvironmentError("CC 세션 종료 시 상주 캐시 바이트가 SESSION 지오메트리 합계와 다릅니다.")
     if session["cache_peak_estimated_bytes"] < resident:
         raise CcCoreEnvironmentError("CC 세션 캐시 최고 바이트가 종료 시 상주 바이트보다 작습니다.")
+    if session["bvh_resident_bytes"] > resident:
+        raise CcCoreEnvironmentError("CC BVH 상주 바이트가 전체 상주 캐시보다 큽니다.")
+    if session["bvh_eviction_count"] > session["bvh_build_count"]:
+        raise CcCoreEnvironmentError("CC BVH 퇴거 횟수가 생성 횟수보다 큽니다.")
+    if session["bvh_build_count"] == 0 and any(session[name] for name in (
+        "bvh_cache_hits", "bvh_resident_bytes", "bvh_peak_build_bytes",
+    )):
+        raise CcCoreEnvironmentError("CC BVH 생성 없이 재사용 또는 메모리가 기록되었습니다.")
     for name, total in physical_totals.items():
         if session[name] != total:
             raise CcCoreEnvironmentError(f"CC 세션 {name} 합계가 실제 네이티브 명령 합계와 다릅니다.")

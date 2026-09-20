@@ -23,7 +23,7 @@ from .icp_cccore_contract import CC_DEFAULT_MAX_ITERATIONS, CC_DEFAULT_SCALE_REF
 from .types import Sim3Transform
 
 CC_BACKEND_ID = "CCCORELIB"
-CC_ALGORITHM_VERSION = "cccore-icp-v5"
+CC_ALGORITHM_VERSION = "cccore-icp-v6"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
 CC_PROGRESS_STAGES = frozenset({
     "PREPARING", "BASELINE", "RIGID", "RIGID_EVALUATION", "SCALE_REFINE",

@@ -99,11 +99,13 @@ def _clean_mesh_geometry(
 
 
 def make_normalization(moving: np.ndarray, reference: np.ndarray) -> Normalization:
-    """큰 전역 좌표에서도 두 형상이 같은 원점과 길이 단위를 사용하게 합니다."""
-    minimum = np.minimum(np.min(moving, axis=0), np.min(reference, axis=0))
-    maximum = np.maximum(np.max(moving, axis=0), np.max(reference, axis=0))
+    """각 형상의 범위를 한 번 구해 공통 원점과 길이 단위에 재사용합니다."""
+    moving_min, reference_min = np.min(moving, axis=0), np.min(reference, axis=0)
+    moving_max, reference_max = np.max(moving, axis=0), np.max(reference, axis=0)
+    minimum = np.minimum(moving_min, reference_min)
+    maximum = np.maximum(moving_max, reference_max)
     origin = minimum + (maximum - minimum) * 0.5
-    unit = max(float(np.linalg.norm(np.ptp(moving, axis=0))), float(np.linalg.norm(np.ptp(reference, axis=0))))
+    unit = max(float(np.linalg.norm(moving_max - moving_min)), float(np.linalg.norm(reference_max - reference_min)))
     if not math.isfinite(unit) or unit <= 0.0 or not np.isfinite(origin).all():
         raise contract.CcCoreInputError("CC 공통 정규화 원점이나 길이 단위가 올바르지 않습니다.")
     return Normalization(origin, unit)
@@ -233,7 +235,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 v6 배포 지문과 안전·메모리·고정 범위·내부 ICP 재사용 패치를 검증합니다."""
+    """네이티브 v7 배포 지문과 기존 패치·정확 BVH 검색 원문을 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -258,6 +260,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
         "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
         "icp_mesh_grid_reuse_patch", "icp_mesh_grid_reuse_patch_sha256", "icp_mesh_grid_reuse_source_sha256",
+        "mesh_bvh_search_patch", "mesh_bvh_search_patch_sha256", "mesh_bvh_search_source_sha256", "bvh_source_sha256",
     }
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
@@ -265,7 +268,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             f"CC Runtime Manifest의 필수 필드가 없습니다: {', '.join(missing_fields)}"
         )
     if manifest.get("protocol_version") != contract.CC_NATIVE_PROTOCOL_VERSION:
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v6 네이티브 계약이 아닙니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v7 네이티브 계약이 아닙니다.")
     if manifest.get("platform") != "windows-x64":
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 플랫폼이 windows-x64가 아닙니다.")
     if manifest.get("coordinate_type") != "float32" or manifest.get("matrix_scalar_type") != "float64":
@@ -409,6 +412,36 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             source.get("patched_sha256"), "내부 ICP 의존성 원문",
         ):
             raise contract.CcCoreEnvironmentError("CC 내부 ICP 패치의 최종 원문 해시가 다릅니다.")
+    bvh_patch = core_dependency.get("mesh_bvh_search_patch")
+    if (
+        not isinstance(bvh_patch, Mapping) or bvh_patch.get("id") != "mesh-bvh-search-v1"
+        or bvh_patch.get("file") != "patches/mesh_bvh_search.patch"
+        or manifest["mesh_bvh_search_patch"] != bvh_patch["id"]
+        or bvh_patch["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["mesh_bvh_search_patch_sha256"], "BVH 검색 패치")
+        != _manifest_sha256(bvh_patch.get("sha256"), "BVH 검색 의존성 패치")
+    ):
+        raise contract.CcCoreEnvironmentError("CC BVH 표면 검색 패치가 검증되지 않았습니다.")
+    bvh_files = bvh_patch.get("files")
+    bvh_sources = manifest["mesh_bvh_search_source_sha256"]
+    bvh_names = {"include/RegistrationTools.h", "src/RegistrationTools.cpp"}
+    if (not isinstance(bvh_files, list) or len(bvh_files) != 2
+        or any(not isinstance(item, Mapping) for item in bvh_files)
+        or {item.get("path") for item in bvh_files} != bvh_names
+        or not isinstance(bvh_sources, Mapping) or set(bvh_sources) != bvh_names):
+        raise contract.CcCoreEnvironmentError("CC BVH 패치의 원문 목록이 올바르지 않습니다.")
+    for source in bvh_files:
+        if _manifest_sha256(source.get("original_sha256"), "BVH 패치 이전 원문") != icp_sources[source["path"]]:
+            raise contract.CcCoreEnvironmentError("CC BVH 패치의 이전 원문 연결이 다릅니다.")
+        if _manifest_sha256(bvh_sources[source["path"]], "BVH 패치 최종 원문") != _manifest_sha256(
+            source.get("patched_sha256"), "BVH 패치 의존성 원문",
+        ):
+            raise contract.CcCoreEnvironmentError("CC BVH 패치의 최종 원문 해시가 다릅니다.")
+    bvh_implementation = manifest["bvh_source_sha256"]
+    if not isinstance(bvh_implementation, Mapping) or set(bvh_implementation) != {"mesh_bvh.h", "mesh_bvh.cpp"}:
+        raise contract.CcCoreEnvironmentError("CC BVH 구현 원문 목록이 올바르지 않습니다.")
+    for name, digest in bvh_implementation.items():
+        _manifest_sha256(digest, f"BVH 구현 원문 {name}")
     tbb_dependency = dependencies.get("tbb") if isinstance(dependencies, Mapping) else None
     if not isinstance(tbb_dependency, Mapping) or tbb_dependency.get("version") != contract.CC_TBB_VERSION:
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 oneTBB 고정 의존성이 올바르지 않습니다.")
@@ -425,7 +458,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         or self_test.get("coordinate_type") != "float32"
         or self_test.get("matrix_scalar_type") != "float64"
     ):
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v6 계약과 다릅니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v7 계약과 다릅니다.")
     expected_self_test_libraries = {
         "library_path": "CCCoreLib.dll",
         "tbb_library_path": "tbb12.dll",
@@ -478,6 +511,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
         "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
         "icp_mesh_grid_reuse_patch", "icp_mesh_grid_reuse_patch_sha256", "icp_mesh_grid_reuse_source_sha256",
+        "mesh_bvh_search_patch", "mesh_bvh_search_patch_sha256", "mesh_bvh_search_source_sha256", "bvh_source_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",
@@ -594,8 +628,10 @@ class NativeRunner:
         cancel_probe: CancelProbe = None, progress_sink: ProgressSink = None,
         session_identity: Mapping[str, Any] | None = None,
     ) -> None:
-        """실행 파일과 작업 식별자를 검증하고 아직 시작하지 않은 세션을 구성합니다."""
+        """실행 파일·작업 식별자·고정 취소 경로를 검증하고 세션을 구성합니다."""
         self.directory = Path(directory).resolve(strict=True)
+        contract.job_path(self.directory, "cancel.request")
+        self._cancel_path = self.directory / "cancel.request"
         self.executable = Path(executable)
         if not self.executable.is_absolute() or not self.executable.is_file():
             raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -646,11 +682,21 @@ class NativeRunner:
         else:
             self.abort()
 
+    def _cancel_requested(self) -> bool:
+        """취소 항목이 없을 때 경로를 재사용하고 존재하는 파일·링크는 기존 경계를 검증합니다."""
+        try:
+            self._cancel_path.lstat()
+        except FileNotFoundError:
+            # 작업 폴더 소실을 정상적인 취소 파일 부재로 숨기지 않습니다.
+            self.directory.stat()
+            file_cancelled = False
+        else:
+            file_cancelled = contract.job_path(self.directory, "cancel.request").is_file()
+        return file_cancelled or (self.cancel_probe is not None and self.cancel_probe())
+
     def check_cancelled(self) -> None:
-        """파일과 외부 취소 신호를 동일한 작업 취소로 처리합니다."""
-        if contract.job_path(self.directory, "cancel.request").is_file() or (
-            self.cancel_probe is not None and self.cancel_probe()
-        ):
+        """고정 경로의 파일 상태와 외부 취소 신호를 동일한 작업 취소로 처리합니다."""
+        if self._cancel_requested():
             raise contract.CcCoreCancelled("CC 정렬 작업을 취소했습니다.")
 
     def _session_payload(self) -> dict[str, Any]:
@@ -839,16 +885,14 @@ class NativeRunner:
         self, response_path: Path, progress_path: Path, *, sequence: int,
         operation: str, stage: str, allow_cancel: bool = True,
     ) -> dict[str, Any]:
-        """현재 순번 응답을 기다리며 진행률·취소·충돌을 같은 세션 경계에서 처리합니다."""
+        """공통 취소 판정과 기존 유예를 유지하며 현재 순번의 응답·진행률·충돌을 처리합니다."""
         process = self.process
         if process is None:
             raise contract.CcCoreEnvironmentError("CC 네이티브 세션 프로세스가 시작되지 않았습니다.")
         last_progress = None
         cancelled_at = None
         while not response_path.is_file():
-            cancelled = contract.job_path(self.directory, "cancel.request").is_file() or (
-                self.cancel_probe is not None and self.cancel_probe()
-            )
+            cancelled = self._cancel_requested()
             if cancelled and allow_cancel:
                 if cancelled_at is None:
                     cancelled_at = monotonic()
@@ -1210,11 +1254,15 @@ def _spatial_bins(points: np.ndarray, distances: np.ndarray, unit: float) -> lis
 def prepare_overlap_policy(
     runner: NativeRunner, moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry, reverse: bool,
     *, marker_initial_rms: float = 0.0,
+    geometry_bounds: tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
-    """초기 위치의 형상 규모·점 간격·마커 잔차로 두 고정 거리 반경을 정합니다."""
+    """최종 형상의 선택적 범위·점 간격·마커 잔차로 두 고정 거리 반경을 정합니다."""
     data = reference if reverse else moving
     model = moving if reverse else reference
-    data_diagonal = min(float(np.linalg.norm(np.ptp(item.positions, axis=0))) for item in (data, model))
+    if geometry_bounds is None:
+        geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
+                                for item in (moving, reference))
+    data_diagonal = min(float(np.linalg.norm(upper - lower)) for lower, upper in geometry_bounds)
     spacing = 0.0
     spacing_count = 0
     if model.triangles is None:
@@ -1268,14 +1316,15 @@ def prepare_candidate_samples(
     *, full_samples: dict[str, np.ndarray] | None = None,
     preparation_progress: Callable[[str], None] | None = None,
     normalization: Mapping[str, Any] | None = None,
+    geometry_bounds: tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """전체 형상의 고정 메시 격자 범위에서 정확 거리로 독립 등록·평가 표본을 준비합니다."""
+    """최종 형상 범위를 재사용하며 고정 검색 범위에서 독립 등록·평가 표본을 준비합니다."""
     parameters = runner.parameters
-    geometry_bounds = None
     search_domain = None
     if moving.triangles is not None or reference.triangles is not None:
-        geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
-                                for item in (moving, reference))
+        if geometry_bounds is None:
+            geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
+                                    for item in (moving, reference))
         search_domain = make_preparing_search_domain(
             moving, reference, normalization=normalization, geometry_bounds=geometry_bounds,
         )
@@ -1333,6 +1382,7 @@ def prepare_candidate_samples(
                 source, geometry_bounds[0 if target is moving else 1],
                 policy["candidate_radius_normalized"], runner.directory,
                 cancel_probe=runner.check_cancelled, batch_size=parameters["candidate_probe_batch_size"],
+                source_bounds=geometry_bounds[0 if source is moving else 1],
             ) as sampler:
                 domain_seconds = float(monotonic() - domain_started)
                 probe_started = monotonic()
@@ -1775,7 +1825,7 @@ def solve_cccore_job(
     )
 
     def execute_session() -> CcCoreSolverResult:
-        """퇴화면을 제외한 동일 계산 메시로 표본·등록·평가를 한 네이티브 세션에서 실행합니다."""
+        """정제 완료 형상의 범위를 공유하며 표본·등록·평가를 한 네이티브 세션에서 실행합니다."""
         runner.start()
         progress("PREPARING", 0.02, "현재 초기 정렬에서 겹침 후보와 독립 평가 표본을 준비합니다.")
         runner.check_cancelled()
@@ -1790,6 +1840,8 @@ def solve_cccore_job(
         )
         moving = _clean_mesh_geometry(moving, "이동", native_precision=True)
         reference = _clean_mesh_geometry(reference, "기준", native_precision=True)
+        geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
+                                for item in (moving, reference))
         mode = contract.GEOMETRY_MODES[(moving.kind, reference.kind)]
         reverse = mode == "MESH_TO_POINT"
         marker_initial_rms = manifest.get("marker_initial_rms", 0.0)
@@ -1797,6 +1849,7 @@ def solve_cccore_job(
             raise contract.CcCoreInputError("CC 초기 마커 잔차가 유한한 비음수 길이가 아닙니다.")
         overlap_policy = prepare_overlap_policy(
             runner, moving, reference, reverse, marker_initial_rms=marker_initial_rms / normalization.unit,
+            geometry_bounds=geometry_bounds,
         )
         def preparation_progress(message: str) -> None:
             """표본 준비의 실제 작업과 확보 개수를 기존 진행 파일에 전달합니다."""
@@ -1807,6 +1860,7 @@ def solve_cccore_job(
             runner, moving, reference, overlap_policy, reverse,
             full_samples=full_samples, preparation_progress=preparation_progress,
             normalization=normalization.to_mapping(),
+            geometry_bounds=geometry_bounds,
         )
         moving_samples = np.concatenate((moving_overlap, full_samples.get("moving_to_reference", np.empty((0, 3)))))
         reference_samples = np.concatenate((reference_overlap, full_samples.get("reference_to_moving", np.empty((0, 3)))))

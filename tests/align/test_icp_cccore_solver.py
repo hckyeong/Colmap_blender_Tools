@@ -38,7 +38,7 @@ def mesh_icp_statistics():
             **dict.fromkeys(contract.CC_ICP_TIMING_FIELDS, 0.0),
             "iterations_attempted": 1, "iterations_accepted": 1, "distance_call_count": 2,
             "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 1,
-            "query_octree_build_count": 2, "stop_reason": "MAX_ITERATIONS"}
+            "query_octree_build_count": 2, "surface_search_backend": "GRID", "stop_reason": "MAX_ITERATIONS"}
 
 
 def box_mesh() -> tuple[np.ndarray, np.ndarray]:
@@ -230,6 +230,10 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
     icp["files"].extend({"path": name, "original_sha256": "4" * 64, "patched_sha256": "b" * 64}
                         for name in ("include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp"))
     icp["files"].append({"path": "src/GridAndMeshIntersection.cpp", "original_sha256": "2" * 64, "patched_sha256": "c" * 64})
+    bvh = {"id": "mesh-bvh-search-v1", "file": "patches/mesh_bvh_search.patch", "sha256": "e" * 64,
+           "files": [{"path": item["path"], "original_sha256": item["patched_sha256"], "patched_sha256": "f" * 64}
+                     for item in icp["files"] if "RegistrationTools" in item["path"]]}
+    thread_metadata["core_patch"] += "+" + bvh["id"]
     thread_metadata["core_patch"] += "+" + icp["id"]
     thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"] + "+" + reuse["id"] + "+" + fixed["id"]
     manifest = {
@@ -240,7 +244,11 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
         "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
                          "cccore": {"commit": thread_metadata["core_commit"],
                                     "registration_safety_patch": safety, "mesh_grid_memory_patch": grid,
-                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed, "icp_mesh_grid_reuse_patch": icp}},
+                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed, "icp_mesh_grid_reuse_patch": icp, "mesh_bvh_search_patch": bvh}},
+        "mesh_bvh_search_patch": bvh["id"],
+        "mesh_bvh_search_patch_sha256": bvh["sha256"],
+        "mesh_bvh_search_source_sha256": {item["path"]: item["patched_sha256"] for item in bvh["files"]},
+        "bvh_source_sha256": {name: "a" * 64 for name in ("mesh_bvh.h", "mesh_bvh.cpp")},
         "icp_mesh_grid_reuse_patch": icp["id"],
         "icp_mesh_grid_reuse_patch_sha256": icp["sha256"],
         "icp_mesh_grid_reuse_source_sha256": {item["path"]: item["patched_sha256"] for item in icp["files"]},
@@ -471,6 +479,26 @@ class PureContractTests(unittest.TestCase):
                     solver.native_build_identity(executable)
 
 
+    def test_bvh_patch_identity_rejects_stale_sources_and_protocol(self) -> None:
+        """새 패치와 워커 원문의 누락·변조 및 이전 런타임 혼용을 거부합니다."""
+        for case in ("missing", "patch", "source", "worker", "protocol"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                executable, manifest = make_native_runtime(Path(temporary))
+                self.assertEqual(solver.native_build_identity(executable)["mesh_bvh_search_patch"], "mesh-bvh-search-v1")
+                if case == "missing":
+                    manifest.pop("mesh_bvh_search_patch")
+                elif case == "patch":
+                    manifest["mesh_bvh_search_patch_sha256"] = "0" * 64
+                elif case == "source":
+                    manifest["mesh_bvh_search_source_sha256"]["src/RegistrationTools.cpp"] = "0" * 64
+                elif case == "worker":
+                    manifest["bvh_source_sha256"].pop("mesh_bvh.cpp")
+                else:
+                    manifest["protocol_version"] = "cccore-native-v6"
+                contract.write_json_atomic(executable.with_name("runtime_manifest.json"), manifest)
+                with self.assertRaises(contract.CcCoreEnvironmentError):
+                    solver.native_build_identity(executable)
+
     def test_surface_sampling_follows_area_and_uses_distinct_seed(self) -> None:
         """면적비 1:4가 표본 비율에 반영되고 두 평가 시드가 구분되는지 확인합니다."""
         vertices = np.array(((0, 0, 0), (1, 0, 0), (0, 1, 0), (10, 0, 0), (12, 0, 0), (10, 2, 0)), dtype=float)
@@ -483,11 +511,11 @@ class PureContractTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first, evaluation))
         self.assertTrue(np.all(first[:, 2] == 0.0))
 
-    def test_v6_protocol_and_thread_limit_contract(self) -> None:
-        """표본 정책 v5·작업 v4·네이티브 v5와 1..1024 범위의 스레드 요청만 허용합니다."""
-        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
+    def test_v7_protocol_and_thread_limit_contract(self) -> None:
+        """알고리즘 v6·작업 v4·네이티브 v7과 1..1024 범위의 스레드 요청만 허용합니다."""
+        self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v6")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v6")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v7")
         self.assertEqual(contract.resolve_parameters({"cc_max_threads": 1024})["max_threads"], 1024)
         for value in (0, -1, 1025, True, 1.5):
             with self.subTest(value=value), self.assertRaises(contract.CcCoreInputError):
@@ -682,11 +710,13 @@ class PureContractTests(unittest.TestCase):
             "geometry_load_count": 2, "geometry_cache_hits": 3,
             "octree_build_count": 2, "octree_cache_hits": 1,
             "mesh_grid_build_count": 1, "mesh_grid_cache_hits": 0,
+            "bvh_build_count": 0, "bvh_cache_hits": 0, "bvh_eviction_count": 0,
         }
         for name, total in totals.items():
             physical[0][name] = total
         session = {
             **totals, "peak_working_set_bytes": 1000,
+            "bvh_resident_bytes": 0, "bvh_peak_build_bytes": 0,
             "cache_peak_estimated_bytes": 120,
             "cache_resident_estimated_bytes": 100,
         }
@@ -793,6 +823,7 @@ class PureContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             runner = object.__new__(solver.NativeRunner)
             runner.directory = Path(temporary)
+            runner._cancel_path = runner.directory / "cancel.request"
             runner.process = ExitedProcess()
             runner.cancel_probe = None
             runner.progress_sink = None
@@ -847,6 +878,7 @@ class PureContractTests(unittest.TestCase):
 
         runner = object.__new__(solver.NativeRunner)
         runner.directory = Path(tempfile.gettempdir())
+        runner._cancel_path = runner.directory / "cancel.request"
         runner.cancel_probe = None
         runner.progress_sink = None
         response_path = AppearingResponse()
@@ -894,6 +926,7 @@ class PureContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             runner = object.__new__(solver.NativeRunner)
             runner.directory = Path(temporary)
+            runner._cancel_path = runner.directory / "cancel.request"
             runner.executable = Path(temporary) / "worker.exe"
             runner.parameters = {"max_threads": 1}
             runner.session_id = "session"
@@ -960,6 +993,7 @@ class PureContractTests(unittest.TestCase):
             ready_path = directory / "native" / "session-ready.json"
             runner = object.__new__(solver.NativeRunner)
             runner.directory = directory
+            runner._cancel_path = runner.directory / "cancel.request"
             runner.executable = directory / "worker.exe"
             runner.parameters = {"max_threads": 1}
             runner.session_id = "session"
