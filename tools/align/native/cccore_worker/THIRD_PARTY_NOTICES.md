@@ -4,7 +4,7 @@
 
 | 구성요소 | 채택 버전 또는 커밋 | 라이선스 파일 |
 | --- | --- | --- |
-| CCCoreLib 공유 라이브러리 | dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 + bounded-scale-v1 + multithread-state-race-v1 + farthest-mesh-correspondence-v1 + mesh-grid-memory-budget-v1 | licenses/CCCoreLib-LGPL-2.0.txt |
+| CCCoreLib 공유 라이브러리 | dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 + bounded-scale-v1 + multithread-state-race-v1 + farthest-mesh-correspondence-v1 + mesh-grid-memory-budget-v1 + mesh-grid-reuse-v1 + mesh-grid-fixed-domain-v1 | licenses/CCCoreLib-LGPL-2.0.txt |
 | CCCoreLib 빌드 구성 | 같은 커밋 | licenses/CCCoreLib-build-MIT.txt |
 | nanoflann | 1.7.1, 9a653cb243db6a09c94f833b28732b62f033e2b5 | licenses/nanoflann-BSD.txt |
 | nlohmann/json | 3.11.3 | licenses/json-MIT.txt |
@@ -24,3 +24,5 @@ Microsoft Visual C++ 런타임 `msvcp140.dll`, `vcruntime140.dll`, `vcruntime140
 `mesh-grid-memory-budget-v1`은 정확한 점–메시 거리 계산의 격자 단계를 실제 경계와 포인터 배열 메모리 예산에 맞게 제한합니다. Windows 가용 물리·커밋 메모리와 고정 최대 예산을 함께 사용하며, 원본 형상·표본·거리 근사를 변경하지 않습니다. 준비·등록·평가의 공통 코어 경로에 적용하고 별도 패치 및 적용 전후 원문 해시를 재빌드 묶음에 제공합니다.
 
 `mesh-grid-reuse-v1`은 불변 메시·경계·단계·셀 크기가 같은 독립 거리 호출에서 완성된 격자를 재사용하는 별도 API를 추가합니다. 기존 거리 함수와 메모리 예산을 유지하며, 캐시 메모리 추정 함수와 별도 패치·최종 원문 해시를 재빌드 묶음에 제공합니다.
+
+`mesh-grid-fixed-domain-v1`은 준비 단계의 전체 형상 범위를 명시하여 검사점 묶음이 달라도 동일 좌표계의 격자를 재사용하는 별도 API를 추가합니다. 범위 유효성과 모든 검사점의 포함 여부를 확인하며 기존 정확 거리 함수와 격자 메모리 제한은 유지합니다. `Grid3D.h`의 교차 후보 검사에서 평면 부호 0을 중립으로 처리하여 셀 경계에 닿은 삼각형 누락도 수정합니다. 적용 전후 원문 해시와 별도 패치를 재빌드 묶음에 제공합니다.

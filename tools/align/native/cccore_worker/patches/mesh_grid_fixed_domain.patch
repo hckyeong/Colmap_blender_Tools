@@ -1,0 +1,124 @@
+--- a/include/DistanceComputationTools.h
++++ b/include/DistanceComputationTools.h
+@@ -252,6 +252,22 @@
+ 			GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
+ 			Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
+ 			DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache);
++
++		// 선언된 전체 검색 경계로 정확 비부호 거리의 재사용 격자를 구성합니다.
++		static int computeCloud2MeshDistancesWithCacheAndBounds(
++			GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
++			Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
++			DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache,
++			const CCVector3& domainMin, const CCVector3& domainMax);
++
++	private:
++		// 기존 경계 및 고정 경계 경로의 거리 계산 본문을 공유합니다.
++		static int computeCloud2MeshDistancesInternal(
++			GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
++			Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
++			DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache,
++			const CCVector3* domainMin, const CCVector3* domainMax);
++	public:
+ 
+ 		//! Computes the distances between a point cloud and a mesh projected into a grid structure
+ 		/** This method is used by computeCloud2MeshDistances, after intersectMeshWithOctree has been called.
+--- a/src/DistanceComputationTools.cpp
++++ b/src/DistanceComputationTools.cpp
+@@ -1971,6 +1971,28 @@
+ 	Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
+ 	DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache)
+ {
++	return computeCloud2MeshDistancesInternal(pointCloud, mesh, params, progressCb, cloudOctree, cache, nullptr, nullptr);
++}
++
++// 고정 범위를 명시한 호출만 새 경계 검증을 거쳐 같은 거리 계산 본문에 연결합니다.
++int DistanceComputationTools::computeCloud2MeshDistancesWithCacheAndBounds(
++	GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
++	Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
++	DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache,
++	const CCVector3& domainMin, const CCVector3& domainMax)
++{
++	if (params.signedDistances || params.useDistanceMap)
++		return DISTANCE_COMPUTATION_RESULTS::INVALID_INPUT;
++	return computeCloud2MeshDistancesInternal(pointCloud, mesh, params, progressCb, cloudOctree, cache, &domainMin, &domainMax);
++}
++
++// 경계 선택만 분기하고 격자 예산과 정확 거리 계산은 공통으로 유지합니다.
++int DistanceComputationTools::computeCloud2MeshDistancesInternal(
++	GenericIndexedCloudPersist* pointCloud, GenericIndexedMesh* mesh,
++	Cloud2MeshDistancesComputationParams& params, GenericProgressCallback* progressCb,
++	DgmOctree* cloudOctree, Cloud2MeshDistancesCache* cache,
++	const CCVector3* domainMin, const CCVector3* domainMax)
++{
+ 
+ 	// 기본값 0은 단일 셀로 유지하고 배열 조회의 상한만 검사합니다.
+ 	if (params.octreeLevel > DgmOctree::MAX_OCTREE_LEVEL)
+@@ -2038,12 +2060,33 @@
+ 			maxBB.u[k] = std::max(meshMaxBB.u[k], cloudMaxBB.u[k]);
+ 		}
+ 
++		// 선언된 범위 밖의 실제 입력을 확대나 이전 경로로 대체하지 않습니다.
++		if (domainMin && domainMax)
++		{
++			for (unsigned char k = 0; k < 3; ++k)
++			{
++				if (!std::isfinite(domainMin->u[k]) || !std::isfinite(domainMax->u[k])
++					|| domainMin->u[k] > domainMax->u[k]
++					|| minBB.u[k] < domainMin->u[k] || maxBB.u[k] > domainMax->u[k])
++					return DISTANCE_COMPUTATION_RESULTS::INVALID_INPUT;
++			}
++			minBB = *domainMin;
++			maxBB = *domainMax;
++		}
++
+ 		//max cubical bounding-box
+ 		cubicalMinBB = minBB;
+ 		cubicalMaxBB = maxBB;
+ 
+ 		//we make this bounding-box cubical (+0.1% growth to avoid round-off issues when projecting points or triangles in the grid)
+ 		CCMiscTools::MakeMinAndMaxCubical(cubicalMinBB, cubicalMaxBB, 0.001);
++		// 부동소수점 오버플로와 붕괴한 정육면체는 계산 전에 거부합니다.
++		if (domainMin)
++			for (unsigned char k = 0; k < 3; ++k)
++				if (!std::isfinite(cubicalMinBB.u[k]) || !std::isfinite(cubicalMaxBB.u[k])
++					|| cubicalMinBB.u[k] >= cubicalMaxBB.u[k]
++					|| cubicalMinBB.u[k] > minBB.u[k] || cubicalMaxBB.u[k] < maxBB.u[k])
++					return DISTANCE_COMPUTATION_RESULTS::INVALID_INPUT;
+ 	}
+ 
+ 	//compute the octree if necessary
+@@ -2079,6 +2122,10 @@
+ 			return DISTANCE_COMPUTATION_RESULTS::ERROR_BUILD_OCTREE_FAILURE;
+ 		}
+ 	}
++
++	// 일부 검사점의 격자 투영 누락을 성공으로 보고하지 않습니다.
++	if (domainMin && octree->getNumberOfProjectedPoints() != pointCloud->size())
++		return DISTANCE_COMPUTATION_RESULTS::ERROR_BUILD_OCTREE_FAILURE;
+ 
+ 
+ 	Cloud2MeshDistancesComputationParams effectiveParams = params;
+--- a/include/Grid3D.h
++++ b/include/Grid3D.h
+@@ -148,7 +148,7 @@
+ 		//! Generic function applied to a cell intersected by a triangle (used by the generic form of intersectWith)
+ 		using genericCellTriIntersectionAction = std::function<void(const Tuple3i&, unsigned)>;
+ 
+-		//! Intersects this grid with a mesh (generic form)
++		// 경계에 접촉한 삼각형까지 정확한 상자 교차 검사로 전달하여 메시 격자를 구성합니다.
+ 		bool intersectWith(	GenericIndexedMesh* mesh,
+ 							PointCoordinateType cellLength,
+ 							const CCVector3& gridMinCorner,
+@@ -299,8 +299,9 @@
+ 										{
+ 											AB.z = distanceToMinBorder.z + static_cast<PointCoordinateType>(currentCellPos.z + k * halfCellSize) * cellLength;
+ 
+-											//determine on which side the triangle is
+-											*_pointsPosition++/*pointsPosition[i*9+j*3+k]*/ = (AB.dot(N) < 0 ? -1 : 1);
++											// 평면에 닿은 꼭짓점은 중립으로 유지하여 접촉 셀이 제거되지 않게 합니다.
++											const PointCoordinateType side = AB.dot(N);
++											*_pointsPosition++/*pointsPosition[i*9+j*3+k]*/ = (side < 0 ? -1 : (side > 0 ? 1 : 0));
+ 										}
+ 									}
+ 								}

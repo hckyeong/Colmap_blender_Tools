@@ -114,6 +114,30 @@ def transform_positions(positions: np.ndarray, matrix: np.ndarray) -> np.ndarray
     return np.ascontiguousarray(positions @ matrix[:3, :3].T + matrix[:3, 3])
 
 
+def make_preparing_search_domain(
+    moving: contract.CcCoreGeometry, reference: contract.CcCoreGeometry,
+    *, normalization: Mapping[str, Any] | None = None,
+    geometry_bounds: tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None = None,
+) -> dict[str, Any]:
+    """정리·정규화된 전체 형상의 공통 범위와 출처에 종속된 준비 격자 식별자를 만듭니다."""
+    if geometry_bounds is None:
+        geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
+                                for item in (moving, reference))
+    minimum = np.minimum(geometry_bounds[0][0], geometry_bounds[1][0])
+    maximum = np.maximum(geometry_bounds[0][1], geometry_bounds[1][1])
+    if (minimum.shape != (3,) or maximum.shape != (3,) or not np.isfinite(minimum).all()
+        or not np.isfinite(maximum).all() or np.any(minimum > maximum)):
+        raise contract.CcCoreInputError("CC 준비 격자의 전체 범위가 유한한 3차원 범위가 아닙니다.")
+    bounds = {"min": minimum.tolist(), "max": maximum.tolist()}
+    identity = {"policy": "mesh-grid-fixed-domain-v1", **bounds,
+                "normalization": normalization,
+                "geometry": [{"kind": item.kind, "provenance": item.provenance}
+                             for item in (moving, reference)]}
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {"domain_id": hashlib.sha256(encoded).hexdigest(), **bounds}
+
+
 def inverse_surface_query(positions: np.ndarray, matrix: np.ndarray) -> tuple[np.ndarray, float]:
     """양의 유사변환을 역으로 적용한 표본과 원래 거리 복원용 균일 배율을 반환합니다."""
     sim3, scale = contract.matrix_sim3(matrix, "CC 역방향 표면 평가 변환")
@@ -209,7 +233,7 @@ def _manifest_sha256(value: Any, field_name: str) -> str:
 
 
 def native_build_identity(executable: Path) -> dict[str, Any]:
-    """네이티브 v4 배포 지문과 등록 안전·격자 메모리·재사용 패치의 일치를 검증합니다."""
+    """네이티브 v5 배포 지문과 등록 안전·격자 메모리·고정 범위 패치의 일치를 검증합니다."""
     executable = Path(executable)
     if not executable.is_absolute() or not executable.is_file():
         raise contract.CcCoreEnvironmentError("CC 네이티브 실행 파일의 절대 경로가 올바르지 않습니다.")
@@ -232,6 +256,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "registration_safety_patch", "registration_safety_patch_sha256", "patched_registration_sha256",
         "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
         "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
+        "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
     }
     missing_fields = sorted(required_fields.difference(manifest))
     if missing_fields:
@@ -239,7 +264,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             f"CC Runtime Manifest의 필수 필드가 없습니다: {', '.join(missing_fields)}"
         )
     if manifest.get("protocol_version") != contract.CC_NATIVE_PROTOCOL_VERSION:
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v4 네이티브 계약이 아닙니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest가 v5 네이티브 계약이 아닙니다.")
     if manifest.get("platform") != "windows-x64":
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 플랫폼이 windows-x64가 아닙니다.")
     if manifest.get("coordinate_type") != "float32" or manifest.get("matrix_scalar_type") != "float64":
@@ -319,6 +344,38 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
             source.get("patched_sha256"), "격자 재사용 의존성 원문"
         ):
             raise contract.CcCoreEnvironmentError("CC 메시 격자 재사용 원문 해시가 다릅니다.")
+    fixed_domain = core_dependency.get("mesh_grid_fixed_domain_patch")
+    if (
+        not isinstance(fixed_domain, Mapping) or fixed_domain.get("id") != "mesh-grid-fixed-domain-v1"
+        or fixed_domain.get("file") != "patches/mesh_grid_fixed_domain.patch"
+        or manifest["mesh_grid_fixed_domain_patch"] != fixed_domain["id"]
+        or fixed_domain["id"] not in str(manifest["core_patch"]).split("+")
+        or _manifest_sha256(manifest["mesh_grid_fixed_domain_patch_sha256"], "격자 고정 범위 패치")
+        != _manifest_sha256(fixed_domain.get("sha256"), "격자 고정 범위 의존성 패치")
+    ):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 고정 범위 패치가 검증되지 않았습니다.")
+    fixed_files = fixed_domain.get("files")
+    fixed_sources = manifest["mesh_grid_fixed_domain_source_sha256"]
+    expected_fixed_names = {"include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp", "include/Grid3D.h"}
+    if (not isinstance(fixed_files, list) or len(fixed_files) != 3
+        or any(not isinstance(item, Mapping) for item in fixed_files)
+        or {item.get("path") for item in fixed_files} != expected_fixed_names
+        or not isinstance(fixed_sources, Mapping) or set(fixed_sources) != expected_fixed_names):
+        raise contract.CcCoreEnvironmentError("CC 메시 격자 고정 범위 패치의 원문 목록이 올바르지 않습니다.")
+    for source in fixed_files:
+        previous = _manifest_sha256(source.get("original_sha256"), "격자 고정 범위 이전 원문")
+        # 재사용 패치 밖의 Grid3D 원문은 빌드 과정에서 고정 코어 커밋과 대조합니다.
+        if source["path"] in reuse_sources and previous != reuse_sources[source["path"]]:
+            raise contract.CcCoreEnvironmentError("CC 격자 재사용·고정 범위 패치의 원문 연결이 다릅니다.")
+        if source["path"] == "include/Grid3D.h" and (
+            source.get("original_commit") != core_dependency.get("commit")
+            or source.get("original_commit") != manifest.get("core_commit")
+        ):
+            raise contract.CcCoreEnvironmentError("CC 격자 경계 패치의 원문 커밋이 고정 코어 커밋과 다릅니다.")
+        if _manifest_sha256(fixed_sources[source["path"]], "격자 고정 범위 최종 원문") != _manifest_sha256(
+            source.get("patched_sha256"), "격자 고정 범위 의존성 원문"
+        ):
+            raise contract.CcCoreEnvironmentError("CC 메시 격자 고정 범위 원문 해시가 다릅니다.")
     tbb_dependency = dependencies.get("tbb") if isinstance(dependencies, Mapping) else None
     if not isinstance(tbb_dependency, Mapping) or tbb_dependency.get("version") != contract.CC_TBB_VERSION:
         raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 oneTBB 고정 의존성이 올바르지 않습니다.")
@@ -335,7 +392,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         or self_test.get("coordinate_type") != "float32"
         or self_test.get("matrix_scalar_type") != "float64"
     ):
-        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v4 계약과 다릅니다.")
+        raise contract.CcCoreEnvironmentError("CC Runtime Manifest의 자체 검사 결과가 고정 v5 계약과 다릅니다.")
     expected_self_test_libraries = {
         "library_path": "CCCoreLib.dll",
         "tbb_library_path": "tbb12.dll",
@@ -386,6 +443,7 @@ def native_build_identity(executable: Path) -> dict[str, Any]:
         "registration_safety_patch", "registration_safety_patch_sha256",
         "mesh_grid_memory_patch", "mesh_grid_memory_patch_sha256", "mesh_grid_source_sha256",
         "mesh_grid_reuse_patch", "mesh_grid_reuse_patch_sha256", "mesh_grid_reuse_source_sha256",
+        "mesh_grid_fixed_domain_patch", "mesh_grid_fixed_domain_patch_sha256", "mesh_grid_fixed_domain_source_sha256",
         "patched_registration_sha256", "build_options", "requested_max_threads",
         "effective_max_threads", "hardware_thread_count", "worker_source_sha256",
         "cmake_source_sha256", "source_archive_sha256", "thread_backend", "tbb_version",
@@ -796,13 +854,19 @@ class NativeRunner:
         *, adjust_scale: bool = False, reverse: bool = False, stage: str = "PREPARING",
         evaluation_key_sha256: str = "",
         overlap_ratio: float = 1.0,
+        search_domain: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """실제 후보의 겹침 비율을 단일 세션에 전달하고 응답·거리 파일을 검증합니다."""
+        """후보 겹침 비율과 선택적 준비 격자 범위를 전달하고 응답·거리 파일을 검증합니다."""
         self.check_cancelled()
         self._validate_runtime_unchanged("CC 호출 전에 실행 파일이나 라이브러리 배포 정보가 변경되었습니다.")
         self.start()
         if operation not in {"register", "distance"}:
             raise contract.CcCoreInputError("CC 네이티브 명령 종류가 올바르지 않습니다.")
+        if search_domain is not None and (
+            operation != "distance" or stage != "PREPARING" or "triangles_file" not in model
+        ):
+            raise contract.CcCoreInputError("CC 고정 격자 범위는 준비 단계의 메시 거리 조회에만 사용할 수 있습니다.")
+        search_domain = contract.validate_native_search_domain(search_domain)
         if evaluation_key_sha256 and (
             operation != "distance"
             or len(evaluation_key_sha256) != 64
@@ -829,6 +893,7 @@ class NativeRunner:
         request = {
             **self._session_payload(), "sequence": number, "operation": operation, "stage": stage,
             "data": dict(data), "model": dict(model), "parameters": parameters,
+            "search_domain": dict(search_domain) if search_domain is not None else None,
             "response_file": f"native/command-{number:04d}.response.json",
             "progress_file": f"native/command-{number:04d}.progress.json",
             "distances_file": distance_name,
@@ -1156,9 +1221,18 @@ def prepare_candidate_samples(
     policy: Mapping[str, Any], reverse: bool,
     *, full_samples: dict[str, np.ndarray] | None = None,
     preparation_progress: Callable[[str], None] | None = None,
+    normalization: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """면적 표본의 정확 거리만 검사하여 독립 등록·평가 집합을 준비합니다."""
+    """전체 형상의 고정 메시 격자 범위에서 정확 거리로 독립 등록·평가 표본을 준비합니다."""
     parameters = runner.parameters
+    geometry_bounds = None
+    search_domain = None
+    if moving.triangles is not None or reference.triangles is not None:
+        geometry_bounds = tuple((item.positions.min(axis=0), item.positions.max(axis=0))
+                                for item in (moving, reference))
+        search_domain = make_preparing_search_domain(
+            moving, reference, normalization=normalization, geometry_bounds=geometry_bounds,
+        )
     sampling = {"directions": {}, "optimizer_seed": contract.CC_OPTIMIZER_SEED,
                 "evaluation_seed": contract.CC_EVALUATION_SEED,
                 "probe_seed": parameters["probe_seed"],
@@ -1185,14 +1259,15 @@ def prepare_candidate_samples(
         model = runner.geometry(model_label, target.positions, target.triangles)
 
         def query(points: np.ndarray) -> np.ndarray:
-            """독립 탐색과 합격 표본의 사전 계산된 명령 예산을 지킵니다."""
+            """준비 명령 예산을 지키며 메시 대상 조회에만 동일한 전체 범위를 전달합니다."""
             if runner.counter >= operation_limit:
                 raise contract.CcCoreInputError(
                     "CC 겹침 표본의 준비 거리 조회 예산을 초과했습니다. "
                     f"현재 준비 조회 상한은 {operation_limit:,}회입니다."
                 )
             data = runner.geometry(f"candidate-query-{runner.counter + 1}", points, cache_scope="COMMAND")
-            return runner.call("distance", data, model, stage="PREPARING")["distances"]
+            return runner.call("distance", data, model, stage="PREPARING",
+                               search_domain=search_domain if target.triangles is not None else None)["distances"]
 
         def sample_progress(event: Mapping[str, Any]) -> None:
             """실제 확보 개수로 준비 상태를 전달하고 취소를 확인합니다."""
@@ -1209,7 +1284,7 @@ def prepare_candidate_samples(
             preparation_progress("원본 표면의 면적과 표본을 준비합니다.")
         if source.triangles is not None:
             with overlap.build_surface_sampler(
-                source, (target.positions.min(axis=0), target.positions.max(axis=0)),
+                source, geometry_bounds[0 if target is moving else 1],
                 policy["candidate_radius_normalized"], runner.directory,
                 cancel_probe=runner.check_cancelled, batch_size=parameters["candidate_probe_batch_size"],
             ) as sampler:
@@ -1685,6 +1760,7 @@ def solve_cccore_job(
         data_positions, moving_overlap, reference_overlap, sampling_diagnostics = prepare_candidate_samples(
             runner, moving, reference, overlap_policy, reverse,
             full_samples=full_samples, preparation_progress=preparation_progress,
+            normalization=normalization.to_mapping(),
         )
         moving_samples = np.concatenate((moving_overlap, full_samples.get("moving_to_reference", np.empty((0, 3)))))
         reference_samples = np.concatenate((reference_overlap, full_samples.get("reference_to_moving", np.empty((0, 3)))))

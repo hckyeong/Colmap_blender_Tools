@@ -179,12 +179,12 @@ def physical_native_call_summaries(logical_operations: list[dict]) -> list[dict]
 
 
 def make_native_runtime(directory: Path) -> tuple[Path, dict]:
-    """등록 안전·격자 메모리·재사용 패치 지문을 포함하는 최소 v4 실행 환경을 만듭니다."""
+    """등록 안전·메모리·재사용·고정 범위 패치 지문을 포함하는 최소 v5 실행 환경을 만듭니다."""
     directory.mkdir(parents=True, exist_ok=True)
     binary_contents = {
-        "colmap_cccore_worker.exe": b"worker-v4",
-        "CCCoreLib.dll": b"cccore-v4",
-        "tbb12.dll": b"tbb-v4",
+        "colmap_cccore_worker.exe": b"worker-v5",
+        "CCCoreLib.dll": b"cccore-v5",
+        "tbb12.dll": b"tbb-v5",
     }
     binary_hashes = {}
     for filename, contents in binary_contents.items():
@@ -207,15 +207,26 @@ def make_native_runtime(directory: Path) -> tuple[Path, dict]:
                   for name in ("include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp",
                                "include/GridAndMeshIntersection.h", "src/GridAndMeshIntersection.cpp")],
     }
-    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"] + "+" + reuse["id"]
+    fixed = {
+        "id": "mesh-grid-fixed-domain-v1", "file": "patches/mesh_grid_fixed_domain.patch", "sha256": "3" * 64,
+        "files": [{"path": name, "original_sha256": "2" * 64, "patched_sha256": "4" * 64}
+                  for name in ("include/DistanceComputationTools.h", "src/DistanceComputationTools.cpp")],
+    }
+    fixed["files"].append({"path": "include/Grid3D.h", "original_sha256": "5" * 64,
+                           "patched_sha256": "6" * 64, "original_commit": thread_metadata["core_commit"]})
+    thread_metadata["core_patch"] += "+multithread-state-race-v1+" + safety["id"] + "+" + grid["id"] + "+" + reuse["id"] + "+" + fixed["id"]
     manifest = {
         "protocol_version": contract.CC_NATIVE_PROTOCOL_VERSION,
         "platform": "windows-x64",
         "core_commit": thread_metadata["core_commit"],
         "core_patch": thread_metadata["core_patch"],
         "dependencies": {"tbb": {"version": contract.CC_TBB_VERSION},
-                         "cccore": {"registration_safety_patch": safety, "mesh_grid_memory_patch": grid,
-                                    "mesh_grid_reuse_patch": reuse}},
+                         "cccore": {"commit": thread_metadata["core_commit"],
+                                    "registration_safety_patch": safety, "mesh_grid_memory_patch": grid,
+                                    "mesh_grid_reuse_patch": reuse, "mesh_grid_fixed_domain_patch": fixed}},
+        "mesh_grid_fixed_domain_patch": fixed["id"],
+        "mesh_grid_fixed_domain_patch_sha256": fixed["sha256"],
+        "mesh_grid_fixed_domain_source_sha256": {item["path"]: item["patched_sha256"] for item in fixed["files"]},
         "mesh_grid_reuse_patch": reuse["id"],
         "mesh_grid_reuse_patch_sha256": reuse["sha256"],
         "mesh_grid_reuse_source_sha256": {item["path"]: item["patched_sha256"] for item in reuse["files"]},
@@ -325,6 +336,81 @@ class MeshCleanupTests(unittest.TestCase):
 class PureContractTests(unittest.TestCase):
     """외부 라이브러리 계산을 대체하지 않는 순수 계약 회귀입니다."""
 
+    def test_preparing_domain_uses_full_union_and_mesh_targets_only(self) -> None:
+        """혼합 형상의 전체 경계를 고정하고 메시 대상 준비 조회에만 같은 범위를 전달합니다."""
+        vertices, faces = box_mesh()
+        for moving_mesh, reference_mesh in ((False, True), (True, False), (True, True), (False, False)):
+            with self.subTest(moving_mesh=moving_mesh, reference_mesh=reference_mesh), tempfile.TemporaryDirectory() as temporary:
+                moving = contract.CcCoreGeometry("TRIANGLE_MESH" if moving_mesh else "COLMAP_POINT_CLOUD",
+                                                vertices, faces if moving_mesh else None, {})
+                reference = contract.CcCoreGeometry("TRIANGLE_MESH" if reference_mesh else "COLMAP_POINT_CLOUD",
+                                                   vertices + .001, faces if reference_mesh else None, {})
+                calls = []
+                runner = mock.Mock()
+                runner.check_cancelled.return_value = None
+                runner.parameters = {**contract.resolve_parameters({}), "mesh_sample_count": 32,
+                                     "point_sample_count": 8, "evaluation_sample_count": 32}
+                runner.counter = 0
+                runner.directory = Path(temporary)
+                def geometry(label, points, triangles=None, **kwargs):
+                    """표본과 대상 종류를 기록하는 최소 형상 설명을 반환합니다."""
+                    return {"positions": points, "triangles": triangles}
+                def call(operation, data, model, **kwargs):
+                    """준비 조회의 전달 인자를 기록하고 표본 채택용 영거리를 반환합니다."""
+                    runner.counter += 1
+                    calls.append((model, kwargs))
+                    return {"distances": np.zeros(len(data["positions"]))}
+                runner.geometry.side_effect = geometry
+                runner.call.side_effect = call
+                reverse = moving_mesh and not reference_mesh
+                policy = {"primary_direction": "reference_to_moving" if reverse else "moving_to_reference",
+                          "candidate_radius_normalized": .2, "correspondence_radius_normalized": .1,
+                          "minimum_candidate_fraction": .01, "minimum_original_span_ratio": .01}
+                solver.prepare_candidate_samples(runner, moving, reference, policy, reverse)
+                self.assertTrue(calls)
+                mesh_domains = []
+                for model, kwargs in calls:
+                    self.assertEqual(kwargs["stage"], "PREPARING")
+                    domain = kwargs["search_domain"]
+                    if model["triangles"] is None:
+                        self.assertIsNone(domain)
+                    else:
+                        mesh_domains.append(domain)
+                        np.testing.assert_array_equal(domain["min"], vertices.min(axis=0))
+                        np.testing.assert_array_equal(domain["max"], (vertices + .001).max(axis=0))
+                if mesh_domains:
+                    self.assertTrue(all(domain == mesh_domains[0] for domain in mesh_domains))
+
+    def test_native_identity_requires_fixed_domain_patch(self) -> None:
+        """고정 범위 패치의 누락·지문·소스 연결과 경계 원문 커밋 변조를 거부합니다."""
+        for case in ("missing", "hash", "source", "chain", "core", "grid_commit", "missing_grid_commit", "old_protocol"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                executable, manifest = make_native_runtime(Path(temporary) / "runtime")
+                identity = solver.native_build_identity(executable)
+                self.assertEqual(identity["mesh_grid_fixed_domain_patch"], "mesh-grid-fixed-domain-v1")
+                if case == "missing":
+                    manifest.pop("mesh_grid_fixed_domain_patch")
+                elif case == "hash":
+                    manifest["mesh_grid_fixed_domain_patch_sha256"] = "0" * 64
+                elif case == "source":
+                    manifest["mesh_grid_fixed_domain_source_sha256"]["src/DistanceComputationTools.cpp"] = "0" * 64
+                elif case == "chain":
+                    manifest["dependencies"]["cccore"]["mesh_grid_fixed_domain_patch"]["files"][0]["original_sha256"] = "0" * 64
+                elif case == "core":
+                    manifest["core_patch"] = manifest["core_patch"].replace("+mesh-grid-fixed-domain-v1", "")
+                elif case in {"grid_commit", "missing_grid_commit"}:
+                    source = manifest["dependencies"]["cccore"]["mesh_grid_fixed_domain_patch"]["files"][-1]
+                    if case == "grid_commit":
+                        source["original_commit"] = "0" * 40
+                    else:
+                        source.pop("original_commit")
+                else:
+                    manifest["protocol_version"] = "cccore-native-v4"
+                contract.write_json_atomic(executable.with_name("runtime_manifest.json"), manifest)
+                with self.assertRaises(contract.CcCoreEnvironmentError):
+                    solver.native_build_identity(executable)
+
+
     def test_surface_sampling_follows_area_and_uses_distinct_seed(self) -> None:
         """면적비 1:4가 표본 비율에 반영되고 두 평가 시드가 구분되는지 확인합니다."""
         vertices = np.array(((0, 0, 0), (1, 0, 0), (0, 1, 0), (10, 0, 0), (12, 0, 0), (10, 2, 0)), dtype=float)
@@ -337,11 +423,11 @@ class PureContractTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first, evaluation))
         self.assertTrue(np.all(first[:, 2] == 0.0))
 
-    def test_v4_protocol_and_thread_limit_contract(self) -> None:
-        """표본 정책 v5·통신 v4와 1..1024 범위의 스레드 요청만 허용합니다."""
+    def test_v5_protocol_and_thread_limit_contract(self) -> None:
+        """표본 정책 v5·작업 v4·네이티브 v5와 1..1024 범위의 스레드 요청만 허용합니다."""
         self.assertEqual(contract.CC_ALGORITHM_VERSION, "cccore-icp-v5")
         self.assertEqual(contract.CC_JOB_PROTOCOL_VERSION, "cccore-job-v4")
-        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v4")
+        self.assertEqual(contract.CC_NATIVE_PROTOCOL_VERSION, "cccore-native-v5")
         self.assertEqual(contract.resolve_parameters({"cc_max_threads": 1024})["max_threads"], 1024)
         for value in (0, -1, 1025, True, 1.5):
             with self.subTest(value=value), self.assertRaises(contract.CcCoreInputError):
@@ -1014,7 +1100,7 @@ class PureContractTests(unittest.TestCase):
                     solver.native_build_identity(executable)
 
     def test_native_runner_requires_manifest_fields(self) -> None:
-        """시작 시 필수 Manifest 필드가 빠진 v4 런타임을 거부합니다."""
+        """시작 시 필수 Manifest 필드가 빠진 v5 런타임을 거부합니다."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable, manifest = make_native_runtime(root / "runtime")
@@ -1610,27 +1696,62 @@ class NativeIntegrationTests(unittest.TestCase):
             self.assertFalse((directory / "result.npz").exists())
             self.assertEqual(contract.read_json_object(directory / "error.json")["status"], "CANCELLED")
 
-    def test_disjoint_shape_and_degenerate_contact_are_rejected(self) -> None:
-        """입체 점군과 평면의 작은 접촉을 정렬 성공으로 반환하지 않는지 확인합니다."""
-        for half_size in (0.03, 2.0):
-            with self.subTest(half_size=half_size), tempfile.TemporaryDirectory() as temporary:
+    def _make_volume_plane_contact_job(self, directory: Path, half_size: float) -> None:
+        """중앙 평면과 교차하는 9×9×9 입체 점군의 소형 접촉 입력을 만듭니다."""
+        manifest, _delta = make_job(directory, "COLMAP_POINT_CLOUD", "TRIANGLE_MESH")
+        axis = np.linspace(-1.0, 1.0, 9)
+        volume = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
+        plane = np.array(((-half_size, -half_size, 0), (half_size, -half_size, 0),
+                          (half_size, half_size, 0), (-half_size, half_size, 0)), dtype=np.float64)
+        triangles = np.array(((0, 1, 2), (0, 2, 3)), dtype=np.uint32)
+        volume.astype("<f8").tofile(directory / "moving.bin")
+        plane.astype("<f8").tofile(directory / "reference.bin")
+        triangles.astype("<u4").tofile(directory / "reference-triangles.bin")
+        manifest["geometry"]["moving"]["point_count"] = len(volume)
+        manifest["geometry"]["reference"]["point_count"] = len(plane)
+        manifest["geometry"]["reference"]["triangle_count"] = len(triangles)
+        contract.write_json_atomic(directory / "manifest.json", manifest)
+
+    def test_small_plane_contact_rejects_insufficient_overlap_samples(self) -> None:
+        """한 점만 닿는 작은 평면은 정확 거리 계산 뒤 표본 부족으로 거부합니다."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._make_volume_plane_contact_job(directory, 0.03)
+            with self.assertRaisesRegex(contract.CcCoreInputError, "3개 미만|퇴화"):
+                solver.solve_cccore_job(directory, NATIVE_WORKER)
+            self.assertFalse((directory / "result.json").exists())
+            self.assertFalse((directory / "result.npz").exists())
+
+    def test_full_plane_contact_requires_review_in_both_domain_paths(self) -> None:
+        """넓은 평면의 81점 접촉은 두 범위 경로에서 변환 없는 검토 대상으로 동일하게 남습니다."""
+        results = []
+        original_call = solver.NativeRunner.call
+        def null_domain_call(runner, *args, **kwargs):
+            """비교 실행에서만 기존 자동 범위 거리 경로를 사용합니다."""
+            kwargs["search_domain"] = None
+            return original_call(runner, *args, **kwargs)
+        for fixed_domain in (True, False):
+            with self.subTest(fixed_domain=fixed_domain), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
-                manifest, _delta = make_job(directory, "COLMAP_POINT_CLOUD", "TRIANGLE_MESH")
-                axis = np.linspace(-1.0, 1.0, 9)
-                volume = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
-                plane = np.array(((-half_size, -half_size, 0), (half_size, -half_size, 0),
-                                  (half_size, half_size, 0), (-half_size, half_size, 0)), dtype=np.float64)
-                triangles = np.array(((0, 1, 2), (0, 2, 3)), dtype=np.uint32)
-                volume.astype("<f8").tofile(directory / "moving.bin")
-                plane.astype("<f8").tofile(directory / "reference.bin")
-                triangles.astype("<u4").tofile(directory / "reference-triangles.bin")
-                manifest["geometry"]["moving"]["point_count"] = len(volume)
-                manifest["geometry"]["reference"]["point_count"] = len(plane)
-                manifest["geometry"]["reference"]["triangle_count"] = len(triangles)
-                contract.write_json_atomic(directory / "manifest.json", manifest)
-                with self.assertRaises(contract.CcCoreNumericalError):
-                    solver.solve_cccore_job(directory, NATIVE_WORKER)
-                self.assertFalse((directory / "result.json").exists())
+                self._make_volume_plane_contact_job(directory, 2.0)
+                with mock.patch.object(solver.NativeRunner, "call", original_call if fixed_domain else null_domain_call):
+                    result = solver.solve_cccore_job(directory, NATIVE_WORKER)
+                metadata = result.metadata
+                self.assertEqual(metadata["quality"], "REVIEW")
+                self.assertTrue(metadata["user_review_required"])
+                self.assertEqual(metadata["best_stage"], "baseline")
+                self.assertEqual(metadata["relative_improvement"], 0.0)
+                self.assertEqual(metadata["solver_stop_reason"], "NO_MEAN_RMS_IMPROVEMENT")
+                np.testing.assert_array_equal(result.delta_4x4, np.eye(4))
+                metrics = metadata["best_candidate_metrics"]
+                self.assertEqual(metrics["evaluation_sample_count"], 81)
+                self.assertLess(metrics["overlap_mean_rms"], 1.0e-12)
+                self.assertGreater(metrics["full_reference_metrics"]["rms"], 0.6)
+                self.assertEqual(metrics["full_reference_metrics"]["count"], 729)
+                results.append(metadata)
+        for field in ("quality", "user_review_required", "review_reasons", "best_stage",
+                      "relative_improvement", "baseline_metrics", "best_candidate_metrics"):
+            self.assertEqual(results[0][field], results[1][field], field)
 
     def test_unrelated_reference_part_does_not_require_reverse_overlap(self) -> None:
         """복수 기준점의 먼 부분이 이동→기준 정상 대응을 강제로 거부하지 않게 합니다."""

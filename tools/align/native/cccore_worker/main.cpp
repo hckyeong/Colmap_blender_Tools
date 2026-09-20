@@ -40,7 +40,7 @@ using Clock = std::chrono::steady_clock;
 using Cloud = CCCoreLib::PointCloud;
 using Transform = CCCoreLib::PointProjectionTools::Transformation;
 constexpr const char* kProtocol = "cccore-native-v2";
-constexpr const char* kSessionProtocol = "cccore-native-v4";
+constexpr const char* kSessionProtocol = "cccore-native-v5";
 constexpr const char* kThreadBackend = "oneTBB";
 constexpr const char* kTbbVersion = TBB_VERSION_PIN;
 
@@ -532,12 +532,76 @@ Json matrixJson(const Transform& transform) {
     return matrix;
 }
 
+struct SearchDomain {
+    std::string id;
+    CCVector3 min;
+    CCVector3 max;
+    Json declaration;
+};
+
+// 전체 검색 경계를 검증하고 float32 변환 오차를 바깥 방향으로 보정합니다.
+std::optional<SearchDomain> parseSearchDomain(const Json& value) {
+    if (value.is_null()) return std::nullopt;
+    require(value.is_object() && value.size() == 3 && value.contains("domain_id")
+            && value.contains("min") && value.contains("max"),
+            "INVALID_SEARCH_DOMAIN", "검색 범위 필드가 고정 계약과 다릅니다.");
+    require(value.at("domain_id").is_string(), "INVALID_SEARCH_DOMAIN", "검색 범위 식별자는 문자열이어야 합니다.");
+    SearchDomain result;
+    result.id = value.at("domain_id").get<std::string>();
+    require(!result.id.empty() && result.id.size() <= 128
+            && std::none_of(result.id.begin(), result.id.end(), [](unsigned char c) {
+                // 식별자 안의 제어 문자를 거부합니다.
+                return c < 32 || c == 127;
+            }), "INVALID_SEARCH_DOMAIN", "검색 범위 식별자가 유효하지 않습니다.");
+    // Python 문자열 공백 규칙과 맞춰 유니코드 공백만 있는 식별자도 거부합니다.
+    wchar_t identifier[128];
+    const int identifierLength = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        result.id.data(), static_cast<int>(result.id.size()), identifier, 128);
+    require(identifierLength > 0 && std::wstring(identifier, identifierLength).find_first_not_of(
+                L" \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000") != std::wstring::npos,
+            "INVALID_SEARCH_DOMAIN", "검색 범위 식별자는 공백만 포함할 수 없습니다.");
+    result.declaration = value;
+    require(value.at("min").is_array() && value.at("max").is_array()
+            && value.at("min").size() == 3 && value.at("max").size() == 3,
+            "INVALID_SEARCH_DOMAIN", "검색 범위는 각 축의 최솟값과 최댓값 세 개여야 합니다.");
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        require(value.at("min")[axis].is_number() && value.at("max")[axis].is_number(),
+                "INVALID_SEARCH_DOMAIN", "검색 범위 좌표는 유한한 숫자여야 합니다.");
+        const double low = value.at("min")[axis].get<double>();
+        const double high = value.at("max")[axis].get<double>();
+        const double limit = double(std::numeric_limits<PointCoordinateType>::max());
+        require(std::isfinite(low) && std::isfinite(high) && low <= high
+                && low >= -limit && high <= limit,
+                "INVALID_SEARCH_DOMAIN", "검색 범위 순서 또는 float32 표현 범위가 유효하지 않습니다.");
+        auto roundedLow = static_cast<PointCoordinateType>(low);
+        auto roundedHigh = static_cast<PointCoordinateType>(high);
+        if (double(roundedLow) > low)
+            roundedLow = std::nextafter(roundedLow, -std::numeric_limits<PointCoordinateType>::infinity());
+        if (double(roundedHigh) < high)
+            roundedHigh = std::nextafter(roundedHigh, std::numeric_limits<PointCoordinateType>::infinity());
+        require(std::isfinite(roundedLow) && std::isfinite(roundedHigh),
+                "INVALID_SEARCH_DOMAIN", "보수적으로 변환한 검색 범위가 float32 범위를 벗어났습니다.");
+        result.min.u[axis] = roundedLow;
+        result.max.u[axis] = roundedHigh;
+    }
+    return result;
+}
+
+// 검사점과 대상 전체 정점이 선언된 검색 경계 안에 포함되는지 확인합니다.
+void validateDomainContains(const SearchDomain& domain, Cloud& cloud) {
+    CCVector3 low, high;
+    cloud.getBoundingBox(low, high);
+    for (unsigned axis = 0; axis < 3; ++axis)
+        require(low.u[axis] >= domain.min.u[axis] && high.u[axis] <= domain.max.u[axis],
+                "INVALID_SEARCH_DOMAIN", "실제 지오메트리가 선언된 검색 범위를 벗어났습니다.");
+}
+
 // 불변 메시의 검색 단계와 격자를 재사용하고 조회점의 정확 거리는 매번 계산합니다.
 int computeDistances(
     Cloud& data, Cloud& model, CCCoreLib::SimpleMesh* mesh, Progress* progress,
     unsigned maxThreads, NativeTimings* timings = nullptr, OperationCounters* counters = nullptr,
     CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* meshGrid = nullptr,
-    std::optional<unsigned char>* meshLevel = nullptr
+    std::optional<unsigned char>* meshLevel = nullptr, const SearchDomain* domain = nullptr
 ) {
     if (mesh) {
         unsigned char requestedLevel;
@@ -568,9 +632,11 @@ int computeDistances(
         params.maxThreadCount = static_cast<int>(maxThreads);
         progress->setSubstage("KERNEL");
         const auto kernelStarted = Clock::now();
-        const auto code = CCCoreLib::DistanceComputationTools::computeCloud2MeshDistancesWithCache(
-            &data, mesh, params, progress, nullptr, meshGrid
-        );
+        const auto code = domain
+            ? CCCoreLib::DistanceComputationTools::computeCloud2MeshDistancesWithCacheAndBounds(
+                &data, mesh, params, progress, nullptr, meshGrid, domain->min, domain->max)
+            : CCCoreLib::DistanceComputationTools::computeCloud2MeshDistancesWithCache(
+                &data, mesh, params, progress, nullptr, meshGrid);
         // 메모리 예산으로 낮아진 실제 단계를 유지하여 가용량 회복 때 재생성하지 않습니다.
         if (meshLevel && meshGrid && code >= CCCoreLib::DistanceComputationTools::SUCCESS)
             *meshLevel = meshGrid->level;
@@ -786,6 +852,8 @@ class GeometryRegistry {
     std::optional<unsigned char> meshLevel;
     CachedGeometry* meshGridOwner = nullptr;
     std::uint64_t meshGridBytes = 0;
+    std::string meshGridDomainId;
+    std::map<std::string, Json> domainDeclarations;
 
     // 지오메트리 설명의 필수 필드와 메시 필드 쌍을 검사합니다.
     static void validateDescriptor(const Json& entity) {
@@ -850,6 +918,7 @@ public:
     void clearMeshGrid() {
         meshGrid.clear();
         meshLevel.reset();
+        meshGridDomainId.clear();
         if (meshGridOwner) meshGridOwner->estimatedBytes -= meshGridBytes;
         estimatedBytes -= meshGridBytes;
         meshGridBytes = 0;
@@ -857,11 +926,21 @@ public:
         statistics.cacheResidentEstimated = estimatedBytes;
     }
 
-    // 불변 메시 식별자가 같을 때만 기존 격자를 다음 거리 명령에 전달합니다.
-    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* prepareMeshGrid(CachedGeometry& model) {
-        if (meshGridOwner != &model || !model.mesh) clearMeshGrid();
+    // 대상과 검색 범위가 같을 때만 한 개의 기존 격자를 다음 명령에 전달합니다.
+    CCCoreLib::DistanceComputationTools::Cloud2MeshDistancesCache* prepareMeshGrid(
+        CachedGeometry& model, const SearchDomain* domain
+    ) {
+        const std::string domainId = domain ? domain->id : std::string();
+        if (domain) {
+            const auto known = domainDeclarations.find(domainId);
+            require(known == domainDeclarations.end() || known->second == domain->declaration,
+                    "INVALID_SEARCH_DOMAIN", "같은 검색 범위 식별자에 다른 경계를 지정할 수 없습니다.");
+            domainDeclarations.emplace(domainId, domain->declaration);
+        }
+        if (meshGridOwner != &model || !model.mesh || meshGridDomainId != domainId) clearMeshGrid();
         if (!model.mesh) return nullptr;
         meshGridOwner = &model;
+        meshGridDomainId = domainId;
         return &meshGrid;
     }
 
@@ -971,6 +1050,13 @@ Json executeSessionOperation(
     auto& data = registry.resolve(request.at("data"), operation == "register", counters, timings, progress);
     auto& model = registry.resolve(request.at("model"), operation == "register", counters, timings, progress);
     require(!data.mesh, "INVALID_MESH", "이동 데이터에는 점 좌표만 전달해야 합니다.");
+    const auto domain = parseSearchDomain(request.at("search_domain"));
+    if (domain) {
+        require(operation == "distance" && request.at("stage") == "PREPARING" && bool(model.mesh),
+                "INVALID_SEARCH_DOMAIN", "고정 검색 범위는 준비 단계의 메시 거리 조회에만 사용할 수 있습니다.");
+        validateDomainContains(*domain, *data.cloud);
+        validateDomainContains(*domain, *model.cloud);
+    }
     progress.check();
     Json identity = {{"protocol_version", kSessionProtocol}, {"session_id", request.at("session_id")},
                      {"job_id", request.at("job_id")}, {"input_fingerprint", request.at("input_fingerprint")}};
@@ -1008,9 +1094,10 @@ Json executeSessionOperation(
         result["native_code"] = code;
         timings.serializationSeconds += elapsedSeconds(serializationStarted);
     } else {
-        auto* meshGrid = registry.prepareMeshGrid(model);
+        auto* meshGrid = registry.prepareMeshGrid(model, domain ? &*domain : nullptr);
         const auto code = computeDistances(*data.cloud, *model.cloud, model.mesh.get(), &progress,
-                                           threads.effective, &timings, &counters, meshGrid, registry.meshLevelCache());
+                                           threads.effective, &timings, &counters, meshGrid, registry.meshLevelCache(),
+                                           domain ? &*domain : nullptr);
         registry.accountMeshGrid();
         progress.check();
         if (code < CCCoreLib::DistanceComputationTools::SUCCESS)
@@ -1129,7 +1216,7 @@ std::pair<Json, int> runSession(const fs::path& sessionRequestPath) {
                                    "ready_file", "result_file", "cancel_file", "command_directory"},
                          "세션 시작 요청 필드가 고정 계약과 다릅니다.");
         require(request.at("protocol_version") == kSessionProtocol, "PROTOCOL_MISMATCH",
-                "세션 시작 요청은 v4 네이티브 프로토콜이어야 합니다.");
+                "세션 시작 요청은 v5 네이티브 프로토콜이어야 합니다.");
         identity["session_id"] = safeIdentifier(request, "session_id");
         identity["job_id"] = safeIdentifier(request, "job_id");
         identity["input_fingerprint"] = safeIdentifier(request, "input_fingerprint");
@@ -1181,7 +1268,7 @@ std::pair<Json, int> runSession(const fs::path& sessionRequestPath) {
             } else {
                 requireExactKeys(command, {"protocol_version", "session_id", "job_id", "input_fingerprint",
                                            "sequence", "operation", "stage", "data", "model", "parameters",
-                                           "response_file", "progress_file", "distances_file"},
+                                           "response_file", "progress_file", "distances_file", "search_domain"},
                                  "세션 계산 명령 필드가 고정 계약과 다릅니다.");
             }
             validateCommandIdentity(command, identity, expectedSequence);

@@ -55,7 +55,7 @@ PowerShell 7에서 다음 명령을 실행합니다. 출력은 지정한 격리 
 
 ## 배포된 원문만으로 재빌드
 
-원문 ZIP을 별도 작업 폴더에 풀고, 해당 폴더에서 실행합니다. ZIP의 코어는 배율·동시성·등록 안전·격자 메모리 패치가 적용된 상태이며 `tbb/`에는 검증된 공식 Windows 패키지가 있습니다. 네트워크 다운로드가 필요하지 않습니다.
+원문 ZIP을 별도 작업 폴더에 풀고, 해당 폴더에서 실행합니다. ZIP의 코어는 배율·동시성·등록 안전·격자 메모리·재사용·고정 범위 패치가 적용된 상태이며 `tbb/`에는 검증된 공식 Windows 패키지가 있습니다. 네트워크 다운로드가 필요하지 않습니다.
 
 ```powershell
 $cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
@@ -64,7 +64,7 @@ Expand-Archive -LiteralPath .\tbb\oneapi-tbb-2022.0.0-win.zip -DestinationPath .
   "-DCCCORE_SOURCE=$PWD\cccore-src" "-DJSON_INCLUDE_DIR=$PWD\json" `
   "-DTBB_DIR=$PWD\tbb\oneapi-tbb-2022.0.0\lib\cmake\tbb" `
   -DCORE_COMMIT=dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432 `
-  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1+mesh-grid-reuse-v1
+  -DCORE_PATCH=bounded-scale-v1+multithread-state-race-v1+farthest-mesh-correspondence-v1+mesh-grid-memory-budget-v1+mesh-grid-reuse-v1+mesh-grid-fixed-domain-v1
 & $cmake --build .\build --config Release --parallel 8
 Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -Destination .\build\bin\tbb12.dll
 & .\build\bin\colmap_cccore_worker.exe --check-environment
@@ -72,7 +72,7 @@ Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -
 
 `build/bin`에 워커, `CCCoreLib.dll`, `tbb12.dll`이 준비됩니다. 배포 런타임에서 Microsoft C++ 재배포 DLL 네 파일과 oneTBB 라이선스·제삼자 고지를 함께 유지합니다. Windows의 Universal CRT는 운영체제 제공 구성요소를 사용합니다.
 
-준비 스크립트는 매 실행마다 새 빌드·원문·런타임 스테이징을 만들고 허용 파일 목록, v4 Manifest 연결, 자체 검사와 단일 세션·캐시 네이티브 회귀를 모두 확인한 뒤 런타임 디렉터리를 교체합니다. 실패하면 기존 런타임을 유지하거나 교체 직전 백업으로 되돌리므로 이전 파일이 원문 ZIP이나 최종 배포에 섞이지 않습니다.
+준비 스크립트는 매 실행마다 새 빌드·원문·런타임 스테이징을 만들고 허용 파일 목록, v5 Manifest 연결, 자체 검사와 단일 세션·캐시 네이티브 회귀를 모두 확인한 뒤 런타임 디렉터리를 교체합니다. 실패하면 기존 런타임을 유지하거나 교체 직전 백업으로 되돌리므로 이전 파일이 원문 ZIP이나 최종 배포에 섞이지 않습니다.
 
 v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비율을 받으며 `filter_out_farthest_points`를 공개 `Parameters::filterOutFarthestPoints`에 연결합니다. 절대 최대거리 제한을 코어에 추가하지 않으며, 코어 커밋과 두 기존 패치의 원문·적용 결과 해시를 보존하고, 등록 안전 패치의 적용 전후 해시를 별도로 고정합니다. v3 런타임은 v4 배포 검증을 통과할 수 없습니다.
 
@@ -98,7 +98,15 @@ v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비
 
 `mesh_grid_build_count`와 `mesh_grid_cache_hits`는 실제 생성·재사용을 기록합니다. 재사용 명령의 `mesh_grid_seconds`는 0이며 생성 시간은 `kernel_seconds`에서 분리합니다. 포인터 배열·삼각형 목록 용량의 추정 바이트를 소유 지오메트리와 세션 상주·최고 메모리에 포함합니다. 생성 실패의 불완전 격자는 재사용하지 않습니다.
 
-새 패치의 입력 해시는 이전 메모리 패치의 출력과 연결합니다. Manifest의 `mesh_grid_source_sha256`는 메모리 패치 단계의 해시이며, `mesh_grid_reuse_source_sha256`가 재사용 패치 적용 후 최종 네 파일의 해시입니다. 배포 원문 ZIP은 최종 해시로 검사합니다.
+새 패치의 입력 해시는 이전 메모리 패치의 출력과 연결합니다. Manifest의 `mesh_grid_source_sha256`는 메모리 패치 단계의 해시이며, `mesh_grid_reuse_source_sha256`는 재사용 패치 직후 네 파일의 해시입니다. 후속 고정 범위 패치에서 변경한 파일은 아래 최종 해시로 배포 원문 ZIP을 검사합니다.
+
+## 준비 거리의 고정 검색 범위
+
+`mesh-grid-fixed-domain-v1`은 `computeCloud2MeshDistancesWithCacheAndBounds`를 추가합니다. v5 준비 거리 명령의 `search_domain`으로 받은 전체 형상 범위를 검사점 옥트리와 메시 격자의 공통 좌표계로 사용합니다. 검사점 묶음의 경계가 바뀌어도 대상·공통 큐브·실제 단계·셀 크기가 같으면 완성된 격자를 재사용합니다. 기존 두 거리 API와 실제 삼각형 거리 계산은 유지합니다.
+
+`search_domain`은 준비 단계의 메시 거리 명령에서만 유효하며 다른 계산 명령은 `null`을 보냅니다. 범위 식별자의 재정의, 비유한 경계와 범위 밖 점·메시는 오류입니다. 대상 변경·등록 시작·기본 거리 경로 전환 때 고정 범위 캐시를 초기화합니다. 메모리 예산을 매 명령 검사하고 하향된 단계는 해당 대상에서 유지합니다. 격자는 동시에 한 개만 보관합니다.
+
+잠금 파일의 `mesh_grid_fixed_domain_patch`에 이전 재사용 패치 결과와 새 패치 적용 후 해시를 기록합니다. 이전 패치에서 변경하지 않은 `include/Grid3D.h`는 고정 코어 커밋 원문과 직접 대조합니다. 이 파일의 수정은 셀 경계에 닿은 삼각형을 제거하지 않도록 평면 부호 0을 중립으로 처리하며, 최종 상자 교차 검사는 그대로 사용합니다. Manifest의 `mesh_grid_fixed_domain_source_sha256`는 해당 세 파일의 최종 원문 해시이며 이전 단계의 해시도 별도 보존합니다. 현재 실행은 v5 워커와 DLL·Manifest 조합만 허용하며 과거 저장된 정렬 결과는 자동 재계산하지 않습니다.
 
 ## 메시 최원거리점 필터의 대응 식별자 보존
 

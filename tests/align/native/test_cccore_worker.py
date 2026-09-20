@@ -90,12 +90,12 @@ class NativeContractTest(unittest.TestCase):
         return result
 
     def start_session(self, *, max_threads=4):
-        """v4 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
+        """v5 파일 세션을 시작하고 ready 식별자와 자식 프로세스를 반환합니다."""
         root = self.root / "session-job"
         native = root / "native"
         native.mkdir(parents=True)
         identity = {
-            "protocol_version": "cccore-native-v4",
+            "protocol_version": "cccore-native-v5",
             "session_id": "0123456789abcdef0123456789abcdef",
             "job_id": root.name,
             "input_fingerprint": "fedcba9876543210fedcba9876543210",
@@ -166,10 +166,10 @@ class NativeContractTest(unittest.TestCase):
             result.update(triangles_file=triangles_name, triangle_count=len(triangles) // 3)
         return result
 
-    def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4):
-        """고정 순번 v4 명령을 제출하고 응답 또는 세션 실패를 기다립니다."""
+    def session_command(self, root, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None):
+        """고정 순번 v5 명령을 제출하고 응답 또는 세션 실패를 기다립니다."""
         command = self.session_command_payload(
-            identity, sequence, operation, data=data, model=model, stage=stage, max_threads=max_threads,
+            identity, sequence, operation, data=data, model=model, stage=stage, max_threads=max_threads, search_domain=search_domain,
         )
         stem = f"native/command-{sequence:04d}"
         request_path = root / f"{stem}.request.json"
@@ -182,8 +182,8 @@ class NativeContractTest(unittest.TestCase):
             return json.loads(response_path.read_text(encoding="utf-8"))
         self.fail("세션 명령 응답이 제한 시간 안에 생성되지 않았습니다.")
 
-    def session_command_payload(self, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4):
-        """오류 계약 검사에도 재사용할 순번별 v4 명령 객체를 만듭니다."""
+    def session_command_payload(self, identity, sequence, operation, *, data=None, model=None, stage="TEST", max_threads=4, search_domain=None):
+        """오류 계약 검사에도 재사용할 순번별 v5 명령 객체를 만듭니다."""
         stem = f"native/command-{sequence:04d}"
         command = {
             **identity, "sequence": sequence, "operation": operation, "stage": stage,
@@ -191,7 +191,7 @@ class NativeContractTest(unittest.TestCase):
         }
         if operation != "close":
             command.update({
-                "data": data, "model": model,
+                "data": data, "model": model, "search_domain": search_domain,
                 "parameters": {
                     "adjust_scale": False, "min_scale": 1.0, "max_scale": 1.0,
                     "overlap_ratio": 1.0, "filter_out_farthest_points": True, "max_iterations": 100,
@@ -229,12 +229,123 @@ class NativeContractTest(unittest.TestCase):
         self.assertEqual(result["code"], code)
         return result
 
+    def test_fixed_domain_varied_batches_preserve_analytic_distances(self):
+        """서로 다른 조회 경계와 얇은 평면에서도 고정 격자 재사용과 임계값 판정을 보존합니다."""
+        root, identity, process, _ = self.start_session(max_threads=1)
+        try:
+            model = self.session_geometry(root, "plane", [(0,0,0), (1,0,0), (1,1,0), (0,1,0)], [(0,1,2),(0,2,3)])
+            domain = {"domain_id": "fixed-plane", "min": [-2.00000006,-1,-.50000003], "max": [3.00000012,2,.50000003]}
+            batches = [[(.2,.2,.09999),(.3,.4,.10001)],
+                       [(-2.00000006,0,-.50000003),(3.00000012,1,.50000003),(0,-1,0),(1,2,0)],
+                       [(0,0,0),(1,1,0),(.7,.8,-.25)]]
+            for sequence, points in enumerate(batches, 1):
+                data = self.session_geometry(root, f"query-{sequence}", points, cache_scope="COMMAND")
+                result = self.session_command(root, identity, sequence, "distance", data=data, model=model,
+                                              stage="PREPARING", max_threads=1, search_domain=domain)
+                self.assertEqual(result["status"], "completed", result)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], int(sequence == 1))
+                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], int(sequence > 1))
+                values = struct.unpack("<" + "d" * len(points), (root / result["distances_file"]).read_bytes())
+                for (x,y,z), value in zip(points, values):
+                    expected = math.sqrt(max(-x,0,x-1)**2 + max(-y,0,y-1)**2 + z*z)
+                    self.assertAlmostEqual(value, expected, delta=2e-6)
+                if sequence == 1:
+                    self.assertLess(values[0], .1)
+                    self.assertGreater(values[1], .1)
+            closed = self.session_command(root, identity, 4, "close")
+            self.finish_session(root, process)
+            self.assertEqual(closed["statistics"]["mesh_grid_build_count"], 1)
+            self.assertEqual(closed["statistics"]["mesh_grid_cache_hits"], 2)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_fixed_domain_invalid_contract_is_terminal(self):
+        """누락·잘못된 범위·허용되지 않은 연산·범위 밖 형상을 명시적 오류로 거부합니다."""
+        valid = {"domain_id": "fixed", "min": [-1,-1,-1], "max": [2,2,2]}
+        cases = ("missing", "empty_id", "short", "reversed", "infinite", "query_outside",
+                 "mesh_outside", "stage", "point_model", "register", "changed", "changed_after_null")
+        for case in cases:
+            with self.subTest(case=case):
+                root, identity, process, _ = self.start_session()
+                try:
+                    points = [(0,0,0),(1,0,0),(0,1,0)]
+                    data = self.session_geometry(root, "query", [(3,0,0)] if case == "query_outside" else points)
+                    model_points = [(3,0,0),(1,0,0),(0,1,0)] if case == "mesh_outside" else points
+                    model = self.session_geometry(root, "mesh", model_points, None if case == "point_model" else [(0,1,2)])
+                    domain = {**valid, "min": list(valid["min"]), "max": list(valid["max"])}
+                    sequence = 1
+                    if case in {"changed", "changed_after_null"}:
+                        result = self.session_command(root, identity, 1, "distance", data=data, model=model,
+                                                      stage="PREPARING", search_domain=domain)
+                        self.assertEqual(result["status"], "completed", result)
+                        sequence = 2
+                        if case == "changed_after_null":
+                            cleared = self.session_command(root, identity, 2, "distance", data=data, model=model,
+                                                           stage="PREPARING", search_domain=None)
+                            self.assertEqual(cleared["status"], "completed", cleared)
+                            sequence = 3
+                        domain["max"][0] = 3
+                    elif case == "empty_id":
+                        domain["domain_id"] = ""
+                    elif case == "short":
+                        domain["min"] = [0,0]
+                    elif case == "reversed":
+                        domain["min"][0] = 4
+                    elif case == "infinite":
+                        domain["max"][0] = "Infinity"
+                    command = self.session_command_payload(identity, sequence,
+                        "register" if case == "register" else "distance", data=data, model=model,
+                        stage="BASELINE" if case == "stage" else "PREPARING", search_domain=domain)
+                    if case == "missing":
+                        del command["search_domain"]
+                    (root / f"native/command-{sequence:04d}.request.json").write_text(json.dumps(command), encoding="utf-8")
+                    expected = "INVALID_REQUEST" if case == "missing" else "INVALID_SEARCH_DOMAIN"
+                    self.assert_failed_session(root, process, expected)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    shutil.rmtree(root)
+
+    def test_fixed_domain_null_model_and_registration_invalidate_grid(self):
+        """동일 경계에서도 null 전환·모델 교체·등록 뒤에는 고정 격자를 새로 생성합니다."""
+        root, identity, process, _ = self.start_session()
+        try:
+            points = [(0,0,0),(1,0,0),(0,1,0),(0,0,1)]
+            triangles = [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]
+            models = [self.session_geometry(root, f"mesh-{i}", points, triangles) for i in range(2)]
+            data = self.session_geometry(root, "query", [(.2,.2,.2),(.1,.1,.1),(.3,.2,.1)])
+            domain = {"domain_id": "fixed", "min": [0,0,0], "max": [1,1,1]}
+            sequence = 0
+            for model_index, search_domain, build in ((0,domain,1),(0,domain,0),(0,None,1),
+                                                      (0,domain,1),(1,domain,1),(0,domain,1)):
+                sequence += 1
+                result = self.session_command(root, identity, sequence, "distance", data=data, model=models[model_index],
+                                              stage="PREPARING", search_domain=search_domain)
+                self.assertEqual(result["status"], "completed", result)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], build)
+                self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 1-build)
+            registration = self.session_geometry(root, "registration", points)
+            result = self.session_command(root, identity, 7, "register", data=registration, model=models[0])
+            self.assertEqual(result["status"], "completed", result)
+            result = self.session_command(root, identity, 8, "distance", data=data, model=models[0],
+                                          stage="PREPARING", search_domain=domain)
+            self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
+            self.session_command(root, identity, 9, "close")
+            self.finish_session(root, process)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
     def test_environment(self):
         """환경 검사가 DLL과 실제 합성 등록을 수행하는지 확인합니다."""
         process = subprocess.run([str(WORKER),"--check-environment"],capture_output=True,text=True,encoding="utf-8",timeout=30)
         self.assertEqual(process.returncode,0,process.stdout)
         result=json.loads(process.stdout)
-        self.assertEqual(result["protocol_version"],"cccore-native-v4")
+        self.assertEqual(result["protocol_version"],"cccore-native-v5")
         self.assertEqual(result["self_test"],"passed")
         self.assertTrue(Path(result["library_path"]).is_file())
         self.assertTrue(Path(result["tbb_library_path"]).is_file())
@@ -362,7 +473,8 @@ class NativeContractTest(unittest.TestCase):
             for sequence in (1, 2):
                 data = self.session_geometry(root, f"query-{sequence}", [(0.2, 0.2, .1)], cache_scope="COMMAND")
                 model = self.session_geometry(root, f"model-{sequence}", [(0,0,0), (1,0,0), (0,1,0)], [(0,1,2)], cache_scope="COMMAND")
-                result = self.session_command(root, identity, sequence, "distance", data=data, model=model)
+                result = self.session_command(root, identity, sequence, "distance", data=data, model=model, stage="PREPARING",
+                                              search_domain={"domain_id": "command-domain", "min": [0,0,0], "max": [1,1,1]})
                 self.assertEqual(result["operation_statistics"]["mesh_grid_build_count"], 1)
                 self.assertEqual(result["operation_statistics"]["mesh_grid_cache_hits"], 0)
             closed = self.session_command(root, identity, 3, "close")

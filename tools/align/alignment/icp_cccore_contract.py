@@ -16,7 +16,8 @@ import numpy as np
 CC_BACKEND_ID = "CCCORELIB"
 CC_ALGORITHM_VERSION = "cccore-icp-v5"
 CC_JOB_PROTOCOL_VERSION = "cccore-job-v4"
-CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v4"
+CC_NATIVE_PROTOCOL_VERSION = "cccore-native-v5"
+CC_NATIVE_COORDINATE_MAX = float(np.finfo(np.float32).max)
 CC_LEGACY_NATIVE_PROTOCOL_VERSION = "cccore-native-v2"
 CC_THREAD_BACKEND = "oneTBB"
 CC_TBB_VERSION = "2022.0.0"
@@ -288,6 +289,34 @@ def validate_native_execution_metadata(
             if expected_identity.get(name) != value:
                 raise CcCoreEnvironmentError(f"CC 순차 호출의 {name} 값이 첫 호출과 다릅니다.")
     return {**identity, "elapsed_seconds": elapsed}
+
+
+def validate_native_search_domain(value: Any) -> dict[str, Any] | None:
+    """준비 격자 식별자의 바이트 계약과 단정도로 표현 가능한 전체 범위를 검증합니다."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"domain_id", "min", "max"}:
+        raise CcCoreInputError("CC 준비 격자 범위의 필드가 고정 계약과 다릅니다.")
+    identifier = value["domain_id"]
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise CcCoreInputError("CC 준비 격자 범위 식별자가 비어 있습니다.")
+    try:
+        identifier_bytes = identifier.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise CcCoreInputError("CC 준비 격자 범위 식별자가 유효한 UTF-8 문자열이 아닙니다.") from error
+    if len(identifier_bytes) > 128 or any(byte < 32 or byte == 127 for byte in identifier_bytes):
+        raise CcCoreInputError("CC 준비 격자 범위 식별자가 길이 또는 제어문자 계약을 벗어났습니다.")
+    result = {"domain_id": identifier}
+    for name in ("min", "max"):
+        vector = value[name]
+        if (not isinstance(vector, (list, tuple)) or len(vector) != 3
+            or any(isinstance(item, bool) or not isinstance(item, (int, float))
+                   or abs(item) > CC_NATIVE_COORDINATE_MAX or not math.isfinite(item) for item in vector)):
+            raise CcCoreInputError("CC 준비 격자 범위는 단정도로 표현 가능한 유한한 3차원 좌표여야 합니다.")
+        result[name] = [float(item) for item in vector]
+    if any(low > high for low, high in zip(result["min"], result["max"])):
+        raise CcCoreInputError("CC 준비 격자 범위의 최솟값이 최댓값보다 큽니다.")
+    return result
 
 
 def validate_native_session_identity(

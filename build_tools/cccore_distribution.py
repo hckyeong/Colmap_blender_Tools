@@ -87,14 +87,14 @@ def validate_package_archive(path):
 
 
 def validate_cccore_runtime(runtime_root):
-    """CC 런타임의 v4 단일 세션·oneTBB Manifest와 파일 해시를 검사합니다."""
+    """CC 런타임의 v5 고정 범위·단일 세션 Manifest와 파일 해시를 검사합니다."""
     root = Path(runtime_root).resolve()
     manifest_path = root / "runtime_manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError("CC Runtime Manifest가 없습니다.")
     manifest = read_json(manifest_path)
-    if manifest.get("protocol_version") != "cccore-native-v4":
-        raise RuntimeError("CC Runtime Manifest가 v4 네이티브 계약이 아닙니다.")
+    if manifest.get("protocol_version") != "cccore-native-v5":
+        raise RuntimeError("CC Runtime Manifest가 v5 네이티브 계약이 아닙니다.")
     options = manifest.get("build_options")
     if not isinstance(options, dict) or options.get("CCCORELIB_USE_TBB") is not True:
         raise RuntimeError("CC Runtime Manifest에서 oneTBB 빌드가 활성화되지 않았습니다.")
@@ -139,8 +139,8 @@ def validate_cccore_runtime(runtime_root):
     if file_hash(license_path).lower() != expected_license_hash.lower():
         raise RuntimeError("CC 런타임의 oneTBB 라이선스 해시가 Manifest와 다릅니다.")
     self_test = manifest.get("self_test")
-    if not isinstance(self_test, dict) or self_test.get("protocol_version") != "cccore-native-v4":
-        raise RuntimeError("CC Runtime Manifest의 자체 검사 결과가 v4 계약이 아닙니다.")
+    if not isinstance(self_test, dict) or self_test.get("protocol_version") != "cccore-native-v5":
+        raise RuntimeError("CC Runtime Manifest의 자체 검사 결과가 v5 계약이 아닙니다.")
     expected_libraries = {"library_path": "CCCoreLib.dll", "tbb_library_path": "tbb12.dll"}
     for name, expected in expected_libraries.items():
         if self_test.get(name) != expected:
@@ -152,7 +152,7 @@ def validate_cccore_runtime(runtime_root):
 
 
 def validate_cccore_distribution(runtime_root):
-    """배포 파일·등록·격자 메모리·재사용 패치와 최종 재빌드 원문을 고정 소스와 대조합니다."""
+    """배포 파일·격자 고정 범위까지의 패치 이력과 최종 재빌드 원문을 대조합니다."""
     root = Path(runtime_root).resolve()
     manifest = validate_cccore_runtime(root)
     lock = read_json(ROOT / "tools/align/native/cccore_worker/dependencies.lock.json")
@@ -161,9 +161,10 @@ def validate_cccore_distribution(runtime_root):
     safety = lock["cccore"]["registration_safety_patch"]
     grid = lock["cccore"]["mesh_grid_memory_patch"]
     reuse = lock["cccore"]["mesh_grid_reuse_patch"]
+    domain = lock["cccore"]["mesh_grid_fixed_domain_patch"]
     expected_core_patch = "+".join((
         lock["cccore"]["patch_id"], lock["cccore"]["concurrency_patch"]["patch_id"], safety["id"],
-        grid["id"], reuse["id"],
+        grid["id"], reuse["id"], domain["id"],
     ))
     expected_safety = {
         "core_patch": expected_core_patch, "registration_safety_patch": safety["id"],
@@ -172,6 +173,9 @@ def validate_cccore_distribution(runtime_root):
         "mesh_grid_reuse_patch": reuse["id"],
         "mesh_grid_reuse_patch_sha256": reuse["sha256"],
         "mesh_grid_reuse_source_sha256": {source["path"]: source["patched_sha256"] for source in reuse["files"]},
+        "mesh_grid_fixed_domain_patch": domain["id"],
+        "mesh_grid_fixed_domain_patch_sha256": domain["sha256"],
+        "mesh_grid_fixed_domain_source_sha256": {source["path"]: source["patched_sha256"] for source in domain["files"]},
         "mesh_grid_memory_patch": grid["id"],
         "mesh_grid_memory_patch_sha256": grid["sha256"],
         "mesh_grid_source_sha256": {source["path"]: source["patched_sha256"] for source in grid["files"]},
@@ -215,6 +219,8 @@ def validate_cccore_distribution(runtime_root):
             **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in grid["files"]},
             "native/" + reuse["file"]: reuse["sha256"],
             **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in reuse["files"]},
+            "native/" + domain["file"]: domain["sha256"],
+            **{"cccore-src/" + source["path"]: source["patched_sha256"] for source in domain["files"]},
         }
         for name, expected_hash in source_hashes.items():
             if hashlib.sha256(archive.read(name)).hexdigest() != expected_hash:

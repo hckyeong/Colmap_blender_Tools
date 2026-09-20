@@ -2,16 +2,17 @@
 
 이 디렉터리는 Blender 또는 CloudCompare GUI를 불러오지 않는 Windows x64 실행 파일의 소스입니다. 상위 Python 조정자가 공통 좌표 정규화, 결정적 표본화, 강체→유사변환 두 단계와 독립 평가를 담당합니다.
 
-`colmap_cccore_worker.exe --session <JSON 절대경로>`는 Align 작업 하나의 등록·거리 명령을 단일 프로세스에서 순차 처리합니다. 세션의 요청·응답·진행·취소·종료 결과는 작업 폴더의 원자 파일로만 교환하며 표준 입출력 파이프를 사용하지 않습니다. 기존 `--request` v2는 수치 기준선과 호환 검사에만 유지하며 v4 세션과 혼용하지 않습니다. `--check-environment`는 실제로 로드한 공유 DLL 경로와 비대칭 점군 합성 등록 검사를 반환합니다.
+`colmap_cccore_worker.exe --session <JSON 절대경로>`는 Align 작업 하나의 등록·거리 명령을 단일 프로세스에서 순차 처리합니다. 세션의 요청·응답·진행·취소·종료 결과는 작업 폴더의 원자 파일로만 교환하며 표준 입출력 파이프를 사용하지 않습니다. 기존 `--request` v2는 수치 기준선과 호환 검사에만 유지하며 v5 세션과 혼용하지 않습니다. `--check-environment`는 실제로 로드한 공유 DLL 경로와 비대칭 점군 합성 등록 검사를 반환합니다.
 
 ## 파일 계약
 
-- 세션 `protocol_version`: `cccore-native-v4`
+- 세션 `protocol_version`: `cccore-native-v5`
 - 시작 요청은 `session_id`, `job_id`, `input_fingerprint`, `parameters.max_threads`와 고정된 ready·result·cancel·command 경로를 포함합니다.
 - 각 명령은 1부터 단조 증가하는 `sequence`, `operation`, `stage`, 동일한 세션 식별자와 순번별 고정 response·progress·distance 경로를 포함합니다.
 - `operation`: `register`, `distance`, 세션 종료용 `close`
 - `data`, `model`: 캐시 키인 `geometry_id`, `positions_file`, `point_count`와 `cache_scope`
 - 메시 `model`만 `triangles_file`, `triangle_count`를 추가합니다.
+- 종료를 제외한 명령은 `search_domain`을 포함합니다. `PREPARING` 단계의 메시 거리 조회만 `{domain_id, min, max}`를 허용하며 다른 명령은 `null`을 사용합니다. 식별자는 세션 내에서 같은 경계를 유지해야 합니다.
 - 위치는 리틀엔디언 `float64` 세 성분, 면은 리틀엔디언 `uint32` 세 인덱스입니다.
 - 세션 시작·명령·응답·진행·거리·종료 결과는 모두 작업 전용 디렉터리에서 완성된 파일만 원자 교체합니다. 누락·중복·역순·부분 JSON과 식별자 불일치는 세션 오류로 종료합니다.
 - 요청 내 파일 경로는 요청 디렉터리 하위 상대경로입니다. 상위 이동, 절대경로, 연결/재분석 지점과 파일 역할 간 경로 충돌을 거부합니다.
@@ -26,7 +27,7 @@
 
 ## 결과와 중단
 
-논리 연산 성공 상태는 `completed`, 정상 세션 종료는 `closed`, 취소는 `cancelled`, 오류는 `error`입니다. 프로세스 종료 코드는 정상 0, 취소 2, 오류 1입니다. v4 계산 결과는 순번별 응답 파일에 기록하고 전체 세션 결과는 `native/session-result.json`에 기록하며 Python은 stdout을 통신이나 결과 경로로 사용하지 않습니다. 호환 기준선인 v2 `--request`만 단발 결과를 stdout에 반환합니다.
+논리 연산 성공 상태는 `completed`, 정상 세션 종료는 `closed`, 취소는 `cancelled`, 오류는 `error`입니다. 프로세스 종료 코드는 정상 0, 취소 2, 오류 1입니다. v5 계산 결과는 순번별 응답 파일에 기록하고 전체 세션 결과는 `native/session-result.json`에 기록하며 Python은 stdout을 통신이나 결과 경로로 사용하지 않습니다. 호환 기준선인 v2 `--request`만 단발 결과를 stdout에 반환합니다.
 
 공통 결과는 세션·작업·입력 식별자, 순번, 코어·패치·스레드 식별자와 실행 시간을 포함합니다. 명령별 `timings`는 binary read, float32 변환·검증, mesh load, octree, mesh grid, kernel, serialization을 구분하고, `operation_statistics`는 geometry load/cache hit와 가속구조 생성 횟수를 기록합니다. close 결과는 세션 누계, 최고 작업 집합, 캐시 추정 크기와 geometry별 적재·캐시 적중 통계를 포함합니다. 등록 `matrix_4x4`는 행 우선 `data→model`, 즉 `p'=sRp+T`이며 거리 파일은 입력 순서의 N개 `float64`입니다.
 
@@ -49,6 +50,8 @@ Python 조정자는 물리 명령 요청 파일을 원자 기록하기 직전부
 0.3.58부터 준비 단계의 연속 거리 명령은 불변 메시·결합 큐브 경계·실제 단계·셀 크기가 같으면 `GridAndMeshIntersection`을 재사용합니다. 세션에 한 개만 보관하고 조건 변경·등록 시작·COMMAND 메시 해제 시 배열까지 반환합니다. 포인터 배열 메모리 예산을 유지하며 원본 면·표본 수와 정확 거리 계산을 바꾸지 않습니다. 실제 생성·적중 횟수와 생성 시간, 상주 메모리를 기존 v4 통계에 기록합니다. 상세 구현은 `mesh-grid-reuse-v1` 패치와 [재빌드 안내](REBUILD.md)에 있습니다.
 
 0.3.59는 자동 검색 단계 선택을 동일 대상의 첫 거리 명령에서만 수행합니다. 선택용 전체 대상·조회점 옥트리는 즉시 해제하고 실제 격자 단계 값 하나만 보관합니다. 후속 조회의 밀도 변화로 자동 단계를 다시 선택하지 않으므로 선택용 옥트리 생성과 격자 단계 변경에 따른 재생성을 제거합니다. 메모리 예산은 계속 매 호출 검사하며, 예산으로 낮아진 단계는 해당 대상의 연속 명령에서 유지합니다. 대상 변경·등록 시작·COMMAND 대상 해제 시 단계도 초기화합니다. 전체 옥트리를 보관하는 캐시가 아니므로 `octree_cache_hits`는 늘리지 않으며, 생략된 선택용 옥트리 생성은 `octree_build_count`에 합산하지 않습니다.
+
+v5는 준비 단계의 정규화된 전체 형상 경계를 한 번 정하여 검사점 묶음이 바뀌어도 같은 격자 좌표계를 사용합니다. `computeCloud2MeshDistancesWithCacheAndBounds`는 선언 범위와 모든 조회점의 투영을 확인한 뒤 기존 정확 거리 루틴을 사용합니다. 기존 두 거리 API의 시그니처와 기본 경로는 유지합니다. 대상·범위·실제 단계가 달라지거나 등록·범위 없는 조회로 전환하면 한 개의 캐시를 해제합니다. `mesh-grid-fixed-domain-v1`에는 평면이 셀 경계에 닿을 때 삼각형을 누락하지 않도록 교차 후보의 0 부호를 중립으로 처리하는 수정도 포함합니다.
 
 ## 스케일 경계 수정
 

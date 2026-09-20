@@ -72,6 +72,31 @@ function Assert-Hash {
     if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Expected) { throw "고정 SHA-256이 다른 파일입니다: $Path" }
 }
 
+function Get-PinnedSourceSha256 {
+    <# 이전 패치가 바꾸지 않은 파일을 고정 커밋의 원문과 직접 대조합니다. #>
+    param([string]$RelativePath)
+    $start = [Diagnostics.ProcessStartInfo]::new('git')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    foreach ($argument in @('-C', $CoreSource, 'show', "$($Lock.cccore.commit):$RelativePath")) {
+        $start.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        $content = $process.StandardOutput.ReadToEnd().Replace("`r`n", "`n")
+        $errorText = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "고정 커밋 원문을 읽지 못했습니다: $RelativePath ($errorText)" }
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try { return [Convert]::ToHexString($algorithm.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($content))).ToLowerInvariant() }
+        finally { $algorithm.Dispose() }
+    }
+    finally { $process.Dispose() }
+}
+
 function Get-PinnedFile {
     <# 이미 검증 가능한 캐시를 재사용하거나 고정 출처 파일을 내려받습니다. #>
     param([string]$Url, [string]$Path, [string]$Sha256)
@@ -155,14 +180,14 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 등록·격자 메모리·재사용 패치와 최종 원문·배포 해시를 빠짐없이 연결하는지 검사합니다. #>
+    <# Manifest가 등록·격자 고정 범위까지의 패치와 최종 원문·배포 해시를 연결하는지 검사합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.protocol_version -ne $Lock.protocol_version -or $manifest.tbb_version -ne $Lock.tbb.version) {
         throw "Runtime Manifest의 프로토콜 또는 oneTBB 버전이 잠금 정보와 다릅니다."
     }
-    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)"
+    $expectedCorePatch = "$($Lock.cccore.patch_id)+$($Lock.cccore.concurrency_patch.patch_id)+$($Lock.cccore.registration_safety_patch.id)+$($Lock.cccore.mesh_grid_memory_patch.id)+$($Lock.cccore.mesh_grid_reuse_patch.id)+$($Lock.cccore.mesh_grid_fixed_domain_patch.id)"
     if ($manifest.core_patch -ne $expectedCorePatch -or $manifest.self_test.core_patch -ne $expectedCorePatch -or
         $manifest.registration_safety_patch -ne $Lock.cccore.registration_safety_patch.id -or
         $manifest.registration_safety_patch_sha256 -ne $Lock.cccore.registration_safety_patch.sha256 -or
@@ -196,6 +221,21 @@ function Assert-RuntimeManifest {
     foreach ($source in $reusePatch.files) {
         if ($manifest.mesh_grid_reuse_source_sha256.($source.path) -ne $source.patched_sha256) {
             throw "Runtime Manifest의 격자 재사용 최종 원문 해시가 다릅니다."
+        }
+    }
+    $domainPatch = $Lock.cccore.mesh_grid_fixed_domain_patch
+    if ($manifest.mesh_grid_fixed_domain_patch -ne $domainPatch.id -or
+        $manifest.mesh_grid_fixed_domain_patch_sha256 -ne $domainPatch.sha256) {
+        throw "Runtime Manifest의 격자 고정 범위 패치가 잠금 정보와 다릅니다."
+    }
+    $domainNames = @($manifest.mesh_grid_fixed_domain_source_sha256.PSObject.Properties.Name | Sort-Object)
+    $expectedDomainNames = @($domainPatch.files | ForEach-Object { $_.path } | Sort-Object)
+    if (@(Compare-Object -ReferenceObject $expectedDomainNames -DifferenceObject $domainNames).Count -ne 0) {
+        throw "Runtime Manifest의 격자 고정 범위 원문 목록이 다릅니다."
+    }
+    foreach ($source in $domainPatch.files) {
+        if ($manifest.mesh_grid_fixed_domain_source_sha256.($source.path) -ne $source.patched_sha256) {
+            throw "Runtime Manifest의 격자 고정 범위 최종 원문 해시가 다릅니다."
         }
     }
     $manifestFiles = @($manifest.runtime_files | ForEach-Object { [string]$_ } | Sort-Object)
@@ -246,7 +286,7 @@ $NanoSource = Join-Path $CoreSource "extern\nanoflann"
 $actualNanoCommit = (& git -C $NanoSource rev-parse HEAD).Trim()
 if ($actualNanoCommit -ne $Lock.nanoflann.commit) { throw "nanoflann 커밋이 잠금 파일과 다릅니다." }
 if ((& git -C $NanoSource status --porcelain)) { throw "nanoflann 원문에 예상하지 않은 변경이 있습니다." }
-$allowedChangedFiles = @('CMakeLists.txt','src/RegistrationTools.cpp','include/DgmOctree.h','src/DgmOctree.cpp','src/DistanceComputationTools.cpp','include/DistanceComputationTools.h','include/GridAndMeshIntersection.h','src/GridAndMeshIntersection.cpp')
+$allowedChangedFiles = @('CMakeLists.txt','src/RegistrationTools.cpp','include/DgmOctree.h','src/DgmOctree.cpp','src/DistanceComputationTools.cpp','include/DistanceComputationTools.h','include/GridAndMeshIntersection.h','src/GridAndMeshIntersection.cpp','include/Grid3D.h')
 $changedFiles = @(& git -C $CoreSource diff --name-only HEAD)
 foreach ($changedFile in $changedFiles) {
     if ($changedFile -notin $allowedChangedFiles) { throw "CCCoreLib 원문에 예상하지 않은 변경이 있습니다: $changedFile" }
@@ -303,6 +343,24 @@ foreach ($source in $MeshGridReusePatch.files) {
         throw "격자 재사용 패치의 입력 원문이 메모리 패치 결과와 연결되지 않습니다."
     }
 }
+$MeshGridDomainPatch = $Lock.cccore.mesh_grid_fixed_domain_patch
+$MeshGridDomainPatchFile = Join-Path $NativeSource $MeshGridDomainPatch.file
+Assert-Hash $MeshGridDomainPatchFile $MeshGridDomainPatch.sha256
+$MeshGridDomainSources = @{}
+foreach ($source in $MeshGridDomainPatch.files) {
+    $MeshGridDomainSources[$source.path] = $source
+    if ($MeshGridReuseSources.ContainsKey($source.path)) {
+        if ($MeshGridReuseSources[$source.path].patched_sha256 -ne $source.original_sha256) {
+            throw "격자 고정 범위 패치의 입력 원문이 재사용 패치 결과와 연결되지 않습니다."
+        }
+    }
+    else {
+        if ($source.original_commit -ne $Lock.cccore.commit -or
+            (Get-PinnedSourceSha256 $source.path) -ne $source.original_sha256) {
+            throw "격자 고정 범위 패치의 입력 원문이 고정 커밋과 다릅니다: $($source.path)"
+        }
+    }
+}
 $originalConcurrencyFiles = 0
 $patchedConcurrencyFiles = 0
 foreach ($source in $ConcurrencyPatch.files) {
@@ -314,6 +372,9 @@ foreach ($source in $ConcurrencyPatch.files) {
         $patchedConcurrencyFiles++
     }
     elseif ($MeshGridReuseSources.ContainsKey($source.path) -and $sourceHash -eq $MeshGridReuseSources[$source.path].patched_sha256) {
+        $patchedConcurrencyFiles++
+    }
+    elseif ($MeshGridDomainSources.ContainsKey($source.path) -and $sourceHash -eq $MeshGridDomainSources[$source.path].patched_sha256) {
         $patchedConcurrencyFiles++
     }
     else { throw "CCCoreLib 동시성 패치 원문 해시가 다릅니다: $($source.path)" }
@@ -328,13 +389,15 @@ if ($originalConcurrencyFiles -eq $ConcurrencyPatch.files.Count) {
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $ConcurrencyPatchFile)
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $ConcurrencyPatchFile)
 }
-# 후속 격자 패치가 적용된 캐시도 허용하되 두 단계의 원문 해시를 모두 고정합니다.
+# 후속 격자 패치가 적용된 캐시도 허용하되 각 단계의 원문 해시를 고정합니다.
 foreach ($source in $ConcurrencyPatch.files) {
     $sourcePath = Join-Path $CoreSource $source.path
     if ($MeshGridSources.ContainsKey($source.path) -and
         (Get-NormalizedSha256 $sourcePath) -eq $MeshGridSources[$source.path].patched_sha256) { continue }
     if ($MeshGridReuseSources.ContainsKey($source.path) -and
         (Get-NormalizedSha256 $sourcePath) -eq $MeshGridReuseSources[$source.path].patched_sha256) { continue }
+    if ($MeshGridDomainSources.ContainsKey($source.path) -and
+        (Get-NormalizedSha256 $sourcePath) -eq $MeshGridDomainSources[$source.path].patched_sha256) { continue }
     Assert-Hash $sourcePath $source.patched_sha256
 }
 $originalGridFiles = 0
@@ -344,6 +407,7 @@ foreach ($source in $MeshGridPatch.files) {
     if ($sourceHash -eq $source.original_sha256) { $originalGridFiles++ }
     elseif ($sourceHash -eq $source.patched_sha256) { $patchedGridFiles++ }
     elseif ($MeshGridReuseSources.ContainsKey($source.path) -and $sourceHash -eq $MeshGridReuseSources[$source.path].patched_sha256) { $patchedGridFiles++ }
+    elseif ($MeshGridDomainSources.ContainsKey($source.path) -and $sourceHash -eq $MeshGridDomainSources[$source.path].patched_sha256) { $patchedGridFiles++ }
     else { throw "격자 메모리 패치 원문 해시가 다릅니다: $($source.path)" }
 }
 if ($originalGridFiles -and $patchedGridFiles) { throw "격자 메모리 패치가 일부 파일에만 적용되어 있습니다." }
@@ -355,6 +419,8 @@ foreach ($source in $MeshGridPatch.files) {
     $sourcePath = Join-Path $CoreSource $source.path
     if ($MeshGridReuseSources.ContainsKey($source.path) -and
         (Get-NormalizedSha256 $sourcePath) -eq $MeshGridReuseSources[$source.path].patched_sha256) { continue }
+    if ($MeshGridDomainSources.ContainsKey($source.path) -and
+        (Get-NormalizedSha256 $sourcePath) -eq $MeshGridDomainSources[$source.path].patched_sha256) { continue }
     Assert-Hash $sourcePath $source.patched_sha256
 }
 $originalReuseFiles = 0
@@ -364,6 +430,7 @@ foreach ($source in $MeshGridReusePatch.files) {
     $sourceHash = Get-NormalizedSha256 $sourcePath
     if ($sourceHash -eq $source.original_sha256) { $originalReuseFiles++ }
     elseif ($sourceHash -eq $source.patched_sha256) { $patchedReuseFiles++ }
+    elseif ($MeshGridDomainSources.ContainsKey($source.path) -and $sourceHash -eq $MeshGridDomainSources[$source.path].patched_sha256) { $patchedReuseFiles++ }
     else { throw "격자 재사용 패치 원문 해시가 다릅니다: $($source.path)" }
     [IO.File]::WriteAllText($sourcePath, [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
 }
@@ -372,7 +439,28 @@ if ($originalReuseFiles -eq $MeshGridReusePatch.files.Count) {
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $MeshGridReusePatchFile)
     Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $MeshGridReusePatchFile)
 }
-foreach ($source in $MeshGridReusePatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
+foreach ($source in $MeshGridReusePatch.files) {
+    $sourcePath = Join-Path $CoreSource $source.path
+    if ($MeshGridDomainSources.ContainsKey($source.path) -and
+        (Get-NormalizedSha256 $sourcePath) -eq $MeshGridDomainSources[$source.path].patched_sha256) { continue }
+    Assert-Hash $sourcePath $source.patched_sha256
+}
+$originalDomainFiles = 0
+$patchedDomainFiles = 0
+foreach ($source in $MeshGridDomainPatch.files) {
+    $sourcePath = Join-Path $CoreSource $source.path
+    $sourceHash = Get-NormalizedSha256 $sourcePath
+    if ($sourceHash -eq $source.original_sha256) { $originalDomainFiles++ }
+    elseif ($sourceHash -eq $source.patched_sha256) { $patchedDomainFiles++ }
+    else { throw "격자 고정 범위 패치 원문 해시가 다릅니다: $($source.path)" }
+    [IO.File]::WriteAllText($sourcePath, [IO.File]::ReadAllText($sourcePath).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+}
+if ($originalDomainFiles -and $patchedDomainFiles) { throw "격자 고정 범위 패치가 일부 파일에만 적용되어 있습니다." }
+if ($originalDomainFiles -eq $MeshGridDomainPatch.files.Count) {
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', '--check', $MeshGridDomainPatchFile)
+    Invoke-Checked git @('-C', $CoreSource, '-c', 'core.autocrlf=false', 'apply', $MeshGridDomainPatchFile)
+}
+foreach ($source in $MeshGridDomainPatch.files) { Assert-Hash (Join-Path $CoreSource $source.path) $source.patched_sha256 }
 Get-PinnedFile $Lock.json.header_url (Join-Path $Dependencies 'json.hpp') $Lock.json.header_sha256
 Get-PinnedFile $Lock.json.license_url (Join-Path $Dependencies 'json-LICENSE.MIT') $Lock.json.license_sha256
 Get-PinnedFile $Lock.tbb.archive_url $TbbArchive $Lock.tbb.archive_sha256
@@ -394,7 +482,7 @@ $CMake = Join-Path $VisualStudio "Common7\IDE\CommonExtensions\Microsoft\CMake\C
 if (!(Test-Path -LiteralPath $CMake)) { throw "Visual Studio에 포함된 CMake를 찾지 못했습니다." }
 Invoke-Checked $CMake @('-S',$NativeSource,'-B',$BuildPath,'-G','Visual Studio 17 2022','-A','x64',
     "-DCCCORE_SOURCE=$CoreSource","-DJSON_INCLUDE_DIR=$Dependencies","-DTBB_DIR=$TbbCMake","-DCORE_COMMIT=$($Lock.cccore.commit)",
-    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)")
+    "-DCORE_PATCH=$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)")
 Invoke-Checked $CMake @('--build',$BuildPath,'--config','Release','--parallel','8')
 foreach ($binary in @('colmap_cccore_worker.exe','CCCoreLib.dll')) {
     Copy-Item -LiteralPath (Join-Path $BuildPath "bin\$binary") -Destination (Join-Path $StagedRuntime $binary) -Force
@@ -463,11 +551,13 @@ $MeshGridSourceHashes = [ordered]@{}
 foreach ($source in $MeshGridPatch.files) { $MeshGridSourceHashes[$source.path] = $source.patched_sha256 }
 $MeshGridReuseSourceHashes = [ordered]@{}
 foreach ($source in $MeshGridReusePatch.files) { $MeshGridReuseSourceHashes[$source.path] = $source.patched_sha256 }
+$MeshGridDomainSourceHashes = [ordered]@{}
+foreach ($source in $MeshGridDomainPatch.files) { $MeshGridDomainSourceHashes[$source.path] = $source.patched_sha256 }
 $Manifest = [ordered]@{
     protocol_version = $Lock.protocol_version
     platform = 'windows-x64'
     core_commit = $Lock.cccore.commit
-    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)"
+    core_patch = "$($Lock.cccore.patch_id)+$($ConcurrencyPatch.patch_id)+$($RegistrationSafetyPatch.id)+$($MeshGridPatch.id)+$($MeshGridReusePatch.id)+$($MeshGridDomainPatch.id)"
     core_patch_sha256 = $Lock.cccore.patch_sha256
     concurrency_patch = $ConcurrencyPatch.patch_id
     concurrency_patch_sha256 = $ConcurrencyPatch.patch_sha256
@@ -480,6 +570,9 @@ $Manifest = [ordered]@{
     mesh_grid_reuse_patch = $MeshGridReusePatch.id
     mesh_grid_reuse_patch_sha256 = $MeshGridReusePatch.sha256
     mesh_grid_reuse_source_sha256 = $MeshGridReuseSourceHashes
+    mesh_grid_fixed_domain_patch = $MeshGridDomainPatch.id
+    mesh_grid_fixed_domain_patch_sha256 = $MeshGridDomainPatch.sha256
+    mesh_grid_fixed_domain_source_sha256 = $MeshGridDomainSourceHashes
     dependencies = $Lock
     build_options = @{ CCCORELIB_SHARED=$true; CCCORELIB_USE_QT_CONCURRENT=$false; CCCORELIB_USE_TBB=$true; CCCORELIB_USE_CGAL=$false; configuration='Release' }
     cmake_version = ((& $CMake --version) | Select-Object -First 1)

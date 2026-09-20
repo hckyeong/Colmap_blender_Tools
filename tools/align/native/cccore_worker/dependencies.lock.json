@@ -1,5 +1,5 @@
 {
-  "protocol_version": "cccore-native-v4",
+  "protocol_version": "cccore-native-v5",
   "cccore": {
     "repository": "https://github.com/CloudCompare/CCCoreLib.git",
     "commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432",
@@ -79,6 +79,29 @@
           "path": "src/GridAndMeshIntersection.cpp",
           "original_sha256": "91157d276dea02fd43d90274328b4b86096488a3ca85a347df128bfe7d0c768b",
           "patched_sha256": "55082c89aaf4bf0c72068523ebc1657dad0e4e7aa3c496b9fff6bb25f867891f"
+        }
+      ]
+    },
+    "mesh_grid_fixed_domain_patch": {
+      "id": "mesh-grid-fixed-domain-v1",
+      "file": "patches/mesh_grid_fixed_domain.patch",
+      "sha256": "0b5d6b1689e86c742af1a7ea0118b4cd304d463028a744c21330923bef7091c0",
+      "files": [
+        {
+          "path": "include/DistanceComputationTools.h",
+          "original_sha256": "2aee6c1c0cf6afb002f8d861699cc2005d8a0fe3bb279cc6a16129ef7a502472",
+          "patched_sha256": "523b1684c85bb259c84293c7827b3976a0d5e4d3f1bc571c5674648d87af5894"
+        },
+        {
+          "path": "src/DistanceComputationTools.cpp",
+          "original_sha256": "281d5da45323cc265e214d59ff15e5482d7b1ec67fc10c1a38aa10dde16b9ceb",
+          "patched_sha256": "58d1cc48741a3ca8c64eebcd03ff39cd9af3338832ecbb66696e02e8ea9abf12"
+        },
+        {
+          "path": "include/Grid3D.h",
+          "original_sha256": "df3afb7fa8f166a8a38efd933be80516e73a744ae88eb278cb0459880cd1e7e7",
+          "patched_sha256": "51e8ff375b36ca8f9a307083e816b4a4c9282b9b1088f6686d7b70d4612667bc",
+          "original_commit": "dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432"
         }
       ]
     }
