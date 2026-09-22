@@ -77,6 +77,9 @@ Modifier와 Projection Paint의 신규 작업공간도 Align과 같은 N 패널 
 
 ### 2.2 표시·카메라·타임라인
 
+- 0.3.46부터 Align·Modifier·Painting의 기능 메뉴 제목은 모두 최상위 패널의 왼쪽 기준선에 배치한다. 0.3.47에서는 본문 여백을 기존 1.0에서 0.5 UI 단위로 줄였다(화면 배율 적용 전 약 10px). 각 메뉴의 개별 접기·펼치기는 유지하며, 전체 도구 부모 메뉴에 따른 추가 제목 들여쓰기는 제거한다. Align의 기존 부모 패널은 연결 상태 안내만 표시하고 Painting의 Layers도 독립 메뉴로 표시한다.
+- 이 변경 전 복귀 지점은 `926699a`다. 0.3.46에서 빌드 검사 298개와 패널 계층 검사, 숨김 GUI에서 17개 패널의 펼친 상태 그리기를 확인했다. 실제 설치본의 세 패널·버전 파일도 소스와 일치한다. 별도 실행한 Align 전체 등록 검사에는 기존 `test_marker_ui_mirror_and_default_display_setting`의 `SMALL_GICP` 기본값 기대가 현행 CCCoreLib와 맞지 않는 실패가 남아 있다. 이번 UI 변경 범위에서는 엔진 테스트를 수정하지 않았다.
+
 - Modifier 관리 Root는 전용 View Layer에서만 보인다. 그 전용 View Layer에서는 일반 Scene 데이터를 숨기며 일반 작업공간의 표시 상태와 데이터 블록은 보존한다.
 - Painting의 Snapshot 자원도 자기 전용 View Layer에서 관리한다. Align 데이터는 두 도구의 전달·표시 구조에 의존하지 않는다.
 - 실제 `Scene.timeline_markers`는 활성 도구 한 곳만 사용한다. 영구 Camera Marker Manifest는 보존하고, 진입 때 실제 Marker를 붙이며 종료 때 정확히 소유한 Marker만 내린다.
@@ -116,9 +119,9 @@ A는 기준 그룹이고 P는 이동 대상이다. 정밀 정렬은 선택한 P 
 
 새 RC 입력은 COLMAP에 `RC COLMAP`의 Forward `Z` / Up `-Y`, OBJ에 `RC 표준 OBJ`의 Forward `Y` / Up `Z`를 사용한다. Native OBJ Import는 `Y/Z`와 Identity Object Matrix 확인을 기준으로 하고, 화면 축 보정은 별도 데이터로 관리해 이중 축 변환을 피한다.
 
-레이어 톱니 팝업에서 COLMAP 점군·카메라와 연결 메시의 프리셋, Forward/Up, XYZ 추가 회전을 각각 편집한다. RC 초기화, 미리보기, 적용과 취소를 제공한다. 두 축의 적용은 Undo 한 건이며, 취소·Esc·창 종료·작업공간 이탈 시 임시 설정을 폐기한다.
+레이어 톱니 팝업에서 COLMAP 점군·카메라와 연결 메시의 프리셋, Forward/Up, XYZ 이동·추가 회전·배율을 각각 편집한다. 배율 자물쇠는 현재 XYZ 비율을 유지하고, 원점 이동은 형상의 바운딩 박스 중심을 월드 원점으로 이동한다. RC 초기화, 미리보기, 적용과 취소를 제공한다. 적용은 Undo 한 건이며, 취소·Esc·창 종료·작업공간 이탈 시 임시 설정을 폐기한다.
 
-형상별 축은 `N = Rz × Ry × Rx × B`, 공통 정렬은 `C`로 구분한다. 화면 좌표는 `C × N × 원본 좌표`로 계산한다. 원본 점·정점·카메라를 축 편집 때 다시 쓰지 않는다. 표시·법선·피킹·마커는 해당 형상의 현재 축을 사용한다. 실제 정렬에 사용된 형상 축이 바뀌면 관련 품질 기록을 무효화하고 Undo/Redo로 기록까지 복원한다.
+형상별 표시 변환은 원본 중심 `c`, 이동 `t`, 회전 `R`, 배율 `s`, 축 변환 `B`에 대해 `N(x) = R diag(s) B(x-c) + Bc + t`이며, 공통 정렬은 `C`로 구분한다. 화면 좌표는 `C × N × 원본 좌표`로 계산한다. 원본 점·정점·카메라를 축 편집 때 다시 쓰지 않는다. 표시·법선·피킹·마커는 해당 형상의 현재 변환을 사용한다. 실제 정렬에 사용된 변환이 바뀌면 관련 품질 기록을 무효화하고 Undo/Redo로 기록까지 복원한다. [이동·배율·중심 변환 설계](COLMAP_Align_축설정_이동_배율_계획서.md)에 호환성 및 검증 범위를 기록한다.
 
 ### 3.3 마커와 3점 초기 정렬
 
@@ -207,6 +210,12 @@ Normal·Roughness·Metallic 등 임의 MTL 확장 전체를 지원한다고 해�
 
 ### 4.1 편집 권위와 되돌리기
 
+0.3.50에서는 데이터셋 배율과 점·카메라 표시 크기를 분리한다. 공개 Point Scale은 유지하고 내부 반지름만 역배율로 보정하며, 카메라 중심은 변환하되 최종 표시 배율을 1로 유지한다. Modifier 전용 View Layer의 별도 컬렉션에는 +X·+Y 방향 1~10m 텍스트 20개와 기준 눈금을 배치한다. 눈금은 Scene 단위에 맞춰 환산하고 선택·렌더·데이터 출력에서 제외한다. [표시 크기·미터 눈금 계획 및 검증](COLMAP_Modifier_표시크기_고정_미터눈금_계획서.md)을 참고한다.
+
+0.3.49에서는 Modifier 일반 탐색 중 연속 클릭도 Align과 동일하게 Blender의 더블클릭 시간·거리 설정으로 판정한다. 점 더블클릭으로 기즈모 피벗과 화면 회전 중심을 함께 이동하며, 점·카메라 편집 모드에서는 기존 선택 입력을 유지한다. 실제 뷰포트에서 제어된 클릭 간격으로 피벗·회전 중심 이동과 편집 이력 불변을 확인했다.
+
+0.3.48부터 내부 `AXIS_ROOT`는 뷰포트에서 숨기고 선택을 잠근다. 이전에는 화살표 Empty가 카메라와 함께 선택되면 외부 오브젝트 혼입 검사로 Remove가 차단됐다. 신규 Import에서 숨김·선택 잠금을 적용하며, 기존 파일도 Modifier 작업공간 진입 시 해당 데이터셋 보조 축의 선택을 해제하고 같은 정책을 적용한다. 하위 점군·카메라 표시와 부모 변환, 별도로 그리는 Dataset Transform 기즈모는 유지한다. 실제 Blender에서 신규·기존 루트 처리, 자식 표시·변환과 카메라·점 선택을 검증했다.
+
 0.3.34부터 독립 Python Runtime Domain이 현재 COLMAP Reconstruction·확정 EditOperation·관계 Index·전용 Journal을 소유한다. Scene Property, Point Mesh, Camera와 Timeline Marker는 저장 연결 또는 다시 만들 수 있는 파생 표시다. Domain UUID·Generation·Dataset 지문·Revision·History Hash로 현재 상태를 확인한다.
 
 점·카메라 제거와 Pending Filter 적용은 변경된 범위의 Forward/Inverse Delta를 전용 Command로 기록한다. Modifier 작업공간에서 `Ctrl+Z`는 전용 Undo, `Ctrl+Shift+Z`와 `Ctrl+Y`는 전용 Redo다. 빈 Journal에서도 Blender Global Undo로 입력을 넘기지 않으며 `Ctrl+Alt+Z`는 안내를 표시한다. 다른 작업공간의 Blender Undo는 그대로 유지한다.
@@ -287,7 +296,7 @@ GUI에서는 Color·Alpha Bake를 Blender Native `OBJECT_BAKE` Job으로 실행�
 
 | 데이터 | `.blend`에 남는 내용 | 다시 열 때의 조건 |
 |---|---|---|
-| Align | 스키마 8, 마커·개별 축·확정 행렬·품질/출처, OBJ 원본 Polygon·UV·내장 UUID | COLMAP 원본은 외부 참조. 정상 내장 OBJ는 외부 OBJ 없이 복원·출력. 외부 텍스처는 별도 보관 필요 |
+| Align | 스키마 9, 마커·개별 축·이동·배율·중심·확정 행렬·품질/출처, OBJ 원본 Polygon·UV·내장 UUID | COLMAP 원본은 외부 참조. 정상 내장 OBJ는 외부 OBJ 없이 복원·출력. 외부 텍스처는 별도 보관 필요 |
 | Modifier | Source Metadata·Domain Identity·확정 EditOperation을 Active/Staging Text로 저장 | 같은 Source를 읽고 편집·Undo를 재구축. Reconstruction·Index·Delta·Redo 분기 자체는 저장하지 않음 |
 | Projection Painting | 독립 COLMAP Snapshot과 Paint Layer·Mask·Composite·Brush 상태 | 외부 Original·촬영 이미지 의존성을 보존. Modifier 최신 편집은 수동 업데이트 필요 |
 
@@ -298,7 +307,7 @@ Align은 구현된 이전 스키마와 과거 엔진 승인 기록을 읽으며 
 <a id="build"></a>
 ## 7. 빌드·배포
 
-현재 설치 산출물은 **`build/colmap_tools-0.3.45.zip`**이다. CC 전용 CPython 3.12.10·NumPy 1.26.4, 네이티브 워커·DLL·oneTBB 2022.0.0, 라이선스와 재빌드 원문을 포함한다. 사용자는 별도 Python을 설치하지 않아도 된다. 업데이트 전에 열린 Blender는 이전 모듈을 유지하므로 재시작해야 새 설치본이 적용된다. 0.3.43 실제 설치본에서도 숨김 GUI 검증으로 세 도구의 N 패널 폭이 모두 461px(UI 배율 1.25)임을 확인했다.
+현재 설치 산출물은 **`build/colmap_tools-0.3.51.zip`**이다. CC 전용 CPython 3.12.10·NumPy 1.26.4, 네이티브 워커·DLL·oneTBB 2022.0.0, 라이선스와 재빌드 원문을 포함한다. 사용자는 별도 Python을 설치하지 않아도 된다. 업데이트 전에 열린 Blender는 이전 모듈을 유지하므로 재시작해야 새 설치본이 적용된다. 0.3.43 실제 설치본에서도 숨김 GUI 검증으로 세 도구의 N 패널 폭이 모두 461px(UI 배율 1.25)임을 확인했다.
 
 | 빌드 프로필 | 기본 엔진 | 용도 |
 |---|---|---|
@@ -306,7 +315,7 @@ Align은 구현된 이전 스키마와 과거 엔진 승인 기록을 읽으며 
 | `SmallGicp` | Small GICP | 모든 A/P가 점군인 명시적 비교 |
 | `Full` | CC | 선택형 이전 엔진 소스를 포함하는 개발 비교. 해당 외부 Python은 별도 지정 |
 
-기본 CC ZIP에 Small GICP·Open3D 실행 패키지를 혼합하지 않는다. 대용량 실행 환경·ZIP·로그·캐시는 Git에서 제외하고 `.cccore-runtime/`과 빌드 Staging에서 관리한다. 새 실행 환경 빌드에는 Visual Studio 2022 C++ 도구와 고정 원문 다운로드가 필요하다.
+기본 CC ZIP에 Small GICP·Open3D 실행 패키지를 혼합하지 않는다. 저장소 최상위의 `colmap_tools.zip` 하나를 최신 정식 설치본으로 Git에 포함한다. 기본 빌드는 검증을 통과한 파일로 이 ZIP을 교체하고 같은 출력 폴더의 이전 버전 설치 ZIP을 정리한다. 나머지 실행 환경·ZIP·로그·캐시는 Git에서 제외하고 `.cccore-runtime/`과 빌드 Staging에서 관리한다. 새 실행 환경 빌드에는 Visual Studio 2022 C++ 도구와 고정 원문 다운로드가 필요하다.
 
 Root 환경설정의 CPU 스레드는 0 자동, 1 단일, 2 이상 수동 상한이다. 자동은 논리 CPU 하나를 남기는 정책이며 실행기는 활성 논리 프로세서 수로 다시 제한한다. 실행 중 변경값은 다음 정렬에 반영한다. 현재 엔진은 CPU/oneTBB 경로이며 GPU 정렬 엔진은 포함하지 않는다.
 
@@ -326,7 +335,7 @@ CCCoreLib 고정 커밋은 `dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432`다. 잠금
 
 # 격리 설치본과 작업공간·파일 재연결까지 검사
 .\build_tools\test_installed_extension.ps1 `
-  -PackagePath "$PWD\build\colmap_tools-0.3.45.zip" -WorkspaceGui
+  -PackagePath "$PWD\colmap_tools.zip" -WorkspaceGui
 ```
 
 새 네이티브 실행 환경 준비와 다른 세부 검사 명령은 [보관된 검증 문서](temp/TESTING.md)와 현재 빌드 스크립트를 참조한다. 보관 문서의 실험판 경로·과거 버전 고정 인자는 그 시점의 재현 기록이다.

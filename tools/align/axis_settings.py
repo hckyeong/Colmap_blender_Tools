@@ -2,11 +2,49 @@
 from __future__ import annotations
 from typing import Any
 from uuid import uuid4
+import numpy as np
 from .axis_settings_state import AxisEditSnapshot, AxisSettingsRuntimeState
 from .constants import MARKER_GEOMETRY_SOURCE_MAIN, MARKER_GEOMETRY_SOURCE_COMPANION
 from .display_axes import DEFAULT_AXIS_PRESET, RC_OBJ_AXIS_PRESET, ModelDisplayTransform, create_model_display_transform
+from .geometry_access import bounds_for_model
 
 AXIS_SETTINGS_COMMAND = "EDIT_GEOMETRY_AXES"
+
+
+def axis_transform_center(runtime: Any, model_id: str, *, companion: bool = False) -> np.ndarray:
+    """대형 원본 배열을 순회하지 않고 저장된 바운딩 박스 중심을 반환합니다."""
+    repository = runtime.model_repository
+    model = repository.companion_mesh_for_model_id(model_id) if companion else repository.models[model_id]
+    minimum, maximum = bounds_for_model(model)
+    return minimum * 0.5 + maximum * 0.5
+
+
+def centered_axis_transform(runtime: Any, model_id: str, transform: ModelDisplayTransform, *, companion: bool = False) -> ModelDisplayTransform:
+    """현재 위치를 유지하면서 회전·배율의 기준점을 원본 바운딩 박스 중심으로 옮깁니다."""
+    center = axis_transform_center(runtime, model_id, companion=companion)
+    if tuple(center) == transform.pivot_source:
+        return transform
+    base = create_model_display_transform(transform.preset_id, transform.forward_axis, transform.up_axis)
+    translation = transform.matrix_float64[:3, 3] - (base.matrix_float64[:3, :3] @ center - transform.matrix_float64[:3, :3] @ center)
+    return create_model_display_transform(
+        transform.preset_id, transform.forward_axis, transform.up_axis,
+        rotation_xyz_degrees=transform.rotation_xyz_degrees,
+        translation_xyz=translation, scale_xyz=transform.scale_xyz, pivot_source=center,
+    )
+
+
+def axis_transform_at_world_origin(runtime: Any, model_id: str, transform: ModelDisplayTransform, *, companion: bool = False) -> ModelDisplayTransform:
+    """기존 정렬 변환까지 반영해 바운딩 박스 중심이 월드 원점에 오도록 이동합니다."""
+    centered = centered_axis_transform(runtime, model_id, transform, companion=companion)
+    alignment = runtime.model_repository.alignment_transform_for_model_id(model_id).matrix_float64
+    target = np.linalg.solve(alignment, np.array((0.0, 0.0, 0.0, 1.0)))[:3]
+    base = create_model_display_transform(centered.preset_id, centered.forward_axis, centered.up_axis)
+    translation = target - base.matrix_float64[:3, :3] @ centered.pivot_source
+    return create_model_display_transform(
+        centered.preset_id, centered.forward_axis, centered.up_axis,
+        rotation_xyz_degrees=centered.rotation_xyz_degrees,
+        translation_xyz=translation, scale_xyz=centered.scale_xyz, pivot_source=centered.pivot_source,
+    )
 
 
 class AxisSettingsError(RuntimeError):

@@ -326,7 +326,7 @@ def test_cc_mesh_approval_roundtrip_uses_real_project_snapshot() -> None:
         origin.model_catalog.set_model_visibility("reference", False)
         snapshot, _text = _write_snapshot(origin)
         assert isinstance(snapshot, ProjectStateSnapshot)
-        assert snapshot.schema_version == PROJECT_PERSISTENCE_SCHEMA_VERSION == 8
+        assert snapshot.schema_version == PROJECT_PERSISTENCE_SCHEMA_VERSION == 9
         payload = encode_project_state(snapshot)
         document = json.loads(payload)
         saved = document["models"][1]["catalog"]["alignment_provenance"]

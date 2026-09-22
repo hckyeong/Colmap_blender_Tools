@@ -195,6 +195,26 @@ def dataset_display_matrix(dataset_uuid, forward_axis, up_axis, matrix=None):
     return display_axis_matrix(forward_axis, up_axis) @ Matrix(validate_transform(matrix))
 
 
+def hide_dataset_axis_roots(scene) -> None:
+    """기존 파일의 현재 데이터셋 보조 축을 숨기고 남은 선택을 해제합니다."""
+    dataset_uuid = scene.colmap_import.dataset_uuid
+    if not dataset_uuid:
+        return
+    for root in scene.objects:
+        if (root.get(OWNER_KEY) != OWNER_TOKEN
+                or root.get(RECORD_KIND_KEY) != "AXIS_ROOT"
+                or root.get(DATASET_UUID_KEY) != dataset_uuid):
+            continue
+        for view_layer in scene.view_layers:
+            if root.name in view_layer.objects:
+                root.select_set(False, view_layer=view_layer)
+                if view_layer.objects.active == root:
+                    view_layer.objects.active = None
+        root.hide_select = True
+        root.hide_viewport = True
+        root.hide_render = True
+
+
 def dataset_transform_roots(scene):
     """변환 시작 시 해당 데이터셋의 표시 루트만 한 번 수집합니다."""
 
@@ -202,8 +222,8 @@ def dataset_transform_roots(scene):
     return tuple(_managed_axis_roots(dataset_uuid)) if dataset_uuid else ()
 
 
-def apply_dataset_transform_preview(scene, matrix=None, *, roots=None) -> None:
-    """점 배열을 수정하지 않고 미리보기 또는 확정 변환을 표시 루트에 적용합니다."""
+def apply_dataset_transform_preview(scene, matrix=None, *, roots=None, display_targets=None) -> None:
+    """점 위치 변환과 표시 크기 보정을 미리보기 또는 확정 행렬로 적용합니다."""
 
     settings = scene.colmap_import
     dataset_uuid = settings.dataset_uuid
@@ -218,13 +238,20 @@ def apply_dataset_transform_preview(scene, matrix=None, *, roots=None) -> None:
     composed = dataset_display_matrix(
         dataset_uuid, settings.axis_forward, settings.axis_up, matrix
     )
-    for axis_root in dataset_transform_roots(scene) if roots is None else roots:
+    roots = dataset_transform_roots(scene) if roots is None else roots
+    for axis_root in roots:
         if (
             axis_root.get(OWNER_KEY) != OWNER_TOKEN
             or axis_root.get(RECORD_KIND_KEY) != "AXIS_ROOT"
             or axis_root.get(DATASET_UUID_KEY) != dataset_uuid
         ):
             raise ValueError("변환 시작 이후 표시 루트의 소유권이 변경되었습니다.")
+    if display_targets is None:
+        from .display_scale import DisplayScaleTargets
+
+        display_targets = DisplayScaleTargets(scene, roots)
+    display_targets.apply(composed)
+    for axis_root in roots:
         axis_root.matrix_world = composed
         axis_root["colmap_display_forward_axis"] = settings.axis_forward
         axis_root["colmap_display_up_axis"] = settings.axis_up
@@ -239,7 +266,11 @@ def _apply_display_axis(settings, context) -> None:
     )
     dataset_uuid = settings.dataset_uuid or None
     if dataset_uuid is not None:
-        for axis_root in _managed_axis_roots(dataset_uuid):
+        from .display_scale import DisplayScaleTargets
+
+        roots = tuple(_managed_axis_roots(dataset_uuid))
+        DisplayScaleTargets(settings.id_data, roots).apply(matrix)
+        for axis_root in roots:
             axis_root.matrix_world = matrix
             axis_root["colmap_display_forward_axis"] = settings.axis_forward
             axis_root["colmap_display_up_axis"] = settings.axis_up

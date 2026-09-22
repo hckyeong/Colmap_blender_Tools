@@ -445,11 +445,33 @@ function Test-BuiltArchive {
     }
 }
 
-# 통합 Extension Root와 출력 위치를 확정합니다.
+function Remove-PreviousInstallPackages {
+    <# 새 정식 ZIP이 준비된 출력 폴더에서 버전 이름이 붙은 이전 설치 ZIP만 정리합니다. #>
+    param([Parameter(Mandatory = $true)][string]$OutputPath)
+
+    $directory = Get-Item -LiteralPath $OutputPath
+    if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "설치 ZIP 정리 대상은 연결 경로가 아닌 일반 폴더여야 합니다: $OutputPath"
+    }
+    $current = Join-Path $directory.FullName "colmap_tools.zip"
+    if (-not (Test-Path -LiteralPath $current -PathType Leaf)) {
+        throw "새 정식 설치 ZIP이 없으므로 이전 설치본을 정리하지 않습니다: $current"
+    }
+    foreach ($previous in Get-ChildItem -LiteralPath $directory.FullName -File -Filter "colmap_tools-*.zip") {
+        if ($previous.Name -notmatch '^colmap_tools-\d+\.\d+\.\d+(?:-[A-Za-z0-9_.-]+)?\.zip$') { continue }
+        Assert-ChildPath -ParentPath $directory.FullName -ChildPath $previous.FullName
+        if ($previous.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "연결 파일은 이전 설치 ZIP으로 삭제하지 않습니다: $($previous.FullName)"
+        }
+        Remove-Item -LiteralPath $previous.FullName -Force
+    }
+}
+
+# 정식 설치본의 기본 출력은 GitHub 다운로드 링크와 같은 저장소 최상위입니다.
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $projectRoot = (Resolve-Path -LiteralPath $projectRoot).Path
 $buildOutput = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    Join-Path $projectRoot "build"
+    $projectRoot
 }
 elseif ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
     [System.IO.Path]::GetFullPath($OutputDirectory)
@@ -461,6 +483,9 @@ else {
 if (-not (Test-Path -LiteralPath $BlenderPath -PathType Leaf)) {
     throw "Blender 5.2 실행 파일을 찾을 수 없습니다: $BlenderPath"
 }
+
+# 이전 설치본 정리의 삭제 범위를 실제 임시 파일로 검사합니다.
+& (Join-Path $projectRoot "tests\build_tools\test_install_package_cleanup.ps1")
 
 # 정적 구조, 공존 식별자와 순수 Core 회귀 테스트를 먼저 실행합니다.
 $testSuites = @(
@@ -541,7 +566,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "배포 ZIP의 경로 또는 CC 파일 무결성 검사에 실패했습니다." }
 
     New-Item -ItemType Directory -Path $buildOutput -Force | Out-Null
-    $finalPackage = Join-Path $buildOutput $package.Name
+    # 비교 프로필은 별도 이름을 써서 정식 다운로드 파일을 덮어쓰지 않습니다.
+    $finalName = if ($AlignProfile -eq "CCCoreLib") { "colmap_tools.zip" } else { "colmap_tools-$($AlignProfile.ToLowerInvariant()).zip" }
+    $finalPackage = Join-Path $buildOutput $finalName
     $temporaryDestination = Join-Path $buildOutput (".$buildId-" + $package.Name)
     Copy-Item -LiteralPath $package.FullName -Destination $temporaryDestination
     if ((Get-FileHash -LiteralPath $temporaryDestination -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256).Hash) {
@@ -549,6 +576,9 @@ try {
     }
     Move-Item -LiteralPath $temporaryDestination -Destination $finalPackage -Force
     $temporaryDestination = ""
+    if ($AlignProfile -eq "CCCoreLib") {
+        Remove-PreviousInstallPackages -OutputPath $buildOutput
+    }
 }
 finally {
     if (-not [string]::IsNullOrWhiteSpace($temporaryDestination) -and (Test-Path -LiteralPath $temporaryDestination)) {

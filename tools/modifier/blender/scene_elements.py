@@ -114,7 +114,7 @@ def _create_point_display_nodes(
     material: bpy.types.Material,
     point_size: float,
 ) -> bpy.types.GeometryNodeTree:
-    """Mesh Vertex를 색상과 반지름이 있는 Point Cloud 표시로 변환합니다."""
+    """공개 반지름과 내부 배율 보정을 분리한 Point Cloud 표시를 생성합니다."""
     node_group = bpy.data.node_groups.new("COLMAP_Point_Display", "GeometryNodeTree")
     mark_managed(node_group, loaded, "POINT_DISPLAY_NODES")
     node_group.interface.new_socket(
@@ -171,6 +171,9 @@ def _create_point_display_nodes(
     links.new(visible_points.outputs["Boolean"], mesh_to_points.inputs["Selection"])
     links.new(mesh_to_points.outputs["Points"], set_material.inputs["Geometry"])
     links.new(set_material.outputs["Geometry"], group_output.inputs["Geometry"])
+    from .display_scale import ensure_radius_compensation
+
+    ensure_radius_compensation(node_group)
     return node_group
 
 
@@ -312,7 +315,7 @@ def _create_point_object_display(
     mesh: bpy.types.Mesh,
     point_size: float,
 ) -> bpy.types.Object:
-    """Point Object와 Geometry Nodes 표시 리소스를 연결합니다."""
+    """Point Object와 현재 데이터 배율을 보정한 표시 리소스를 연결합니다."""
 
     point_object = bpy.data.objects.new("COLMAP_Points", mesh)
     mark_managed(point_object, loaded, "POINT_MESH")
@@ -329,6 +332,9 @@ def _create_point_object_display(
     modifier = point_object.modifiers.new("COLMAP Point Display", "NODES")
     modifier.node_group = node_group
     set_modifier_point_scale(modifier, node_group, point_size)
+    from .display_scale import compensate_object
+
+    compensate_object(point_object, axis_root.matrix_world.to_3x3().col[0].length)
     return point_object
 
 
@@ -402,7 +408,7 @@ def _create_camera(
     *,
     camera_frustum_size: float = DEFAULT_CAMERA_FRUSTUM_SIZE,
 ) -> bpy.types.Object:
-    """Image 하나를 관리 Camera Data와 Object로 변환합니다."""
+    """Image를 관리 카메라로 생성하고 데이터 배율과 표시 크기를 분리합니다."""
 
     camera_record = loaded.reconstruction.cameras[image.camera_id]
     camera_data = bpy.data.cameras.new(f"IMAGE_{image.image_id}_Camera")
@@ -423,6 +429,9 @@ def _create_camera(
         camera_object.parent = axis_root
         camera_object.matrix_parent_inverse = Matrix.Identity(4)
         camera_object.matrix_basis = _camera_matrix(image.qvec, image.tvec)
+        from .display_scale import compensate_object
+
+        compensate_object(camera_object, axis_root.matrix_world.to_3x3().col[0].length)
         camera_object.hide_select = True
         camera_object.select_set(False)
         collection.objects.link(camera_object)
@@ -441,13 +450,15 @@ def _create_axis_root(
     forward_axis: str,
     up_axis: str,
 ) -> bpy.types.Object:
-    """기준 좌표의 하위 표시를 현재 데이터셋 변환으로 배치할 루트를 만듭니다."""
+    """하위 표시를 배치하되 화면과 편집 선택에서 제외되는 내부 변환 루트를 만듭니다."""
 
     axis_root = bpy.data.objects.new("COLMAP_Axis_Root", None)
     mark_managed(axis_root, loaded, "AXIS_ROOT")
     axis_root.empty_display_type = "ARROWS"
     axis_root.empty_display_size = 1.0
     axis_root.hide_render = True
+    axis_root.hide_select = True
+    axis_root.hide_viewport = True
     axis_root["colmap_display_forward_axis"] = forward_axis
     axis_root["colmap_display_up_axis"] = up_axis
     axis_root.matrix_world = dataset_display_matrix(

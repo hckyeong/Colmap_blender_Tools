@@ -13,6 +13,8 @@ __pycache__/
 /.small-gicp-runtime-build/
 /.cccore-runtime/
 *.zip
+# GitHub에서 바로 내려받는 정식 설치본 하나만 추적합니다.
+!/colmap_tools.zip
 .codex_*
 
 # 통합 전 원본 저장소는 검증이 끝날 때까지 작업 폴더에 보존합니다.

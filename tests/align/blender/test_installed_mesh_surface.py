@@ -33,7 +33,7 @@ def _installed_mesh(model_id: str):
 
 
 def run_test() -> None:
-    """설치 경로·schema v8·MESH_SURFACE 광선 교차를 하나의 설치본 계약으로 검증합니다."""
+    """설치 경로·저장 버전 9·메시 표면 광선 교차를 설치본 계약으로 검증합니다."""
 
     addon_utils.enable("colmap_align", default_set=False, persistent=False)
     from tools import align as colmap_align
@@ -52,7 +52,7 @@ def run_test() -> None:
     )
     if user_addons not in addon_file.parents:
         raise AssertionError(f"사용자 설치본이 아닌 모듈이 로드되었습니다: {addon_file}")
-    assert PROJECT_PERSISTENCE_SCHEMA_VERSION == 8
+    assert PROJECT_PERSISTENCE_SCHEMA_VERSION == 9
 
     runtime = RuntimeState()
     model = _installed_mesh("installed-surface")

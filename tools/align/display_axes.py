@@ -245,6 +245,27 @@ def _axis_matrix_with_rotation(forward: str, up: str, angles: tuple[float, float
     return extra @ matrix
 
 
+def transform_vector(values: object, label: str, *, positive: bool = False) -> tuple[float, float, float]:
+    """이동·중심·배율의 유한한 세 성분을 검증하고 배율은 양수로 제한합니다."""
+    vector = np.asarray(values, dtype=np.float64)
+    if vector.shape != (3,) or not np.isfinite(vector).all() or (positive and np.any(vector <= 0.0)):
+        raise ValueError(f"{label}은 유한한 세 {'양수' if positive else '실수'}여야 합니다.")
+    return tuple(float(value) for value in vector)
+
+
+def _axis_matrix_with_transform(forward, up, angles, translation, scale, pivot) -> np.ndarray:
+    """원본 축 변환 후 바운딩 박스 중심을 기준으로 배율·회전·이동을 합성합니다."""
+    matrix = _axis_matrix_with_rotation(forward, up, angles)
+    base = _axis_matrix_with_rotation(forward, up, (0.0, 0.0, 0.0))[:3, :3]
+    if scale != (1.0, 1.0, 1.0):
+        rotation = _axis_matrix_with_rotation("Y", "Z", angles)[:3, :3]
+        matrix[:3, :3] = rotation @ np.diag(scale) @ base
+    if pivot != (0.0, 0.0, 0.0):
+        matrix[:3, 3] = base @ pivot - matrix[:3, :3] @ pivot
+    matrix[:3, 3] += translation
+    return matrix
+
+
 @dataclass(frozen=True, slots=True)
 class ModelDisplayTransform:
     """한 COLMAP 모델의 원본 좌표와 분리된 불변 표시 축 변환입니다."""
@@ -256,9 +277,12 @@ class ModelDisplayTransform:
     inverse_float64: np.ndarray
     fingerprint: str = ""
     rotation_xyz_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    scale_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    pivot_source: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
-        """원본 축·추가 회전·행렬 관계를 검증해 불변 정규화 값으로 고정합니다."""
+        """원본 축·이동·회전·배율·중심과 행렬 관계를 검증해 불변 값으로 고정합니다."""
 
         preset = axis_preset_for_id(self.preset_id)
         forward, up = validate_axis_pair(self.forward_axis, self.up_axis)
@@ -270,13 +294,20 @@ class ModelDisplayTransform:
             )
         matrix = _freeze_matrix(self.matrix_float64, "표시 축 행렬")
         inverse = _freeze_matrix(self.inverse_float64, "표시 축 역행렬")
-        if not np.allclose(matrix @ inverse, np.identity(4), rtol=0.0, atol=1.0e-12):
-            raise ValueError("표시 축 행렬과 역행렬의 곱이 Identity가 아닙니다.")
+        # 큰 이동과 작은 배율의 곱셈 상쇄 오차 대신 재계산한 역행렬 자체를 검증합니다.
+        if not np.allclose(inverse, np.linalg.inv(matrix), rtol=1.0e-12, atol=1.0e-12):
+            raise ValueError("표시 축 역행렬이 원래 행렬의 역변환과 다릅니다.")
         angles = normalize_extra_rotation(self.rotation_xyz_degrees)
-        expected = _axis_matrix_with_rotation(forward, up, angles)
+        translation = transform_vector(self.translation_xyz, "이동")
+        scale = transform_vector(self.scale_xyz, "배율", positive=True)
+        pivot = transform_vector(self.pivot_source, "변환 중심")
+        expected = _axis_matrix_with_transform(forward, up, angles, translation, scale, pivot)
         if not np.allclose(matrix, expected, rtol=0.0, atol=1.0e-12):
-            raise ValueError("축 설정과 추가 회전으로 재현한 행렬이 저장된 행렬과 다릅니다.")
+            raise ValueError("축·이동·회전·배율로 재현한 행렬이 저장된 행렬과 다릅니다.")
         object.__setattr__(self, "rotation_xyz_degrees", angles)
+        object.__setattr__(self, "translation_xyz", translation)
+        object.__setattr__(self, "scale_xyz", scale)
+        object.__setattr__(self, "pivot_source", pivot)
         fingerprint = _transform_fingerprint(preset.identifier, forward, up, matrix)
         if self.fingerprint and self.fingerprint != fingerprint:
             raise ValueError("표시 축 변환 fingerprint가 행렬 값과 일치하지 않습니다.")
@@ -294,8 +325,11 @@ def create_model_display_transform(
     up_axis: str,
     *,
     rotation_xyz_degrees: object = (0.0, 0.0, 0.0),
+    translation_xyz: object = (0.0, 0.0, 0.0),
+    scale_xyz: object = (1.0, 1.0, 1.0),
+    pivot_source: object = (0.0, 0.0, 0.0),
 ) -> ModelDisplayTransform:
-    """원본 축과 선택적 추가 회전으로 공통 표시 기준의 불변 변환을 생성합니다."""
+    """원본 축과 중심 기준 이동·회전·배율로 공통 표시 변환을 생성합니다."""
 
     preset = axis_preset_for_id(preset_id)
     forward, up = validate_axis_pair(forward_axis, up_axis)
@@ -306,7 +340,10 @@ def create_model_display_transform(
             f"{forward} / {up}"
         )
     angles = normalize_extra_rotation(rotation_xyz_degrees)
-    matrix = _axis_matrix_with_rotation(forward, up, angles)
+    translation = transform_vector(translation_xyz, "이동")
+    scale = transform_vector(scale_xyz, "배율", positive=True)
+    pivot = transform_vector(pivot_source, "변환 중심")
+    matrix = _axis_matrix_with_transform(forward, up, angles, translation, scale, pivot)
     inverse = np.linalg.inv(matrix)
     return ModelDisplayTransform(
         preset_id=preset.identifier,
@@ -315,6 +352,9 @@ def create_model_display_transform(
         matrix_float64=matrix,
         inverse_float64=inverse,
         rotation_xyz_degrees=angles,
+        translation_xyz=translation,
+        scale_xyz=scale,
+        pivot_source=pivot,
     )
 
 

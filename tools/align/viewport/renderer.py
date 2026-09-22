@@ -36,7 +36,12 @@ from ..logging_utils import get_logger
 from ..state import RUNTIME
 from ..constants import MARKER_GEOMETRY_SOURCE_MAIN, MARKER_GEOMETRY_SOURCE_COMPANION
 from ..marker_geometry import normalize_marker_geometry_source
-from .labels import clear_display_transform_errors, draw_viewport_labels
+from .labels import clear_display_transform_errors, draw_text, draw_viewport_labels
+from .meter_grid_guide import (
+    clear_meter_grid_resources,
+    draw_meter_grid_labels,
+    draw_meter_grid_lines,
+)
 from .picking import marker_source_model_ids
 from .point_data import (
     companion_mesh_data_for_id,
@@ -1258,7 +1263,7 @@ def _draw_marker_circle(shader, position, radius_px: float, color, line_width: f
 
 
 def _draw_post_view() -> None:
-    """POST_VIEW 단계에서 점군·preview 도형·3차원 마커를 순서대로 그립니다."""
+    """POST_VIEW 단계에서 형상·미터 눈금·preview 도형·3차원 마커를 그립니다."""
     role = _active_role()
     if role is None:
         return
@@ -1271,6 +1276,7 @@ def _draw_post_view() -> None:
         gpu.state.depth_test_set("LESS_EQUAL")
         _draw_meshes(role)
         _draw_point_clouds(role)
+        draw_meter_grid_lines(bpy.context)
         _draw_marker_preview_geometry(role)
         _draw_markers(role)
     finally:
@@ -1282,9 +1288,10 @@ def _draw_post_view() -> None:
 
 
 def _draw_post_pixel() -> None:
-    """POST_PIXEL 단계에서 역할 라벨과 마커 안내만 표시합니다."""
+    """POST_PIXEL 단계에서 미터 눈금 글자 위에 역할 라벨과 마커 안내를 표시합니다."""
     role = _active_role()
     if role is not None:
+        draw_meter_grid_labels(bpy.context, draw_text)
         draw_viewport_labels(role)
 
 
@@ -1308,7 +1315,7 @@ def install_draw_handlers() -> None:
 
 
 def remove_draw_handlers() -> None:
-    """등록된 모든 draw handler와 GPU 배치·셰이더 참조를 해제합니다."""
+    """등록된 모든 draw handler와 형상·미터 눈금 GPU 자원을 해제합니다."""
     global _POINT_SHADER, _MESH_SHADER, _MESH_TEXTURE_SHADER
     while RUNTIME.draw_handlers:
         region_type, handle = RUNTIME.draw_handlers.pop()
@@ -1320,6 +1327,7 @@ def remove_draw_handlers() -> None:
     RUNTIME.gpu_batches.clear()
     _DISPLAY_TRANSFORM_ERROR_MODEL_IDS.clear()
     clear_display_transform_errors()
+    clear_meter_grid_resources()
     _POINT_SHADER = None
     _MESH_SHADER = None
     _MESH_TEXTURE_SHADER = None

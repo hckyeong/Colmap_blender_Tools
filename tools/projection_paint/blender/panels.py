@@ -266,6 +266,15 @@ def _draw_paint_setup(
         layout.operator("projection_paint.recover_overlay", icon="RECOVER_LAST")
 
 
+def _indented_panel_body(layout):
+    """메뉴 제목보다 본문을 반 UI 단위 오른쪽에 배치합니다."""
+    row = layout.row()
+    gutter = row.column()
+    gutter.ui_units_x = 0.5
+    gutter.label(text="")
+    return row.column()
+
+
 class _ProjectionPaintPanelMixin:
     """Projection Paint 전용 Workspace에서만 도구 패널을 표시합니다."""
 
@@ -321,9 +330,9 @@ class PP_OT_open_paint_workspace(bpy.types.Operator):
 class PP_PT_status(_ProjectionPaintPanelMixin, bpy.types.Panel):
     """현재 Dataset, Paint와 Overlay 내구성 상태를 표시합니다."""
 
-    bl_label = "Projection Painting"
+    bl_label = "Status"
     bl_idname = "PP_PT_status"
-    bl_options = {"HIDE_HEADER"}
+    bl_order = 0
 
     def draw(self, context):
         """현재 자동화 상태를 읽기 전용으로 표시합니다."""
@@ -331,8 +340,7 @@ class PP_PT_status(_ProjectionPaintPanelMixin, bpy.types.Panel):
         from .stencil_session import resolve_stencil_connection
 
         connection = resolve_stencil_connection(context.scene, context)
-        box = self.layout.box()
-        box.label(text="Status")
+        box = _indented_panel_body(self.layout).box()
         box.label(text=settings.status, icon="ERROR" if settings.status_kind == "ERROR" else "INFO")
         box.label(text=f"Paint: {settings.paint_state}")
         box.label(text=_stencil_status_text(connection))
@@ -348,13 +356,14 @@ class PP_PT_colmap(_ProjectionPaintPanelMixin, bpy.types.Panel):
 
     bl_label = "COLMAP Dataset"
     bl_idname = "PP_PT_colmap"
+    bl_order = 10
 
     def draw(self, context):
         """수동 업데이트 버튼과 Point·Camera 표시 크기를 제공합니다."""
 
         from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         settings = context.scene.projection_paint
         update_row = layout.row(align=True)
         update_row.enabled = modifier_snapshot_available(context)
@@ -379,13 +388,14 @@ class PP_PT_paint(_ProjectionPaintPanelMixin, bpy.types.Panel):
 
     bl_label = "Paint Setup"
     bl_idname = "PP_PT_paint"
+    bl_order = 30
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         """Paint Target과 Overlay 해상도 및 세션 버튼을 표시합니다."""
         settings = context.scene.projection_paint
         _draw_paint_setup(
-            self.layout,
+            _indented_panel_body(self.layout),
             context.scene,
             settings,
             include_paint_mode=(
@@ -401,13 +411,14 @@ class PP_PT_camera_review(_ProjectionPaintPanelMixin, bpy.types.Panel):
 
     bl_label = "Camera Review"
     bl_idname = "PP_PT_camera_review"
+    bl_order = 20
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         """현재 IMAGE_ID와 배경 표시 토글 및 Alpha를 표시합니다."""
 
         settings = context.scene.projection_paint
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         layout.enabled = _snapshot_ready(context.scene)
         info = layout.box()
         info.label(
@@ -439,11 +450,12 @@ class PP_PT_camera_review(_ProjectionPaintPanelMixin, bpy.types.Panel):
 
 
 class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
-    """Paint Setup 아래에 논리 Paint Layer 목록을 표시합니다."""
+    """독립 메뉴 아래에 논리 Paint Layer 목록을 들여써 표시합니다."""
 
     bl_label = "Layers"
     bl_idname = "PP_PT_layers"
-    bl_parent_id = "PP_PT_paint"
+    bl_order = 40
+    bl_parent_id = ""
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
@@ -467,7 +479,8 @@ class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
             original_layer_is_read_only,
         )
 
-        row = self.layout.row()
+        layout = _indented_panel_body(self.layout)
+        row = layout.row()
         tree = row.column(align=True)
         tree.context_pointer_set("projection_paint_layer_tree", settings)
         active_index = int(settings.active_layer_index)
@@ -770,7 +783,7 @@ class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
                 text="",
                 icon="FILE_REFRESH",
             )
-        composite_options = self.layout.column(align=True)
+        composite_options = layout.column(align=True)
         if str(settings.composite_state) == "ACTIVE":
             current_composite = next(
                 (
@@ -799,7 +812,7 @@ class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
             alpha_warning = ""
         if alpha_warning and not bool(settings.composite_include_alpha):
             _draw_panel_warning(composite_options, alpha_warning)
-        composite_actions = self.layout.row(align=True)
+        composite_actions = layout.row(align=True)
         if str(settings.composite_state) == "ACTIVE":
             active_composite = next(
                 (
@@ -834,7 +847,7 @@ class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
                 text="Composite Layer 생성",
                 icon="NODE_MATERIAL",
             )
-        export_row = self.layout.row(align=True)
+        export_row = layout.row(align=True)
         export_row.operator(
             "projection_paint.texture_export",
             text="Export Texture",
@@ -845,7 +858,7 @@ class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
         selected_adjustment = active_layer_adjustment(active_layer)
         if selected_adjustment is not None and not str(settings.active_mask_uuid or ""):
             label, icon = adjustment_ui(selected_adjustment.adjustment_type)
-            adjustment_box = self.layout.box()
+            adjustment_box = layout.box()
             adjustment_box.enabled = composite_layer_is_editable(settings, active_layer)
             header = adjustment_box.row(align=True)
             header.label(text=label, icon=icon)
@@ -866,7 +879,7 @@ class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):
         ]
         if not parameter_adjustments:
             return
-        parameter_box = self.layout.box()
+        parameter_box = layout.box()
         parameter_box.enabled = composite_layer_is_editable(settings, active_layer)
         for adjustment in parameter_adjustments:
             if adjustment.adjustment_type == "BRIGHTNESS":

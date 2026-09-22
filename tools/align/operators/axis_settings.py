@@ -1,11 +1,14 @@
 """데이터셋 하나의 점군·카메라와 메시 축을 미리보기 팝업에서 편집합니다."""
 
 import bpy
+import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty, StringProperty
 
 from ..axis_settings import (
     axis_edit_block_reason,
     begin_axis_edit,
+    centered_axis_transform,
+    axis_transform_at_world_origin,
     cancel_axis_edit,
     commit_axis_edit,
     rc_axis_pair_for_model,
@@ -27,27 +30,36 @@ from ..viewport.renderer import request_redraw
 
 
 _OPEN_DIALOGS: dict[str, object] = {}
+# RNA 갱신 콜백의 속성 래퍼도 같은 편집 토큰으로 정밀도·배율 기준에 접근합니다.
+_AXIS_INPUTS: dict[str, dict] = {}
+_PREVIOUS_SCALES: dict[str, dict] = {}
 
 
 def clear_axis_edit_dialogs() -> None:
-    """세션 종료·파일 로드·등록 해제 뒤 팝업 참조와 수명 감시 타이머를 정리합니다."""
+    """세션 종료·파일 로드·등록 해제 뒤 팝업과 편집 기준 및 감시 타이머를 정리합니다."""
     _OPEN_DIALOGS.clear()
+    _AXIS_INPUTS.clear()
+    _PREVIOUS_SCALES.clear()
     if bpy.app.timers.is_registered(_watch_axis_edit_dialogs):
         bpy.app.timers.unregister(_watch_axis_edit_dialogs)
 
 
 def _release_dialog(token: str) -> None:
-    """끝난 팝업의 참조를 해제하고 마지막 팝업이면 수명 감시도 중지합니다."""
+    """끝난 팝업과 편집 기준을 해제하고 마지막 팝업이면 수명 감시도 중지합니다."""
     _OPEN_DIALOGS.pop(token, None)
+    _AXIS_INPUTS.pop(token, None)
+    _PREVIOUS_SCALES.pop(token, None)
     if not _OPEN_DIALOGS:
         clear_axis_edit_dialogs()
 
 
 def _watch_axis_edit_dialogs():
-    """대상 창 닫힘·작업공간 이탈·모델 삭제를 감지하면 임시 편집을 취소합니다."""
+    """대상 창 닫힘·작업공간 이탈·모델 삭제를 감지하면 임시 편집과 기준을 정리합니다."""
     state = RUNTIME.axis_settings
     if not _OPEN_DIALOGS or not state.is_active or state.token not in _OPEN_DIALOGS:
         _OPEN_DIALOGS.clear()
+        _AXIS_INPUTS.clear()
+        _PREVIOUS_SCALES.clear()
         return None
     manager = getattr(bpy.context, "window_manager", None)
     windows = getattr(manager, "windows", ())
@@ -63,6 +75,8 @@ def _watch_axis_edit_dialogs():
     if invalid:
         cancel_axis_edit(RUNTIME, state.token)
         _OPEN_DIALOGS.clear()
+        _AXIS_INPUTS.clear()
+        _PREVIOUS_SCALES.clear()
         request_redraw()
         return None
     return 0.1
@@ -75,21 +89,76 @@ def _ensure_dialog_watch() -> None:
 
 
 def _set_component_values(operator, component: str, transform) -> None:
-    """갱신 콜백이 중지된 팝업 항목에 확정 축과 도 단위 회전값을 복사합니다."""
+    """현재 화면을 유지하는 중심 기준 편집값과 반올림 전 원본값을 함께 보관합니다."""
+    centered = centered_axis_transform(RUNTIME, operator.model_id, transform, companion=component == "companion")
     setattr(operator, f"{component}_preset", transform.preset_id)
     setattr(operator, f"{component}_forward", transform.forward_axis)
     setattr(operator, f"{component}_up", transform.up_axis)
     setattr(operator, f"{component}_rotation", transform.rotation_xyz_degrees)
+    setattr(operator, f"{component}_translation", centered.translation_xyz)
+    setattr(operator, f"{component}_scale", centered.scale_xyz)
+    inputs = _AXIS_INPUTS.setdefault(operator.edit_token, {})
+    inputs[component] = (transform, centered, _component_values(operator, component))
+    previous = _PREVIOUS_SCALES.setdefault(operator.edit_token, {})
+    previous[component] = tuple(getattr(operator, f"{component}_scale"))
+
+
+def _component_values(operator, component: str) -> tuple:
+    """팝업의 축 식별자와 이동·회전·배율 입력을 비교 가능한 값으로 반환합니다."""
+    return tuple(getattr(operator, f"{component}_{name}") for name in ("preset", "forward", "up")) + tuple(
+        tuple(getattr(operator, f"{component}_{name}")) for name in ("rotation", "translation", "scale")
+    )
 
 
 def _component_transform(operator, component: str):
-    """팝업 항목의 원본 축과 추가 회전값을 검증된 표시 변환으로 만듭니다."""
+    """실제로 수정한 입력만 반영하여 팝업을 여는 것만으로 정밀도나 화면이 바뀌지 않게 합니다."""
+    values = _component_values(operator, component)
+    inputs = _AXIS_INPUTS.get(operator.edit_token, {})
+    if component not in inputs:
+        raise ValueError("축 설정 편집 기준이 만료되었습니다. 팝업을 다시 열어 주세요.")
+    original, centered, initial = inputs[component]
+    if values == initial:
+        return original
+    exact_vectors = (centered.rotation_xyz_degrees, centered.translation_xyz, centered.scale_xyz)
+    vectors = [tuple(exact if value == before else value for value, before, exact in zip(current, prior, full))
+               for current, prior, full in zip(values[3:], initial[3:], exact_vectors)]
     return create_model_display_transform(
-        getattr(operator, f"{component}_preset"),
-        getattr(operator, f"{component}_forward"),
-        getattr(operator, f"{component}_up"),
-        rotation_xyz_degrees=tuple(getattr(operator, f"{component}_rotation")),
+        *values[:3], rotation_xyz_degrees=vectors[0], translation_xyz=vectors[1],
+        scale_xyz=vectors[2], pivot_source=centered.pivot_source,
     )
+
+
+def _update_scale(operator, component: str) -> None:
+    """자물쇠가 잠겨 있으면 편집 축의 변화 비율을 나머지 두 축에도 적용합니다."""
+    if getattr(operator, "suspend_updates", False) or not operator.edit_token:
+        return
+    current = np.asarray(getattr(operator, f"{component}_scale"), dtype=np.float64)
+    previous = _PREVIOUS_SCALES.setdefault(operator.edit_token, {})
+    before = np.asarray(previous.get(component, current), dtype=np.float64)
+    changed = np.flatnonzero(current != before)
+    if getattr(operator, f"{component}_scale_locked", False) and len(changed):
+        index = int(changed[0])
+        linked = before * (current[index] / before[index])
+        # 한 축이 입력 한계에 닿으면 전체 배율을 같은 비율로 제한합니다.
+        linked *= min(1.0, 1.0e6 / float(linked.max()))
+        linked *= max(1.0, 1.0e-6 / float(linked.min()))
+        operator.suspend_updates = True
+        try:
+            setattr(operator, f"{component}_scale", tuple(linked))
+        finally:
+            operator.suspend_updates = False
+    previous[component] = tuple(getattr(operator, f"{component}_scale"))
+    _publish_preview(operator)
+
+
+def _update_main_scale(operator, _context) -> None:
+    """주 형상의 독립 또는 비율 고정 배율 편집을 반영합니다."""
+    _update_scale(operator, "main")
+
+
+def _update_companion_scale(operator, _context) -> None:
+    """연결 메시의 독립 또는 비율 고정 배율 편집을 반영합니다."""
+    _update_scale(operator, "companion")
 
 
 def _publish_preview(operator) -> bool:
@@ -166,12 +235,12 @@ def _update_companion_axes(operator, _context) -> None:
 
 
 def _update_preview(operator, _context) -> None:
-    """회전 또는 미리보기 선택이 바뀌면 검증된 편집값을 다시 전달합니다."""
+    """이동·회전 또는 미리보기 선택이 바뀌면 검증된 편집값을 다시 전달합니다."""
     _publish_preview(operator)
 
 
 def _draw_component(layout, operator, component: str, title: str) -> None:
-    """원본 축·추가 회전·RC 초기화를 한 형상 항목으로 그립니다."""
+    """축·이동·중심 기준 회전·잠금 배율·월드 원점 이동을 형상별로 표시합니다."""
     box = layout.box()
     header = box.row(align=True)
     header.label(text=title, icon="MESH_DATA" if component == "companion" or operator.is_standalone else "POINTCLOUD_DATA")
@@ -182,10 +251,29 @@ def _draw_component(layout, operator, component: str, title: str) -> None:
     axes = box.row(align=True)
     axes.prop(operator, f"{component}_forward", text="Forward")
     axes.prop(operator, f"{component}_up", text="Up")
-    box.label(text="추가 회전 · 도(°)")
+    location_header = box.row(align=True)
+    location_header.label(text="이동")
+    origin = location_header.operator("colmap_align.center_geometry_at_origin", text="중심을 원점으로", icon="PIVOT_CURSOR")
+    origin.edit_token = operator.edit_token
+    origin.component = component.upper()
+    translation = box.row(align=True)
+    for index, axis in enumerate(("X", "Y", "Z")):
+        translation.prop(operator, f"{component}_translation", index=index, text=axis)
+    box.label(text="추가 회전 · 도(°) · 바운딩 박스 중심")
     rotation = box.row(align=True)
     for index, axis in enumerate(("X", "Y", "Z")):
         rotation.prop(operator, f"{component}_rotation", index=index, text=axis)
+    scale_header = box.row(align=True)
+    scale_header.label(text="스케일")
+    locked = getattr(operator, f"{component}_scale_locked", False)
+    scale_header.prop(operator, f"{component}_scale_locked", text="", icon="LOCKED" if locked else "UNLOCKED", toggle=True)
+    scale = box.row(align=True)
+    for index, axis in enumerate(("X", "Y", "Z")):
+        scale.prop(operator, f"{component}_scale", index=index, text=axis)
+    if component == "main" and not operator.is_standalone:
+        values = tuple(getattr(operator, "main_scale"))
+        if max(values) - min(values) > 1.0e-6:
+            box.label(text="COLMAP 내보내기는 세 축의 동일 배율이 필요합니다.", icon="INFO")
 
 
 class COLMAPALIGN_OT_edit_geometry_axes(bpy.types.Operator):
@@ -193,7 +281,7 @@ class COLMAPALIGN_OT_edit_geometry_axes(bpy.types.Operator):
 
     bl_idname = "colmap_align.edit_geometry_axes"
     bl_label = "데이터셋 축 설정"
-    bl_description = "이 데이터셋의 점군·카메라와 메시 축을 개별 설정합니다"
+    bl_description = "이 데이터셋의 축과 이동·회전·배율을 개별 설정합니다"
     bl_options = {"INTERNAL"}
 
     suspend_updates: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
@@ -208,10 +296,16 @@ class COLMAPALIGN_OT_edit_geometry_axes(bpy.types.Operator):
     main_forward: EnumProperty(name="Forward", items=AXIS_ITEMS, default="Z", update=_update_main_axes, options={"SKIP_SAVE"})
     main_up: EnumProperty(name="Up", items=AXIS_ITEMS, default="-Y", update=_update_main_axes, options={"SKIP_SAVE"})
     main_rotation: FloatVectorProperty(name="추가 회전(°)", description="원본 축 변환 뒤 적용할 X·Y·Z 회전각을 도 단위로 입력합니다", size=3, default=(0.0, 0.0, 0.0), precision=2, step=100, update=_update_preview, options={"SKIP_SAVE"})
+    main_translation: FloatVectorProperty(name="이동", description="정렬 전 표시 축을 기준으로 이동합니다", size=3, default=(0, 0, 0), precision=4, update=_update_preview, options={"SKIP_SAVE"})
+    main_scale: FloatVectorProperty(name="스케일", description="바운딩 박스 중심에서 각 축의 배율을 조절합니다", size=3, default=(1, 1, 1), min=1.0e-6, max=1.0e6, precision=4, update=_update_main_scale, options={"SKIP_SAVE"})
+    main_scale_locked: BoolProperty(name="비율 고정", description="현재 X:Y:Z 비율을 유지하면서 세 축을 함께 조절합니다", default=False, options={"SKIP_SAVE"})
     companion_preset: EnumProperty(name="원본 축 프리셋", items=AXIS_PRESET_ITEMS, default=RC_OBJ_AXIS_PRESET, update=_update_companion_preset, options={"SKIP_SAVE"})
     companion_forward: EnumProperty(name="Forward", items=AXIS_ITEMS, default="Y", update=_update_companion_axes, options={"SKIP_SAVE"})
     companion_up: EnumProperty(name="Up", items=AXIS_ITEMS, default="Z", update=_update_companion_axes, options={"SKIP_SAVE"})
     companion_rotation: FloatVectorProperty(name="추가 회전(°)", description="원본 축 변환 뒤 적용할 X·Y·Z 회전각을 도 단위로 입력합니다", size=3, default=(0.0, 0.0, 0.0), precision=2, step=100, update=_update_preview, options={"SKIP_SAVE"})
+    companion_translation: FloatVectorProperty(name="이동", description="정렬 전 표시 축을 기준으로 이동합니다", size=3, default=(0, 0, 0), precision=4, update=_update_preview, options={"SKIP_SAVE"})
+    companion_scale: FloatVectorProperty(name="스케일", description="바운딩 박스 중심에서 각 축의 배율을 조절합니다", size=3, default=(1, 1, 1), min=1.0e-6, max=1.0e6, precision=4, update=_update_companion_scale, options={"SKIP_SAVE"})
+    companion_scale_locked: BoolProperty(name="비율 고정", description="현재 X:Y:Z 비율을 유지하면서 세 축을 함께 조절합니다", default=False, options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
@@ -219,7 +313,7 @@ class COLMAPALIGN_OT_edit_geometry_axes(bpy.types.Operator):
         model_id = getattr(properties, "model_id", "")
         record = RUNTIME.model_catalog.models.get(model_id)
         name = record.display_name if record is not None else model_id
-        return f"{name}: 원본 축과 추가 회전을 개별 설정합니다"
+        return f"{name}: 원본 축과 이동·회전·배율을 개별 설정합니다"
 
     @classmethod
     def poll(cls, context):
@@ -327,11 +421,11 @@ class COLMAPALIGN_OT_edit_geometry_axes(bpy.types.Operator):
 
 
 class COLMAPALIGN_OT_reset_geometry_axes(bpy.types.Operator):
-    """열린 팝업의 한 항목 또는 두 항목을 RC 기본 축과 0도 회전으로 초기화합니다."""
+    """열린 팝업의 형상을 RC 기본 축·이동 0·회전 0·배율 1로 초기화합니다."""
 
     bl_idname = "colmap_align.reset_geometry_axes"
     bl_label = "RC 축 초기화"
-    bl_description = "선택한 축 항목을 RC 기본값과 추가 회전 0도로 되돌립니다"
+    bl_description = "RC 기본 축으로 되돌리고 이동·추가 회전을 0, 배율을 1로 초기화합니다"
     bl_options = {"INTERNAL"}
 
     edit_token: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
@@ -356,4 +450,35 @@ class COLMAPALIGN_OT_reset_geometry_axes(bpy.types.Operator):
         return {"FINISHED"} if _publish_preview(operator) else {"CANCELLED"}
 
 
-CLASSES = (COLMAPALIGN_OT_edit_geometry_axes, COLMAPALIGN_OT_reset_geometry_axes)
+class COLMAPALIGN_OT_center_geometry_at_origin(bpy.types.Operator):
+    """열린 팝업에서 선택한 형상의 바운딩 박스 중심을 월드 원점으로 옮깁니다."""
+
+    bl_idname = "colmap_align.center_geometry_at_origin"
+    bl_label = "중심을 원점으로"
+    bl_description = "데이터의 바운딩 박스 중심을 월드 원점 (0, 0, 0)으로 이동합니다"
+    bl_options = {"INTERNAL"}
+
+    edit_token: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    component: EnumProperty(items=(("MAIN", "주 형상", "주 형상의 중심을 이동합니다"), ("COMPANION", "연결 메시", "연결 메시의 중심을 이동합니다")), options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, _context):
+        """편집 토큰을 검증하고 확정 전 미리보기에만 원점 이동을 반영합니다."""
+        operator = _OPEN_DIALOGS.get(self.edit_token)
+        state = RUNTIME.axis_settings
+        if operator is None or not state.is_active or state.token != self.edit_token:
+            self.report({"WARNING"}, "축 설정 팝업이 열려 있지 않습니다.")
+            return {"CANCELLED"}
+        component = self.component.lower()
+        try:
+            transform = axis_transform_at_world_origin(RUNTIME, state.model_id, _component_transform(operator, component), companion=component == "companion")
+            operator.suspend_updates = True
+            _set_component_values(operator, component, transform)
+        except (ValueError, RuntimeError) as error:
+            operator.error_message = str(error)
+            return {"CANCELLED"}
+        finally:
+            operator.suspend_updates = False
+        return {"FINISHED"} if _publish_preview(operator) else {"CANCELLED"}
+
+
+CLASSES = (COLMAPALIGN_OT_edit_geometry_axes, COLMAPALIGN_OT_reset_geometry_axes, COLMAPALIGN_OT_center_geometry_at_origin)

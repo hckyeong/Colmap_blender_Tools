@@ -18,6 +18,10 @@ except ImportError:
     )
 
 from .managed_scene import is_managed, iter_managed_roots
+from .meter_grid_guide import (
+    ensure_meter_grid_guide, is_meter_guide, iter_meter_guide_collections,
+    subscribe_meter_grid_units,
+)
 from .ownership import OWNER_KEY, OWNER_TOKEN, RECORD_KIND_KEY
 
 
@@ -103,7 +107,7 @@ def _isolate_modifier_view_layer_collections(
     view_layer: Any,
     managed_roots: tuple[Any, ...],
 ) -> None:
-    """Modifier 전용 View Layer에서 관리 Root 외의 최상위 Collection을 제외합니다."""
+    """Modifier 전용 View Layer에서 데이터와 눈금 외의 최상위 Collection을 제외합니다."""
 
     managed_root_pointers = {_pointer(root) for root in managed_roots}
     for layer_collection in tuple(view_layer.layer_collection.children):
@@ -122,7 +126,7 @@ def _hide_foreign_root_objects(view_layer: Any) -> None:
     """Collection 제외로 가릴 수 없는 Scene Root의 일반 Object를 전용 View Layer에서 숨깁니다."""
 
     for obj in tuple(view_layer.objects):
-        if is_managed(obj):
+        if is_managed(obj) or is_meter_guide(obj):
             continue
         try:
             obj.hide_set(True, view_layer=view_layer)
@@ -146,6 +150,7 @@ def synchronize_modifier_data_visibility(
     if scene is None:
         raise RuntimeError("Modifier 데이터 가시성을 동기화할 Scene이 없습니다.")
     managed_roots = tuple(iter_managed_roots(scene))
+    guide_roots = iter_meter_guide_collections(scene)
     owned_layers = _owned_modifier_view_layers(scene)
     if not managed_roots and not owned_layers and not create_view_layer:
         return None
@@ -170,12 +175,24 @@ def synchronize_modifier_data_visibility(
                     f"{view_layer.name} View Layer의 Modifier 데이터 제외 상태를 확정하지 못했습니다."
                 )
         if is_modifier_view_layer:
-            _isolate_modifier_view_layer_collections(view_layer, managed_roots)
+            _isolate_modifier_view_layer_collections(view_layer, managed_roots + guide_roots)
+        for root in guide_roots:
+            layer_collection = _layer_collection_for_collection(view_layer.layer_collection, root)
+            if layer_collection is not None:
+                layer_collection.exclude = not is_modifier_view_layer
         view_layer.update()
         if is_modifier_view_layer:
             _hide_foreign_root_objects(view_layer)
             view_layer.update()
     return modifier_view_layer
+
+
+def restore_modifier_meter_visibility() -> None:
+    """기존 눈금 또는 Modifier 전용 View Layer가 있는 Scene의 눈금 표시를 복구합니다."""
+    for scene in bpy.data.scenes:
+        if iter_meter_guide_collections(scene) or _owned_modifier_view_layers(scene):
+            ensure_meter_grid_guide(scene)
+            synchronize_modifier_data_visibility(scene, create_view_layer=True)
 
 
 def activate_modifier_data_view_layer(window: Any) -> Any:
@@ -184,6 +201,8 @@ def activate_modifier_data_view_layer(window: Any) -> Any:
     scene = getattr(window, "scene", None)
     if scene is None:
         raise RuntimeError("Modifier 데이터 View Layer를 활성화할 Scene이 없습니다.")
+    ensure_meter_grid_guide(scene)
+    subscribe_meter_grid_units()
     view_layer = synchronize_modifier_data_visibility(
         scene,
         create_view_layer=True,
@@ -209,5 +228,6 @@ __all__ = [
     "activate_modifier_data_view_layer",
     "ensure_modifier_data_view_layer",
     "is_modifier_data_view_layer",
+    "restore_modifier_meter_visibility",
     "synchronize_modifier_data_visibility",
 ]

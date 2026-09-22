@@ -249,12 +249,15 @@ def _project_companion_snapshot(runtime: Any, model_id: str) -> ProjectCompanion
 
 
 def _display_transform_from_axes(axes: ProjectAxesSnapshot) -> ModelDisplayTransform:
-    """저장된 축·XYZ 회전으로 행렬을 재생성하고 최종 변환 지문을 검증합니다."""
+    """저장된 축·이동·회전·배율·중심으로 행렬을 재생성하고 최종 지문을 검증합니다."""
 
     try:
         transform = create_model_display_transform(
             axes.preset_id, axes.axis_forward, axes.axis_up,
             rotation_xyz_degrees=axes.rotation_xyz_degrees,
+            translation_xyz=axes.translation_xyz,
+            scale_xyz=axes.scale_xyz,
+            pivot_source=axes.pivot_source,
         )
     except (TypeError, ValueError) as error:
         raise ProjectPersistenceRuntimeError(f"저장된 현재 축 설정이 올바르지 않습니다: {error}") from error
@@ -264,7 +267,7 @@ def _display_transform_from_axes(axes: ProjectAxesSnapshot) -> ModelDisplayTrans
 
 
 def _project_axes_snapshot(transform: ModelDisplayTransform) -> ProjectAxesSnapshot:
-    """원본 메타데이터와 미리보기 상태를 읽지 않고 확정 변환만 검증해 저장합니다."""
+    """원본과 미리보기 상태를 읽지 않고 확정된 중심 기준 변환만 검증해 저장합니다."""
 
     axes = ProjectAxesSnapshot(
         preset_id=transform.preset_id,
@@ -272,6 +275,9 @@ def _project_axes_snapshot(transform: ModelDisplayTransform) -> ProjectAxesSnaps
         axis_up=transform.up_axis,
         rotation_xyz_degrees=tuple(transform.rotation_xyz_degrees),
         display_transform_fingerprint=transform.fingerprint,
+        translation_xyz=transform.translation_xyz,
+        scale_xyz=transform.scale_xyz,
+        pivot_source=transform.pivot_source,
     )
     restored = _display_transform_from_axes(axes)
     if not np.array_equal(restored.matrix_float64, transform.matrix_float64):

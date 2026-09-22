@@ -138,16 +138,24 @@ def _companion_source_mapping(
     return mapping
 
 
-def _axes_mapping(axes: ProjectAxesSnapshot) -> dict[str, object]:
-    """확정 표시 축과 도 단위 XYZ 회전을 원시 JSON 객체로 변환합니다."""
+def _axes_mapping(axes: ProjectAxesSnapshot, schema_version: int = PROJECT_PERSISTENCE_SCHEMA_VERSION) -> dict[str, object]:
+    """확정 표시 변환을 저장 버전에 맞게 기록하고 구버전에서의 변환 손실을 차단합니다."""
 
-    return {
+    mapping = {
         "preset_id": axes.preset_id,
         "axis_forward": axes.axis_forward,
         "axis_up": axes.axis_up,
         "rotation_xyz_degrees": axes.rotation_xyz_degrees,
         "display_transform_fingerprint": axes.display_transform_fingerprint,
     }
+    extra = {"translation_xyz": axes.translation_xyz, "scale_xyz": axes.scale_xyz, "pivot_source": axes.pivot_source}
+    if int(schema_version) >= 9:
+        mapping.update(extra)
+    elif any(tuple(extra[key]) != default for key, default in (
+        ("translation_xyz", (0.0, 0.0, 0.0)), ("scale_xyz", (1.0, 1.0, 1.0)), ("pivot_source", (0.0, 0.0, 0.0)),
+    )):
+        raise ProjectPersistenceCodecError("이동·배율·중심 설정은 프로젝트 저장 버전 9 이상이 필요합니다.")
+    return mapping
 
 
 def _axes_from_source(source: ProjectSourceSnapshot) -> ProjectAxesSnapshot:
@@ -215,7 +223,7 @@ def _upgrade_snapshot(snapshot: ProjectStateSnapshot) -> ProjectStateSnapshot:
 
 
 def _model_mapping(model: ProjectModelSnapshot, schema_version: int) -> dict[str, object]:
-    """모델 출처·표시 상태와 v5 형상별 확정 축을 저장 객체로 변환합니다."""
+    """모델 출처·표시 상태와 버전별 형상 변환을 저장 객체로 변환합니다."""
 
     mapping = {
         "model_id": model.model_id,
@@ -239,9 +247,9 @@ def _model_mapping(model: ProjectModelSnapshot, schema_version: int) -> dict[str
         if model.companion_source is not None:
             mapping["companion_source"] = _companion_source_mapping(model.companion_source, schema_version)
     if int(schema_version) >= 5:
-        mapping["current_axes"] = _axes_mapping(model.current_axes)
+        mapping["current_axes"] = _axes_mapping(model.current_axes, schema_version)
         if model.companion_axes is not None:
-            mapping["companion_axes"] = _axes_mapping(model.companion_axes)
+            mapping["companion_axes"] = _axes_mapping(model.companion_axes, schema_version)
     if int(schema_version) >= 8:
         mapping.update(
             {
@@ -747,17 +755,26 @@ def _decode_companion_source(
     )
 
 
-def _decode_axes(value: object, field_name: str) -> ProjectAxesSnapshot:
-    """형상별 표시 축의 키·유한한 세 회전값·최종 변환 지문을 엄격히 검증합니다."""
+def _decode_axes(value: object, field_name: str, schema_version: int = PROJECT_PERSISTENCE_SCHEMA_VERSION) -> ProjectAxesSnapshot:
+    """저장 버전별 축·이동·회전·양수 배율·중심과 최종 변환 지문을 검증합니다."""
 
     mapping = _mapping(value, field_name)
-    _require_keys(mapping, {
+    required = {
         "preset_id", "axis_forward", "axis_up", "rotation_xyz_degrees",
         "display_transform_fingerprint",
-    }, field_name)
+    }
+    if int(schema_version) >= 9:
+        required.update({"translation_xyz", "scale_xyz", "pivot_source"})
+    _require_keys(mapping, required, field_name)
     rotation = _optional_position(mapping["rotation_xyz_degrees"], f"{field_name}.rotation_xyz_degrees")
     if rotation is None:
         raise ProjectPersistenceCodecError(f"{field_name}.rotation_xyz_degrees는 세 회전값이어야 합니다.")
+    extra = {}
+    for key, default in (("translation_xyz", (0.0, 0.0, 0.0)), ("scale_xyz", (1.0, 1.0, 1.0)), ("pivot_source", (0.0, 0.0, 0.0))):
+        vector = _optional_position(mapping[key], f"{field_name}.{key}") if int(schema_version) >= 9 else default
+        if vector is None or (key == "scale_xyz" and any(value <= 0.0 for value in vector)):
+            raise ProjectPersistenceCodecError(f"{field_name}.{key} 값이 올바르지 않습니다.")
+        extra[key] = vector
     return ProjectAxesSnapshot(
         preset_id=_string(mapping["preset_id"], f"{field_name}.preset_id", 128),
         axis_forward=_string(mapping["axis_forward"], f"{field_name}.axis_forward", 8),
@@ -766,11 +783,12 @@ def _decode_axes(value: object, field_name: str) -> ProjectAxesSnapshot:
         display_transform_fingerprint=_hex_fingerprint(
             mapping["display_transform_fingerprint"], f"{field_name}.display_transform_fingerprint", 32,
         ),
+        **extra,
     )
 
 
 def _decode_model(value: object, schema_version: int) -> ProjectModelSnapshot:
-    """지원 버전의 모델을 읽고 v5에서는 각 형상의 현재 축을 필수로 검증합니다."""
+    """지원 버전의 모델을 읽고 버전별 형상 축과 중심 변환을 검증합니다."""
 
     mapping = _mapping(value, "models 항목")
     v2 = "geometry_kind" in mapping
@@ -828,8 +846,8 @@ def _decode_model(value: object, schema_version: int) -> ProjectModelSnapshot:
             _decode_companion_source(mapping["companion_source"], schema_version)
             if "companion_source" in mapping else None
         ),
-        current_axes=_decode_axes(mapping["current_axes"], "current_axes") if int(schema_version) >= 5 else None,
-        companion_axes=_decode_axes(mapping["companion_axes"], "companion_axes") if "companion_axes" in mapping else None,
+        current_axes=_decode_axes(mapping["current_axes"], "current_axes", schema_version) if int(schema_version) >= 5 else None,
+        companion_axes=_decode_axes(mapping["companion_axes"], "companion_axes", schema_version) if "companion_axes" in mapping else None,
         embedded_obj_asset_uuid=(
             _string(mapping["embedded_obj_asset_uuid"], "embedded_obj_asset_uuid", 64, allow_empty=True)
             if int(schema_version) >= 8 else ""
@@ -1155,7 +1173,7 @@ def _validate_snapshot_semantics(snapshot: ProjectStateSnapshot) -> None:
                     raise ProjectPersistenceCodecError("형상별 현재 축은 프로젝트 schema v5 이상에서만 저장할 수 있습니다.")
                 if not isinstance(axes, ProjectAxesSnapshot):
                     raise ProjectPersistenceCodecError(f"{field_name} snapshot 형식이 올바르지 않습니다.")
-                _decode_axes(_axes_mapping(axes), field_name)
+                _decode_axes(_axes_mapping(axes, schema_version), field_name, schema_version)
         if model.companion_axes is not None and model.companion_source is None:
             raise ProjectPersistenceCodecError("연결 OBJ 출처 없이 연결 메시 축을 저장할 수 없습니다.")
         _boolean(model.catalog.show_points, "catalog.show_points")

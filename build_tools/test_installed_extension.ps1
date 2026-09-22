@@ -31,7 +31,7 @@ if (-not $manifestVersionMatch.Success) {
 }
 $manifestVersion = $manifestVersionMatch.Groups["version"].Value
 $resolvedPackage = if ([string]::IsNullOrWhiteSpace($PackagePath)) {
-    Join-Path $projectRoot "build\colmap_tools-$manifestVersion.zip"
+    Join-Path $projectRoot "colmap_tools.zip"
 }
 else {
     [System.IO.Path]::GetFullPath($PackagePath)

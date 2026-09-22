@@ -44,8 +44,8 @@ def _open(model_id: str) -> str:
 
 
 def _capture(name: str) -> None:
-    """완전히 그려진 팝업을 실험 출력 폴더에 저장해 육안 검증에 사용합니다."""
-    output_dir = Path(__file__).resolve().parents[4] / "outputs" / "axis-ui-verification"
+    """완전히 그려진 팝업을 저장소 내부 검증 폴더에 저장해 육안 검증에 사용합니다."""
+    output_dir = Path(__file__).resolve().parents[3] / "build" / "verification" / "axis-transform-20260921" / "gui"
     output_dir.mkdir(parents=True, exist_ok=True)
     window = bpy.context.window_manager.windows[0]
     with bpy.context.temp_override(window=window):
@@ -75,7 +75,7 @@ def _finish(passed: bool) -> None:
 
 
 def _step():
-    """팝업의 RNA 콜백·초기화·취소·적용을 실제 이벤트 루프에서 순차 검사합니다."""
+    """실제 팝업에서 축·이동·비율 잠금·원점 이동·취소·적용을 순차 검사합니다."""
     global _STAGE, _RUNTIME, _FIXTURE, _SESSION_PATCH, _BASELINE, _SELECTED, _TOKEN
     from tools.align.operators import axis_settings
     try:
@@ -104,6 +104,17 @@ def _step():
             return 0.35
         if _STAGE == "EDIT_CANCEL":
             dialog = axis_settings._OPEN_DIALOGS[_TOKEN]
+            dialog.main_scale = (2.0, 3.0, 4.0)
+            assert tuple(dialog.main_scale) == (2.0, 3.0, 4.0)
+            dialog.main_scale_locked = True
+            assert tuple(dialog.main_scale) == (2.0, 3.0, 4.0)
+            dialog.main_scale[1] = 6.0
+            assert tuple(dialog.main_scale) == (4.0, 6.0, 8.0)
+            assert _RUNTIME.axis_settings.main_transform.scale_xyz == (4.0, 6.0, 8.0)
+            dialog.main_translation = (1.0, 2.0, 3.0)
+            assert _RUNTIME.axis_settings.main_transform.translation_xyz == (1.0, 2.0, 3.0)
+            assert bpy.ops.colmap_align.center_geometry_at_origin(edit_token=_TOKEN, component="MAIN") == {"FINISHED"}
+            assert not dialog.error_message
             dialog.main_rotation = (12.0, 24.0, 36.0)
             dialog.companion_rotation = (0.0, 0.0, 45.0)
             assert _RUNTIME.axis_settings.main_transform.rotation_xyz_degrees == (12.0, 24.0, 36.0)

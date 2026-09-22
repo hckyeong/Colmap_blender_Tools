@@ -40,15 +40,15 @@ def _matrix_value(value: Any, label: str) -> np.ndarray:
 
 
 def compose_project_world_matrix(alignment: Any, display_axis: Any) -> np.ndarray:
-    """확정 Alignment와 Display Axis를 Project World column-vector 순서로 합성합니다."""
+    """확정 정렬과 축별 배율 표시 변환을 합성하고 작은 양수 배율의 가역성도 보존합니다."""
 
     alignment_matrix = _matrix_value(alignment, "Alignment")
     display_matrix = _matrix_value(display_axis, "Display Axis")
     matrix = np.ascontiguousarray(alignment_matrix @ display_matrix, dtype=np.float64)
     if not np.isfinite(matrix).all():
         raise ValueError("Project World 합성 행렬에 유한하지 않은 값이 있습니다.")
-    determinant = float(np.linalg.det(matrix[:3, :3]))
-    if not np.isfinite(determinant) or abs(determinant) <= np.finfo(np.float64).eps:
+    sign, log_determinant = np.linalg.slogdet(matrix[:3, :3])
+    if sign == 0 or not np.isfinite(log_determinant):
         raise ValueError("Project World 합성 행렬의 선형부가 가역이 아닙니다.")
     matrix.setflags(write=False)
     return matrix

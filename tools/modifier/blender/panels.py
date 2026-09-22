@@ -19,6 +19,15 @@ from .status_display import (
 )
 
 
+def _indented_panel_body(layout):
+    """메뉴 제목보다 본문을 반 UI 단위 오른쪽에 배치합니다."""
+    row = layout.row()
+    gutter = row.column()
+    gutter.ui_units_x = 0.5
+    gutter.label(text="")
+    return row.column()
+
+
 def _runtime_ready(context) -> bool:
     """현재 Scene의 Modifier Runtime과 편집 token이 일치하는지 반환합니다."""
 
@@ -51,7 +60,7 @@ class COLMAP_PT_modifier(_COLMAPModifierPanelMixin, bpy.types.Panel):
     def draw(self, _context):
         """전용 Workspace 종료 버튼을 표시합니다."""
 
-        self.layout.operator(
+        _indented_panel_body(self.layout).operator(
             "colmap.exit_modifier_workspace",
             text="COLMAP Modifier 종료",
             icon="QUIT",
@@ -61,13 +70,13 @@ class COLMAP_PT_modifier(_COLMAPModifierPanelMixin, bpy.types.Panel):
 class COLMAP_PT_status(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_label = "COLMAP Status"
     bl_idname = "COLMAP_PT_status"
-    bl_parent_id = "COLMAP_PT_modifier"
+    bl_parent_id = ""
     bl_order = 10
 
     def draw(self, context):
         """상태 기록과 진행 중인 지연 Runtime 복원률을 표시합니다."""
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         settings = context.scene.colmap_import
 
         status_box = layout.box()
@@ -96,14 +105,14 @@ class COLMAP_PT_status(_COLMAPModifierPanelMixin, bpy.types.Panel):
 class COLMAP_PT_import(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_label = "COLMAP Import"
     bl_idname = "COLMAP_PT_import"
-    bl_parent_id = "COLMAP_PT_modifier"
+    bl_parent_id = ""
     bl_order = 20
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         """경로 옆 폴더 아이콘으로 가져오기 창을 열고 표시 크기를 설정합니다."""
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         settings = context.scene.colmap_import
 
         row = layout.row(align=True)
@@ -124,14 +133,14 @@ class COLMAP_PT_dataset_transform(_COLMAPModifierPanelMixin, bpy.types.Panel):
 
     bl_label = "Dataset Transform"
     bl_idname = "COLMAP_PT_dataset_transform"
-    bl_parent_id = "COLMAP_PT_modifier"
+    bl_parent_id = ""
     bl_order = 25
 
     def draw(self, context):
         """현재 편집 잠금에 맞춰 전체 데이터 변환 입력을 표시합니다."""
         from .dataset_transform_gizmo import dataset_transform_block_reason
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         layout.label(text="전체 점군 + 카메라")
         layout.prop(context.scene.colmap_import, "show_transform_gizmo")
         column = layout.column()
@@ -149,14 +158,14 @@ class COLMAP_PT_dataset_transform(_COLMAPModifierPanelMixin, bpy.types.Panel):
 class COLMAP_PT_point_selection(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_label = "Point Selection"
     bl_idname = "COLMAP_PT_point_selection"
-    bl_parent_id = "COLMAP_PT_modifier"
+    bl_parent_id = ""
     bl_order = 30
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         """Runtime 준비 여부에 따라 Point·Camera 편집 입력을 잠가 표시합니다."""
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         layout.enabled = _runtime_ready(context)
         settings = context.scene.colmap_import
         pending = has_pending_filter_data(settings)
@@ -269,14 +278,14 @@ class COLMAP_PT_point_selection(_COLMAPModifierPanelMixin, bpy.types.Panel):
 class COLMAP_PT_camera_review(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_label = "Camera Review"
     bl_idname = "COLMAP_PT_camera_review"
-    bl_parent_id = "COLMAP_PT_modifier"
+    bl_parent_id = ""
     bl_order = 40
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         """Runtime 준비 전 Camera Review 입력을 잠가 저장 상태만 보존합니다."""
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         layout.enabled = _runtime_ready(context)
         settings = context.scene.colmap_import
         pending = has_pending_filter_data(settings)
@@ -416,14 +425,14 @@ class COLMAP_PT_camera_review(_COLMAPModifierPanelMixin, bpy.types.Panel):
 class COLMAP_PT_export(_COLMAPModifierPanelMixin, bpy.types.Panel):
     bl_label = "COLMAP Export"
     bl_idname = "COLMAP_PT_export"
-    bl_parent_id = "COLMAP_PT_modifier"
+    bl_parent_id = ""
     bl_order = 50
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         """Runtime과 Scene token이 일치할 때만 Export 입력을 활성화합니다."""
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         layout.enabled = _runtime_ready(context)
         settings = context.scene.colmap_import
 

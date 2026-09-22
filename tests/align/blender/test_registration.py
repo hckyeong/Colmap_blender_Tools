@@ -263,7 +263,7 @@ def test_immediate_unregister_completes_pending_legacy_migration() -> None:
 
 
 def test_moving_sidebar_panel_hierarchy() -> None:
-    """부모와 네 하위 패널이 오른쪽 P 뷰 N 패널용으로 등록됐는지 확인합니다."""
+    """연결 상태와 네 기능 패널이 오른쪽 P 뷰의 독립 메뉴로 등록됐는지 확인합니다."""
     from tools.align import registration
 
     panel_classes = _get_panel_classes()
@@ -274,12 +274,12 @@ def test_moving_sidebar_panel_hierarchy() -> None:
             for panel_class in panel_classes
             if panel_class.bl_label == "COLMAP Align" and not panel_class.bl_parent_id
         ]
-        assert len(root_panels) == 1, "COLMAP Align 부모 패널이 하나여야 합니다."
+        assert len(root_panels) == 1, "COLMAP Align 연결 상태 패널이 하나여야 합니다."
         root_panel = root_panels[0]
         child_panels = [
             panel_class
             for panel_class in panel_classes
-            if panel_class.bl_parent_id == root_panel.bl_idname
+            if panel_class != root_panel and not panel_class.bl_parent_id
         ]
 
         assert [panel_class.bl_label for panel_class in sorted(child_panels, key=lambda panel: panel.bl_order)] == [
@@ -288,6 +288,7 @@ def test_moving_sidebar_panel_hierarchy() -> None:
             "Marker Align",
             "Merge & Export",
         ]
+        assert "HIDE_HEADER" in root_panel.bl_options
         for panel_class in (root_panel, *child_panels):
             assert panel_class.bl_space_type == "VIEW_3D"
             assert panel_class.bl_region_type == "UI"

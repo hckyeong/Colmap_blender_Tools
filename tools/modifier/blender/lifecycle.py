@@ -74,6 +74,8 @@ from .modifier_input_guard import (
 )
 from .panels import CLASSES as PANEL_CLASSES
 from .point_display import register_point_scale_sync, unregister_point_scale_sync
+from .meter_grid_guide import register_meter_grid_guide, unregister_meter_grid_guide
+from .modifier_data_visibility import restore_modifier_meter_visibility
 from .projection_snapshot_provider import (
     register_projection_snapshot_provider,
     unregister_projection_snapshot_provider,
@@ -261,8 +263,10 @@ def register():
         register_modifier_workspace_runtime()
         register_workspace_handoff_adapter(_MODIFIER_HANDOFF_ADAPTER)
         register_transform_runtime()
+        register_meter_grid_guide(restore_modifier_meter_visibility)
         _REGISTERED = True
     except Exception:
+        unregister_meter_grid_guide()
         unregister_transform_runtime()
         unregister_workspace_handoff_adapter("modifier")
         if snapshot_provider_registered:
@@ -302,6 +306,7 @@ def unregister():
     if not _REGISTERED:
         return
     _detach_modifier_markers_before_unregister()
+    unregister_meter_grid_guide()
     unregister_transform_runtime()
     stop_modifier_input_guard()
     _REGISTERED = False

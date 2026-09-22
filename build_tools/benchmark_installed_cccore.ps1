@@ -13,8 +13,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $reportRoot = [IO.Path]::GetFullPath($ReportDirectory)
 if (Test-Path -LiteralPath $reportRoot) { throw "기존 측정 결과를 덮어쓰지 않습니다: $reportRoot" }
 if (!$PackagePath) {
-    $version = [regex]::Match((Get-Content -LiteralPath (Join-Path $projectRoot "blender_manifest.toml") -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
-    $PackagePath = Join-Path $projectRoot "build\colmap_tools-$version.zip"
+    $PackagePath = Join-Path $projectRoot "colmap_tools.zip"
 }
 $PackagePath = [IO.Path]::GetFullPath($PackagePath)
 $InputBlend = [IO.Path]::GetFullPath($InputBlend)

@@ -1,5 +1,9 @@
 # COLMAP Tools
 
+**[최신 설치 ZIP 다운로드](https://github.com/hckyeong/Colmap_blender_Tools/raw/refs/heads/main/colmap_tools.zip)** · 현재 버전 **0.3.71** · Windows x64 / Blender 5.2 이상
+
+다운로드한 `colmap_tools.zip`을 Blender의 **환경설정 → 애드온 → 디스크에서 설치**에서 선택하세요. 저장소 최상위에는 최신 정식 설치본 하나만 유지합니다.
+
 `COLMAP Tools`는 다음 세 Blender 도구를 하나의 Extension으로 배포합니다.
 
 - COLMAP Align
@@ -32,6 +36,8 @@ Blender 5.2가 기본 경로에 설치된 환경에서 다음 명령을 사용�
 ```powershell
 .\build_tools\build_extension.ps1
 ```
+
+기본 출력은 저장소 최상위의 **`colmap_tools.zip`**입니다. 빌드와 ZIP 무결성 검사가 성공하면 이 파일을 교체하고, 같은 출력 폴더의 이전 `colmap_tools-버전.zip`을 정리합니다. 실패한 빌드는 기존 설치본을 유지합니다. 출력 위치를 따로 지정할 때는 `-OutputDirectory`를 사용합니다.
 
 0.3.37부터 기본 빌드는 `CCCoreLib` 프로필입니다. 전용 CPython 3.12.10·NumPy 1.26.4와 CC v4·oneTBB 실행 환경을 ZIP에 포함하므로 별도 Python 설치 없이 정렬할 수 있습니다. 실행 환경은 Git에서 제외한 `.cccore-runtime/`에 준비하고 빌드 스테이징에 복사합니다. 처음 네이티브 실행 환경을 준비할 때에는 Visual Studio 2022 C++ 빌드 도구와 네트워크가 필요합니다.
 

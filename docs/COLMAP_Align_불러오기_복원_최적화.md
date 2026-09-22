@@ -47,4 +47,14 @@ Blender 5.2.0 LTS에서 다음 11개 테스트 스크립트가 통과했다. 실
 
 남은 비용은 불러오기 기준 OBJ 읽기 7.31초, 형상 검사·배열 추출·프록시 생성 17.18초, 표시 표본 1.01초, GPU 준비 3.70초이다. 각 준비 단계 내부는 여전히 동기 실행이므로 UI 응답성을 위한 별도 분할·워커 적용까지 해결한 것은 아니다.
 
+## 0.3.51 빌드·설치
+
+2026-09-18 사용자 요청으로 `build/colmap_tools-0.3.51.zip`을 정식 CCCoreLib 프로필로 빌드하고 Blender 5.2의 `user_default` 저장소에 설치했다. 기존 0.3.50 ZIP과 비교하면 버전·빌드 프로필 외 제품 코드 변경은 이 문서의 Align 네 파일뿐이며, 기존 Modifier·패널 수정은 이전 ZIP에도 이미 포함되어 있었다.
+
+- 정식 빌드의 구조·공존·Core·Blender 등록, 네이티브 정렬 및 ZIP 무결성 검사가 통과했다.
+- `test_installed_extension.ps1`의 격리 설치·등록·네 가지 입력 조합 정렬·OBJ/UV 입출력 검사가 통과했다.
+- 별도 Blender 프로세스에서 실제 설치본 0.3.51 활성화와 1,170개 배포 파일의 해시 일치를 확인했다. 사용자 환경설정 파일의 SHA-256은 설치 전후 동일했다.
+- ZIP SHA-256: `dc9d6c40e10c95d1f47e4cb11c48dd5ea278d2d709028162d182e81d6c894e05`.
+- 로컬 검증 기록: `build/verification/align-optimization-0.3.51/`. 실제 대용량 성능 수치는 위 소스 측정 결과이며 설치 후 대용량 재계측이나 사용자 직접 조작 검수 결과를 뜻하지 않는다.
+
 Blender 버퍼 구현 근거: [공식 RNA foreach 구현](https://github.com/blender/blender/blob/main/source/blender/python/intern/bpy_rna.cc).

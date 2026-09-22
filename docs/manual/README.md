@@ -35,7 +35,7 @@ Projection Paint의 실제 메뉴 이름은 **Projection Painting**입니다. �
 ## 설치
 
 - Windows x64 컴퓨터와 Blender 5.2.0 이상.
-- 정식 설치 파일 **`colmap_tools-0.3.41.zip`**.
+- 정식 설치 파일 **[colmap_tools.zip 다운로드](https://github.com/hckyeong/Colmap_blender_Tools/raw/refs/heads/main/colmap_tools.zip)**. 저장소 최상위에 최신 설치본 하나만 유지합니다.
 - 사용할 COLMAP 모델, 촬영 이미지, 필요에 따라 OBJ와 텍스처.
 
 정식 설치 ZIP에는 CC 정렬 실행 환경이 포함되어 있습니다. 일반 사용자는 별도 Python이나 CloudCompare 프로그램을 설치할 필요가 없습니다. 소스 저장소의 일반 압축 파일과 정식 설치 ZIP을 구분하십시오.

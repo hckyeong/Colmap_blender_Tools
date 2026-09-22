@@ -23,6 +23,7 @@ $scripts = @(
     "test_companion_display.py", "test_companion_persistence.py",
     "test_display_axes.py", "test_geometry_axes_display.py", "test_geometry_axes_persistence.py",
     "test_geometry_axes_runtime.py", "test_geometry_axes_ui.py", "test_geometry_axes_export.py",
+    "test_geometry_axes_transform.py",
     "test_marker_state.py", "test_marker_alignment_runtime.py", "test_marker_alignment_integration.py",
     "test_marker_preview_combined_clouds.py", "test_mesh_surface_picking.py",
     "test_embedded_pick_bvh.py", "test_picking_optimization.py", "test_picking_cache_lifecycle.py",

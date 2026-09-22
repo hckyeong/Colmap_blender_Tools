@@ -228,16 +228,17 @@ class COLMAP_PG_import_settings(bpy.types.PropertyGroup):
     )
     point_size: FloatProperty(
         name="Point Scale",
-        description="Import된 COLMAP Point3D 표시 반지름을 실시간으로 변경합니다",
+        description="데이터 배율과 독립적인 COLMAP Point3D의 월드 표시 반지름입니다",
         default=0.05,
         min=0.000001,
         soft_max=1.0,
         precision=4,
+        subtype="DISTANCE",
         update=_update_point_scale,
     )
     camera_frustum_size: FloatProperty(
         name="Camera Frustum Size",
-        description="Import한 COLMAP 카메라 프러스텀의 Viewport 표시 크기를 변경합니다",
+        description="데이터 배율과 독립적인 COLMAP 카메라 프러스텀의 표시 크기입니다",
         default=DEFAULT_CAMERA_FRUSTUM_SIZE,
         min=CAMERA_FRUSTUM_SIZE_MIN,
         max=CAMERA_FRUSTUM_SIZE_MAX,

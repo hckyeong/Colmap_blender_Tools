@@ -816,8 +816,17 @@ def wrapped_marker_align_status_entries(
     )
 
 
+def _indented_panel_body(layout):
+    """메뉴 제목보다 본문을 반 UI 단위 오른쪽에 배치합니다."""
+    row = layout.row()
+    gutter = row.column()
+    gutter.ui_units_x = 0.5
+    gutter.label(text="")
+    return row.column()
+
+
 class COLMAPALIGN_PT_main(bpy.types.Panel):
-    """COLMAP Align 자식 패널을 묶는 최상위 부모 패널입니다."""
+    """COLMAP Align 작업공간의 재연결 상태를 표시합니다."""
 
     bl_idname = "COLMAPALIGN_PT_main"
     bl_label = "COLMAP Align"
@@ -826,6 +835,7 @@ class COLMAPALIGN_PT_main(bpy.types.Panel):
     bl_category = CONTROL_PANEL_CATEGORY
     bl_parent_id = ""
     bl_order = 0
+    bl_options = {"HIDE_HEADER"}
 
     @classmethod
     def poll(cls, context):
@@ -837,7 +847,7 @@ class COLMAPALIGN_PT_main(bpy.types.Panel):
 
         if not is_session_active_for_window(context.window):
             error_message = str(RUNTIME.workspace_setup_error or "").strip()
-            self.layout.label(
+            _indented_panel_body(self.layout).label(
                 text=error_message or "Align 세션 연결 중",
                 icon="ERROR" if error_message else "TIME",
             )
@@ -902,7 +912,7 @@ def _draw_data_layer_row(layout, model, catalog, *, importing: bool, selection_l
 
 
 def _draw_marker_target_visibility(layout, catalog) -> None:
-    """역할별 형상 고정·충돌과 숨겨진 P 대상만 마커 영역에 안내합니다."""
+    """형상 고정·충돌과 숨겨진 P 대상 안내를 버튼 아래 상태 영역에 표시합니다."""
     state = RUNTIME.marker_selection
     message = state.geometry_status_message()
     if message:
@@ -923,7 +933,7 @@ class COLMAPALIGN_PT_data_layers(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = CONTROL_PANEL_CATEGORY
-    bl_parent_id = "COLMAPALIGN_PT_main"
+    bl_parent_id = ""
     bl_order = 10
 
     @classmethod
@@ -933,7 +943,7 @@ class COLMAPALIGN_PT_data_layers(bpy.types.Panel):
 
     def draw(self, context):
         """데이터셋마다 한 행에 선택·점군·메시·축 설정·전체 표시를 그립니다."""
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         _set_session_layout_enabled(layout, context)
         if _draw_project_restore(layout):
             return
@@ -1006,7 +1016,7 @@ class COLMAPALIGN_PT_viewport(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = CONTROL_PANEL_CATEGORY
-    bl_parent_id = "COLMAPALIGN_PT_main"
+    bl_parent_id = ""
     bl_order = 20
 
     @classmethod
@@ -1016,7 +1026,7 @@ class COLMAPALIGN_PT_viewport(bpy.types.Panel):
 
     def draw(self, context):
         """Data Layers와 독립적인 COLMAP 뷰포트 표시 설정을 그립니다."""
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         _configure_layout(layout)
         _set_session_layout_enabled(layout, context)
         settings = context.scene.colmap_align_settings
@@ -1044,7 +1054,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = CONTROL_PANEL_CATEGORY
-    bl_parent_id = "COLMAPALIGN_PT_main"
+    bl_parent_id = ""
     bl_order = 30
 
     @classmethod
@@ -1053,8 +1063,8 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         return _moving_panel_poll(context)
 
     def draw(self, context):
-        """현재 대상의 숨김 점군 안내와 마커 편집·미리보기·수치 요약을 그립니다."""
-        layout = self.layout
+        """마커 버튼의 행 수를 유지하고 형상·편집 안내는 하단 상태 영역에 표시합니다."""
+        layout = _indented_panel_body(self.layout)
         _configure_layout(layout)
         _set_session_layout_enabled(layout, context)
         restore_reason = restore_input_block_reason()
@@ -1069,7 +1079,6 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         merge_locked = is_merge_export_input_locked()
         obj_locked = is_obj_export_input_locked()
         export_locked = merge_locked or obj_locked
-        _draw_marker_target_visibility(layout, catalog)
         editing_layout = layout.column()
         editing_layout.enabled = (
             not RUNTIME.import_in_progress
@@ -1091,17 +1100,12 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
             )
 
         if state.has_draft:
-            draft = state.draft
-            editing_layout.label(text=f"편집 중 A{draft.pair_id} · P{draft.pair_id}", icon="TIME")
             confirm_row = editing_layout.row(align=True)
             confirm_row.enabled = state.can_confirm_draft()
             confirm_row.operator("colmap_align.confirm_marker_selection", text="쌍 지정", icon="CHECKMARK")
             cancel_row = editing_layout.row(align=True)
             cancel_row.enabled = RUNTIME.marker_command != MARKER_COMMAND_CANCEL
             cancel_row.operator("colmap_align.cancel_marker_selection", text="선택 취소", icon="X")
-            locked_row = editing_layout.row()
-            locked_row.enabled = False
-            locked_row.operator("colmap_align.edit_marker_pair", text="편집 중에는 목록 편집/삭제 잠김", icon="LOCKED")
         else:
             add_row = editing_layout.row()
             add_row.enabled = (
@@ -1205,6 +1209,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
             preview_box.label(text="OBJ 내보내기 중에는 마커·ICP 입력이 잠깁니다.", icon="LOCKED")
 
         preview_box.label(text="상태 로그")
+        _draw_marker_target_visibility(preview_box, catalog)
         status_start_reason = start_reason
         status_direct_align_ready = direct_align_ready
         if direct_align_ready and not preview_active:
@@ -1219,6 +1224,13 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
             status_start_reason,
             status_direct_align_ready,
         )
+        if state.has_draft:
+            draft = state.draft
+            log_entries = (
+                f"편집 중 A{draft.pair_id} · P{draft.pair_id}",
+                "편집 중에는 목록 편집/삭제 잠김",
+                *log_entries,
+            )
         sync_marker_align_log(log_entries, context.window_manager)
         log_list = marker_align_log_list(context.window_manager)
         if log_list is not None:
@@ -1241,7 +1253,7 @@ class COLMAPALIGN_PT_merge_export(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = CONTROL_PANEL_CATEGORY
-    bl_parent_id = "COLMAPALIGN_PT_main"
+    bl_parent_id = ""
     bl_order = 40
 
     @classmethod
@@ -1253,7 +1265,7 @@ class COLMAPALIGN_PT_merge_export(bpy.types.Panel):
     def draw(self, context):
         """COLMAP과 OBJ Export를 분리하고 실행 중인 작업의 진행·결과를 표시합니다."""
 
-        layout = self.layout
+        layout = _indented_panel_body(self.layout)
         _configure_layout(layout)
         _set_session_layout_enabled(layout, context)
         restore_reason = restore_input_block_reason()

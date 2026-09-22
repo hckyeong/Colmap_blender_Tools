@@ -1,6 +1,7 @@
 """Modifier 전체 데이터의 행렬 미리보기와 전용 입력·피벗을 소유합니다."""
 
 from math import atan2, exp, pi
+from time import monotonic
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
@@ -15,6 +16,7 @@ from .modifier_session import SESSION, modifier_panel_poll
 
 _ACTIVE = None
 _PIVOTS = {}
+_PIVOT_CLICK = None
 _AXES = {"X": Vector((1, 0, 0)), "Y": Vector((0, 1, 0)), "Z": Vector((0, 0, 1))}
 
 
@@ -117,28 +119,60 @@ def _pick_pivot(context, event):
     return True
 
 
+def _is_pivot_double_click(context, event):
+    """같은 데이터셋·뷰에서 Blender 설정 시간과 거리 내의 연속 클릭을 판정합니다."""
+    global _PIVOT_CLICK
+    if event.value == "DOUBLE_CLICK":
+        _PIVOT_CLICK = None
+        return True
+    inputs = context.preferences.inputs
+    domain = domain_for_scene(context.scene, required=True)
+    scope = (context.window.as_pointer(), context.area.as_pointer(), domain.domain_uuid)
+    mouse = (event.mouse_x, event.mouse_y)
+    now = monotonic()
+    previous = _PIVOT_CLICK
+    threshold = max(1, int(inputs.drag_threshold_mouse))
+    if previous is not None:
+        old_scope, old_mouse, old_time = previous
+        distance = sum((a - b) ** 2 for a, b in zip(mouse, old_mouse))
+        if (scope == old_scope and 0 <= now - old_time <= max(1, inputs.mouse_double_click_time) / 1000.0
+                and distance <= threshold ** 2):
+            _PIVOT_CLICK = None
+            return True
+    _PIVOT_CLICK = (scope, mouse, now)
+    return False
+
+
 def route_dataset_transform_input(context, event):
     """실제 Modifier WINDOW 위의 G/R/S와 일반 탐색 더블클릭만 소비합니다."""
+    global _PIVOT_CLICK
     from .modifier_input_guard import _area_and_region_under_mouse, _owned_modifier_screen_is_active
     if transform_in_progress() or not _owned_modifier_screen_is_active(context):
+        _PIVOT_CLICK = None
         return False
     if getattr(context, "region_popup", None) is not None:
+        _PIVOT_CLICK = None
         return False
     if any(getattr(event, name, False) for name in ("ctrl", "shift", "alt", "oskey", "hyper")):
+        _PIVOT_CLICK = None
         return False
     mode = {"G": "TRANSLATE", "R": "ROTATE", "S": "SCALE"}.get(event.type)
-    double = event.type == "LEFTMOUSE" and event.value == "DOUBLE_CLICK"
-    if not double and (mode is None or event.value != "PRESS" or getattr(event, "is_repeat", False)):
+    pivot_click = event.type == "LEFTMOUSE" and event.value in {"PRESS", "DOUBLE_CLICK"}
+    if event.value == "PRESS" and not pivot_click:
+        _PIVOT_CLICK = None
+    if not pivot_click and (mode is None or event.value != "PRESS" or getattr(event, "is_repeat", False)):
         return False
     area, region = _area_and_region_under_mouse(context, event)
     if getattr(area, "type", "") != "VIEW_3D" or getattr(region, "type", "") != "WINDOW":
+        _PIVOT_CLICK = None
         return False
     with context.temp_override(area=area, region=region):
         if not dataset_transform_allowed(context):
+            _PIVOT_CLICK = None
             # 전용 뷰의 금지된 변환이 Blender 기본 G/R/S로 빠져나가지 않게 소비합니다.
-            return not double
-        if double:
-            return _pick_pivot(context, event)
+            return not pivot_click
+        if pivot_click:
+            return _is_pivot_double_click(context, event) and _pick_pivot(context, event)
         return "RUNNING_MODAL" in bpy.ops.colmap.transform_dataset("INVOKE_DEFAULT", mode=mode)
 
 
@@ -179,6 +213,9 @@ class COLMAP_OT_transform_dataset(bpy.types.Operator):
             return {"CANCELLED"}
         self._domain = domain_for_scene(context.scene, required=True)
         self._roots = dataset_transform_roots(context.scene)
+        from .display_scale import DisplayScaleTargets
+
+        self._display_targets = DisplayScaleTargets(context.scene, self._roots)
         self._identity = self._domain.identity
         self._session_generation = SESSION.generation
         self._display = _display(context.scene)
@@ -265,7 +302,8 @@ class COLMAP_OT_transform_dataset(bpy.types.Operator):
             compose_transforms(inverse_transform(self._display), delta),
             compose_transforms(self._display, self._start),
         )
-        apply_dataset_transform_preview(self._scene, self._preview, roots=self._roots)
+        apply_dataset_transform_preview(self._scene, self._preview, roots=self._roots,
+                                        display_targets=self._display_targets)
         self._area.tag_redraw()
 
     def _release(self, *, restore):
@@ -401,6 +439,8 @@ class COLMAP_GGT_dataset_transform(bpy.types.GizmoGroup):
 @persistent
 def _before_load(_unused):
     """파일을 교체하기 전에 미리보기와 임시 피벗 참조를 정리합니다."""
+    global _PIVOT_CLICK
+    _PIVOT_CLICK = None
     cancel_active_transform()
     _PIVOTS.clear()
 
@@ -417,6 +457,8 @@ def register_transform_runtime():
 
 def unregister_transform_runtime():
     """등록 해제 시 자체 미리보기·피벗·파일 처리기만 정리합니다."""
+    global _PIVOT_CLICK
+    _PIVOT_CLICK = None
     from .modifier_input_guard import set_transform_input_callbacks
 
     cancel_active_transform()

@@ -46,6 +46,16 @@ def _matrix_tuple(value: object) -> tuple[tuple[float, ...], ...]:
     return tuple(tuple(float(component) for component in row) for row in matrix)
 
 
+def _display_matrix_tuple(value: object) -> tuple[tuple[float, ...], ...]:
+    """축별 배율을 포함한 표시 변환만 가역 아핀 행렬로 검증해 정렬 입력에 보관합니다."""
+    matrix = np.asarray(value, dtype=np.float64)
+    if (matrix.shape != (4, 4) or not np.isfinite(matrix).all()
+        or not np.array_equal(matrix[3], (0.0, 0.0, 0.0, 1.0))
+        or np.linalg.slogdet(matrix[:3, :3])[0] <= 0.0):
+        raise CcCoreGeometryError("표시 변환은 양수 배율을 가진 가역 아핀 행렬이어야 합니다.")
+    return tuple(tuple(float(component) for component in row) for row in matrix)
+
+
 def _immutable_array(value: np.ndarray, dtype: str) -> np.ndarray:
     """원본을 변경하지 않고 쓰기 권한을 다시 켤 수 없는 배열을 반환합니다."""
     array = np.asarray(value, dtype=np.dtype(dtype), order="C")
@@ -406,7 +416,7 @@ def _marker_signature(runtime: Any) -> tuple[tuple, ...]:
 
 def _prepare_source(repository: Any, selected: _SelectedGeometry, applied_alignment: object | None,
                     *, verify_content: bool, validate_geometry: bool) -> tuple[GeometrySourceProvenance, np.ndarray, np.ndarray | None]:
-    """원본 전체의 지문·개수를 보존하고 정렬에 전달할 배열만 별도로 정제합니다."""
+    """원본 지문·개수와 축별 배율을 보존하고 정렬에 전달할 배열만 별도로 정제합니다."""
     owner_id = str(selected.record.model_id)
     positions, triangles = _raw_arrays(selected)
     alignment_positions, alignment_triangles = positions, triangles
@@ -419,7 +429,7 @@ def _prepare_source(repository: Any, selected: _SelectedGeometry, applied_alignm
               else repository.display_transform_for_model_id)
     display = getter(owner_id)
     committed = repository.alignment_transform_for_model_id(owner_id)
-    display_matrix = _matrix_tuple(display.matrix_float64)
+    display_matrix = _display_matrix_tuple(display.matrix_float64)
     committed_matrix = _matrix_tuple(committed.matrix_float64)
     applied = committed_matrix if applied_alignment is None else _matrix_tuple(applied_alignment)
     source = getattr(repository, "companion_sources" if companion else "source_metadata", {}).get(owner_id)

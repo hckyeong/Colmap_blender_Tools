@@ -25,8 +25,9 @@ CONTROL_PANEL_CATEGORY = "COLMAP Align"
 # `.blend` Text에 저장하는 작은 확정 작업 상태 schema와 소유 표식입니다.
 # v1 COLMAP 전용과 v2 OBJ 정점 marker는 codec에서 호환하고 v3은 면 마커 좌표를 보관합니다.
 # v4 연결 OBJ, v5 개별 축, v6은 마커가 참조하는 주 형상·연결 메시 출처를 보관합니다.
-PROJECT_PERSISTENCE_SCHEMA_VERSION = 8
-PROJECT_PERSISTENCE_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
+# v9는 중심 기준 이동·축별 배율·원본 중심 좌표를 보관합니다.
+PROJECT_PERSISTENCE_SCHEMA_VERSION = 9
+PROJECT_PERSISTENCE_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
 PROJECT_PERSISTENCE_MAX_JSON_BYTES = 16 * 1024 * 1024
 PROJECT_PERSISTENCE_MAX_MODELS = 256
 PROJECT_PERSISTENCE_MAX_MARKERS = 10_000

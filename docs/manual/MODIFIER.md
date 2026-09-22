@@ -2,7 +2,7 @@
 
 COLMAP 희소 점군과 카메라를 검토하고, 불필요한 점·카메라를 제거하여 COLMAP 데이터에 반영하는 도구입니다.
 
-- 기준: **COLMAP Tools 0.3.45 · Windows x64 · Blender 5.2.0 이상**.
+- 기준: **COLMAP Tools 0.3.50 · Windows x64 · Blender 5.2.0 이상**.
 - 실행: **Window → COLMAP Tools → COLMAP Modifier**.
 - [설치·공통 조작](README.md) · [Align](ALIGN.md) · [Projection Paint](PROJECTION_PAINT.md).
 - 캡처는 사용자가 직접 추가합니다. 각 기능 옆 상자에 준비 상태와 예정 파일명을 표시했습니다.
@@ -84,6 +84,8 @@ Display Axis는 화면 표시용입니다. Modifier Export는 COLMAP 원본 축�
 | Point Display | 화면에 그리는 희소 점 크기 조절 |
 | Camera Display | 카메라 프러스텀의 표시 크기 조절 |
 
+0.3.50부터 점의 표시 반지름과 카메라 절두체 크기는 **Dataset Transform의 배율과 독립적으로 설정값을 유지**합니다. 데이터를 확대하면 점 위치와 카메라 간격만 함께 벌어집니다. 화면을 확대·축소할 때 보이는 픽셀 크기는 원근과 줌에 따라 달라집니다. Edit Point 모드의 기본 편집 정점 크기는 Blender의 표시 설정을 따릅니다.
+
 **결과:** 화면 표시만 바뀝니다. 원본 점 위치나 카메라 내부 파라미터를 편집하는 기능이 아니며, Export는 COLMAP 원본 축을 유지합니다.
 
 파일 선택창을 취소하면 경로와 축은 바뀌지 않습니다. **Import**를 누르면 선택한 경로와 축을 적용하고 바로 가져옵니다. N패널에는 별도의 Import 버튼이 없습니다.
@@ -111,6 +113,15 @@ Display Axis는 화면 표시용입니다. Modifier Export는 COLMAP 원본 축�
 한 번 확정한 변환은 전용 Undo 한 단계입니다. 점·카메라 삭제와 같은 이력에서 Undo·Redo하며, 저장·재실행과 Export 및 Painter 데이터 업데이트에도 반영됩니다. 기즈모 표시를 꺼도 버튼과 단축키는 사용할 수 있습니다.
 
 **Display Axis**는 화면 방향만 바꾸는 설정이고, **Dataset Transform**은 실제 출력 좌표를 바꾸는 편집입니다. 비균일 배율과 좌우 반전은 지원하지 않습니다.
+
+Modifier 바닥의 +X·+Y 방향에는 `1 m`부터 `10 m`까지 거리 눈금이 항상 배치됩니다. 데이터와 별도로 고정되어 확대·축소할 때 크기를 비교할 수 있습니다. 눈금은 선택되지 않으며 렌더·COLMAP 내보내기·Painter 전달에도 포함되지 않습니다.
+
+눈금은 Scene 단위를 미터로 환산합니다. 단위가 None이면 1 Blender 단위를 1m로 봅니다. 눈금을 표시하는 것만으로 COLMAP 모델의 실제 크기가 보정되지는 않습니다. 실제 길이를 알고 있는 부분을 기준으로 데이터 배율을 조절하십시오.
+
+> **[추가 캡처 필요] 배율과 독립적인 표시 크기·미터 눈금**
+>
+> - 준비: 점·카메라가 있는 데이터를 서로 다른 배율로 표시한 상태.
+> - 필수 표시: 같은 Point Scale·Camera Frustum Size, 고정된 1~10m 눈금과 달라진 데이터 크기.
 
 > **[추가 캡처 필요] Modifier 기즈모**
 >

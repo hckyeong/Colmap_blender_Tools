@@ -82,13 +82,16 @@ class ProjectCatalogSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ProjectAxesSnapshot:
-    """최초 가져오기 정보와 분리한 확정 표시 축과 도 단위 XYZ 회전을 보관합니다."""
+    """최초 가져오기 정보와 분리한 확정 표시 축·이동·회전·배율·중심을 보관합니다."""
 
     preset_id: str
     axis_forward: str
     axis_up: str
     rotation_xyz_degrees: tuple[float, float, float]
     display_transform_fingerprint: str
+    translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    scale_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    pivot_source: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True, slots=True)

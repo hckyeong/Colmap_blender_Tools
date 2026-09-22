@@ -70,7 +70,11 @@ def set_modifier_perspective_view(area: Any) -> None:
 
 
 def normalize_modifier_viewport(window: Any, area: Any) -> None:
-    """Modifier View3D의 오브젝트 필터를 모두 켜고 Local View를 해제합니다."""
+    """표시 필터와 Local View를 정규화하고 내부 보조 축은 숨김·선택 잠금합니다."""
+
+    from .axis_display import hide_dataset_axis_roots
+
+    hide_dataset_axis_roots(window.scene)
 
     if area is None or getattr(area, "type", "") != "VIEW_3D":
         raise RuntimeError("표시 필터를 정규화할 Modifier 3D View가 없습니다.")
