@@ -310,7 +310,7 @@ def _assert_restored_geometry(origin, restored) -> None:
 
 
 def test_cc_mesh_approval_roundtrip_uses_real_project_snapshot() -> None:
-    """메시 정렬 승인 출처가 실제 프로젝트 저장·재가져오기에서 원본과 함께 보존됩니다."""
+    """현재 스키마에서도 메시 정렬 승인 출처가 원본과 함께 저장·복원되는지 확인합니다."""
     from test_companion_persistence import _restore, _write_snapshot
     from tools.align.constants import PROJECT_PERSISTENCE_SCHEMA_VERSION
     from tools.align.project_persistence import decode_project_state, encode_project_state
@@ -326,7 +326,7 @@ def test_cc_mesh_approval_roundtrip_uses_real_project_snapshot() -> None:
         origin.model_catalog.set_model_visibility("reference", False)
         snapshot, _text = _write_snapshot(origin)
         assert isinstance(snapshot, ProjectStateSnapshot)
-        assert snapshot.schema_version == PROJECT_PERSISTENCE_SCHEMA_VERSION == 9
+        assert snapshot.schema_version == PROJECT_PERSISTENCE_SCHEMA_VERSION
         payload = encode_project_state(snapshot)
         document = json.loads(payload)
         saved = document["models"][1]["catalog"]["alignment_provenance"]

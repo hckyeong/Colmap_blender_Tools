@@ -15,6 +15,68 @@ _SESSION_PATCH = None
 _BASELINE = None
 _SELECTED = None
 _TOKEN = ""
+_DRAW_HANDLER = None
+_DRAW_COUNTS = {"points": 0, "surface": 0}
+
+
+def _draw_geometry():
+    """실제 GPU 배치로 팝업 대상의 점군·면을 그려 동시 표시 제출을 검사합니다."""
+    import gpu
+    from tools.align.constants import ROLE_MOVING
+    from tools.align.viewport import renderer
+    try:
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.blend_set("ALPHA")
+        renderer._draw_meshes(ROLE_MOVING)
+        renderer._draw_point_clouds(ROLE_MOVING)
+    finally:
+        gpu.state.depth_test_set("NONE")
+        gpu.state.blend_set("NONE")
+
+
+class _CountingBatch:
+    """실제 배치를 대체하지 않고 GPU 제출 횟수만 기록합니다."""
+
+    def __init__(self, batch, kind):
+        """원본 GPU 배치와 제출 형상 종류를 보관합니다."""
+        self.batch, self.kind = batch, kind
+
+    def draw(self, shader):
+        """원본 GPU 그리기를 수행한 후 성공 횟수를 기록합니다."""
+        self.batch.draw(shader)
+        _DRAW_COUNTS[self.kind] += 1
+
+
+def _setup_geometry():
+    """별도 창에 실제 점군·면 배치와 화면을 준비하고 원래 숨김 상태에서 팝업을 엽니다."""
+    global _DRAW_HANDLER
+    from mathutils import Vector
+    from tools.align.properties import COLMAPALIGN_PG_settings
+    from tools.align.viewport import renderer
+    bpy.utils.register_class(COLMAPALIGN_PG_settings)
+    bpy.types.Scene.colmap_align_settings = bpy.props.PointerProperty(type=COLMAPALIGN_PG_settings)
+    bpy.context.scene.colmap_align_settings.point_size = 12.0
+    bpy.context.scene.colmap_align_settings.use_colmap_rgb = False
+    for obj in bpy.context.scene.objects:
+        obj.hide_set(True)
+    window = bpy.context.window_manager.windows[0]
+    area = next(item for item in window.screen.areas if item.type == "VIEW_3D")
+    area.spaces.active.region_3d.view_location = Vector((15, 6, 6))
+    area.spaces.active.region_3d.view_distance = 38
+    area.spaces.active.region_3d.view_perspective = "ORTHO"
+    area.spaces.active.overlay.show_overlays = False
+    region = next(item for item in area.regions if item.type == "WINDOW")
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        renderer.ensure_gpu_batches()
+    repository = _RUNTIME.model_repository
+    key = renderer._batch_key(repository.models["moving"])
+    _RUNTIME.gpu_batches[key] = _CountingBatch(_RUNTIME.gpu_batches[key], "points")
+    key = renderer._mesh_batch_key(repository.companion_meshes["moving"])
+    batch = _RUNTIME.gpu_batches[key]
+    _RUNTIME.gpu_batches[key] = renderer._MeshSurfaceBatch(_CountingBatch(batch.solid_batch, "surface"), batch.textured_batches)
+    _RUNTIME.model_catalog.set_geometry_visibility("moving", show_surface=True)
+    _RUNTIME.model_catalog.set_model_visibility("moving", False)
+    _DRAW_HANDLER = bpy.types.SpaceView3D.draw_handler_add(_draw_geometry, (), "WINDOW", "POST_VIEW")
 
 
 def _add_test_paths() -> None:
@@ -33,11 +95,11 @@ def _key(event_type: str) -> None:
 
 
 def _open(model_id: str) -> str:
-    """현재 실제 창에서 네이티브 속성 대화상자를 열고 편집 토큰을 반환합니다."""
+    """두 형상을 가리지 않는 창 오른쪽에 실제 속성 대화상자를 열고 토큰을 반환합니다."""
     window = bpy.context.window_manager.windows[0]
     area = next(item for item in window.screen.areas if item.type == "VIEW_3D")
     region = next(item for item in area.regions if item.type == "WINDOW")
-    window.event_simulate(type="MOUSEMOVE", value="NOTHING", x=region.x + region.width // 2, y=region.y + region.height // 2)
+    window.event_simulate(type="MOUSEMOVE", value="NOTHING", x=region.x + region.width * 4 // 5, y=region.y + region.height // 2)
     with bpy.context.temp_override(window=window, area=area, region=region):
         assert bpy.ops.colmap_align.edit_geometry_axes("INVOKE_DEFAULT", model_id=model_id) == {"RUNNING_MODAL"}
     return _RUNTIME.axis_settings.token
@@ -45,7 +107,7 @@ def _open(model_id: str) -> str:
 
 def _capture(name: str) -> None:
     """완전히 그려진 팝업을 저장소 내부 검증 폴더에 저장해 육안 검증에 사용합니다."""
-    output_dir = Path(__file__).resolve().parents[3] / "build" / "verification" / "axis-transform-20260921" / "gui"
+    output_dir = Path(__file__).resolve().parents[3] / "build" / "verification" / "axis-split-20261001" / "gui"
     output_dir.mkdir(parents=True, exist_ok=True)
     window = bpy.context.window_manager.windows[0]
     with bpy.context.temp_override(window=window):
@@ -55,9 +117,17 @@ def _capture(name: str) -> None:
 
 def _finish(passed: bool) -> None:
     """이 테스트가 등록한 클래스와 fixture만 정리하고 전용 Blender 프로세스를 종료합니다."""
-    global _FIXTURE, _SESSION_PATCH
+    global _FIXTURE, _SESSION_PATCH, _DRAW_HANDLER
     from tools.align.operators import axis_settings
+    from tools.align.properties import COLMAPALIGN_PG_settings
     try:
+        if _DRAW_HANDLER is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(_DRAW_HANDLER, "WINDOW")
+            _DRAW_HANDLER = None
+        if hasattr(bpy.types.Scene, "colmap_align_settings"):
+            del bpy.types.Scene.colmap_align_settings
+        if getattr(COLMAPALIGN_PG_settings, "is_registered", False):
+            bpy.utils.unregister_class(COLMAPALIGN_PG_settings)
         if _FIXTURE is not None:
             _FIXTURE.__exit__(None, None, None)
             _FIXTURE = None
@@ -75,7 +145,7 @@ def _finish(passed: bool) -> None:
 
 
 def _step():
-    """실제 팝업에서 축·이동·비율 잠금·원점 이동·취소·적용을 순차 검사합니다."""
+    """실제 팝업의 개별 축·공통 변환·초기화·취소·적용을 순차 검사합니다."""
     global _STAGE, _RUNTIME, _FIXTURE, _SESSION_PATCH, _BASELINE, _SELECTED, _TOKEN
     from tools.align.operators import axis_settings
     try:
@@ -97,31 +167,35 @@ def _step():
             _SESSION_PATCH.start()
             for cls in axis_settings.CLASSES:
                 bpy.utils.register_class(cls)
+            _setup_geometry()
             _BASELINE = _RUNTIME.model_repository.display_transforms["moving"]
             _SELECTED = _RUNTIME.model_catalog.selected_model_ids
             _TOKEN = _open("moving")
             _STAGE = "EDIT_CANCEL"
             return 0.35
         if _STAGE == "EDIT_CANCEL":
+            assert _DRAW_COUNTS["points"] > 0 and _DRAW_COUNTS["surface"] > 0
+            assert not _RUNTIME.model_catalog.models["moving"].is_visible
+            assert not _RUNTIME.model_catalog.models["moving"].show_points
+            _capture("popup-both-geometries.png")
             dialog = axis_settings._OPEN_DIALOGS[_TOKEN]
-            dialog.main_scale = (2.0, 3.0, 4.0)
-            assert tuple(dialog.main_scale) == (2.0, 3.0, 4.0)
-            dialog.main_scale_locked = True
-            assert tuple(dialog.main_scale) == (2.0, 3.0, 4.0)
-            dialog.main_scale[1] = 6.0
-            assert tuple(dialog.main_scale) == (4.0, 6.0, 8.0)
+            dialog.dataset_scale = (2.0, 3.0, 4.0)
+            assert tuple(dialog.dataset_scale) == (2.0, 3.0, 4.0)
+            dialog.dataset_scale_locked = True
+            assert tuple(dialog.dataset_scale) == (2.0, 3.0, 4.0)
+            dialog.dataset_scale[1] = 6.0
+            assert tuple(dialog.dataset_scale) == (4.0, 6.0, 8.0)
             assert _RUNTIME.axis_settings.main_transform.scale_xyz == (4.0, 6.0, 8.0)
-            dialog.main_translation = (1.0, 2.0, 3.0)
+            dialog.dataset_translation = (1.0, 2.0, 3.0)
             assert _RUNTIME.axis_settings.main_transform.translation_xyz == (1.0, 2.0, 3.0)
             assert bpy.ops.colmap_align.center_geometry_at_origin(edit_token=_TOKEN, component="MAIN") == {"FINISHED"}
             assert not dialog.error_message
-            dialog.main_rotation = (12.0, 24.0, 36.0)
-            dialog.companion_rotation = (0.0, 0.0, 45.0)
+            dialog.dataset_rotation = (12.0, 24.0, 36.0)
             assert _RUNTIME.axis_settings.main_transform.rotation_xyz_degrees == (12.0, 24.0, 36.0)
             assert _RUNTIME.model_repository.display_transforms["moving"] is _BASELINE
             assert bpy.ops.colmap_align.reset_geometry_axes(edit_token=_TOKEN, component="COMPANION") == {"FINISHED"}
-            assert tuple(dialog.companion_rotation) == (0.0, 0.0, 0.0)
-            assert tuple(dialog.main_rotation) == (12.0, 24.0, 36.0)
+            assert _RUNTIME.axis_settings.companion_transform.rotation_xyz_degrees == (12.0, 24.0, 36.0)
+            assert tuple(dialog.dataset_rotation) == (12.0, 24.0, 36.0)
             dialog.main_forward = "X"
             assert dialog.main_preset == "CUSTOM"
             dialog.main_up = "-X"
@@ -142,18 +216,17 @@ def _step():
             assert not axis_settings._OPEN_DIALOGS
             assert _RUNTIME.model_repository.display_transforms["moving"] is _BASELINE
             assert _RUNTIME.model_catalog.selected_model_ids == _SELECTED
+            assert not _RUNTIME.model_catalog.models["moving"].is_visible
             axis_settings.notify_project_state_changed.assert_not_called()
             _TOKEN = _open("moving")
             _STAGE = "EDIT_APPLY"
             return 0.35
         if _STAGE == "EDIT_APPLY":
             dialog = axis_settings._OPEN_DIALOGS[_TOKEN]
-            dialog.main_rotation = (0.0, 15.0, 0.0)
-            dialog.companion_rotation = (0.0, 0.0, 25.0)
+            dialog.dataset_rotation = (0.0, 15.0, 0.0)
             assert bpy.ops.colmap_align.reset_geometry_axes(edit_token=_TOKEN, component="BOTH") == {"FINISHED"}
             assert dialog.main_preset == "REALITY_CAPTURE" and dialog.companion_preset == "REALITY_CAPTURE_OBJ"
-            dialog.main_rotation = (0.0, 15.0, 0.0)
-            dialog.companion_rotation = (0.0, 0.0, 25.0)
+            dialog.dataset_rotation = (0.0, 15.0, 0.0)
             dialog.preview_enabled = False
             assert not _RUNTIME.axis_settings.preview_enabled
             dialog.preview_enabled = True
@@ -166,7 +239,7 @@ def _step():
         if _STAGE == "VERIFY_APPLY":
             assert not _RUNTIME.axis_settings.is_active
             assert _RUNTIME.model_repository.display_transforms["moving"].rotation_xyz_degrees == (0.0, 15.0, 0.0)
-            assert _RUNTIME.model_repository.companion_display_transforms["moving"].rotation_xyz_degrees == (0.0, 0.0, 25.0)
+            assert _RUNTIME.model_repository.companion_display_transforms["moving"].rotation_xyz_degrees == (0.0, 15.0, 0.0)
             assert _RUNTIME.model_catalog.selected_model_ids == _SELECTED
             axis_settings.notify_project_state_changed.assert_called_once()
             _TOKEN = _open("standalone")
@@ -188,7 +261,7 @@ def _step():
             return 0.3
         if _STAGE == "LEAVE_WORKSPACE":
             dialog = axis_settings._OPEN_DIALOGS[_TOKEN]
-            dialog.main_rotation = (65.0, 0.0, 0.0)
+            dialog.dataset_rotation = (65.0, 0.0, 0.0)
             window = bpy.context.window_manager.windows[0]
             window.workspace = next(workspace for workspace in bpy.data.workspaces if workspace != window.workspace)
             _STAGE = "VERIFY_LEAVE_WORKSPACE"

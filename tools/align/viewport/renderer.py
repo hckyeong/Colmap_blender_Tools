@@ -45,6 +45,7 @@ from .meter_grid_guide import (
 from .picking import marker_source_model_ids
 from .point_data import (
     companion_mesh_data_for_id,
+    model_layer_is_visible,
     model_geometry_is_visible,
     marker_geometry_is_visible,
     surface_model_data_for_id,
@@ -675,16 +676,21 @@ def render_model_ids_for_role(
     catalog=None,
     available_model_ids: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, ...]:
-    """A 전체, 선택 P 또는 선택이 비어 있을 때 유일한 P의 표시 가능 ID를 반환합니다."""
+    """평소에는 기존 A/P 선택을 따르고 축 팝업에서는 편집하는 대상 P를 표시합니다."""
     catalog = catalog or RUNTIME.model_catalog
     available = set(runtime_models()) if available_model_ids is None else set(available_model_ids)
     if role == ROLE_REFERENCE:
         return tuple(
             model.model_id
             for model in catalog.active_models()
-            if model.is_visible and model.model_id in available
+            if model_layer_is_visible(model.model_id, catalog) and model.model_id in available
         )
     if role == ROLE_MOVING:
+        axis_state = RUNTIME.axis_settings
+        if axis_state.is_active and axis_state.model_id in available:
+            inactive_models = getattr(catalog, "inactive_models", None)
+            if callable(inactive_models) and any(model.model_id == axis_state.model_id for model in inactive_models()):
+                return (axis_state.model_id,)
         selected_moving_model_ids = tuple(
             getattr(catalog, "selected_moving_model_ids", ())
         )
@@ -693,7 +699,7 @@ def render_model_ids_for_role(
             for model_id in selected_moving_model_ids
             if (
                 model_id in catalog.models
-                and catalog.models[model_id].is_visible
+                and model_layer_is_visible(model_id, catalog)
                 and model_id in available
             )
         )
@@ -705,7 +711,7 @@ def render_model_ids_for_role(
         visible_model_ids = tuple(
             model.model_id
             for model in inactive_models()
-            if model.is_visible and model.model_id in available
+            if model_layer_is_visible(model.model_id, catalog) and model.model_id in available
         )
         return visible_model_ids if len(visible_model_ids) == 1 else ()
     return ()

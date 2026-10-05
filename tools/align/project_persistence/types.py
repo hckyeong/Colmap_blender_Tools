@@ -82,7 +82,7 @@ class ProjectCatalogSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ProjectAxesSnapshot:
-    """최초 가져오기 정보와 분리한 확정 표시 축·이동·회전·배율·중심을 보관합니다."""
+    """확정 원본 축·공통 변환·중심 및 기존 개별 보정을 보존하는 기준을 보관합니다."""
 
     preset_id: str
     axis_forward: str
@@ -92,6 +92,7 @@ class ProjectAxesSnapshot:
     translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scale_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0)
     pivot_source: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    source_basis: tuple[tuple[float, ...], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

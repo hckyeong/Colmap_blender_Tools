@@ -78,10 +78,12 @@ class _Dialog:
         self.preview_enabled = True
         self.main_preset = "REALITY_CAPTURE"
         self.main_forward, self.main_up = "Z", "-Y"
-        self.main_rotation = (0.0, 0.0, 0.0)
+        self.dataset_rotation = (0.0, 0.0, 0.0)
+        self.dataset_translation = (0.0, 0.0, 0.0)
+        self.dataset_scale = (1.0, 1.0, 1.0)
+        self.dataset_scale_locked = False
         self.companion_preset = "REALITY_CAPTURE_OBJ"
         self.companion_forward, self.companion_up = "Y", "Z"
-        self.companion_rotation = (0.0, 0.0, 0.0)
         self.messages = []
         self.layout = _Layout()
 
@@ -217,7 +219,7 @@ def test_popup_freezes_owner_keeps_selection_and_cancels_without_commit() -> Non
         assert dialog.target_name == "reference" and dialog.has_companion
         assert runtime.model_catalog.selected_model_ids == selected
         context.window_manager.invoke_props_dialog.assert_called_once_with(dialog, width=460, confirm_text="적용")
-        dialog.main_rotation = (0.0, 25.0, 0.0)
+        dialog.dataset_rotation = (0.0, 25.0, 0.0)
         axis_settings._update_preview(dialog, context)
         assert runtime.model_repository.display_transforms["reference"] is baseline
         assert runtime.axis_settings.main_transform.rotation_xyz_degrees == (0.0, 25.0, 0.0)
@@ -257,23 +259,25 @@ def test_popup_manual_axes_validation_and_preview_toggle() -> None:
 
 
 def test_reset_is_component_specific_and_apply_notifies_once() -> None:
-    """개별 RC 초기화와 두 항목 맞춤을 구별하고 확정 시 저장 알림 한 번만 발생하는지 확인합니다."""
+    """개별 RC 축 초기화는 공통 변환을 유지하고 확정 알림은 한 번인지 확인합니다."""
     from tools.align.operators import axis_settings
 
     with _fixture() as (runtime, context):
         selected = runtime.model_catalog.selected_model_ids
         dialog = _open("moving", context)
-        dialog.main_rotation = (10.0, 20.0, 30.0)
-        dialog.companion_rotation = (40.0, 50.0, 60.0)
+        dialog.dataset_rotation = (10.0, 20.0, 30.0)
+        dialog.main_preset, dialog.main_forward, dialog.main_up = "CUSTOM", "X", "Z"
+        dialog.companion_preset, dialog.companion_forward, dialog.companion_up = "MAYA", "-Z", "Y"
         reset = SimpleNamespace(edit_token=dialog.edit_token, component="COMPANION", report=Mock())
         assert axis_settings.COLMAPALIGN_OT_reset_geometry_axes.execute(reset, context) == {"FINISHED"}
-        assert dialog.main_rotation == (10.0, 20.0, 30.0)
-        assert dialog.companion_rotation == (0.0, 0.0, 0.0)
+        assert dialog.dataset_rotation == (10.0, 20.0, 30.0)
+        assert dialog.companion_preset == "REALITY_CAPTURE_OBJ"
+        assert dialog.main_preset == "CUSTOM"
         reset.component = "BOTH"
         assert axis_settings.COLMAPALIGN_OT_reset_geometry_axes.execute(reset, context) == {"FINISHED"}
         assert dialog.main_preset == "REALITY_CAPTURE" and dialog.companion_preset == "REALITY_CAPTURE_OBJ"
-        assert dialog.main_rotation == dialog.companion_rotation == (0.0, 0.0, 0.0)
-        dialog.companion_rotation = (0.0, 0.0, 90.0)
+        assert dialog.dataset_rotation == (10.0, 20.0, 30.0)
+        dialog.dataset_rotation = (0.0, 0.0, 90.0)
         assert axis_settings.COLMAPALIGN_OT_edit_geometry_axes.execute(dialog, context) == {"FINISHED"}
         assert not runtime.axis_settings.is_active
         assert runtime.model_repository.companion_display_transforms["moving"].rotation_xyz_degrees == (0.0, 0.0, 90.0)
@@ -390,17 +394,18 @@ def test_dialog_watch_cancels_closed_window_workspace_exit_and_removed_target() 
             assert not runtime.axis_settings.is_active and not axis_settings._OPEN_DIALOGS
 
 
-def test_missing_companion_draws_disabled_message() -> None:
-    """연결 메시가 없는 COLMAP 팝업은 비활성 메시 안내를 표시하는지 확인합니다."""
+def test_missing_companion_draws_only_existing_geometry_and_common_transform() -> None:
+    """연결 메시가 없으면 존재하는 원본 축과 공통 변환만 표시하는지 확인합니다."""
     from tools.align.operators import axis_settings
 
     with _fixture() as (runtime, context):
         runtime.model_repository.companion_meshes.pop("moving")
         dialog = _open("moving", context)
         axis_settings.COLMAPALIGN_OT_edit_geometry_axes.draw(dialog, context)
-        disabled = [child for child in dialog.layout.children if not child.enabled]
-        assert len(disabled) == 1
-        assert any(entry[0] == "label" and entry[1]["text"] == "연결된 메시가 없습니다." for entry in disabled[0].entries)
+        names = [entry[1] for entry in dialog.layout.all_entries() if entry[0] == "prop"]
+        assert "main_preset" in names and "companion_preset" not in names
+        assert "dataset_scale" in names and "main_scale" not in names
+        assert len(dialog.layout.children) == 2
         dialog.cancel(context)
         assert not bpy.app.timers.is_registered(axis_settings._watch_axis_edit_dialogs)
 

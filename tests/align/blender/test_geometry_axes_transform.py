@@ -41,7 +41,7 @@ def test_center_rotation_scale_and_world_origin():
 
 
 def test_popup_independent_linked_scale_and_noop():
-    """실제 팝업 경계에서 독립 배율·비율 유지·미리보기 취소·무변경 적용을 검증합니다."""
+    """공통 배율·비율 유지·두 형상 동시 이동·미리보기 취소와 무변경 적용을 검증합니다."""
     from test_geometry_axes_ui import _fixture, _open
     from tools.align.operators import axis_settings as ui
     from tools.align.display_axes import create_model_display_transform
@@ -55,24 +55,25 @@ def test_popup_independent_linked_scale_and_noop():
         assert runtime.undo_journal.undo_count == 0
         dialog = _open("moving", context)
         companion = runtime.axis_settings.companion_transform
-        dialog.main_scale = (2, 3, 4)
-        ui._update_main_scale(dialog, context)
+        dialog.dataset_scale = (2, 3, 4)
+        ui._update_dataset_scale(dialog, context)
         np.testing.assert_allclose(runtime.axis_settings.main_transform.scale_xyz, (2, 3, 4))
-        dialog.main_scale_locked = True
-        dialog.main_scale = (2, 6, 4)
-        ui._update_main_scale(dialog, context)
-        np.testing.assert_allclose(dialog.main_scale, (4, 6, 8))
-        dialog.main_scale_locked = False
-        dialog.main_scale = (4, 6, 12)
-        ui._update_main_scale(dialog, context)
-        np.testing.assert_allclose(dialog.main_scale, (4, 6, 12))
-        assert runtime.axis_settings.companion_transform is companion
+        dialog.dataset_scale_locked = True
+        dialog.dataset_scale = (2, 6, 4)
+        ui._update_dataset_scale(dialog, context)
+        np.testing.assert_allclose(dialog.dataset_scale, (4, 6, 8))
+        dialog.dataset_scale_locked = False
+        dialog.dataset_scale = (4, 6, 12)
+        ui._update_dataset_scale(dialog, context)
+        np.testing.assert_allclose(dialog.dataset_scale, (4, 6, 12))
+        change = runtime.axis_settings.main_transform.matrix_float64 @ np.linalg.inv(original.matrix_float64)
+        np.testing.assert_allclose(runtime.axis_settings.companion_transform.matrix_float64,
+                                   change @ companion.matrix_float64, atol=1e-12)
         origin = SimpleNamespace(edit_token=dialog.edit_token, component="MAIN", report=dialog.report)
         assert ui.COLMAPALIGN_OT_center_geometry_at_origin.execute(origin, context) == {"FINISHED"}
-        from tools.align.axis_settings import axis_transform_center
-        center = axis_transform_center(runtime, "moving")
-        world = runtime.model_repository.alignment_transform_for_model_id("moving").matrix_float64 @ runtime.axis_settings.main_transform.matrix_float64 @ np.append(center, 1)
-        np.testing.assert_allclose(world[:3], 0, atol=1e-12)
+        from tools.align.axis_edit_transform import dataset_world_center
+        np.testing.assert_allclose(dataset_world_center(runtime, "moving", runtime.axis_settings.main_transform,
+                                                       runtime.axis_settings.companion_transform), 0, atol=1e-12)
         dialog.cancel(context)
         assert runtime.model_repository.display_transform_for_model_id("moving") is original
         assert runtime.undo_journal.undo_count == 0

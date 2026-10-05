@@ -249,7 +249,7 @@ def _project_companion_snapshot(runtime: Any, model_id: str) -> ProjectCompanion
 
 
 def _display_transform_from_axes(axes: ProjectAxesSnapshot) -> ModelDisplayTransform:
-    """저장된 축·이동·회전·배율·중심으로 행렬을 재생성하고 최종 지문을 검증합니다."""
+    """저장된 축·공통 변환·원본 기준으로 행렬과 최종 지문을 재생성합니다."""
 
     try:
         transform = create_model_display_transform(
@@ -258,6 +258,7 @@ def _display_transform_from_axes(axes: ProjectAxesSnapshot) -> ModelDisplayTrans
             translation_xyz=axes.translation_xyz,
             scale_xyz=axes.scale_xyz,
             pivot_source=axes.pivot_source,
+            source_basis=axes.source_basis,
         )
     except (TypeError, ValueError) as error:
         raise ProjectPersistenceRuntimeError(f"저장된 현재 축 설정이 올바르지 않습니다: {error}") from error
@@ -267,7 +268,7 @@ def _display_transform_from_axes(axes: ProjectAxesSnapshot) -> ModelDisplayTrans
 
 
 def _project_axes_snapshot(transform: ModelDisplayTransform) -> ProjectAxesSnapshot:
-    """원본과 미리보기 상태를 읽지 않고 확정된 중심 기준 변환만 검증해 저장합니다."""
+    """원본과 미리보기를 읽지 않고 확정 중심 변환과 원본 기준을 검증해 저장합니다."""
 
     axes = ProjectAxesSnapshot(
         preset_id=transform.preset_id,
@@ -278,6 +279,7 @@ def _project_axes_snapshot(transform: ModelDisplayTransform) -> ProjectAxesSnaps
         translation_xyz=transform.translation_xyz,
         scale_xyz=transform.scale_xyz,
         pivot_source=transform.pivot_source,
+        source_basis=transform.source_basis,
     )
     restored = _display_transform_from_axes(axes)
     if not np.array_equal(restored.matrix_float64, transform.matrix_float64):

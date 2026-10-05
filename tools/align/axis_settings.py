@@ -20,21 +20,29 @@ def axis_transform_center(runtime: Any, model_id: str, *, companion: bool = Fals
 
 
 def centered_axis_transform(runtime: Any, model_id: str, transform: ModelDisplayTransform, *, companion: bool = False) -> ModelDisplayTransform:
-    """현재 위치를 유지하면서 회전·배율의 기준점을 원본 바운딩 박스 중심으로 옮깁니다."""
+    """원본 기준과 현재 위치를 유지하며 편집 중심을 해당 형상의 경계 중심으로 옮깁니다."""
     center = axis_transform_center(runtime, model_id, companion=companion)
+    if transform.source_basis is not None:
+        center = (np.asarray(transform.source_basis) @ np.append(center, 1.0))[:3]
     if tuple(center) == transform.pivot_source:
         return transform
     base = create_model_display_transform(transform.preset_id, transform.forward_axis, transform.up_axis)
-    translation = transform.matrix_float64[:3, 3] - (base.matrix_float64[:3, :3] @ center - transform.matrix_float64[:3, :3] @ center)
+    common = create_model_display_transform(
+        transform.preset_id, transform.forward_axis, transform.up_axis,
+        rotation_xyz_degrees=transform.rotation_xyz_degrees, translation_xyz=transform.translation_xyz,
+        scale_xyz=transform.scale_xyz, pivot_source=transform.pivot_source,
+    )
+    translation = common.matrix_float64[:3, 3] - (base.matrix_float64[:3, :3] @ center - common.matrix_float64[:3, :3] @ center)
     return create_model_display_transform(
         transform.preset_id, transform.forward_axis, transform.up_axis,
         rotation_xyz_degrees=transform.rotation_xyz_degrees,
         translation_xyz=translation, scale_xyz=transform.scale_xyz, pivot_source=center,
+        source_basis=transform.source_basis,
     )
 
 
 def axis_transform_at_world_origin(runtime: Any, model_id: str, transform: ModelDisplayTransform, *, companion: bool = False) -> ModelDisplayTransform:
-    """기존 정렬 변환까지 반영해 바운딩 박스 중심이 월드 원점에 오도록 이동합니다."""
+    """원본 기준과 정렬 변환을 유지하며 해당 형상의 경계 중심을 월드 원점으로 옮깁니다."""
     centered = centered_axis_transform(runtime, model_id, transform, companion=companion)
     alignment = runtime.model_repository.alignment_transform_for_model_id(model_id).matrix_float64
     target = np.linalg.solve(alignment, np.array((0.0, 0.0, 0.0, 1.0)))[:3]
@@ -44,6 +52,7 @@ def axis_transform_at_world_origin(runtime: Any, model_id: str, transform: Model
         centered.preset_id, centered.forward_axis, centered.up_axis,
         rotation_xyz_degrees=centered.rotation_xyz_degrees,
         translation_xyz=translation, scale_xyz=centered.scale_xyz, pivot_source=centered.pivot_source,
+        source_basis=centered.source_basis,
     )
 
 

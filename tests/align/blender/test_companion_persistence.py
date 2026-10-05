@@ -82,7 +82,7 @@ def _restore():
 
 
 def _legacy_payload(snapshot, schema_version: int) -> str:
-    """현재 스냅샷에서 중심 변환과 내장 식별자를 제외해 실제 v1~v7 원문을 재현합니다."""
+    """현재 스냅샷에서 공통 변환 기준과 내장 식별자를 제외해 실제 v1~v7 원문을 재현합니다."""
 
     from tools.align.project_persistence import encode_project_state
 
@@ -92,7 +92,7 @@ def _legacy_payload(snapshot, schema_version: int) -> str:
     for model in document["models"]:
         for name in ("current_axes", "companion_axes"):
             if name in model:
-                for field in ("translation_xyz", "scale_xyz", "pivot_source"):
+                for field in ("translation_xyz", "scale_xyz", "pivot_source", "source_basis"):
                     model[name].pop(field, None)
         model.pop("embedded_obj_asset_uuid", None)
         model.pop("embedded_obj_schema_version", None)

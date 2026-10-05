@@ -155,6 +155,10 @@ def _axes_mapping(axes: ProjectAxesSnapshot, schema_version: int = PROJECT_PERSI
         ("translation_xyz", (0.0, 0.0, 0.0)), ("scale_xyz", (1.0, 1.0, 1.0)), ("pivot_source", (0.0, 0.0, 0.0)),
     )):
         raise ProjectPersistenceCodecError("이동·배율·중심 설정은 프로젝트 저장 버전 9 이상이 필요합니다.")
+    if int(schema_version) >= 10:
+        mapping["source_basis"] = axes.source_basis
+    elif axes.source_basis is not None:
+        raise ProjectPersistenceCodecError("공통 변환의 원본 기준은 프로젝트 저장 버전 10 이상이 필요합니다.")
     return mapping
 
 
@@ -756,7 +760,7 @@ def _decode_companion_source(
 
 
 def _decode_axes(value: object, field_name: str, schema_version: int = PROJECT_PERSISTENCE_SCHEMA_VERSION) -> ProjectAxesSnapshot:
-    """저장 버전별 축·이동·회전·양수 배율·중심과 최종 변환 지문을 검증합니다."""
+    """저장 버전별 축·공통 변환·원본 기준과 최종 지문을 검증합니다."""
 
     mapping = _mapping(value, field_name)
     required = {
@@ -765,6 +769,8 @@ def _decode_axes(value: object, field_name: str, schema_version: int = PROJECT_P
     }
     if int(schema_version) >= 9:
         required.update({"translation_xyz", "scale_xyz", "pivot_source"})
+    if int(schema_version) >= 10:
+        required.add("source_basis")
     _require_keys(mapping, required, field_name)
     rotation = _optional_position(mapping["rotation_xyz_degrees"], f"{field_name}.rotation_xyz_degrees")
     if rotation is None:
@@ -775,6 +781,15 @@ def _decode_axes(value: object, field_name: str, schema_version: int = PROJECT_P
         if vector is None or (key == "scale_xyz" and any(value <= 0.0 for value in vector)):
             raise ProjectPersistenceCodecError(f"{field_name}.{key} 값이 올바르지 않습니다.")
         extra[key] = vector
+    basis = mapping["source_basis"] if int(schema_version) >= 10 else None
+    if basis is not None:
+        if not isinstance(basis, (list, tuple)) or len(basis) != 4 or any(
+            not isinstance(row, (list, tuple)) or len(row) != 4 for row in basis
+        ):
+            raise ProjectPersistenceCodecError(f"{field_name}.source_basis는 4×4 배열이어야 합니다.")
+        basis = tuple(tuple(_finite_float(item, f"{field_name}.source_basis") for item in row) for row in basis)
+        if basis[3] != (0.0, 0.0, 0.0, 1.0):
+            raise ProjectPersistenceCodecError(f"{field_name}.source_basis는 아핀 행렬이어야 합니다.")
     return ProjectAxesSnapshot(
         preset_id=_string(mapping["preset_id"], f"{field_name}.preset_id", 128),
         axis_forward=_string(mapping["axis_forward"], f"{field_name}.axis_forward", 8),
@@ -784,6 +799,7 @@ def _decode_axes(value: object, field_name: str, schema_version: int = PROJECT_P
             mapping["display_transform_fingerprint"], f"{field_name}.display_transform_fingerprint", 32,
         ),
         **extra,
+        source_basis=basis,
     )
 
 

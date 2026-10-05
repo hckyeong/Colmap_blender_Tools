@@ -266,6 +266,24 @@ def _axis_matrix_with_transform(forward, up, angles, translation, scale, pivot) 
     return matrix
 
 
+def normalize_source_basis(value: object) -> tuple[tuple[float, ...], ...] | None:
+    """기존 배치를 보존하는 원본 기준을 가역 아핀 행렬로 검증합니다."""
+    if value is None:
+        return None
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all() or not np.array_equal(matrix[3], (0, 0, 0, 1)):
+        raise ValueError("원본 기준은 유한한 4×4 아핀 행렬이어야 합니다.")
+    try:
+        inverse = np.linalg.inv(matrix)
+    except np.linalg.LinAlgError as error:
+        raise ValueError("원본 기준 행렬은 가역이어야 합니다.") from error
+    if not np.isfinite(inverse).all():
+        raise ValueError("원본 기준 역행렬에 유한하지 않은 값이 있습니다.")
+    if np.array_equal(matrix, np.eye(4)):
+        return None
+    return tuple(tuple(float(item) for item in row) for row in matrix)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelDisplayTransform:
     """한 COLMAP 모델의 원본 좌표와 분리된 불변 표시 축 변환입니다."""
@@ -280,9 +298,10 @@ class ModelDisplayTransform:
     translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scale_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0)
     pivot_source: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    source_basis: tuple[tuple[float, ...], ...] | None = None
 
     def __post_init__(self) -> None:
-        """원본 축·이동·회전·배율·중심과 행렬 관계를 검증해 불변 값으로 고정합니다."""
+        """원본 기준·축·중심 변환과 최종 행렬 관계를 검증해 불변 값으로 고정합니다."""
 
         preset = axis_preset_for_id(self.preset_id)
         forward, up = validate_axis_pair(self.forward_axis, self.up_axis)
@@ -301,13 +320,17 @@ class ModelDisplayTransform:
         translation = transform_vector(self.translation_xyz, "이동")
         scale = transform_vector(self.scale_xyz, "배율", positive=True)
         pivot = transform_vector(self.pivot_source, "변환 중심")
+        basis = normalize_source_basis(self.source_basis)
         expected = _axis_matrix_with_transform(forward, up, angles, translation, scale, pivot)
+        if basis is not None:
+            expected = expected @ np.asarray(basis, dtype=np.float64)
         if not np.allclose(matrix, expected, rtol=0.0, atol=1.0e-12):
             raise ValueError("축·이동·회전·배율로 재현한 행렬이 저장된 행렬과 다릅니다.")
         object.__setattr__(self, "rotation_xyz_degrees", angles)
         object.__setattr__(self, "translation_xyz", translation)
         object.__setattr__(self, "scale_xyz", scale)
         object.__setattr__(self, "pivot_source", pivot)
+        object.__setattr__(self, "source_basis", basis)
         fingerprint = _transform_fingerprint(preset.identifier, forward, up, matrix)
         if self.fingerprint and self.fingerprint != fingerprint:
             raise ValueError("표시 축 변환 fingerprint가 행렬 값과 일치하지 않습니다.")
@@ -328,8 +351,9 @@ def create_model_display_transform(
     translation_xyz: object = (0.0, 0.0, 0.0),
     scale_xyz: object = (1.0, 1.0, 1.0),
     pivot_source: object = (0.0, 0.0, 0.0),
+    source_basis: object = None,
 ) -> ModelDisplayTransform:
-    """원본 축과 중심 기준 이동·회전·배율로 공통 표시 변환을 생성합니다."""
+    """보존한 원본 기준 위에 축과 중심 기준 이동·회전·배율을 적용합니다."""
 
     preset = axis_preset_for_id(preset_id)
     forward, up = validate_axis_pair(forward_axis, up_axis)
@@ -343,7 +367,10 @@ def create_model_display_transform(
     translation = transform_vector(translation_xyz, "이동")
     scale = transform_vector(scale_xyz, "배율", positive=True)
     pivot = transform_vector(pivot_source, "변환 중심")
+    basis = normalize_source_basis(source_basis)
     matrix = _axis_matrix_with_transform(forward, up, angles, translation, scale, pivot)
+    if basis is not None:
+        matrix = matrix @ np.asarray(basis, dtype=np.float64)
     inverse = np.linalg.inv(matrix)
     return ModelDisplayTransform(
         preset_id=preset.identifier,
@@ -355,6 +382,7 @@ def create_model_display_transform(
         translation_xyz=translation,
         scale_xyz=scale,
         pivot_source=pivot,
+        source_basis=basis,
     )
 
 

@@ -303,7 +303,7 @@ def test_dictionary_fixture_fallback_and_missing_real_axis() -> None:
 
 
 def test_temporary_axis_preview_drives_display_pick_and_bounds_without_commit() -> None:
-    """축 미리보기와 형상 선택이 표시·피킹·경계에 적용되고 취소 때 확정 축으로 복귀하는지 확인합니다."""
+    """축 미리보기 중 두 형상을 경계에 포함하고 취소 때 확정 축과 선택 표시로 복귀합니다."""
     from tools.align.axis_settings import begin_axis_edit, update_axis_edit, cancel_axis_edit
     from tools.align.viewport import point_data, renderer, picking
     from tools.align.operators import workspace
@@ -340,9 +340,10 @@ def test_temporary_axis_preview_drives_display_pick_and_bounds_without_commit() 
             assert result is not None and result.point3d_id == int(model.points.point_ids[2])
             point_bounds = _expected_bounds(main_matrix, model)
             mesh_bounds = _expected_bounds(mesh_matrix, mesh)
-            np.testing.assert_allclose(workspace._bounds_for_model_ids(["moving"]), point_bounds, atol=3e-6)
+            combined_bounds = (np.minimum(point_bounds[0], mesh_bounds[0]), np.maximum(point_bounds[1], mesh_bounds[1]))
+            np.testing.assert_allclose(workspace._bounds_for_model_ids(["moving"]), combined_bounds, atol=3e-6)
             runtime.model_catalog.set_geometry_visibility("moving", show_surface=True)
-            np.testing.assert_allclose(workspace._bounds_for_model_ids(["moving"]), mesh_bounds, atol=3e-6)
+            np.testing.assert_allclose(workspace._bounds_for_model_ids(["moving"]), combined_bounds, atol=3e-6)
             update_axis_edit(runtime, token, main_transform=main_preview, companion_transform=mesh_preview, preview_enabled=False)
             np.testing.assert_allclose(point_data.effective_model_matrix_for_id("moving"), _expected_matrix(runtime))
             np.testing.assert_allclose(point_data.effective_model_matrix_for_id("moving", companion=True), _expected_matrix(runtime, companion=True))
@@ -352,6 +353,8 @@ def test_temporary_axis_preview_drives_display_pick_and_bounds_without_commit() 
             cancel_axis_edit(runtime, token)
         np.testing.assert_allclose(point_data.effective_model_matrix_for_id("moving"), _expected_matrix(runtime))
         np.testing.assert_allclose(point_data.effective_model_matrix_for_id("moving", companion=True), _expected_matrix(runtime, companion=True))
+        restored_mesh_bounds = _expected_bounds(_expected_matrix(runtime, companion=True), mesh)
+        np.testing.assert_allclose(workspace._bounds_for_model_ids(["moving"]), restored_mesh_bounds, atol=3e-6)
 
 
 def test_common_alignment_preview_keeps_geometry_axes_independent() -> None:

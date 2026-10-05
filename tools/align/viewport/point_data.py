@@ -111,14 +111,28 @@ def surface_model_data_for_id(model_id: str) -> Any | None:
     return companion_mesh_data_for_id(model_id)
 
 
+def model_layer_is_visible(model_id: str, catalog=None) -> bool:
+    """축 팝업의 대상만 임시로 표시하고 확정된 레이어 눈 상태는 그대로 유지합니다."""
+    state = getattr(RUNTIME, "axis_settings", None)
+    if state is not None and state.is_active and state.model_id == model_id:
+        return True
+    catalog = catalog or getattr(RUNTIME, "model_catalog", None)
+    record = getattr(catalog, "models", {}).get(model_id)
+    return record is None or bool(getattr(record, "is_visible", True))
+
+
 def model_geometry_is_visible(model_id: str, geometry_kind: str) -> bool:
-    """전체 표시와 점군·표면 토글을 결합하되 카탈로그 없는 테스트 입력을 허용합니다."""
+    """축 팝업에서는 존재하는 두 형상을 표시하고 평소에는 기존 표시 토글을 따릅니다."""
+    state = getattr(RUNTIME, "axis_settings", None)
+    if state is not None and state.is_active and state.model_id == model_id:
+        if geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH:
+            return surface_model_data_for_id(model_id) is not None
+        model = model_data_for_id(model_id)
+        return model is not None and geometry_kind_for_model(model) == GEOMETRY_KIND_COLMAP_POINT_CLOUD
+    if not model_layer_is_visible(model_id):
+        return False
     catalog = getattr(RUNTIME, "model_catalog", None)
     record = getattr(catalog, "models", {}).get(model_id)
-    if record is None:
-        return True
-    if not bool(getattr(record, "is_visible", True)):
-        return False
     field = "show_surface" if geometry_kind == GEOMETRY_KIND_TRIANGLE_MESH else "show_points"
     return bool(getattr(record, field, True))
 

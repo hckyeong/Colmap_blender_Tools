@@ -26,8 +26,9 @@ CONTROL_PANEL_CATEGORY = "COLMAP Align"
 # v1 COLMAP 전용과 v2 OBJ 정점 marker는 codec에서 호환하고 v3은 면 마커 좌표를 보관합니다.
 # v4 연결 OBJ, v5 개별 축, v6은 마커가 참조하는 주 형상·연결 메시 출처를 보관합니다.
 # v9는 중심 기준 이동·축별 배율·원본 중심 좌표를 보관합니다.
-PROJECT_PERSISTENCE_SCHEMA_VERSION = 9
-PROJECT_PERSISTENCE_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9})
+# v10은 공통 변환을 적용해도 기존 개별 보정을 유지하는 원본 기준 행렬을 보관합니다.
+PROJECT_PERSISTENCE_SCHEMA_VERSION = 10
+PROJECT_PERSISTENCE_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 PROJECT_PERSISTENCE_MAX_JSON_BYTES = 16 * 1024 * 1024
 PROJECT_PERSISTENCE_MAX_MODELS = 256
 PROJECT_PERSISTENCE_MAX_MARKERS = 10_000
