@@ -20,17 +20,11 @@ $cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Co
   -G 'Visual Studio 17 2022' -A x64 `
   -DEIGEN_INCLUDE_DIR='<검증된 Eigen 3.4.0 폴더>' `
   -DJSON_INCLUDE_DIR='<고정 json.hpp가 있는 폴더>' `
-  -DTBB_DIR='<oneTBB 2022.0.0>/lib/cmake/tbb' `
-  -DCOLMAP_BUILD_POINT_KD_TESTS=ON
+  -DTBB_DIR='<oneTBB 2022.0.0>/lib/cmake/tbb'
 & $cmake --build .point-kd-runtime/build --config Release --parallel 4
 & .point-kd-runtime/build/bin/colmap_point_kd_worker.exe --check-environment
-& .point-kd-runtime/build/bin/test_point_kd_search.exe
-& .point-kd-runtime/build/bin/test_point_kd_termination.exe
-python -X utf8 tests/align/native/test_point_kd_worker.py `
-  --worker .point-kd-runtime/build/bin/colmap_point_kd_worker.exe `
-  --report build/verification/point-kd-native-tests.json
 ```
 
 배포에서는 `colmap_point_kd_worker.exe`, `tbb12.dll`과 Visual C++ 재배포 런타임을 함께 제공해야 합니다. Eigen과 JSON은 헤더 전용이며 별도 DLL을 요구하지 않습니다. `licenses/`에 Eigen의 `COPYING.MPL2`, JSON의 `LICENSE.MIT`, oneTBB의 `LICENSE.txt`와 `third-party-programs.txt`를 보존합니다.
 
-독립 검색 검사는 정확 KD 결과를 전수 검색 500회와 비교하고 반경·적격점·동률·자기 제외·취소를 검사합니다. Python 실행 검사는 알려진 강체 변환, 두 풀이 방식, 1·4 스레드 재현성, 큰 좌표 원점, 변환 후 삼각형 법선, 퇴화·누락·입력 오류·반경 경계, 원본 불변성, 실행 중 취소와 Windows 진행 파일 잠금 해제를 검사합니다.
+독립 회귀 테스트와 시험 빌드 대상은 제거했습니다. 이전 검사 원문은 [정리 전 Git 이력](https://github.com/hckyeong/Colmap_blender_Tools/tree/61a764f300dccfdef09311ddf4a553673dfa2716/tests/align/native)에서 확인할 수 있습니다. 현재 빌드는 고정 의존성·실행 환경·원문과 배포 파일의 무결성을 검사합니다.

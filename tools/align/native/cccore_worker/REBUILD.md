@@ -1,6 +1,6 @@
 # 재빌드와 변경 원문
 
-0.3.68은 같은 CMake 빌드에 자체 메시 검사 대상 `colmap_mesh_cleanup`을 추가합니다. 이 DLL은 oneTBB만 연결하며 CCCoreLib를 수정하지 않습니다. MSVC `/fp:strict`로 기존 면 판정의 연산 순서를 유지하고, ABI 1과 원문·바이너리 해시를 Runtime Manifest에서 검사합니다. 재빌드 ZIP의 `tests/align/test_icp_mesh_cleanup_native.py`와 `tools/align/alignment/` 순수 모듈은 실제 DLL을 기존 NumPy 판정과 비교하는 재현 자료입니다. 시험은 NumPy가 있는 Python에서 `COLMAP_CCCORE_WORKER`를 재빌드 실행 파일의 절대경로로 지정하여 실행합니다.
+0.3.68은 같은 CMake 빌드에 자체 메시 검사 대상 `colmap_mesh_cleanup`을 추가합니다. 이 DLL은 oneTBB만 연결하며 CCCoreLib를 수정하지 않습니다. MSVC `/fp:strict`로 기존 면 판정의 연산 순서를 유지하고, ABI 1과 원문·바이너리 해시를 Runtime Manifest에서 검사합니다.
 
 2026-09-04 기준 Windows x64, Visual Studio 2022 C++ 도구와 해당 설치본의 CMake로 빌드했습니다. 준비 스크립트가 고정 oneTBB `2022.0.0` 정확한 버전을 검증해 사용하므로 별도 Qt·CGAL 설치는 필요하지 않습니다.
 
@@ -52,7 +52,6 @@ PowerShell 7에서 다음 명령을 실행합니다. 출력은 지정한 격리 
 
 ```powershell
 .\build_tools\prepare_cccore_runtime.ps1 -EnvironmentRoot '<격리환경절대경로>'
-& '<격리환경절대경로>\runtime\python\python.exe' -X utf8 -I .\tests\align\native\test_cccore_worker.py
 ```
 
 ## 배포된 원문만으로 재빌드
@@ -74,7 +73,7 @@ Copy-Item -LiteralPath .\tbb\oneapi-tbb-2022.0.0\redist\intel64\vc14\tbb12.dll -
 
 `build/bin`에 워커, `CCCoreLib.dll`, `tbb12.dll`이 준비됩니다. 배포 런타임에서 Microsoft C++ 재배포 DLL 네 파일과 oneTBB 라이선스·제삼자 고지를 함께 유지합니다. Windows의 Universal CRT는 운영체제 제공 구성요소를 사용합니다.
 
-준비 스크립트는 매 실행마다 새 빌드·원문·런타임 스테이징을 만들고 허용 파일 목록, v7 Manifest 연결, 자체 검사와 단일 세션·캐시 네이티브 회귀를 모두 확인한 뒤 런타임 디렉터리를 교체합니다. 실패하면 기존 런타임을 유지하거나 교체 직전 백업으로 되돌리므로 이전 파일이 원문 ZIP이나 최종 배포에 섞이지 않습니다.
+준비 스크립트는 매 실행마다 새 빌드·원문·런타임 스테이징을 만들고 허용 파일 목록, v8 Manifest 연결과 실제 실행 환경을 확인한 뒤 런타임 디렉터리를 교체합니다. 실패하면 기존 런타임을 유지하거나 교체 직전 백업으로 되돌리므로 이전 파일이 원문 ZIP이나 최종 배포에 섞이지 않습니다.
 
 v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비율을 받으며 `filter_out_farthest_points`를 공개 `Parameters::filterOutFarthestPoints`에 연결합니다. 절대 최대거리 제한을 코어에 추가하지 않으며, 코어 커밋과 두 기존 패치의 원문·적용 결과 해시를 보존하고, 등록 안전 패치의 적용 전후 해시를 별도로 고정합니다. v3 런타임은 v4 배포 검증을 통과할 수 없습니다.
 
@@ -147,29 +146,16 @@ v4는 상위 Python의 후보 선별과 등록 표본에서 추정한 겹침 비
 
 재빌드 ZIP의 `native/mesh_bvh.h`와 `native/mesh_bvh.cpp`는 워커와 함께 C++17로 빌드합니다. `runtime_manifest.json`의 `mesh_bvh_search_source_sha256`는 최종 코어 두 파일, `bvh_source_sha256`는 워커 BVH 두 파일을 식별합니다. 프로토콜은 `cccore-native-v7`이며 새 외부 의존성은 없습니다.
 
-## 선택적 BVH 독립 시험
-
-원문 묶음은 `tests/align/native/test_mesh_bvh.cpp`, `test_bvh_icp.cpp`와 `fixtures/bvh_tetra_surface.json`을 포함합니다. 루트의 `test_cccore_worker.py`도 같은 `fixtures/` 입력을 읽습니다. 위 재빌드 구성 후 다음 명령으로 별도 시험 대상을 활성화할 수 있습니다.
-
-```powershell
-& $cmake -S .\native -B .\build -DCOLMAP_BUILD_BVH_TESTS=ON
-& $cmake --build .\build --config Release --target test_mesh_bvh test_bvh_icp --parallel 8
-& .\build\bin\test_mesh_bvh.exe
-& .\build\bin\test_bvh_icp.exe .\fixtures\bvh_tetra_surface.json
-```
-
-CMake는 배포 묶음과 저장소의 시험 경로를 자동 구분합니다. 다른 배치에서는 `-DCOLMAP_BVH_TEST_SOURCE_DIR=<시험원문절대경로>`로 두 대상의 공통 경로를 지정할 수 있습니다. 배포 검증은 ZIP 전체 SHA-256과 시험 소스·고정 입력의 현재 원문 일치를 함께 검사합니다.
-
 ## 0.3.64 BVH 생성 병렬화
 
 변경 대상은 자체 워커의 `mesh_bvh.h`, `mesh_bvh.cpp`와 CPU 상한을 전달하는 `main.cpp`입니다. 기존 CCCoreLib 패치와 고정 의존성은 바꾸지 않습니다. 노드 선할당과 독립 구간 병렬 생성은 같은 중앙 분할·원본 삼각형 번호·정확 검색을 유지하며, 최초 생성 이후에는 기존 세션 트리를 재사용합니다.
 
-생성·사전 메모리 산정은 동일한 스레드 상한을 받습니다. 생성 최고 추정치에는 배열과 oneTBB의 실제 스택 설정 및 태스크 여유가 포함되므로 이전 버전의 배열 위주 추정치와 구분합니다. 소스 묶음의 C++ 시험은 1·2·4·자동 스레드 생성, 전수 최근접점·면 번호, 예산 경계·취소·콜백 예외·실패 후 재생성을 검사합니다. Release 빌드 방법과 실행 계약은 동일합니다.
+생성·사전 메모리 산정은 동일한 스레드 상한을 받습니다. 생성 최고 추정치에는 배열과 oneTBB의 실제 스택 설정 및 태스크 여유가 포함되므로 이전 버전의 배열 위주 추정치와 구분합니다. 과거 C++ 시험에서 1·2·4·자동 스레드 생성, 전수 최근접점·면 번호, 예산 경계·취소·콜백 예외·실패 후 재생성을 검사했습니다. Release 빌드 방법과 실행 계약은 동일합니다.
 
 ## 0.3.67 점–평면과 노말 대응 필터
 
-기존 BVH 패치 다음에 `patches/point_to_plane.patch`의 `point-to-plane-v1`을 적용합니다. 대상은 `include/RegistrationTools.h`와 `src/RegistrationTools.cpp`이며 잠금 정보의 `point_to_plane_patch`에 직전·적용 후·패치 원문 해시를 보존합니다. 원문 ZIP에는 모든 패치가 적용된 코어와 새 회귀 `test_point_to_plane.py`를 포함합니다.
+기존 BVH 패치 다음에 `patches/point_to_plane.patch`의 `point-to-plane-v1`을 적용합니다. 대상은 `include/RegistrationTools.h`와 `src/RegistrationTools.cpp`이며 잠금 정보의 `point_to_plane_patch`에 직전·적용 후·패치 원문 해시를 보존합니다. 원문 ZIP에는 모든 패치가 적용된 코어와 제품 빌드 소스를 포함합니다.
 
 Manifest의 `point_to_plane_patch`, `point_to_plane_patch_sha256`, `point_to_plane_source_sha256`가 최종 코드와 연결됩니다. 기존 패치의 원문·해시는 중간 단계 증거로 유지합니다. 네이티브 계약은 v8이며 이전 워커와 혼용하지 않습니다. 새 외부 의존성은 없습니다.
 
-위와 같은 재빌드 후, 전용 Python에서 `test_cccore_worker.py`와 `test_point_to_plane.py`를 실행합니다. `COLMAP_CCCORE_WORKER`는 재빌드된 실행 파일 절대 경로를 가리켜야 합니다. 정상·부분 대응·배율 경계·노말 오류·수치 퇴화·취소를 검사하며, 실패하면 런타임을 게시하지 않습니다.
+독립 테스트·고정 시험 입력·시험 실행 결과 파일은 배포에서 제거했습니다. 이전 테스트는 [정리 전 Git 이력](https://github.com/hckyeong/Colmap_blender_Tools/tree/61a764f300dccfdef09311ddf4a553673dfa2716/tests/align/native)에서 확인할 수 있습니다. 재빌드 후 `colmap_cccore_worker.exe --check-environment`로 실제 DLL 로드와 수치 연산을 확인하며, 배포 도구는 원문·바이너리·라이선스 해시를 계속 검사합니다.

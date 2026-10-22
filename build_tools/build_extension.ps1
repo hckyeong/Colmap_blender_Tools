@@ -523,30 +523,7 @@ if (-not (Test-Path -LiteralPath $BlenderPath -PathType Leaf)) {
     throw "Blender 5.2 실행 파일을 찾을 수 없습니다: $BlenderPath"
 }
 
-# 이전 설치본 정리의 삭제 범위를 실제 임시 파일로 검사합니다.
-& (Join-Path $projectRoot "tests\build_tools\test_install_package_cleanup.ps1")
-
-# 정적 구조, 공존 식별자와 순수 Core 회귀 테스트를 먼저 실행합니다.
-$testSuites = @(
-    [pscustomobject]@{ Name = "Architecture"; Path = "tests\architecture" },
-    [pscustomobject]@{ Name = "Coexistence"; Path = "tests\coexistence" },
-    [pscustomobject]@{ Name = "Modifier Core"; Path = "tests\modifier\core" },
-    [pscustomobject]@{ Name = "Projection Core"; Path = "tests\projection_paint\core" }
-)
-foreach ($suite in $testSuites) {
-    # 내장 Python도 검증할 소스 루트를 명시적으로 탐색하며 실행 환경의 격리 설정은 바꾸지 않습니다.
-    & $PythonPath -X utf8 -c "import sys,unittest; sys.path.insert(0,sys.argv[1]); suite=unittest.TestLoader().discover(sys.argv[2], pattern='test_*.py'); result=unittest.TextTestRunner(verbosity=1).run(suite); sys.exit(not result.wasSuccessful())" $projectRoot (Join-Path $projectRoot $suite.Path)
-    if ($LASTEXITCODE -ne 0) {
-        throw "$($suite.Name) 테스트에 실패했습니다."
-    }
-}
-
-# Blender에서 통합 등록, 멱등성과 실패 Rollback을 검증합니다.
-& $BlenderPath --background --factory-startup --python (Join-Path $projectRoot "tests\blender_background\test_extension_registration.py")
-if ($LASTEXITCODE -ne 0) {
-    throw "COLMAP Tools Blender Background 등록 검증에 실패했습니다."
-}
-
+# 독립 테스트 없이 배포 스테이징·실행 환경·최종 ZIP 무결성을 검사합니다.
 $artifactRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot ".artifacts"))
 $buildId = [Guid]::NewGuid().ToString("N")
 $operationRoot = Join-Path $artifactRoot "extension_build_$buildId"

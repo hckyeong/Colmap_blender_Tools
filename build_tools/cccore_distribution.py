@@ -69,7 +69,7 @@ def _scan_zip_for_forbidden_paths(archive, markers, *, prefix="", depth=0):
 
 
 def validate_package_archive(path):
-    """배포 ZIP의 호스트 경로와 포함된 CC 바이너리·라이선스·원문 해시를 검사합니다."""
+    """배포 ZIP의 호스트 경로와 CC 제품 바이너리·라이선스·원문 해시를 검사합니다."""
     with zipfile.ZipFile(Path(path)) as archive:
         hits = _scan_zip_for_forbidden_paths(archive, _forbidden_package_path_markers())
         prefix = "tools/align/runtime/cccore/"
@@ -78,7 +78,6 @@ def validate_package_archive(path):
             expected = dict(manifest["binary_sha256"])
             expected.update({"licenses/" + name: value for name, value in manifest["license_sha256"].items()})
             expected["cccore_rebuild_sources.zip"] = manifest["source_archive_sha256"]
-            expected["native_test_report.json"] = manifest["native_test_report_sha256"]
             for name, fingerprint in expected.items():
                 if hashlib.sha256(archive.read(prefix + name)).hexdigest() != fingerprint:
                     raise RuntimeError(f"배포 ZIP의 CC 파일 해시가 다릅니다: {name}")
@@ -87,7 +86,7 @@ def validate_package_archive(path):
 
 
 def validate_cccore_runtime(runtime_root):
-    """CC 런타임의 v8 등록·메시 검사 계약과 Manifest·파일 해시를 검사합니다."""
+    """독립 테스트 파일 없이 CC v8 실행 계약과 제품 원문·배포 파일 해시를 검사합니다."""
     root = Path(runtime_root).resolve()
     manifest_path = root / "runtime_manifest.json"
     if not manifest_path.is_file():
@@ -154,7 +153,7 @@ def validate_cccore_runtime(runtime_root):
 
 
 def validate_cccore_distribution(runtime_root):
-    """배포 파일·메시 검사·점평면 패치 이력과 최종 재빌드·회귀 원문을 대조합니다."""
+    """배포 파일·점평면 패치 이력과 재빌드 원문의 무결성을 대조합니다."""
     root = Path(runtime_root).resolve()
     manifest = validate_cccore_runtime(root)
     lock = read_json(ROOT / "tools/align/native/cccore_worker/dependencies.lock.json")
@@ -201,7 +200,7 @@ def validate_cccore_distribution(runtime_root):
     required = {
         "colmap_cccore_worker.exe", "colmap_mesh_cleanup.dll", "CCCoreLib.dll", "tbb12.dll", "msvcp140.dll",
         "vcruntime140.dll", "vcruntime140_1.dll", "concrt140.dll",
-        "cccore_rebuild_sources.zip", "native_test_report.json", "REBUILD.md",
+        "cccore_rebuild_sources.zip", "REBUILD.md",
         "THIRD_PARTY_NOTICES.md", "runtime_manifest.json",
         *("licenses/" + name for name in (
             "CCCoreLib-LGPL-2.0.txt", "CCCoreLib-build-MIT.txt", "nanoflann-BSD.txt",
@@ -218,12 +217,9 @@ def validate_cccore_distribution(runtime_root):
             raise RuntimeError(f"CC 라이선스 해시가 다릅니다: {name}")
     if len(manifest.get("license_sha256", {})) != 7:
         raise RuntimeError("CC 라이선스 해시 목록이 누락되었습니다.")
-    for field, filename in (("source_archive", "cccore_rebuild_sources.zip"), ("native_test_report", "native_test_report.json")):
-        if manifest.get(field) != filename or file_hash(root / filename) != manifest.get(field + "_sha256"):
-            raise RuntimeError(f"CC 배포 원문 또는 검증 기록 해시가 다릅니다: {filename}")
-    report = read_json(root / "native_test_report.json")
-    if not report.get("succeeded") or report.get("tests_run", 0) < 1:
-        raise RuntimeError("CC 네이티브 검증 기록이 통과 상태가 아닙니다.")
+    if (manifest.get("source_archive") != "cccore_rebuild_sources.zip"
+            or file_hash(root / "cccore_rebuild_sources.zip") != manifest.get("source_archive_sha256")):
+        raise RuntimeError("CC 배포 원문 묶음의 경로 또는 해시가 다릅니다.")
     native_source = ROOT / "tools/align/native/cccore_worker"
     with zipfile.ZipFile(root / "cccore_rebuild_sources.zip") as archive:
         source_hashes = {
@@ -247,25 +243,6 @@ def validate_cccore_distribution(runtime_root):
                 raise RuntimeError(f"CC 배포 원문의 등록·격자 메모리 패치 해시가 다릅니다: {name}")
         if json.loads(archive.read("native/dependencies.lock.json")) != lock:
             raise RuntimeError("CC 배포 원문의 의존성 잠금 정보가 현재 소스와 다릅니다.")
-        # 원문 ZIP 전체 지문 외에도 현재 회귀 소스와 공통 입력의 포함·내용을 대조합니다.
-        test_files = {
-            "test_cccore_worker.py": "test_cccore_worker.py",
-            "test_point_to_plane.py": "test_point_to_plane.py",
-            "tests/align/native/test_mesh_bvh.cpp": "test_mesh_bvh.cpp",
-            "tests/align/native/test_bvh_icp.cpp": "test_bvh_icp.cpp",
-            "fixtures/bvh_tetra_surface.json": "fixtures/bvh_tetra_surface.json",
-        }
-        for packaged, source in test_files.items():
-            content = archive.read(packaged).decode("utf-8").replace("\r\n", "\n")
-            if content != (ROOT / "tests/align/native" / source).read_text(encoding="utf-8"):
-                raise RuntimeError(f"CC 재빌드 시험 원문 또는 고정 입력이 현재 소스와 다릅니다: {packaged}")
-        cleanup_python_files = ["tests/align/test_icp_mesh_cleanup_native.py"] + [
-            "tools/align/alignment/" + name for name in (
-                "icp_cccore_solver.py", "icp_cccore_contract.py", "icp_cccore_overlap.py",
-                "icp_mesh_cleanup.py", "icp_mesh_cleanup_native.py")]
-        for name in cleanup_python_files:
-            if archive.read(name).decode("utf-8").replace("\r\n", "\n") != (ROOT / name).read_text(encoding="utf-8"):
-                raise RuntimeError(f"CC 메시 검사 재현 원문이 현재 소스와 다릅니다: {name}")
         cleanup_hashes = manifest.get("mesh_cleanup_source_sha256")
         if not isinstance(cleanup_hashes, dict) or set(cleanup_hashes) != {"mesh_cleanup.h", "mesh_cleanup.cpp"}:
             raise RuntimeError("CC 메시 검사 구현 원문 지문 목록이 올바르지 않습니다.")

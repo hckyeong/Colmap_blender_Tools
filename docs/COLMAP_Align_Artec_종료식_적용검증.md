@@ -88,7 +88,7 @@ dr = norm(r_k - r_(k-1)) / (norm(r_(k-1)) + ε)
 - 작업 계약 9개, Blender 연동 6개, 빌드 회귀 314개 및 격리 설치 검증 통과. 기존 알려진 변환의 정확도 허용치는 완화하지 않았다.
 - 측정된 모든 새 반복의 오차 변화 식·기본 허용치·분모 상수·오차 종료 분기를 다시 계산해 확인했다. 사용자 원본 파일의 크기·수정 시각과 형상 출처 해시는 보존됐다.
 
-주요 구현은 [종료 함수](../tools/align/native/point_kd_worker/relative_delta.h), [실제 반복문](../tools/align/native/point_kd_worker/main.cpp), [매개변수 계약](../tools/align/alignment/icp_point_kd_contract.py)에 있다. 검증용 [벤치마크](../tests/align/experiments/benchmark_point_kd_blender.py)는 이전 실행 파일 경로를 명시하여 같은 Python 준비 경로에서 비교한다.
+주요 구현은 [종료 함수](../tools/align/native/point_kd_worker/relative_delta.h), [실제 반복문](../tools/align/native/point_kd_worker/main.cpp), [매개변수 계약](../tools/align/alignment/icp_point_kd_contract.py)에 있다. 검증용 [벤치마크](https://github.com/hckyeong/Colmap_blender_Tools/blob/61a764f300dccfdef09311ddf4a553673dfa2716/tests/align/experiments/benchmark_point_kd_blender.py)는 이전 실행 파일 경로를 명시하여 같은 Python 준비 경로에서 비교한다.
 
 검증 자료는 `build/verification/point-kd-artec-stop-20261021/`에 보관했다.
 

@@ -45,7 +45,6 @@ shared/blender_runtime/     작업공간 소유권·세션 교대·범용 OBJ �
 shared/colmap_io/           도구 실행 상태가 없는 공통 COLMAP 읽기·검증
 shared/colmap_transfer/     Blender ID 없는 불변 값 전달
 shared/colmap_dataset/      과거 0.2.0 데이터의 Legacy 입력
-tests/                      구조·공존·Core·Blender 회귀
 build_tools/                빌드·실행 환경·설치본 검증
 docs/README.md              완료 기능과 현재 구조 통합본
 docs/temp/                 후속 집필·검증에 필요한 원문 9개
@@ -369,12 +368,9 @@ CCCoreLib 고정 커밋은 `dc8c7d80f4ef8fd6a2c302c8d5f9c35099ba8432`다. 잠금
   -CcCorePythonPath "$PWD\.cccore-runtime\python" `
   -CcCoreRuntimePath "$PWD\.cccore-runtime\cccore"
 
-# 격리 설치본과 작업공간·파일 재연결까지 검사
-.\build_tools\test_installed_extension.ps1 `
-  -PackagePath "$PWD\colmap_tools.zip" -WorkspaceGui
 ```
 
-새 네이티브 실행 환경 준비와 다른 세부 검사 명령은 [보관된 검증 문서](temp/TESTING.md)와 현재 빌드 스크립트를 참조한다. 보관 문서의 실험판 경로·과거 버전 고정 인자는 그 시점의 재현 기록이다.
+현재 빌드는 독립 테스트 없이 실행 환경·확장 매니페스트·배포 파일 무결성을 검사한다. 테스트 코드·실행기·벤치마크 및 네이티브 시험 대상은 제거했다. 이전 코드는 [정리 전 Git 이력](https://github.com/hckyeong/Colmap_blender_Tools/tree/61a764f300dccfdef09311ddf4a553673dfa2716/tests), 상세 과거 검증은 [보관된 검증 문서](temp/TESTING.md)를 참고한다. 보관 문서의 명령은 당시 커밋에서만 실행할 수 있다. [정리 범위](테스트코드_정리.md)
 
 <a id="verification"></a>
 ## 8. 완료된 검증과 수치의 해석
@@ -411,19 +407,10 @@ v4는 강체 결과를 선택했다. 초기 대비 고정 겹침 RMS는 약 13.9
 
 합성 100%/20% 겹침을 4스레드에서 각각 3회 실행한 중앙값은 15.359초/21.047초이며 최대 정답 위치 RMS는 0.00000667/0.00048647였다. v3 실데이터 기준선은 다른 검사와 동시에 측정됐으므로 v4와의 벽시계 속도 개선율은 확정하지 않았다. 상세 조건·해시는 [0.3.41 기록](temp/migration/ALIGN_OVERLAP_SAMPLING_RELEASE_NOTE.md)에 있다.
 
-### 8.3 기능 변경 때의 검증 경계
+### 8.3 현재 배포 확인 범위
 
-```powershell
-& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_overlap.py
-& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_v4_contract.py
-& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_solver.py
-& .\.cccore-runtime\python\python.exe -X utf8 tests/align/test_icp_cccore_partial_overlap.py --threads 4
-.\build_tools\test_align_source.ps1
-```
+2026-10-22 사용자 요청으로 독립 테스트 코드를 제거했다. 현재는 정식 빌드의 실행 환경·매니페스트·파일 무결성 확인과 필요에 따른 실제 기능 확인을 수행한다. 위의 회귀 통과 수치는 정리 전 이력이며 현재 자동 회귀가 실행된다는 뜻이 아니다. 과거 회귀와 실험 원문은 [정리 전 Git 이력](https://github.com/hckyeong/Colmap_blender_Tools/tree/61a764f300dccfdef09311ddf4a553673dfa2716/tests)에 보존한다. 사용자 원본은 읽기 전용으로 보존하고 개발 경로·캐시가 ZIP에 섞이지 않도록 검사한다.
 
-구조·공개 식별자·등록·독립 실행은 Architecture/Coexistence와 설치본으로, Core는 순수 Python 검사로, Blender ID·저장·Undo는 Background 검사로 확인한다. GPU 표시·실제 입력·Workspace 교대·Native Bake 진행은 GUI 검사가 필요하며 Background 성공만으로 대체하지 않는다. 사용자 원본은 읽기 전용으로 보존하고 테스트 산출물·로그·개발 경로가 ZIP에 섞이지 않도록 검사한다.
-
-<a id="history"></a>
 ## 9. 주요 완료 이력과 대체된 결정
 
 | 단계 | 완료한 변화 | 현재 해석 |

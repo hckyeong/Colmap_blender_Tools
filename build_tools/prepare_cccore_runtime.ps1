@@ -2,6 +2,7 @@
 param(
     [string]$EnvironmentRoot = "",
     [string]$RuntimePath = "",
+    # 기존 호출 인자와의 호환성을 위해 유지하며 독립 테스트 실행에는 사용하지 않습니다.
     [string]$PythonPath = ""
 )
 
@@ -36,7 +37,7 @@ $TbbThirdParty = Join-Path $TbbRoot $Lock.tbb.third_party_source
 $RuntimeBinaries = @('colmap_cccore_worker.exe','colmap_mesh_cleanup.dll','CCCoreLib.dll','tbb12.dll','msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','concrt140.dll')
 $RuntimeLicenses = @('CCCoreLib-LGPL-2.0.txt','CCCoreLib-build-MIT.txt','nanoflann-BSD.txt','json-MIT.txt','oneTBB-Apache-2.0.txt','oneTBB-third-party-programs.txt','COLMAP-Tools-GPL.txt')
 $ExpectedRuntimeFiles = @($RuntimeBinaries) + @($RuntimeLicenses | ForEach-Object { "licenses\$_" }) + @(
-    'cccore_rebuild_sources.zip','native_test_report.json','REBUILD.md','THIRD_PARTY_NOTICES.md','runtime_manifest.json'
+    'cccore_rebuild_sources.zip','REBUILD.md','THIRD_PARTY_NOTICES.md','runtime_manifest.json'
 )
 
 function Assert-ChildPath {
@@ -180,7 +181,7 @@ function ConvertTo-PortableSelfTestResult {
 }
 
 function Assert-RuntimeManifest {
-    <# Manifest가 메시 검사와 점평면까지의 원문·배포 해시를 연결하는지 검사합니다. #>
+    <# 독립 테스트 기록 없이 제품 원문·배포 해시와 실제 DLL 식별자를 확인합니다. #>
     param([string]$Root)
     $manifestPath = Join-Path $Root 'runtime_manifest.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -319,10 +320,6 @@ function Assert-RuntimeManifest {
     }
     if ($manifest.source_archive -ne 'cccore_rebuild_sources.zip') { throw "Runtime Manifest의 원문 묶음 경로가 올바르지 않습니다." }
     Assert-Hash (Join-Path $Root $manifest.source_archive) $manifest.source_archive_sha256
-    if ($manifest.native_test_report -ne 'native_test_report.json') { throw "Runtime Manifest의 네이티브 검사 경로가 올바르지 않습니다." }
-    Assert-Hash (Join-Path $Root $manifest.native_test_report) $manifest.native_test_report_sha256
-    $nativeReport = Get-Content -LiteralPath (Join-Path $Root $manifest.native_test_report) -Raw -Encoding UTF8 | ConvertFrom-Json
-    if (!$nativeReport.succeeded -or $nativeReport.tests_run -lt 1) { throw "Runtime Manifest가 실패한 네이티브 검사 보고서를 가리킵니다." }
     $loadedLibraries = [ordered]@{ library_path='CCCoreLib.dll'; tbb_library_path='tbb12.dll' }
     foreach ($property in $loadedLibraries.Keys) {
         if (![string]::Equals([string]$manifest.self_test.$property, [string]$loadedLibraries[$property], [StringComparison]::Ordinal)) {
@@ -678,40 +675,10 @@ if (Test-Path -LiteralPath $PackagedTbb) {
 }
 New-Item -ItemType Directory -Path $PackagedTbb -Force | Out-Null
 Copy-Item -LiteralPath $TbbArchive -Destination (Join-Path $PackagedTbb $Lock.tbb.archive_name) -Force
-Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\native\test_cccore_worker.py') -Destination $SourcePackage -Force
-Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\native\test_point_to_plane.py') -Destination $SourcePackage -Force
-# Python 회귀와 선택적 C++ 시험이 같은 고정 입력을 원문 묶음에서 읽도록 보존합니다.
-$NativeTests = Join-Path $ProjectRoot 'tests\align\native'
-$PackagedTests = Join-Path $SourcePackage 'tests\align\native'
-$PackagedFixtures = Join-Path $SourcePackage 'fixtures'
-New-Item -ItemType Directory -Path $PackagedTests, $PackagedFixtures -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $NativeTests 'test_mesh_bvh.cpp'), (Join-Path $NativeTests 'test_bvh_icp.cpp') -Destination $PackagedTests -Force
-Copy-Item -LiteralPath (Join-Path $NativeTests 'fixtures\bvh_tetra_surface.json') -Destination $PackagedFixtures -Force
-# 메시 검사 비교 시험에 필요한 순수 파이썬 원문을 동일한 상대 경로로 보존합니다.
-$PackagedAlignment = Join-Path $SourcePackage 'tools\align\alignment'
-New-Item -ItemType Directory -Path $PackagedAlignment -Force | Out-Null
-foreach ($name in @('icp_cccore_solver.py', 'icp_cccore_contract.py', 'icp_cccore_overlap.py', 'icp_mesh_cleanup.py', 'icp_mesh_cleanup_native.py')) {
-    Copy-Item -LiteralPath (Join-Path $ProjectRoot "tools\align\alignment\$name") -Destination $PackagedAlignment -Force
-}
-Copy-Item -LiteralPath (Join-Path $ProjectRoot 'tests\align\test_icp_mesh_cleanup_native.py') -Destination (Join-Path $SourcePackage 'tests\align') -Force
-
+# 제품과 고정 의존성의 재빌드 원문만 묶고 실제 실행 환경을 확인합니다.
 $SourceArchive = Join-Path $StagedRuntime 'cccore_rebuild_sources.zip'
 Compress-Archive -Path (Join-Path $SourcePackage '*') -DestinationPath $SourceArchive -Force
 $SelfTestResult = ConvertTo-PortableSelfTestResult (Invoke-NativeEnvironmentCheck $StagedRuntime)
-$TestPython = if ($PythonPath) { [IO.Path]::GetFullPath($PythonPath) } else { Join-Path $EnvironmentRoot 'runtime\python\python.exe' }
-if (!(Test-Path -LiteralPath $TestPython)) { throw "네이티브 계약 검사에 사용할 격리 Python이 없습니다." }
-$oldWorker = $env:COLMAP_CCCORE_WORKER
-try {
-    $env:COLMAP_CCCORE_WORKER = Join-Path $StagedRuntime 'colmap_cccore_worker.exe'
-    Invoke-Checked $TestPython @('-X','utf8','-I',(Join-Path $ProjectRoot 'tests\align\native\test_cccore_worker.py'),'--report',(Join-Path $StagedRuntime 'native_test_report.json'))
-    Invoke-Checked $TestPython @('-X','utf8',(Join-Path $ProjectRoot 'tests\align\native\test_point_to_plane.py'))
-}
-finally { $env:COLMAP_CCCORE_WORKER = $oldWorker }
-# 배포 보고서가 폐기되는 staging 경로 대신 런타임 내부 상대 경로를 기록하게 합니다.
-$NativeTestReportPath = Join-Path $StagedRuntime 'native_test_report.json'
-$NativeTestReport = Get-Content -LiteralPath $NativeTestReportPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$NativeTestReport.worker = 'colmap_cccore_worker.exe'
-$NativeTestReport | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $NativeTestReportPath -Encoding utf8
 $Binaries = [ordered]@{}
 foreach ($binary in $RuntimeBinaries) {
     $Binaries[$binary] = (Get-FileHash -LiteralPath (Join-Path $StagedRuntime $binary) -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -793,8 +760,6 @@ $Manifest = [ordered]@{
     source_archive = 'cccore_rebuild_sources.zip'
     source_archive_sha256 = (Get-FileHash -LiteralPath $SourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
     self_test = $SelfTestResult
-    native_test_report = 'native_test_report.json'
-    native_test_report_sha256 = (Get-FileHash -LiteralPath (Join-Path $StagedRuntime 'native_test_report.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     runtime_files = $ExpectedRuntimeFiles
     rebuild_command = '.\build_tools\prepare_cccore_runtime.ps1 -EnvironmentRoot <격리환경절대경로>'
     created_utc = [DateTime]::UtcNow.ToString('o')
@@ -802,12 +767,6 @@ $Manifest = [ordered]@{
 $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $StagedRuntime 'runtime_manifest.json') -Encoding utf8
 Assert-ExactFileSet $StagedRuntime $ExpectedRuntimeFiles
 Assert-RuntimeManifest $StagedRuntime
-$oldCleanupWorker = $env:COLMAP_CCCORE_WORKER
-try {
-    $env:COLMAP_CCCORE_WORKER = Join-Path $StagedRuntime 'colmap_cccore_worker.exe'
-    Invoke-Checked $TestPython @('-X','utf8',(Join-Path $ProjectRoot 'tests\align\test_icp_mesh_cleanup_native.py'))
-}
-finally { $env:COLMAP_CCCORE_WORKER = $oldCleanupWorker }
 
 $hadRuntime = Test-Path -LiteralPath $RuntimePath
 $stagePublished = $false

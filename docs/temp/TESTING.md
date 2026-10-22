@@ -1,4 +1,6 @@
-# 통합 검증 방법
+# 통합 검증 방법 · 과거 기록
+
+> 2026-10-22 사용자 요청으로 테스트 코드와 전용 실행기를 현재 저장소에서 제거했습니다. 아래 명령은 [정리 전 커밋](https://github.com/hckyeong/Colmap_blender_Tools/tree/61a764f300dccfdef09311ddf4a553673dfa2716)의 재현 기록이며 현재 빌드 절차가 아닙니다.
 
 모든 명령은 Repository Root에서 실행합니다.
 

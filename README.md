@@ -1,6 +1,6 @@
 # COLMAP Tools
 
-**[최신 설치 ZIP 다운로드](https://github.com/hckyeong/Colmap_blender_Tools/raw/refs/heads/main/colmap_tools.zip)** · 현재 버전 **0.3.81** · Windows x64 / Blender 5.2 이상
+**[최신 설치 ZIP 다운로드](https://github.com/hckyeong/Colmap_blender_Tools/raw/refs/heads/main/colmap_tools.zip)** · 현재 버전 **0.3.83** · Windows x64 / Blender 5.2 이상
 
 다운로드한 `colmap_tools.zip`을 Blender의 **환경설정 → 애드온 → 디스크에서 설치**에서 선택하세요. 실행 메뉴는 **Window → COLMAP Tools**입니다. 저장소 최상위에는 최신 설치본 하나만 유지합니다.
 
@@ -45,7 +45,8 @@ COLMAP 점·카메라를 **선택·제거·필터링**하고 전체 데이터셋
 
 ```powershell
 .\build_tools\build_extension.ps1
-.\build_tools\test_installed_extension.ps1
 ```
 
 빌드 결과는 최상위 `colmap_tools.zip`입니다. 기본 정렬 실행 환경은 ZIP에 포함되며, 네이티브 실행 환경을 처음 빌드할 때는 Visual Studio 2022 C++ 빌드 도구가 필요합니다. [빌드 상세 안내](docs/README.md#build)
+
+독립 테스트·벤치마크 코드는 저장소에서 제거했습니다. 빌드는 실행 환경·매니페스트·파일 무결성을 검사하며, 과거 테스트는 [정리 전 Git 이력](https://github.com/hckyeong/Colmap_blender_Tools/tree/61a764f300dccfdef09311ddf4a553673dfa2716/tests)에서 확인할 수 있습니다.

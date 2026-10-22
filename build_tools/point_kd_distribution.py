@@ -72,7 +72,7 @@ def validate_native(root):
 
 
 def prepare():
-    """검증한 아카이브와 소스만 사용해 이동 가능한 네이티브 배포 폴더를 만듭니다."""
+    """검증한 의존성과 제품 소스로 테스트 파일 없는 네이티브 배포 폴더를 만듭니다."""
     lock = shared.read_json(SOURCE / 'dependencies.lock.json')
     base = ROOT / '.point-kd-runtime'
     cache = base / 'cache'
@@ -131,9 +131,6 @@ def prepare():
                     archive.write(path, 'native/' + path.name)
                 archive.write(Path(__file__), 'build_tools/point_kd_distribution.py')
                 archive.write(Path(shared.__file__), 'build_tools/cccore_distribution.py')
-                for path in sorted((ROOT / 'tests/align/native').glob('test_point_kd*')):
-                    if path.is_file():
-                        archive.write(path, 'tests/align/native/' + path.name)
             manifest = {'schema_version': 1, 'protocol_version': PROTOCOL, 'backend_id': 'POINT_KD_ICP',
                         'dependencies': lock, 'self_test': probe,
                         'source_sha256': {path.name: shared.file_hash(path) for path in source_files},

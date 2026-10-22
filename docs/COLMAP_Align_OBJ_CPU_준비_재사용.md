@@ -70,7 +70,7 @@ CPU 모델·표시 준비가 약 42초 줄어든 것이 직접 확인된 개선�
 - [전체 비교 결과](../build/verification/obj-cpu-reuse-20261021/comparison.json)
 - [측정 코드](../build/verification/obj-cpu-reuse-20261021/benchmark.py), [교대 실행 스크립트](../build/verification/obj-cpu-reuse-20261021/run_benchmark.ps1), [비교 검사 코드](../build/verification/obj-cpu-reuse-20261021/compare_results.py)
 - [50개 소스 회귀 결과](../build/verification/obj-cpu-reuse-20261021/source-tests/report.json)
-- [신규 CPU 준비 보존 검사](../tests/align/blender/test_obj_cpu_preparation.py)
+- [신규 CPU 준비 보존 검사](https://github.com/hckyeong/Colmap_blender_Tools/blob/61a764f300dccfdef09311ddf4a553673dfa2716/tests/align/blender/test_obj_cpu_preparation.py)
 
 측정 증거와 변경 전 두 모듈은 로컬 `build/verification/obj-cpu-reuse-20261021/`에 보존한다. `build/`는 Git 추적 대상이 아니므로 위 증거 링크는 현재 작업공간 기준이다.
 
