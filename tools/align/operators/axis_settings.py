@@ -11,6 +11,8 @@ from ..axis_settings import (
     commit_axis_edit,
     rc_axis_pair_for_model,
     update_axis_edit,
+    center_axis_gizmo_on_bounds,
+    move_axis_geometry_gizmo_to_origin,
 )
 from ..axis_edit_transform import prepare_dataset_axis_edit, compose_dataset_geometry_transform
 from ..display_axes import (
@@ -260,12 +262,18 @@ def _draw_component(layout, operator, component: str, title: str) -> None:
 
 
 def _draw_dataset_transform(layout, operator) -> None:
-    """데이터셋 전체의 이동·중심 회전·배율과 잠금 및 원점 이동을 한 벌로 표시합니다."""
+    """기즈모 두 버튼의 즉시 실행과 적용을 기다리는 공통 변환 입력을 구분합니다."""
     box = layout.box()
     header = box.row(align=True)
     header.label(text="데이터셋 공통 변환")
     reset = header.operator("colmap_align.reset_dataset_axis_transform", text="변환 초기화", icon="LOOP_BACK")
     reset.edit_token = operator.edit_token
+    pivot = box.column(align=True)
+    pivot.label(text="즉시 실행 · 팝업 취소 후에도 유지", icon="INFO")
+    center = pivot.operator("colmap_align.center_axis_gizmo_on_bounds", text="기즈모를 바운딩 박스 중심으로", icon="PIVOT_BOUNDBOX")
+    center.edit_token = operator.edit_token
+    move = pivot.operator("colmap_align.move_axis_gizmo_to_origin", text="물체를 이동해 기즈모를 원점으로", icon="PIVOT_CURSOR")
+    move.edit_token = operator.edit_token
     location = box.row(align=True)
     location.label(text="이동")
     origin = location.operator("colmap_align.center_geometry_at_origin", text="중심을 원점으로", icon="PIVOT_CURSOR")
@@ -502,7 +510,60 @@ class COLMAPALIGN_OT_center_geometry_at_origin(bpy.types.Operator):
         return {"FINISHED"} if _publish_preview(operator) else {"CANCELLED"}
 
 
+class COLMAPALIGN_OT_center_axis_gizmo_on_bounds(bpy.types.Operator):
+    """물체를 움직이지 않고 팝업 대상의 전체 경계 중심을 기즈모 중심으로 지정합니다."""
+    bl_idname = "colmap_align.center_axis_gizmo_on_bounds"
+    bl_label = "기즈모를 바운딩 박스 중심으로"
+    bl_description = "물체는 유지하고 기즈모만 표시된 전체 경계 중심으로 즉시 옮깁니다. 팝업을 닫은 뒤 실행 취소할 수 있습니다"
+    bl_options = {"INTERNAL"}
+    edit_token: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, _context):
+        """기즈모 중심만 즉시 확정하고 별도 실행 취소 이력을 남깁니다."""
+        operator = _OPEN_DIALOGS.get(self.edit_token)
+        if operator is None or not _publish_preview(operator):
+            self.report({"WARNING"}, "유효한 축 설정 팝업이 열려 있지 않습니다.")
+            return {"CANCELLED"}
+        try:
+            center_axis_gizmo_on_bounds(RUNTIME, self.edit_token)
+        except (ValueError, RuntimeError) as error:
+            operator.error_message = str(error)
+            return {"CANCELLED"}
+        request_redraw()
+        return {"FINISHED"}
+
+
+class COLMAPALIGN_OT_move_axis_gizmo_to_origin(bpy.types.Operator):
+    """현재 기즈모를 기준으로 대상 물체를 움직여 월드 원점에 맞춥니다."""
+    bl_idname = "colmap_align.move_axis_gizmo_to_origin"
+    bl_label = "물체를 이동해 기즈모를 원점으로"
+    bl_description = "현재 표시 기즈모가 월드 원점에 오도록 물체를 즉시 이동합니다. 중심 지정과 독립적이며 팝업을 닫은 뒤 실행 취소할 수 있습니다"
+    bl_options = {"INTERNAL"}
+    edit_token: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, _context):
+        """기즈모 기준 이동을 별도 이력으로 확정하고 미적용 입력의 정밀 기준을 갱신합니다."""
+        operator = _OPEN_DIALOGS.get(self.edit_token)
+        if operator is None or not _publish_preview(operator):
+            self.report({"WARNING"}, "유효한 축 설정 팝업이 열려 있지 않습니다.")
+            return {"CANCELLED"}
+        operator.suspend_updates = True
+        try:
+            changed = move_axis_geometry_gizmo_to_origin(RUNTIME, self.edit_token)
+            state = RUNTIME.axis_settings
+            _set_dialog_values(operator, state.main_transform, state.companion_transform)
+        except (ValueError, RuntimeError) as error:
+            operator.error_message = str(error)
+            return {"CANCELLED"}
+        finally:
+            operator.suspend_updates = False
+        if changed:
+            notify_project_state_changed("기즈모 기준 물체 원점 이동")
+        return {"FINISHED"} if _publish_preview(operator) else {"CANCELLED"}
+
+
 CLASSES = (
     COLMAPALIGN_OT_edit_geometry_axes, COLMAPALIGN_OT_reset_geometry_axes,
     COLMAPALIGN_OT_reset_dataset_axis_transform, COLMAPALIGN_OT_center_geometry_at_origin,
+    COLMAPALIGN_OT_center_axis_gizmo_on_bounds, COLMAPALIGN_OT_move_axis_gizmo_to_origin,
 )

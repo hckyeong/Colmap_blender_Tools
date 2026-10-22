@@ -1,0 +1,40 @@
+{
+  "protocol_version": "point-kd-native-v1",
+  "eigen": {
+    "version": "3.4.0",
+    "repository": "https://gitlab.com/libeigen/eigen",
+    "license": "MPL-2.0",
+    "archive_url": "https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz",
+    "archive_name": "eigen-3.4.0.tar.gz",
+    "archive_sha256": "8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72",
+    "archive_root": "eigen-3.4.0"
+  },
+  "json": {
+    "repository": "https://github.com/nlohmann/json.git",
+    "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+    "version": "3.11.3",
+    "license": "MIT",
+    "header_url": "https://raw.githubusercontent.com/nlohmann/json/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03/single_include/nlohmann/json.hpp",
+    "header_sha256": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6",
+    "license_url": "https://raw.githubusercontent.com/nlohmann/json/9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03/LICENSE.MIT",
+    "license_sha256": "86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14"
+  },
+  "tbb": {
+    "repository": "https://github.com/uxlfoundation/oneTBB.git",
+    "version": "2022.0.0",
+    "license": "Apache-2.0",
+    "archive_name": "oneapi-tbb-2022.0.0-win.zip",
+    "archive_url": "https://github.com/uxlfoundation/oneTBB/releases/download/v2022.0.0/oneapi-tbb-2022.0.0-win.zip",
+    "archive_sha256": "660f3555de26bee8cd4daef1105d5d9e93e695b2fcfa9c57db3aa38c6afe5675",
+    "archive_root": "oneapi-tbb-2022.0.0",
+    "cmake_dir": "lib/cmake/tbb",
+    "runtime_file": "redist/intel64/vc14/tbb12.dll",
+    "runtime_sha256": "6269822eb10b9de2e63812fd52b96c4d93d5ad53835760192f5c892e37d8e52d",
+    "license_source": "LICENSE.txt",
+    "license_file": "licenses/oneTBB-Apache-2.0.txt",
+    "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "third_party_source": "third-party-programs.txt",
+    "third_party_file": "licenses/oneTBB-third-party-programs.txt",
+    "third_party_sha256": "1634857eb058dce5278c57a832b8974190785145f4be9acdbdb511f3a0c4091c"
+  }
+}

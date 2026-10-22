@@ -703,10 +703,10 @@ def _embedded_proxy(
     display_name: str,
     source_path: str,
     geometry_revision: int,
-    display_limit: int,
+    display_limit: int | None,
     geometry_only: bool,
 ) -> Any:
-    """저장 식별자와 형상을 프록시 생성 시 한 번 검증하고 결정적 표시 표본을 복원합니다."""
+    """내장 원본을 검증하고 명시한 표시 상한 또는 전체 등록 정점으로 복원합니다."""
 
     mesh = find_embedded_obj_mesh(asset_uuid)
     if int(schema_version) != int(mesh.get("schema_version", 0)):
@@ -720,6 +720,8 @@ def _embedded_proxy(
         expected_asset_uuid=asset_uuid,
         expected_revision=geometry_revision,
     )
+    if display_limit is None:
+        return proxy
     offsets = build_display_indices(
         proxy.registration_vertex_indices.astype(np.uint64, copy=False),
         max_points=display_limit,
@@ -772,7 +774,7 @@ def _restore_embedded_main(runtime: Any, model: ProjectModelSnapshot) -> None:
 
 
 def _restore_embedded_companion(runtime: Any, model: ProjectModelSnapshot) -> None:
-    """COLMAP 소유 연결 OBJ를 별도 내장 UUID에서 형상 전용 프록시로 복원합니다."""
+    """연결 OBJ를 내장 UUID에서 복원하며 부모 점군의 표시 상한은 적용하지 않습니다."""
 
     source = model.companion_source
     if source is None or not source.embedded_obj_asset_uuid:
@@ -784,7 +786,7 @@ def _restore_embedded_companion(runtime: Any, model: ProjectModelSnapshot) -> No
         display_name=model.display_name,
         source_path=source.path_absolute,
         geometry_revision=source.embedded_obj_geometry_revision,
-        display_limit=model.source.display_vertex_limit,
+        display_limit=None,
         geometry_only=True,
     )
     metadata = CompanionMeshSourceMetadata(

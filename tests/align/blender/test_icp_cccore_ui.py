@@ -30,14 +30,14 @@ def _selected_runtime():
 
 
 def test_defaults_and_legacy_profiles() -> None:
-    """정식·개발 기본은 CC이고 명시적 구엔진 비교 프로필만 Small GICP인지 확인합니다."""
+    """새 기본은 점 기반 엔진이며 명시적 구엔진 비교 프로필의 선택을 유지합니다."""
     from tools.align import distribution_profile
     from tools.align.alignment.icp_solver_backend import backend_algorithm_version
 
     assert backend_algorithm_version("CCCORELIB") == "cccore-icp-v7"
-    for profile in ("CCCORELIB", "SMALL_GICP", "FULL"):
+    for profile in ("POINT_KD", "CCCORELIB", "SMALL_GICP", "FULL"):
         with patch.object(distribution_profile, "DISTRIBUTION_PROFILE", profile):
-            expected = "SMALL_GICP" if profile == "SMALL_GICP" else "CCCORELIB"
+            expected = {"CCCORELIB": "CCCORELIB", "SMALL_GICP": "SMALL_GICP"}.get(profile, "POINT_KD_ICP")
             assert distribution_profile.default_icp_backend() == expected
             items = tuple(item[0] for item in distribution_profile.icp_backend_enum_items())
             if profile != "FULL":
@@ -69,17 +69,20 @@ def test_explicit_small_gicp_profile_rejects_surface_input() -> None:
 
 
 def test_rna_defaults_and_scale_descriptions() -> None:
-    """실제 Blender 속성 등록에서 CC 기본값과 두 배율 단계의 설명을 확인합니다."""
+    """실제 속성 등록에서 기본 강체 모드와 독립적인 마커·Sim(3) 옵션을 확인합니다."""
     from tools.align.properties import COLMAPALIGN_PG_settings
     from tools.align.operators.marker_alignment import COLMAPALIGN_OT_align_marker_preview
+    from tools.align.distribution_profile import default_icp_backend
 
     bpy.utils.register_class(COLMAPALIGN_PG_settings)
     try:
         properties = COLMAPALIGN_PG_settings.bl_rna.properties
-        assert properties["icp_solver_backend"].default == "CCCORELIB"
+        assert properties["icp_solver_backend"].default == default_icp_backend()
         assert "초기 정렬" in properties["marker_use_uniform_scale"].description
         assert "별도" in properties["marker_use_uniform_scale"].description
-        assert "±10%" in COLMAPALIGN_OT_align_marker_preview.bl_description
+        assert properties["icp_sim3_enabled"].default is False
+        assert "Sim(3)" in properties["icp_sim3_enabled"].name
+        assert ("배율을 보존" if default_icp_backend() == "POINT_KD_ICP" else "±10%") in COLMAPALIGN_OT_align_marker_preview.bl_description
     finally:
         bpy.utils.unregister_class(COLMAPALIGN_PG_settings)
 
@@ -148,11 +151,12 @@ def test_geometry_guard_covers_direct_and_marker_preview_paths() -> None:
 
 
 def test_align_execution_always_dispatches_cccore() -> None:
-    """Align 오퍼레이터가 고정 CC 엔진과 배율 보정을 실제 공개 실행 경계로 전달합니다."""
+    """명시적 CC 비교 프로필이 CC 엔진과 배율 보정을 공개 실행 경계로 전달합니다."""
     from tools.align.operators import marker_alignment
 
     runtime = _selected_runtime()
     with patch.object(marker_alignment, "RUNTIME", runtime), patch.object(marker_alignment, "restore_input_block_reason", return_value=None), \
+         patch.object(marker_alignment, "_AUTOMATIC_ICP_BACKEND", "CCCORELIB"), \
          patch.object(marker_alignment, "begin_icp_job") as begin, patch.object(marker_alignment, "_register_icp_poll_timer"), \
          patch.object(marker_alignment, "request_redraw"), patch.object(marker_alignment, "_report_status") as report, \
          patch.object(marker_alignment, "configured_icp_python_path", return_value="전용정렬/python.exe"):
@@ -322,7 +326,8 @@ def test_cc_environment_button_dispatch_and_registration() -> None:
     from tools.align.alignment import icp_cccore_runtime
 
     layout = _Layout()
-    with patch.object(properties, "includes_optional_backends", return_value=False):
+    with patch.object(properties, "includes_optional_backends", return_value=False), \
+         patch.object(properties, "default_icp_backend", return_value="CCCORELIB"):
         properties.COLMAPALIGN_AP_preferences.draw(SimpleNamespace(layout=layout), SimpleNamespace())
     assert layout.operators == ["colmap_align.validate_cccore_environment"]
     assert layout.properties == ["cc_cpu_thread_limit"]

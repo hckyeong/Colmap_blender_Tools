@@ -185,9 +185,10 @@ class LifecycleRegistry:
         space_type: str = "EMPTY",
         region_type: str = "WINDOW",
         alt: bool = False,
+        any_modifier: bool = False,
         head: bool = False,
     ) -> None:
-        """애드온 KeyConfig에 우선순위와 modifier를 포함한 단축키를 등록합니다."""
+        """애드온 단축키를 우선순위·보조키 및 보조키 자체의 입력 조건과 함께 등록합니다."""
         keyconfig = getattr(bpy.context.window_manager.keyconfigs, "addon", None)
         if keyconfig is None:
             return
@@ -202,6 +203,7 @@ class LifecycleRegistry:
                 and candidate.type == str(event_type)
                 and candidate.value == "PRESS"
                 and bool(candidate.alt) is bool(alt)
+                and bool(candidate.any) is bool(any_modifier)
             ):
                 return
         item = keymap.keymap_items.new(
@@ -209,6 +211,7 @@ class LifecycleRegistry:
             str(event_type),
             "PRESS",
             alt=bool(alt),
+            any=bool(any_modifier),
             head=bool(head),
         )
         self._keymap_items.append((keymap, item))
@@ -608,7 +611,7 @@ def _rebuild_layer_ui_event_tracker(_scene: Any, _reason: str, _epoch: int) -> N
 
 
 def _rebuild_projection_marker_session(scene: Any, _reason: str, _epoch: int) -> None:
-    """Load·Undo 뒤 활성 Paint Workspace에만 Projection Marker 사용권을 복원합니다."""
+    """활성 작업공간의 카메라 권한을 복구하되 실행 취소·다시 실행 시 현재 뷰를 유지합니다."""
 
     if scene is None:
         return
@@ -669,6 +672,7 @@ def _rebuild_projection_marker_session(scene: Any, _reason: str, _epoch: int) ->
                 scene,
                 int(scene.frame_current),
                 refresh_source=False,
+                enter_camera_view=_reason not in {"undo_post", "redo_post"},
             )
         return
     invalidate_projection_camera_session(scene)
@@ -822,12 +826,14 @@ def register() -> None:
 
         class_modules = (
             ".properties",
-            ".snapshot_update",
+            ".camera_import",
+            ".model_import",
             ".camera_review",
             ".viewport_navigation",
             ".paint_session",
             ".frame_source",
             ".stencil_session",
+            ".stencil_erase",
             ".overlay_durability",
             ".layers",
             ".texture_export",
@@ -840,6 +846,10 @@ def register() -> None:
             "projection_paint",
             PointerProperty(type=PP_PG_settings),
         )
+        from .camera_import import set_import_request_factory
+        from .core_adapter import create_camera_import_request_job
+
+        set_import_request_factory(create_camera_import_request_job)
         from .layers import draw_layer_list_context_menu
 
         LIFECYCLE.append_menu_callback(
@@ -865,6 +875,20 @@ def register() -> None:
             space_type="VIEW_3D",
             region_type="WINDOW",
             head=True,
+        )
+        from .stencil_erase import clear_stencil_erase
+
+        for keymap_name in ("3D View", "Image Paint"):
+            for control_key in ("LEFT_CTRL", "RIGHT_CTRL"):
+                LIFECYCLE.register_keymap_item(
+                    keymap_name, "projection_paint.hold_stencil_erase", control_key,
+                    space_type="VIEW_3D" if keymap_name == "3D View" else "EMPTY",
+                    region_type="WINDOW", any_modifier=True, head=True,
+                )
+        LIFECYCLE.add_barrier_hook(clear_stencil_erase)
+        LIFECYCLE.register_handler(
+            bpy.app.handlers.save_pre, clear_stencil_erase,
+            component="stencil_erase_save", keep_after_load=True,
         )
         industry_navigation = (
             ("projection_paint.industry_orbit", "LEFTMOUSE"),
@@ -912,6 +936,9 @@ def register() -> None:
         LIFECYCLE.rebuild(getattr(bpy.context, "scene", None), "register")
         _register_paint_handoff_adapter()
     except Exception:
+        from .camera_import import set_import_request_factory
+
+        set_import_request_factory(None)
         _unregister_paint_handoff_adapter()
         LIFECYCLE.unregister_all("register_failure")
         raise
@@ -933,6 +960,9 @@ def _unregister_now() -> None:
         disable_layer_ui_event_tracking()
         unregister_state_handlers()
     finally:
+        from .camera_import import set_import_request_factory
+
+        set_import_request_factory(None)
         LIFECYCLE.unregister_all("unregister")
         if bpy.app.driver_namespace.get(_REGISTRY_NAMESPACE_KEY) is LIFECYCLE:
             del bpy.app.driver_namespace[_REGISTRY_NAMESPACE_KEY]

@@ -76,9 +76,11 @@ class PickResult:
 
 
 def clear_mesh_surface_pick_cache() -> None:
-    """세션 종료·파일 교체 시 메시 면 피킹 BVH 참조를 모두 해제합니다."""
+    """세션 종료·파일 교체 시 기존 BVH와 화면 선택 GPU 셰이더 참조를 해제합니다."""
 
+    from .screen_pick import clear_screen_pick_resources
     _MESH_SURFACE_BVH_CACHE.clear()
+    clear_screen_pick_resources()
 
 
 def discard_mesh_surface_pick_cache_for_model(
@@ -208,6 +210,33 @@ def _view_ray(
     return origin, np.ascontiguousarray(direction / direction_length, dtype=np.float64)
 
 
+def _screen_view_ray(
+    region: Any, region_3d: Any, mouse_region: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """화면 투영을 배정밀도로 역산해 GPU 픽셀과 일치하는 근평면 광선을 만듭니다."""
+    width, height = int(region.width), int(region.height)
+    projection = _matrix_array(region_3d.perspective_matrix)
+    if width <= 0 or height <= 0 or projection is None:
+        raise ValueError("마커 선택 광선의 화면 투영이 올바르지 않습니다.")
+    x, y = float(mouse_region[0]), float(mouse_region[1])
+    if not np.isfinite((x, y)).all() or not (0 <= x < width and 0 <= y < height):
+        raise ValueError("마커 선택 위치가 뷰포트 범위를 벗어났습니다.")
+    try:
+        inverse = np.linalg.inv(projection)
+    except np.linalg.LinAlgError as error:
+        raise ValueError("마커 선택 투영의 역행렬을 계산할 수 없습니다.") from error
+    near = inverse @ np.asarray((2 * x / width - 1, 2 * y / height - 1, -1, 1))
+    middle = inverse @ np.asarray((2 * x / width - 1, 2 * y / height - 1, 0, 1))
+    if not np.isfinite((near, middle)).all() or min(abs(near[3]), abs(middle[3])) <= np.finfo(np.float64).tiny:
+        raise ValueError("마커 선택 광선을 유한한 좌표로 복원할 수 없습니다.")
+    origin = near[:3] / near[3]
+    direction = middle[:3] / middle[3] - origin
+    length = float(np.linalg.norm(direction))
+    if not math.isfinite(length) or length <= np.finfo(np.float64).tiny:
+        raise ValueError("마커 선택 광선 방향을 계산할 수 없습니다.")
+    return np.ascontiguousarray(origin), np.ascontiguousarray(direction / length)
+
+
 def _ray_in_source_local(
     model_id: str,
     ray_origin: np.ndarray,
@@ -323,7 +352,7 @@ def _ray_triangle_position_float64(
     ray_direction: np.ndarray,
     triangle: np.ndarray,
 ) -> np.ndarray | None:
-    """BVH가 찾은 삼각면에 광선을 float64로 다시 교차해 저장 좌표를 계산합니다."""
+    """검색된 원본 삼각면에 광선을 float64로 교차해 저장 좌표를 계산합니다."""
 
     edge_first = triangle[1] - triangle[0]
     edge_second = triangle[2] - triangle[0]
@@ -428,6 +457,50 @@ def _pick_model_mesh_surface_from_ray(
         source_point_id=triangle_index,
         geometry_source=normalize_marker_geometry_source(geometry_source),
     )
+
+
+def _pick_model_mesh_surface_from_screen(
+    model_id: str, model_data: Any, region: Any, region_3d: Any,
+    mouse_region: tuple[float, float], ray_origin: np.ndarray, ray_direction: np.ndarray,
+    geometry_source: str = MARKER_GEOMETRY_SOURCE_MAIN,
+) -> PickResult | None:
+    """화면 ID 후보만 배정밀도로 재교차하여 원본 ID와 Source Local 좌표를 반환합니다."""
+    from .renderer import prepared_mesh_pick_batch
+    from .screen_pick import screen_triangle_candidates
+
+    source = normalize_marker_geometry_source(geometry_source)
+    local_origin, local_direction = _ray_in_source_local(model_id, ray_origin, ray_direction, source)
+    if not _ray_intersects_bounds(local_origin, local_direction, model_data.bounds_min, model_data.bounds_max):
+        return None
+    try:
+        candidates = screen_triangle_candidates(
+            prepared_mesh_pick_batch(model_id, model_data),
+            effective_model_matrix_for_id(model_id, companion=source == MARKER_GEOMETRY_SOURCE_COMPANION),
+            region, region_3d, mouse_region, len(model_data.triangles_uint32),
+            (model_data.bounds_min, model_data.bounds_max),
+        )
+    except (RuntimeError, ValueError, ReferenceError) as error:
+        raise ModelRepositoryError(f"화면에서 마커 표면을 선택할 수 없습니다: {error}") from error
+    best = None
+    nearest = math.inf
+    for triangle_id in candidates:
+        triangle = model_data.vertices_float64[model_data.triangles_uint32[triangle_id]]
+        local_position = _ray_triangle_position_float64(local_origin, local_direction, triangle)
+        if local_position is None:
+            continue
+        project_position = effective_positions_for_model_id(
+            model_id, local_position[np.newaxis, :], companion=source == MARKER_GEOMETRY_SOURCE_COMPANION,
+        )[0]
+        depth = float(np.dot(project_position - ray_origin, ray_direction))
+        if np.isfinite(project_position).all() and math.isfinite(depth) and 0 <= depth < nearest:
+            nearest = depth
+            best = PickResult(
+                model_id=model_id, point3d_id=triangle_id,
+                position=tuple(float(value) for value in local_position),
+                screen_distance=0.0, depth=depth, point_kind=MARKER_POINT_KIND_MESH_SURFACE,
+                source_point_id=triangle_id, geometry_source=source,
+            )
+    return best
 
 
 def _project_positions(
@@ -561,8 +634,10 @@ def pick_nearest_point_for_model_ids(
     region_3d: Any,
     mouse_region: tuple[float, float],
     radius: float = PICK_RADIUS_PX,
+    *,
+    screen_surface: bool = False,
 ) -> PickResult | None:
-    """모든 보이는 레이어의 실제 앞쪽 형상을 종류 제한 없이 마커 후보로 반환합니다."""
+    """표시 레이어를 선택하며 화면 표면 모드는 마커와 피벗의 ID·깊이 경로를 공유합니다."""
 
     if radius <= 0.0:
         return None
@@ -570,10 +645,19 @@ def pick_nearest_point_for_model_ids(
     if not normalized_ids:
         return None
 
+    needs_screen_ray = screen_surface and any(
+        geometry is not None and geometry_kind_for_model(geometry[1]) == "TRIANGLE_MESH"
+        for geometry in (visible_marker_geometry_for_id(model_id) for model_id in normalized_ids)
+    )
     radius_squared = float(radius) * float(radius)
     try:
-        ray_origin, ray_direction = _view_ray(region, region_3d, mouse_region)
+        ray_origin, ray_direction = (
+            _screen_view_ray(region, region_3d, mouse_region)
+            if needs_screen_ray else _view_ray(region, region_3d, mouse_region)
+        )
     except (AttributeError, RuntimeError, TypeError, ValueError):
+        if needs_screen_ray:
+            raise ModelRepositoryError("마커 선택에 사용할 화면 광선을 계산할 수 없습니다.")
         ray_origin = ray_direction = None
 
     best_key: tuple[float, float] | None = None
@@ -586,10 +670,16 @@ def pick_nearest_point_for_model_ids(
             geometry_source, model_data = visible_geometry
             is_mesh = geometry_kind_for_model(model_data) == "TRIANGLE_MESH"
             if is_mesh and ray_origin is not None and ray_direction is not None:
-                result = _pick_model_mesh_surface_from_ray(
-                    model_id, model_data, region, region_3d,
-                    ray_origin, ray_direction, geometry_source,
-                )
+                if screen_surface:
+                    result = _pick_model_mesh_surface_from_screen(
+                        model_id, model_data, region, region_3d, mouse_region,
+                        ray_origin, ray_direction, geometry_source,
+                    )
+                else:
+                    result = _pick_model_mesh_surface_from_ray(
+                        model_id, model_data, region, region_3d,
+                        ray_origin, ray_direction, geometry_source,
+                    )
             else:
                 result = None
             if result is None and geometry_source == MARKER_GEOMETRY_SOURCE_MAIN:
@@ -598,6 +688,8 @@ def pick_nearest_point_for_model_ids(
                     radius_squared, ray_origin, ray_direction,
                 )
         except (ModelRepositoryError, TypeError, ValueError, IndexError) as error:
+            if screen_surface:
+                raise ModelRepositoryError(str(error)) from error
             _LOGGER.error(
                 "event=pick_projection_failed model_id=%s reason=%s",
                 model_id,
@@ -624,7 +716,7 @@ def pick_nearest_point(
     mouse_region: tuple[float, float],
     radius: float = PICK_RADIUS_PX,
 ) -> PickResult | None:
-    """역할별로 실제 보이는 주 형상·연결 표면의 최근접 후보를 반환합니다."""
+    """역할별 마커 표면은 화면 ID·깊이로 찾고 점군은 기존 점 선택을 유지합니다."""
 
     return pick_nearest_point_for_model_ids(
         marker_pick_model_ids(role),
@@ -632,6 +724,7 @@ def pick_nearest_point(
         region_3d,
         mouse_region,
         radius,
+        screen_surface=True,
     )
 
 

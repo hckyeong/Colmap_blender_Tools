@@ -30,6 +30,7 @@ from ..session import (
 )
 from ..axis_settings import axis_edit_active_block_reason
 from ..state import RUNTIME
+from ..model_repository import ModelRepositoryError
 from ..status import set_window_status_text
 from ..viewport.picking import find_viewport_under_mouse, pick_nearest_point
 from ..viewport.registry import find_window_region, refresh_registry, resolve_area
@@ -503,7 +504,7 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
         return None
 
     def modal(self, context, event):
-        """탐색은 허용하고 일반 클릭의 입력 지문·역할 종류 거부 사유를 보고합니다."""
+        """탐색을 허용하며 마커 선택·입력 지문·역할 종류의 오류를 드래프트 변경 전에 보고합니다."""
         if not is_session_active_for_window(context.window):
             return self._cancel_selection(context)
         command_result = self._apply_pending_command(context)
@@ -543,7 +544,11 @@ class COLMAPALIGN_OT_marker_pick_modal(bpy.types.Operator):
         if reason is not None:
             self._report_input_rejection(context, reason)
             return {"RUNNING_MODAL"}
-        picked = pick_nearest_point(role, region, region_3d, mouse_region)
+        try:
+            picked = pick_nearest_point(role, region, region_3d, mouse_region)
+        except ModelRepositoryError as error:
+            self._report_input_rejection(context, str(error))
+            return {"RUNNING_MODAL"}
         if picked is None:
             return {"PASS_THROUGH"}
         pick_arguments = {

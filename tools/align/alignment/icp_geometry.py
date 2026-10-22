@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import Any
+import weakref
 
 import numpy as np
 
@@ -22,12 +24,15 @@ from ..constants import (
 )
 from ..geometry_access import geometry_kind_for_model
 from ..marker_geometry import marker_geometry_model_for_source
+from .icp_array_hash import array_sha256_fingerprint
 from .icp_mesh_cleanup import prepare_mesh_alignment_geometry
 from .types import Sim3Transform
 
 
 _BLOCK_ROWS = 65_536
 _SCHEMA = "CCCORE_GEOMETRY_V1"
+_POINT_KD_CACHE_MAX_BYTES = 512 * 1024 * 1024
+_POINT_KD_CACHE_MAX_ENTRIES = 8
 
 
 class CcCoreGeometryError(ValueError):
@@ -56,15 +61,117 @@ def _display_matrix_tuple(value: object) -> tuple[tuple[float, ...], ...]:
     return tuple(tuple(float(component) for component in row) for row in matrix)
 
 
-def _immutable_array(value: np.ndarray, dtype: str) -> np.ndarray:
-    """원본을 변경하지 않고 쓰기 권한을 다시 켤 수 없는 배열을 반환합니다."""
+def _immutable_array(value: np.ndarray, dtype: str, *, copy: bool = False) -> np.ndarray:
+    """원본을 변경하지 않고 재가변화를 막으며 요청 시 별도 소유 버퍼로 복사합니다."""
     array = np.asarray(value, dtype=np.dtype(dtype), order="C")
     base = array
     while isinstance(base, np.ndarray) and base.base is not None:
         base = base.base
-    if isinstance(base, bytes) and not array.flags.writeable:
+    if not copy and isinstance(base, bytes) and not array.flags.writeable:
         return array
     return np.frombuffer(array.tobytes(order="C"), dtype=np.dtype(dtype)).reshape(array.shape)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMeshCacheEntry:
+    """원본 수명을 연장하지 않는 참조와 자체 소유 불변 메시 사본을 보관합니다."""
+
+    repository_ref: Any
+    positions_ref: Any
+    triangles_ref: Any
+    model_identity: int
+    geometry_revision: int
+    fingerprints: tuple[str, str]
+    positions_float64: np.ndarray
+    triangles_uint32: np.ndarray
+    token: object
+
+    @property
+    def byte_count(self) -> int:
+        """캐시가 소유한 두 불변 버퍼의 메모리 합계를 반환합니다."""
+        return self.positions_float64.nbytes + self.triangles_uint32.nbytes
+
+
+class _PreparedMeshCache:
+    """원본·저장소 수명과 전체 메모리 상한으로 메시 정리 결과의 재사용을 제한합니다."""
+
+    def __init__(self) -> None:
+        """정리 결과를 최근 조회 순서와 소유 버퍼 바이트 수로 관리합니다."""
+        self.entries: OrderedDict[tuple[int, str, str], _PreparedMeshCacheEntry] = OrderedDict()
+        self.byte_count = 0
+
+    def _discard(self, key: tuple[int, str, str], token: object | None = None) -> None:
+        """현재 항목과 일치하는 소멸 알림만 제거하고 메모리 합계를 갱신합니다."""
+        entry = self.entries.get(key)
+        if entry is not None and (token is None or entry.token is token):
+            self.byte_count -= self.entries.pop(key).byte_count
+
+    def _prune(self) -> None:
+        """제거·교체·재로드된 실제 형상 슬롯의 오래된 결과를 폐기합니다."""
+        for key, entry in tuple(self.entries.items()):
+            repository = entry.repository_ref()
+            try:
+                current = None if repository is None else marker_geometry_model_for_source(repository, key[1], key[2])
+                revision = int(getattr(current, "geometry_revision", -1))
+            except (ValueError, RuntimeError, KeyError, AttributeError, TypeError, OverflowError):
+                current, revision = None, -1
+            if (current is None or id(current) != entry.model_identity
+                    or revision != entry.geometry_revision
+                    or getattr(current, "vertices_float64", None) is not entry.positions_ref()
+                    or getattr(current, "triangles_uint32", None) is not entry.triangles_ref()):
+                self._discard(key)
+
+    def get(self, repository: Any, selected: _SelectedGeometry, positions: np.ndarray,
+            triangles: np.ndarray, fingerprints: tuple[str, str]) -> tuple[np.ndarray, np.ndarray] | None:
+        """실제 소유 슬롯·배열 객체·전체 내용 해시가 모두 같을 때만 정리 결과를 반환합니다."""
+        self._prune()
+        key = (id(repository), str(selected.record.model_id), selected.geometry_source)
+        entry = self.entries.get(key)
+        if entry is None:
+            return None
+        if (entry.repository_ref() is not repository or entry.model_identity != id(selected.model)
+                or entry.geometry_revision != int(getattr(selected.model, "geometry_revision", 0))
+                or entry.positions_ref() is not positions or entry.triangles_ref() is not triangles
+                or entry.fingerprints != fingerprints):
+            self._discard(key)
+            return None
+        self.entries.move_to_end(key)
+        return entry.positions_float64, entry.triangles_uint32
+
+    def store(self, repository: Any, selected: _SelectedGeometry, positions: np.ndarray,
+              triangles: np.ndarray, fingerprints: tuple[str, str],
+              prepared: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """상한 안의 결과만 자체 불변 버퍼로 보관하고 원본 소멸 시 즉시 해제합니다."""
+        byte_count = prepared[0].size * 8 + prepared[1].size * 4
+        if byte_count > _POINT_KD_CACHE_MAX_BYTES:
+            return prepared
+        key = (id(repository), str(selected.record.model_id), selected.geometry_source)
+        token = object()
+
+        def discard_expired(_reference: Any) -> None:
+            """원본 배열 또는 저장소가 소멸하면 해당 세대의 정리 사본을 제거합니다."""
+            self._discard(key, token)
+
+        try:
+            repository_ref = weakref.ref(repository, discard_expired)
+            positions_ref = weakref.ref(positions, discard_expired)
+            triangles_ref = weakref.ref(triangles, discard_expired)
+        except TypeError:
+            return prepared
+        self._discard(key)
+        while self.entries and (len(self.entries) >= _POINT_KD_CACHE_MAX_ENTRIES
+                                or self.byte_count + byte_count > _POINT_KD_CACHE_MAX_BYTES):
+            self._discard(next(iter(self.entries)))
+        frozen = (_immutable_array(prepared[0], "<f8", copy=True),
+                  _immutable_array(prepared[1], "<u4", copy=True))
+        entry = _PreparedMeshCacheEntry(repository_ref, positions_ref, triangles_ref, id(selected.model),
+            int(getattr(selected.model, "geometry_revision", 0)), fingerprints, *frozen, token)
+        self.entries[key] = entry
+        self.byte_count += entry.byte_count
+        return frozen
+
+
+_POINT_KD_PREPARED_MESH_CACHE = _PreparedMeshCache()
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,8 +495,10 @@ def _validate_raw_geometry(
         raise CcCoreGeometryError(f"{name}: 모든 등록점이 한 직선에 놓인 퇴화 점군입니다.")
 
 
-def _array_fingerprint(array: np.ndarray, dtype: str) -> str:
-    """대형 배열 전체 복사 없이 표준 형식의 블록을 순서대로 해시합니다."""
+def _array_fingerprint(array: np.ndarray, dtype: str, *, point_kd_input: bool = False) -> str:
+    """전체 원본 SHA-256을 유지하며 새 점 기반 경로에서만 시스템 구현을 사용합니다."""
+    if point_kd_input:
+        return array_sha256_fingerprint(array, dtype, block_rows=_BLOCK_ROWS)
     digest = hashlib.sha256()
     digest.update(f"{dtype}:{array.shape}".encode("ascii"))
     for start in range(0, len(array), _BLOCK_ROWS):
@@ -415,15 +524,34 @@ def _marker_signature(runtime: Any) -> tuple[tuple, ...]:
 
 
 def _prepare_source(repository: Any, selected: _SelectedGeometry, applied_alignment: object | None,
-                    *, verify_content: bool, validate_geometry: bool) -> tuple[GeometrySourceProvenance, np.ndarray, np.ndarray | None]:
-    """원본 지문·개수와 축별 배율을 보존하고 정렬에 전달할 배열만 별도로 정제합니다."""
+                    *, verify_content: bool, validate_geometry: bool,
+                    point_kd_input: bool = False) -> tuple[GeometrySourceProvenance, np.ndarray, np.ndarray | None]:
+    """새 저장소는 불러오기 검증 결과를 재사용하고 구형 호출은 기존 전체 검사를 유지합니다."""
     owner_id = str(selected.record.model_id)
     positions, triangles = _raw_arrays(selected)
     alignment_positions, alignment_triangles = positions, triangles
-    if validate_geometry:
-        alignment_positions, alignment_triangles = _validate_raw_geometry(
-            positions, triangles, str(selected.record.display_name),
-        )
+    fingerprints = None
+    registered = (repository.alignment_input_for(owner_id, selected.geometry_source)
+                  if point_kd_input and hasattr(repository, 'alignment_input_for') else None)
+    if registered is not None:
+        if verify_content:
+            fingerprints = (registered.positions_fingerprint, registered.triangles_fingerprint)
+        if validate_geometry:
+            alignment_positions, alignment_triangles = registered.positions, registered.triangles
+    cacheable = (registered is None and point_kd_input and verify_content and validate_geometry and triangles is not None
+                 and positions.dtype == np.dtype("<f8") and triangles.dtype == np.dtype("<u4"))
+    if cacheable:
+        fingerprints = (_array_fingerprint(positions, "<f8", point_kd_input=point_kd_input),
+                        _array_fingerprint(triangles, "<u4", point_kd_input=point_kd_input))
+    if validate_geometry and registered is None:
+        prepared = (_POINT_KD_PREPARED_MESH_CACHE.get(repository, selected, positions, triangles, fingerprints)
+                    if cacheable else None)
+        if prepared is None:
+            prepared = _validate_raw_geometry(positions, triangles, str(selected.record.display_name))
+            if cacheable:
+                prepared = _POINT_KD_PREPARED_MESH_CACHE.store(
+                    repository, selected, positions, triangles, fingerprints, prepared)
+        alignment_positions, alignment_triangles = prepared
     companion = selected.geometry_source == MARKER_GEOMETRY_SOURCE_COMPANION
     getter = (repository.companion_display_transform_for_model_id if companion
               else repository.display_transform_for_model_id)
@@ -438,8 +566,11 @@ def _prepare_source(repository: Any, selected: _SelectedGeometry, applied_alignm
         geometry_source=selected.geometry_source, geometry_revision=int(getattr(selected.model, "geometry_revision", 0)),
         source_path=str(getattr(selected.model, "source_path", "")),
         source_fingerprint=str(getattr(source, "source_fingerprint", "")),
-        positions_fingerprint=_array_fingerprint(positions, "<f8") if verify_content else "",
-        triangles_fingerprint=_array_fingerprint(triangles, "<u4") if verify_content and triangles is not None else "",
+        positions_fingerprint=(fingerprints[0] if fingerprints is not None else
+                               _array_fingerprint(positions, "<f8", point_kd_input=point_kd_input) if verify_content else ""),
+        triangles_fingerprint=(fingerprints[1] if fingerprints is not None else
+                               _array_fingerprint(triangles, "<u4", point_kd_input=point_kd_input)
+                               if verify_content and triangles is not None else ""),
         point_count=len(positions), triangle_count=0 if triangles is None else len(triangles),
         display_transform_fingerprint=str(display.fingerprint), display_transform_float64=display_matrix,
         committed_alignment_fingerprint=str(committed.fingerprint), committed_alignment_float64=committed_matrix,
@@ -491,8 +622,9 @@ def _combine_references(references: tuple[GeometryInput, ...]) -> GeometryInput:
 
 
 def _capture_sources(runtime: Any, *, moving_model_id: str, reference_model_ids: tuple[str, ...],
-                     initial_alignment_float64: object, verify_content: bool, validate_geometry: bool):
-    """A 전체 목록을 확인하고 변환 좌표를 만들기 전 원본 지문 자료를 캡처합니다."""
+                     initial_alignment_float64: object, verify_content: bool, validate_geometry: bool,
+                     point_kd_input: bool = False):
+    """A 전체 목록과 원본 지문을 캡처하고 새 엔진의 안전한 메시 정리 재사용을 연결합니다."""
     moving, references = _selected_geometries(runtime, moving_model_id)
     actual_ids = tuple(str(item.record.model_id) for item in references)
     if tuple(reference_model_ids) != actual_ids:
@@ -500,9 +632,11 @@ def _capture_sources(runtime: Any, *, moving_model_id: str, reference_model_ids:
     initial = _matrix_tuple(initial_alignment_float64)
     repository = runtime.model_repository
     moving_source = _prepare_source(repository, moving, initial,
-                                    verify_content=verify_content, validate_geometry=validate_geometry)
+                                    verify_content=verify_content, validate_geometry=validate_geometry,
+                                    point_kd_input=point_kd_input)
     reference_sources = tuple(_prepare_source(repository, item, None,
-                              verify_content=verify_content, validate_geometry=validate_geometry) for item in references)
+                              verify_content=verify_content, validate_geometry=validate_geometry,
+                              point_kd_input=point_kd_input) for item in references)
     provenance = CcCoreGeometryProvenance(str(moving.record.model_id), actual_ids, initial,
                                         moving_source[0], tuple(item[0] for item in reference_sources),
                                         _marker_signature(runtime))
@@ -511,11 +645,13 @@ def _capture_sources(runtime: Any, *, moving_model_id: str, reference_model_ids:
 
 def create_cccore_geometry_snapshot(runtime: Any, *, moving_model_id: str,
                                     reference_model_ids: tuple[str, ...],
-                                    initial_alignment_float64: object) -> CcCoreGeometrySnapshot:
-    """선택 형상을 한 번 검증·해시한 뒤 초기 P와 확정 A를 불변 공통 좌표로 만듭니다."""
+                                    initial_alignment_float64: object,
+                                    point_kd_input: bool = False) -> CcCoreGeometrySnapshot:
+    """전체 원본을 해시하고 선택한 엔진의 준비 정책으로 불변 공통 좌표 형상을 만듭니다."""
     provenance, moving_source, reference_sources = _capture_sources(
         runtime, moving_model_id=moving_model_id, reference_model_ids=tuple(reference_model_ids),
-        initial_alignment_float64=initial_alignment_float64, verify_content=True, validate_geometry=True)
+        initial_alignment_float64=initial_alignment_float64, verify_content=True, validate_geometry=True,
+        point_kd_input=point_kd_input)
     moving = _geometry_input(moving_source)
     references = tuple(_geometry_input(item) for item in reference_sources)
     kinds = ("POINT" if item.geometry_kind == GEOMETRY_KIND_COLMAP_POINT_CLOUD else "MESH"
@@ -528,14 +664,16 @@ def create_cccore_geometry_snapshot(runtime: Any, *, moving_model_id: str,
 def geometry_snapshot_validation_message(runtime: Any,
                                          snapshot: CcCoreGeometrySnapshot | CcCoreGeometrySnapshotMetadata,
                                          *, initial_alignment_float64: object | None = None,
-                                         verify_content: bool = True) -> str | None:
-    """변환 배열을 재생성하지 않고 현재 원본·축·정렬·선택·마커가 같은지 확인합니다."""
+                                         verify_content: bool = True,
+                                         point_kd_input: bool = False) -> str | None:
+    """불변 원본의 준비 지문 또는 구형 전체 해시와 현재 변환·선택을 확인합니다."""
     expected = snapshot.provenance
     initial = expected.initial_alignment_float64 if initial_alignment_float64 is None else initial_alignment_float64
     try:
         current, _moving, _references = _capture_sources(
             runtime, moving_model_id=expected.moving_model_id, reference_model_ids=expected.reference_model_ids,
-            initial_alignment_float64=initial, verify_content=verify_content, validate_geometry=False)
+            initial_alignment_float64=initial, verify_content=verify_content, validate_geometry=False,
+            point_kd_input=point_kd_input)
     except (ValueError, RuntimeError, KeyError, AttributeError, TypeError, OverflowError) as error:
         return f"정렬 입력 형상 또는 기준이 바뀌었습니다. 다시 계산하십시오. {error}"
     if not verify_content:

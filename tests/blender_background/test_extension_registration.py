@@ -42,6 +42,9 @@ def _assert_registered_contract() -> None:
         "colmap_align.open_workspace",
         "colmap.open_modifier_workspace",
         "projection_paint.open_workspace",
+        "projection_paint.import_colmap",
+        "projection_paint.select_colmap_directory",
+        "projection_paint.import_obj",
     )
     missing_operators: list[str] = []
     for operator_id in required_operator_ids:
@@ -53,11 +56,11 @@ def _assert_registered_contract() -> None:
     if missing_operators:
         raise AssertionError(f"등록되지 않은 Blender Operator: {missing_operators}")
     try:
-        bpy.ops.projection_paint.import_colmap.get_rna_type()
+        bpy.ops.projection_paint.update_colmap_snapshot.get_rna_type()
     except (AttributeError, KeyError, RuntimeError):
         pass
     else:
-        raise AssertionError("Legacy projection_paint.import_colmap Operator가 등록되었습니다.")
+        raise AssertionError("제거한 Modifier 업데이트 Operator가 등록되었습니다.")
     required_scene_properties = (
         "colmap_dataset",
         "colmap_align_settings",

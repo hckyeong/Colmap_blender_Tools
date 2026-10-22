@@ -31,6 +31,9 @@ class ImportProgressSession:
     window_manager: Any = None
     overlay_handle: Any = None
     final_screen_shown: bool = False
+    last_redraw_time: float = 0.0
+    last_redraw_phase: str = ""
+    last_work_time: float = 0.0
 
     @property
     def elapsed_seconds(self) -> float:

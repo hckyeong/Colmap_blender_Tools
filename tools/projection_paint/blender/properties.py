@@ -270,6 +270,15 @@ class PP_PG_layer(bpy.types.PropertyGroup):
     active_adjustment_index: IntProperty(default=-1, min=-1)
 
 
+class PP_PG_paint_object_visibility(bpy.types.PropertyGroup):
+    """페인트 중 숨긴 오브젝트의 실제 참조와 원래 뷰 레이어 표시 상태를 보관합니다."""
+
+    object: PointerProperty(type=bpy.types.Object, options={"HIDDEN"})
+    view_layer_name: StringProperty(options={"HIDDEN"})
+    view_layer_uuid: StringProperty(options={"HIDDEN"})
+    original_hidden: BoolProperty(default=False, options={"HIDDEN"})
+
+
 class PP_PG_settings(bpy.types.PropertyGroup):
     """Projection Painting의 사용자 설정과 영구 상태를 저장합니다."""
 
@@ -290,6 +299,12 @@ class PP_PG_settings(bpy.types.PropertyGroup):
         ),
         default="AUTO",
     )
+    import_point_limit: IntProperty(
+        name="참고 점 최대 개수", description="카메라·촬영 이미지는 모두 가져오고 참고 점군만 이 개수로 제한합니다",
+        default=20_000, min=1, max=100_000_000,
+    )
+    reference_metadata_json: StringProperty(default="{}", options={"HIDDEN"})
+
     point_size: FloatProperty(
         name="Point Scale",
         description="Import된 COLMAP Point3D 표시 반지름입니다",
@@ -331,6 +346,24 @@ class PP_PG_settings(bpy.types.PropertyGroup):
         default="Y",
         update=_update_camera_axes,
     )
+    model_axis_preset: EnumProperty(
+        name="모델 원본 축",
+        description="가져올 모델의 원본 좌표계 프리셋입니다",
+        items=AXIS_PRESET_ITEMS,
+        default="BLENDER",
+    )
+    model_forward: EnumProperty(
+        name="모델 전방 축",
+        description="사용자 지정 모델 원본 좌표계의 전방 축입니다",
+        items=AXIS_ITEMS,
+        default="Y",
+    )
+    model_up: EnumProperty(
+        name="모델 위쪽 축",
+        description="사용자 지정 모델 원본 좌표계의 위쪽 축입니다",
+        items=AXIS_ITEMS,
+        default="Z",
+    )
     frame_start: IntProperty(name="Frame Start", default=1, min=-1_048_574, max=1_048_574)
     review_background_alpha: FloatProperty(
         name="Background Alpha",
@@ -364,6 +397,10 @@ class PP_PG_settings(bpy.types.PropertyGroup):
         type=bpy.types.Object,
         poll=_mesh_object_poll,
     )
+    paint_object_visibility: CollectionProperty(
+        type=PP_PG_paint_object_visibility, options={"HIDDEN"},
+    )
+    paint_object_visibility_active: BoolProperty(default=False, options={"HIDDEN"})
     paint_material: PointerProperty(
         name="Paint Material",
         type=bpy.types.Material,
@@ -565,6 +602,13 @@ class PP_PG_settings(bpy.types.PropertyGroup):
     dataset_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
     display_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
     source_fingerprint: StringProperty(options={"HIDDEN"})
+    source_kind: EnumProperty(
+        name="입력 출처",
+        items=(("FILE", "COLMAP 파일", "파일에서 직접 가져온 입력"),
+               ("MODIFIER_LEGACY", "이전 Modifier 입력", "이전 저장 자료의 출처")),
+        default="MODIFIER_LEGACY",
+        options={"HIDDEN"},
+    )
     snapshot_uuid: StringProperty(options={"HIDDEN"})
     snapshot_revision: IntProperty(default=0, min=0, options={"HIDDEN"})
     source_modifier_domain_uuid: StringProperty(options={"HIDDEN"})
@@ -600,4 +644,7 @@ class PP_PG_settings(bpy.types.PropertyGroup):
     session_epoch: IntProperty(default=0, min=0, options={"HIDDEN", "SKIP_SAVE"})
 
 
-CLASSES = (PP_PG_mask, PP_PG_layer_adjustment, PP_PG_layer, PP_PG_settings)
+CLASSES = (
+    PP_PG_mask, PP_PG_layer_adjustment, PP_PG_layer,
+    PP_PG_paint_object_visibility, PP_PG_settings,
+)

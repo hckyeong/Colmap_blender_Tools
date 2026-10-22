@@ -453,7 +453,7 @@ def validate_active_paint_session(_token: Any = None) -> PaintSession:
 
 
 def _capture_snapshot(context: Any, target: Any) -> None:
-    """Paint 진입 전 Workspace·선택·Mode·가시성 상태를 Scene에 직렬화합니다."""
+    """페인트 진입 전 작업공간·선택·모드·표시 상태를 Scene에 직렬화합니다."""
     scene = context.scene
     settings = scene.projection_paint
     window = getattr(context, "window", None)
@@ -491,17 +491,12 @@ def _capture_snapshot(context: Any, target: Any) -> None:
     }
     if source_viewport_background is not None:
         snapshot["source_viewport_background"] = source_viewport_background
-    from .point_scene import hide_dataset_points, restore_dataset_points
-
-    point_visibility = hide_dataset_points(scene, context.view_layer)
-    snapshot["point_visibility"] = point_visibility
     try:
         settings.paint_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
         settings.original_active_object = context.view_layer.objects.active
         if snapshot["review_background_changed"]:
             settings.review_background_enabled = False
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        restore_dataset_points(scene, context.view_layer, point_visibility)
         if snapshot["review_background_changed"]:
             settings.review_background_enabled = bool(
                 snapshot["review_background_enabled"]
@@ -607,7 +602,7 @@ def _window_view_parts(window: Any):
 
 
 def _prepare_paint_view(context: Any, session: PaintSession) -> tuple[Any, Any]:
-    """전환된 작업공간에서 Target 가시성과 Diffuse Color 표시를 준비합니다."""
+    """카메라 배경을 유지하며 대상 외 오브젝트를 숨기고 페인트 화면을 준비합니다."""
     target = session.setup.target
     window = getattr(context, "window", None)
     if window is None or _pointer(window) == 0:
@@ -618,12 +613,24 @@ def _prepare_paint_view(context: Any, session: PaintSession) -> tuple[Any, Any]:
     if area is None or region is None or space is None:
         raise PaintSessionError("Texture Paint Workspace에 3D Viewport가 없습니다.")
     payload = _snapshot_payload(session.scene)
+    from .dataset_view_layer import hide_other_paint_objects, hide_paint_dataset_references
+
+    if "dataset_reference_visibility" not in payload:
+        payload["dataset_reference_visibility"] = hide_paint_dataset_references(
+            session.scene, context.view_layer,
+        )
+    hide_other_paint_objects(session.scene, context.view_layer, target)
+    _store_snapshot_payload(session.scene, payload)
     with context.temp_override(
         window=window,
         screen=window.screen,
         area=area,
         region=region,
     ):
+        if "paint_show_extras" not in payload:
+            payload["paint_show_extras"] = bool(space.overlay.show_extras)
+            payload["paint_show_extras_changed"] = bool(space.overlay.show_extras)
+        space.overlay.show_extras = False
         if target.hide_viewport:
             payload["target_hide_viewport_changed"] = True
             target.hide_viewport = False
@@ -657,7 +664,7 @@ def _prepare_paint_view(context: Any, session: PaintSession) -> tuple[Any, Any]:
 
 
 def _restore_snapshot(context: Any, overlay: Any) -> None:
-    """Scene에 보존한 값에 한해 진입 전 사용자 상태를 복구합니다."""
+    """다른 오브젝트·참고 표시·보조 윤곽과 진입 전 사용자 상태를 복원합니다."""
     scene = context.scene
     settings = scene.projection_paint
     payload = _snapshot_payload(scene)
@@ -666,6 +673,11 @@ def _restore_snapshot(context: Any, overlay: Any) -> None:
     _area, _region, paint_space = _window_view_parts(window)
     if paint_space is not None and _pointer(target):
         try:
+            if (
+                bool(payload.get("paint_show_extras_changed", False))
+                and not paint_space.overlay.show_extras
+            ):
+                paint_space.overlay.show_extras = bool(payload["paint_show_extras"])
             if (
                 bool(payload.get("paint_shading_changed", False))
                 and paint_space.shading.type == "MATERIAL"
@@ -689,8 +701,13 @@ def _restore_snapshot(context: Any, overlay: Any) -> None:
     if window is not None and workspace is not None:
         window.workspace = workspace
     try:
+        from .dataset_view_layer import restore_other_paint_objects, restore_paint_dataset_references
         from .point_scene import restore_dataset_points
 
+        restore_other_paint_objects(scene)
+        restore_paint_dataset_references(
+            scene, payload.get("dataset_reference_visibility", ()),
+        )
         restore_dataset_points(
             scene,
             context.view_layer,
@@ -1002,7 +1019,7 @@ def start_paint_session(
 
 
 def _complete_paint_entry(context: Any, scene_pointer: int) -> None:
-    """전환된 3D Viewport에서 Paint·Source 자원만 준비하고 Brush는 변경하지 않습니다."""
+    """페인트 자원과 참고 표시를 준비하고 브러시 자산 교체 없이 진입 색상을 흰색으로 설정합니다."""
     session = active_paint_session()
     if session is None or _pointer(session.scene) != scene_pointer:
         raise PaintSessionError("Paint 진입 상태가 Workspace 전환 중 변경되었습니다.")
@@ -1029,6 +1046,9 @@ def _complete_paint_entry(context: Any, scene_pointer: int) -> None:
 
     if active_paint_runtime(session.scene) is None:
         raise PaintSessionError("Texture Paint Runtime 설치를 확인하지 못했습니다.")
+    unified = session.scene.tool_settings.image_paint.unified_paint_settings
+    unified.use_unified_color = True
+    unified.color = (1.0, 1.0, 1.0)
     settings.paint_enabled = True
     _set_status(session.scene, "Texture Paint 준비 완료", "SUCCESS", "ACTIVE")
 

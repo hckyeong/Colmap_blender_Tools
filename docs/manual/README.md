@@ -1,6 +1,6 @@
 # COLMAP Tools 사용자 매뉴얼
 
-**COLMAP Tools 0.3.41 · Windows x64 · Blender 5.2.0 이상**
+**COLMAP Tools 0.3.74 · Windows x64 · Blender 5.2.0 이상**
 
 기능별 매뉴얼을 **Align, Modifier, Projection Paint** 세 문서로 나누었습니다. 각 문서의 기능 찾기에서 원하는 기능으로 바로 이동할 수 있으며, 기능마다 용도·버튼 위치·사용 방법·결과와 필요한 조건을 설명합니다.
 
@@ -43,7 +43,7 @@ Projection Paint의 실제 메뉴 이름은 **Projection Painting**입니다. �
 1. Blender를 실행합니다.
 2. 상단 **Edit → Preferences**를 엽니다.
 3. **Add-ons** 또는 **Get Extensions** 화면에서 오른쪽 위 드롭다운 메뉴의 **Install from Disk…**를 선택합니다.
-4. `colmap_tools-0.3.41.zip`을 선택하여 설치합니다. ZIP을 미리 풀지 않습니다.
+4. `colmap_tools.zip`을 선택하여 설치합니다. ZIP을 미리 풀지 않습니다.
 5. 설치 목록에서 **COLMAP Tools**가 활성화되어 있는지 확인합니다.
 6. 업데이트 설치였다면 작업을 저장하고 Blender를 완전히 종료한 뒤 다시 실행합니다.
 
@@ -110,10 +110,10 @@ CC 정렬 환경 검사와 CPU 스레드 설정은 [Align 설정](ALIGN.md#cpu)�
 | 전달 방향 | 사용할 기능 |
 |---|---|
 | Align → Modifier | Align에서 [COLMAP Export](ALIGN.md#colmap-export)한 폴더를 Modifier로 [Import](MODIFIER.md#import) |
-| Align 메시 → Projection Paint | [OBJ Export](ALIGN.md#obj-export) 후 일반 Blender Mesh로 불러와 [Paint Target](PROJECTION_PAINT.md#paint-target)에 지정 |
-| Modifier → Projection Paint | Painting의 [COLMAP 데이터 업데이트](PROJECTION_PAINT.md#dataset)로 현재 데이터 복사 |
+| Align 메시 → Projection Paint | [OBJ Export](ALIGN.md#obj-export) 후 Painting의 [OBJ 불러오기](PROJECTION_PAINT.md#dataset)와 [Paint Target](PROJECTION_PAINT.md#paint-target) 사용 |
+| Modifier → Projection Paint | Modifier의 [COLMAP Export](MODIFIER.md#export) 후 Painting의 [COLMAP 불러오기](PROJECTION_PAINT.md#dataset) 사용 |
 
-Align 데이터는 다른 도구에 자동으로 나타나지 않습니다. Painting으로 복사한 COLMAP 데이터도 이후 Modifier 편집을 자동 반영하지 않으므로 필요할 때 다시 업데이트합니다.
+각 도구의 데이터는 다른 도구에 자동으로 나타나지 않습니다. Painting에서는 파일을 직접 가져오며 Modifier의 후속 편집은 내보낸 파일을 다시 불러올 때 반영됩니다.
 
 Blender **File → Save / Save As**는 작업을 재개할 `.blend`를 저장하고, 각 도구의 Export는 외부 프로그램에서 사용할 결과를 기록합니다. Modifier Export는 불러온 sparse 파일을 수정하므로 [출력 범위와 Backup](MODIFIER.md#export)을 확인하십시오.
 

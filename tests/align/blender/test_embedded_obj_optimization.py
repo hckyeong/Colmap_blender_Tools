@@ -71,7 +71,7 @@ def test_float_extraction_and_proxy_preserve_source() -> None:
             mesh.uv_layers.active.data.foreach_get("uv", expected_uv.ravel())
             original_faces = tuple((face.loop_start, face.loop_total, face.material_index) for face in mesh.polygons)
             original_loops = tuple(loop.vertex_index for loop in mesh.loops)
-            with patch.object(store, "_validated_geometry_vertices", wraps=store._validated_geometry_vertices) as validate:
+            with patch.object(store, "_validated_geometry_arrays", wraps=store._validated_geometry_arrays) as validate:
                 proxy = store.commit_embedded_obj_mesh_and_build_proxy(
                     mesh, model_id="precision", display_name="precision", source_path=source,
                 )
@@ -118,7 +118,7 @@ def test_import_restore_validate_once_and_reject_late_corruption() -> None:
             origin = RuntimeState()
             for model_id in ("first", "second"):
                 path = _write_fixture(root, model_id + ".obj")
-                with patch.object(store, "_validated_geometry_vertices", wraps=store._validated_geometry_vertices) as validate:
+                with patch.object(store, "_validated_geometry_arrays", wraps=store._validated_geometry_arrays) as validate:
                     job = run_mesh_import_job(origin, path, model_id_factory=lambda: model_id, prepare_gpu=False)
                     assert job.stage == "COMPLETED", job.error_message
                     assert validate.call_count == 1
@@ -128,7 +128,7 @@ def test_import_restore_validate_once_and_reject_late_corruption() -> None:
             write_active_project_state(snapshot)
             text_before = active_project_text().as_string()
             restored = RuntimeState()
-            with patch.object(store, "_validated_geometry_vertices", wraps=store._validated_geometry_vertices) as validate:
+            with patch.object(store, "_validated_geometry_arrays", wraps=store._validated_geometry_arrays) as validate:
                 assert persistence.schedule_project_restore_if_available(restored)
                 assert validate.call_count == 0
                 _drain_restore_timer(restored)

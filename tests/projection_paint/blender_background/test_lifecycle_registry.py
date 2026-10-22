@@ -280,7 +280,8 @@ class LifecycleRegistryTest(unittest.TestCase):
     def test_panel_default_open_states_match_ui_contract(self) -> None:
         """Status·Dataset·Camera Review·Paint Setup의 독립성과 기본 상태를 검증합니다."""
 
-        self.assertIn("HIDE_HEADER", PP_PT_status.bl_options)
+        addon.register()
+        self.assertNotIn("DEFAULT_CLOSED", getattr(PP_PT_status, "bl_options", frozenset()))
         self.assertNotIn(
             "DEFAULT_CLOSED",
             getattr(PP_PT_colmap, "bl_options", frozenset()),
@@ -288,7 +289,7 @@ class LifecycleRegistryTest(unittest.TestCase):
         self.assertIn("DEFAULT_CLOSED", PP_PT_camera_review.bl_options)
         self.assertIn("DEFAULT_CLOSED", PP_PT_paint.bl_options)
         self.assertIn("DEFAULT_CLOSED", PP_PT_layers.bl_options)
-        self.assertEqual(PP_PT_layers.bl_parent_id, "PP_PT_paint")
+        self.assertFalse(str(getattr(PP_PT_layers, "bl_parent_id", "") or ""))
         for panel in (
             PP_PT_colmap,
             PP_PT_camera_review,
@@ -296,20 +297,24 @@ class LifecycleRegistryTest(unittest.TestCase):
         ):
             self.assertFalse(str(getattr(panel, "bl_parent_id", "") or ""))
             self.assertEqual("Projection Paint", panel.bl_category)
-        self.assertFalse(hasattr(bpy.types, "PP_OT_import_colmap"))
+        self.assertEqual("PROJECTION_PAINT_OT_import_colmap", bpy.ops.projection_paint.import_colmap.get_rna_type().identifier)
+        self.assertEqual("PROJECTION_PAINT_OT_import_obj", bpy.ops.projection_paint.import_obj.get_rna_type().identifier)
+        self.assertFalse(hasattr(bpy.types, "PP_OT_update_colmap_snapshot"))
         colmap_draw_source = inspect.getsource(PP_PT_colmap.draw)
         self.assertIn(
             'display_box.prop(settings, "camera_frustum_size")',
             colmap_draw_source,
         )
-        self.assertIn("projection_paint.update_colmap_snapshot", colmap_draw_source)
-        self.assertIn("COLMAP Modifier에서 데이터를 먼저 불러오세요.", colmap_draw_source)
+        self.assertIn("projection_paint.select_colmap_directory", colmap_draw_source)
+        self.assertIn("projection_paint.import_obj", colmap_draw_source)
+        self.assertNotIn("projection_paint.update_colmap_snapshot", colmap_draw_source)
+        self.assertNotIn("COLMAP Modifier에서 데이터를 먼저 불러오세요.", colmap_draw_source)
         self.assertNotIn("Snapshot Revision", colmap_draw_source)
         self.assertNotIn("Display Axis", colmap_draw_source)
-        self.assertNotIn("camera_axis_preset", colmap_draw_source)
-        self.assertNotIn("projection_paint.import_colmap", colmap_draw_source)
-        self.assertNotIn('prop(settings, "dataset_root")', colmap_draw_source)
-        self.assertNotIn('prop(settings, "input_format")', colmap_draw_source)
+        self.assertIn("input_buttons = layout.column(align=True)", colmap_draw_source)
+        for field in ("dataset_root", "sparse_directory", "images_directory", "input_format", "camera_axis_preset", "model_axis_preset"):
+            self.assertNotIn(field, colmap_draw_source)
+        self.assertNotIn("지정 경로 불러오기", colmap_draw_source)
         self.assertNotIn("camera_display_box", colmap_draw_source)
         self.assertNotIn("display_box.separator()", colmap_draw_source)
         self.assertEqual("Look Through Camera", PP_OT_review_look_through.bl_label)
@@ -375,6 +380,7 @@ class LifecycleRegistryTest(unittest.TestCase):
         self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
         self.assertEqual(len(self._industry_navigation_keymap_items()), 6)
         self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 3)
+
         addon.unregister()
         self.assertEqual(len(self._camera_review_toggle_keymap_items()), 0)
         self.assertEqual(len(self._viewport_zoom_keymap_items()), 0)
@@ -393,6 +399,33 @@ class LifecycleRegistryTest(unittest.TestCase):
         self.assertEqual(len(self._viewport_zoom_keymap_items("Image Paint")), 0)
         self.assertEqual(len(self._industry_navigation_keymap_items()), 6)
         self.assertEqual(len(self._multiselect_stroke_block_keymap_items()), 3)
+
+    def test_stencil_erase_registration_is_symmetric(self) -> None:
+        """Ctrl 입력 네 항목과 저장 복구 처리가 중복 없이 등록·해제되는지 검증합니다."""
+        from tools.projection_paint.blender.stencil_erase import clear_stencil_erase
+
+        for count in (4, 4, 0, 4):
+            if count == 0:
+                addon.unregister()
+            else:
+                addon.register()
+            items = [
+                (km.name, item.type, item.any)
+                for km in bpy.context.window_manager.keyconfigs.addon.keymaps
+                for item in km.keymap_items
+                if item.idname == "projection_paint.hold_stencil_erase"
+            ]
+            self.assertEqual(len(items), count)
+            self.assertEqual(
+                set(items),
+                {(name, key, True) for name in ("3D View", "Image Paint")
+                 for key in ("LEFT_CTRL", "RIGHT_CTRL")} if count else set(),
+            )
+            owned_save_handlers = [
+                callback for callback in bpy.app.handlers.save_pre
+                if getattr(callback, "__wrapped__", None) is clear_stencil_erase
+            ]
+            self.assertEqual(len(owned_save_handlers), 1 if count else 0)
 
     def test_epoch_token_is_invalid_after_barrier(self) -> None:
         """중단 장벽 뒤 이전 Epoch Token이 Commit되지 않는지 확인합니다."""

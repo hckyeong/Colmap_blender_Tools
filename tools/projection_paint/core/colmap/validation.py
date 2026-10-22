@@ -163,13 +163,27 @@ def validate_point3d_records_steps(
     points3d: Mapping[int, Point3DRecord],
     limits: ParserLimits,
 ) -> Generator[tuple[int, int], None, None]:
-    """Point3D 무결성을 레코드 단위로 검증해 처리량을 전달합니다."""
+    """참고 입력의 원본 검사 결과를 재사용하고 전체 입력은 기존 무결성을 검사합니다."""
+    from .shared_reader import PointRecordMapping
+    if isinstance(points3d, PointRecordMapping) and points3d.preview is not None:
+        preview = points3d.preview
+        if preview.source_point_count > limits.max_points3d or preview.source_track_count > limits.max_track_elements:
+            raise ColmapError("원본 점·관측 트랙 수가 안전 상한을 초과했습니다.")
+        yield len(points3d), len(points3d)
+        return
     if len(points3d) > limits.max_points3d:
         raise ColmapError(
             f"Point3D 수가 안전 상한을 초과했습니다: {len(points3d)}"
         )
     total_track_elements = 0
-    total = len(points3d) + sum(len(point.track) for point in points3d.values())
+    from .shared_reader import PointRecordMapping
+
+    track_count = (
+        int(points3d.table.track_offsets[-1])
+        if isinstance(points3d, PointRecordMapping)
+        else sum(len(point.track) for point in points3d.values())
+    )
+    total = len(points3d) + track_count
     completed = 0
     yield completed, total
     for key, point in points3d.items():

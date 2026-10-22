@@ -75,11 +75,7 @@ from .modifier_input_guard import (
 from .panels import CLASSES as PANEL_CLASSES
 from .point_display import register_point_scale_sync, unregister_point_scale_sync
 from .meter_grid_guide import register_meter_grid_guide, unregister_meter_grid_guide
-from .modifier_data_visibility import restore_modifier_meter_visibility
-from .projection_snapshot_provider import (
-    register_projection_snapshot_provider,
-    unregister_projection_snapshot_provider,
-)
+from .modifier_data_visibility import restore_modifier_meter_visibility, synchronize_modifier_meter_visibility
 from .properties import CLASSES as PROPERTY_CLASSES
 from .properties import COLMAP_PG_import_settings
 from .state_handlers import register_state_handlers, unregister_state_handlers
@@ -234,7 +230,6 @@ def register():
     delete_keymaps_registered = False
     workspace_runtime_registered = False
     dataset_adapter_registered = False
-    snapshot_provider_registered = False
     try:
         for cls in CLASSES:
             bpy.utils.register_class(cls)
@@ -243,8 +238,6 @@ def register():
         property_registered = True
         register_modifier_dataset_adapter()
         dataset_adapter_registered = True
-        register_projection_snapshot_provider()
-        snapshot_provider_registered = True
         schedule_axis_preset_migration()
         initialize_status_display(bpy.context)
         register_point_scale_sync()
@@ -263,14 +256,12 @@ def register():
         register_modifier_workspace_runtime()
         register_workspace_handoff_adapter(_MODIFIER_HANDOFF_ADAPTER)
         register_transform_runtime()
-        register_meter_grid_guide(restore_modifier_meter_visibility)
+        register_meter_grid_guide(restore_modifier_meter_visibility, synchronize_modifier_meter_visibility)
         _REGISTERED = True
     except Exception:
         unregister_meter_grid_guide()
         unregister_transform_runtime()
         unregister_workspace_handoff_adapter("modifier")
-        if snapshot_provider_registered:
-            unregister_projection_snapshot_provider()
         if dataset_adapter_registered:
             unregister_modifier_dataset_adapter()
         if workspace_runtime_registered:
@@ -318,7 +309,6 @@ def unregister():
     from .runtime_state import clear_runtime
     from .selection import clear_snapshots
     unregister_workspace_handoff_adapter("modifier")
-    unregister_projection_snapshot_provider()
     unregister_modifier_dataset_adapter()
     unregister_modifier_workspace_runtime()
     cancel_axis_preset_migration()

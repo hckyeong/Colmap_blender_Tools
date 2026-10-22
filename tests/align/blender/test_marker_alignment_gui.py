@@ -191,7 +191,7 @@ def _draw_pass_signature(draw_passes) -> tuple[tuple[object, ...], ...]:
 
 
 def _assert_preview_point_cloud_contract() -> None:
-    """GUI 미리보기에서 P와 A 형상이 모두 일반 불투명 상태로 제출되는지 확인합니다."""
+    """양쪽 GUI 미리보기에 A·P 형상이 각각 일반 불투명 상태로 제출되는지 확인합니다."""
     from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
     from tools.align.viewport.renderer import point_cloud_draw_passes_for_role
 
@@ -199,7 +199,10 @@ def _assert_preview_point_cloud_contract() -> None:
     assert _NORMAL_MOVING_DRAW_PASSES is not None
     reference_passes = _draw_pass_signature(point_cloud_draw_passes_for_role(ROLE_REFERENCE))
     moving_passes = _draw_pass_signature(point_cloud_draw_passes_for_role(ROLE_MOVING))
-    assert reference_passes == _NORMAL_REFERENCE_DRAW_PASSES
+    assert reference_passes == (
+        _NORMAL_REFERENCE_DRAW_PASSES[0],
+        _NORMAL_MOVING_DRAW_PASSES[0],
+    )
     assert moving_passes[0] == _NORMAL_MOVING_DRAW_PASSES[0]
     assert moving_passes[0][1:] == (ROLE_MOVING, 1.0, True, None)
     assert moving_passes[1] == (

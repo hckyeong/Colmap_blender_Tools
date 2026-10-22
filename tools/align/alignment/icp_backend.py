@@ -426,6 +426,7 @@ class IcpJobHandle:
     _worker_log_handle: Any = None
     cleaned: bool = False
     diagnostics_retained: bool = False
+    _input_resource_owner: Any = None
 
     def __post_init__(self) -> None:
         """handle에 기록할 backend 식별자가 고정 계약과 맞는지 검증합니다."""
@@ -1377,6 +1378,10 @@ def read_job_progress(handle: IcpJobHandle) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     payload = read_json_file(path)
+    if handle.backend_id == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import validate_payload
+        validate_payload(payload, handle)
+        return payload
     if handle.backend_id == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import validate_cccore_payload
         validate_cccore_payload(payload, handle)
@@ -1386,12 +1391,15 @@ def read_job_progress(handle: IcpJobHandle) -> dict[str, Any] | None:
 
 
 def read_job_error(handle: IcpJobHandle) -> dict[str, Any] | None:
-    """구조화 오류를 읽고 CC 오류의 작업·입력 식별자를 검증합니다."""
+    """구조화 오류를 읽고 전용 엔진의 작업·입력 식별자를 검증합니다."""
 
     path = handle.files.error_path
     if not path.is_file():
         return None
     payload = read_json_file(path)
+    if handle.backend_id == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import validate_payload
+        validate_payload(payload, handle)
     if handle.backend_id == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import validate_cccore_payload
         validate_cccore_payload(payload, handle)
@@ -1401,6 +1409,9 @@ def read_job_error(handle: IcpJobHandle) -> dict[str, Any] | None:
 def read_job_result(handle: IcpJobHandle) -> tuple[dict[str, Any], dict[str, np.ndarray]] | None:
     """메타데이터와 배열 결과가 모두 기록된 경우에만 함께 읽습니다."""
 
+    if handle.backend_id == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import read_result
+        return read_result(handle)
     if handle.backend_id == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import read_cccore_result
         return read_cccore_result(handle)
@@ -1964,13 +1975,16 @@ def close_job_log(handle: IcpJobHandle) -> None:
 
 
 def cleanup_job_directory(handle: IcpJobHandle, *, keep_failure_diagnostics: bool) -> None:
-    """종료된 작업의 전용 디렉터리만 명시적으로 정리합니다."""
+    """종료된 작업의 입력 자원을 해제한 뒤 진단 보존 정책에 따라 전용 디렉터리를 정리합니다."""
 
     if handle.cleaned:
         return
     if handle.is_running:
         raise IcpBackendError("실행 중인 ICP worker의 작업 디렉터리는 정리할 수 없습니다.")
     close_job_log(handle)
+    if handle._input_resource_owner is not None:
+        owner, handle._input_resource_owner = handle._input_resource_owner, None
+        owner.close()
     if keep_failure_diagnostics:
         handle.diagnostics_retained = True
         return

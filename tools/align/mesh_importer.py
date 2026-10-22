@@ -154,7 +154,7 @@ class MeshImportJob:
     axis_preset: str = DEFAULT_AXIS_PRESET
     axis_forward: str = DEFAULT_FORWARD_AXIS
     axis_up: str = DEFAULT_UP_AXIS
-    display_vertex_limit: int = OBJ_DISPLAY_VERTEX_LIMIT
+    display_vertex_limit: int | None = OBJ_DISPLAY_VERTEX_LIMIT
     display_name_hint: str = ""
     expected_source_fingerprint: str = ""
     dataset_root: str = ""
@@ -183,7 +183,7 @@ class MeshImportJob:
     prepare_gpu: bool = True
 
     def __post_init__(self) -> None:
-        """작업 시작 시 표시 축·정점 표시 상한·예상 fingerprint를 검증합니다."""
+        """표시 축·선택적 정점 상한·예상 지문을 검증하고 기본값은 전체 표시로 둡니다."""
         try:
             self.display_transform = create_model_display_transform(
                 self.axis_preset,
@@ -196,7 +196,8 @@ class MeshImportJob:
         self.axis_forward = self.display_transform.forward_axis
         self.axis_up = self.display_transform.up_axis
         try:
-            self.display_vertex_limit = normalize_display_point_limit(self.display_vertex_limit)
+            if self.display_vertex_limit is not None:
+                self.display_vertex_limit = normalize_display_point_limit(self.display_vertex_limit)
         except ValueError as error:
             raise MeshImportJobError(f"OBJ 표시 정점 상한이 올바르지 않습니다: {error}") from error
         expected = str(self.expected_source_fingerprint).strip().lower()
@@ -377,7 +378,7 @@ class MeshImportJob:
         return "FINISHED"
 
     def step(self, runtime: Any | None = None, *, time_budget_seconds: float = 0.025) -> str:
-        """독립 OBJ의 기존 ID는 자산·GPU 준비 전에 거부하고 연결 표면의 부모 ID는 허용합니다."""
+        """OBJ·작은 UV·GPU 준비를 완료하고 표시 제한 변경에도 준비된 원본 표현을 재사용합니다."""
         if self.is_terminal:
             return "FINISHED" if self.stage == MESH_IMPORT_STAGE_COMPLETED else "CANCELLED"
         if self.cancel_requested:
@@ -458,51 +459,58 @@ class MeshImportJob:
                 model = self.staged_model
                 if model is None:
                     raise MeshImportJobError("표시 샘플을 만들 staged 메시가 없습니다.")
-                if self.display_builder is None:
-                    self.display_builder = IncrementalDisplayIndexBuilder(
-                        model.registration_vertex_indices.astype(np.uint64, copy=False),
-                        max_points=self.display_vertex_limit,
-                        _validated_unique=True,
+                if self.display_vertex_limit is None:
+                    self.display_vertex_limit = int(model.registration_vertex_indices.size)
+                if self.display_vertex_limit >= model.registration_vertex_indices.size:
+                    # 최초 프록시의 표시 배열은 전체 등록 배열이므로 바뀌지 않은 모델을 그대로 씁니다.
+                    self.display_indices = model.display_vertex_indices
+                    self.current_count = self.total_count = int(model.registration_vertex_indices.size)
+                    self.progress = max(self.progress, 0.88)
+                else:
+                    if self.display_builder is None:
+                        self.display_builder = IncrementalDisplayIndexBuilder(
+                            model.registration_vertex_indices.astype(np.uint64, copy=False),
+                            max_points=self.display_vertex_limit,
+                            _validated_unique=True,
+                        )
+                    sample_progress = self.display_builder.step(
+                        max_records=DEFAULT_DISPLAY_SAMPLE_CHUNK_SIZE,
+                        time_budget_seconds=time_budget_seconds,
                     )
-                sample_progress = self.display_builder.step(
-                    max_records=DEFAULT_DISPLAY_SAMPLE_CHUNK_SIZE,
-                    time_budget_seconds=time_budget_seconds,
-                )
-                self.current_count = sample_progress.processed_count
-                self.total_count = sample_progress.total_count
-                self.progress = max(self.progress, 0.82 + 0.06 * sample_progress.fraction)
-                if not sample_progress.is_completed:
-                    return "RUNNING"
-                sample_offsets = self.display_builder.display_indices
-                self.display_indices = np.ascontiguousarray(
-                    model.registration_vertex_indices[sample_offsets],
-                    dtype=np.uint32,
-                )
-                self.display_indices.setflags(write=False)
-                self.display_builder = None
-                self.staged_model = TriangleMeshModelData(
-                    model_id=model.model_id,
-                    display_name=model.display_name,
-                    source_path=model.source_path,
-                    vertices_float64=model.vertices_float64,
-                    triangles_uint32=model.triangles_uint32,
-                    registration_vertex_indices=model.registration_vertex_indices,
-                    display_vertex_indices=self.display_indices,
-                    bounds_min=model.bounds_min,
-                    bounds_max=model.bounds_max,
-                    geometry_revision=model.geometry_revision,
-                    texcoords_float64=model.texcoords_float64,
-                    texcoord_component_counts_uint8=model.texcoord_component_counts_uint8,
-                    triangle_texcoord_indices_int32=model.triangle_texcoord_indices_int32,
-                    materials=model.materials,
-                    triangle_material_indices_int32=model.triangle_material_indices_int32,
-                    triangle_polygon_indices_uint32=model.triangle_polygon_indices_uint32,
-                    triangle_loop_indices_uint32=model.triangle_loop_indices_uint32,
-                    embedded_asset_uuid=model.embedded_asset_uuid,
-                    embedded_asset_schema_version=model.embedded_asset_schema_version,
-                    embedded_data_name_hint=model.embedded_data_name_hint,
-                    original_polygon_count=model.original_polygon_count,
-                )
+                    self.current_count = sample_progress.processed_count
+                    self.total_count = sample_progress.total_count
+                    self.progress = max(self.progress, 0.82 + 0.06 * sample_progress.fraction)
+                    if not sample_progress.is_completed:
+                        return "RUNNING"
+                    sample_offsets = self.display_builder.display_indices
+                    self.display_indices = np.ascontiguousarray(
+                        model.registration_vertex_indices[sample_offsets],
+                        dtype=np.uint32,
+                    )
+                    self.display_indices.setflags(write=False)
+                    self.display_builder = None
+                    self.staged_model = TriangleMeshModelData(
+                        model_id=model.model_id,
+                        display_name=model.display_name,
+                        source_path=model.source_path,
+                        vertices_float64=model.vertices_float64,
+                        triangles_uint32=model.triangles_uint32,
+                        registration_vertex_indices=model.registration_vertex_indices,
+                        display_vertex_indices=self.display_indices,
+                        bounds_min=model.bounds_min,
+                        bounds_max=model.bounds_max,
+                        geometry_revision=model.geometry_revision,
+                        uv_data=model.uv_data,
+                        triangle_texcoord_indices_int32=model.triangle_texcoord_indices_int32,
+                        materials=model.materials,
+                        triangle_material_indices_int32=model.triangle_material_indices_int32,
+                        triangle_polygon_indices_uint32=model.triangle_polygon_indices_uint32,
+                        triangle_loop_indices_uint32=model.triangle_loop_indices_uint32,
+                        embedded_asset_uuid=model.embedded_asset_uuid,
+                        embedded_asset_schema_version=model.embedded_asset_schema_version,
+                        embedded_data_name_hint=model.embedded_data_name_hint,
+                        original_polygon_count=model.original_polygon_count,
+                    )
                 if self.stage_only:
                     return self._complete()
                 if not self.prepare_gpu:

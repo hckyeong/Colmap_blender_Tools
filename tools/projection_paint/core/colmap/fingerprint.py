@@ -43,7 +43,7 @@ def _write_f64(digest: object, value: float) -> None:
 def semantic_fingerprint_steps(
     dataset: ColmapDataset,
 ) -> Generator[tuple[int, int], None, str]:
-    """의미 Fingerprint를 레코드 단위로 계산해 처리량을 전달합니다."""
+    """불변 점 보기를 복사하지 않고 의미 지문과 진행률을 계산합니다."""
     digest = hashlib.sha256()
     _write_tag(digest, SCHEMA_TAG)
     _write_u32(digest, SCHEMA_VERSION)
@@ -84,8 +84,14 @@ def semantic_fingerprint_steps(
             yield completed, total
 
     _write_u64(digest, len(dataset.points3d))
-    for point3d_id in sorted(dataset.points3d):
-        point = dataset.points3d[point3d_id]
+    from .shared_reader import PointRecordMapping
+
+    point_records = (
+        dataset.points3d.values()
+        if isinstance(dataset.points3d, PointRecordMapping)
+        else (dataset.points3d[key] for key in sorted(dataset.points3d))
+    )
+    for point in point_records:
         _write_tag(digest, "POINT3D")
         _write_u64(digest, point.point3d_id)
         for value in point.xyz:

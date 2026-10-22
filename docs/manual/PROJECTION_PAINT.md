@@ -2,7 +2,7 @@
 
 촬영 이미지를 모델 표면에 투영해 텍스처를 보정하고, 레이어·마스크·색 보정을 합성하여 이미지로 출력하는 도구입니다. 실제 Blender 메뉴 이름은 **Projection Painting**입니다.
 
-- 기준: **COLMAP Tools 0.3.41 · Windows x64 · Blender 5.2.0 이상**.
+- 기준: **COLMAP Tools 0.3.74 · Windows x64 · Blender 5.2.0 이상**.
 - 실행: **Window → COLMAP Tools → Projection Painting**.
 - [설치·공통 조작](README.md) · [Align](ALIGN.md) · [Modifier](MODIFIER.md).
 - 캡처는 사용자가 직접 추가합니다. 각 기능 옆 상자에 준비 상태와 예정 파일명을 표시했습니다.
@@ -11,7 +11,7 @@
 
 | 기능 | 할 수 있는 일 |
 |---|---|
-| [COLMAP 데이터 업데이트](#dataset) | Modifier의 현재 점군·카메라 복사 |
+| [COLMAP·OBJ 불러오기](#dataset) | 파일에서 점군·카메라·촬영 이미지와 실제 메시 가져오기 |
 | [Paint Target·Painting Mode](#paint-target) | 칠할 모델·해상도를 정하고 페인트 시작·종료 |
 | [레이어 관리](#layers) | 추가·선택·활성화·이름 변경·순서 변경·삭제 |
 | [카메라 이미지 검토](#camera-review) | 투영에 사용할 촬영 시점과 이미지 확인 |
@@ -27,29 +27,34 @@
 
 <a id="dataset"></a>
 
-## 1. COLMAP 데이터 업데이트
+## 1. COLMAP·OBJ 불러오기
 
-**용도:** Modifier에서 준비한 점군·카메라·이미지 연결을 Painting에서 사용합니다.
+**용도:** COLMAP 파일의 점군·카메라·촬영 이미지와 OBJ 모델을 직접 사용합니다. Modifier나 Align을 먼저 실행할 필요가 없습니다.
 
-**위치:** **COLMAP Dataset → COLMAP 데이터 업데이트**.
+**위치:** **COLMAP Dataset → COLMAP 불러오기 / OBJ 불러오기**.
 
-1. Modifier에서 데이터를 불러오고 사용할 편집 결과를 준비합니다.
-2. **Window → COLMAP Tools → Projection Painting**을 엽니다.
-3. **COLMAP Dataset → COLMAP 데이터 업데이트**를 누릅니다.
-4. 완료 상태와 카메라·점 표시를 확인합니다.
+입력 영역에는 두 버튼을 각각 한 줄씩 표시합니다. 경로·파일 형식·원본 축 입력란은 패널에 표시하지 않습니다.
 
-업데이트는 그 시점의 데이터를 Painting에 독립 복사합니다. Modifier에서 이후에 카메라를 제거하거나 편집을 되돌렸다면, Painting에도 반영할 때 다시 업데이트합니다. 기존 레이어·페인트 대상은 이 버튼으로 새 모델과 자동 교체되지 않습니다.
+1. **Window → COLMAP Tools → Projection Painting**을 엽니다.
+2. **COLMAP 불러오기**에서 희소 모델과 촬영 이미지가 있는 데이터셋 폴더를 선택합니다. 파일 탐색기의 **참고 점 최대 개수**는 기본 20,000개이며 필요하면 변경할 수 있습니다. 카메라·촬영 이미지는 모두 가져옵니다.
+3. 선택한 폴더에서 희소 모델과 촬영 이미지를 자동 탐색합니다. TXT·BIN을 지원합니다.
+4. **OBJ 불러오기**로 메시를 가져옵니다. 원본 UV·재질·텍스처 연결을 유지합니다.
+5. **Paint Setup → Paint Target**에서 사용할 메시를 지정합니다.
 
-**사용 조건:** 먼저 [Modifier Import](MODIFIER.md#import)를 완료해야 합니다. 사용할 촬영 이미지 파일도 원래 경로에 있어야 합니다.
+COLMAP 재입력은 카메라·점군만 교체하며 기존 메시·페인트 대상·레이어를 유지합니다. OBJ는 새 메시로 추가하며 기존 페인트 대상을 자동 교체하지 않습니다. 기본 OBJ 가져오기 호출 도중에는 즉시 취소할 수 없습니다.
 
-**결과:** 업데이트 시점의 독립 데이터가 준비됩니다. COLMAP Dataset의 Point Display·Camera Display로 점과 카메라 표시 크기를 조절할 수 있습니다.
+**사용 조건:** 촬영 이미지가 지정 경로에 있어야 하며 정확한 투영은 `SIMPLE_PINHOLE`·`PINHOLE` 카메라를 사용합니다. 페인팅 중에는 입력을 바꿀 수 없습니다. Modifier 편집 결과는 [COLMAP Export](MODIFIER.md#export) 후 파일로 불러옵니다.
+
+**결과:** 파일에서 가져온 독립 데이터가 준비됩니다. COLMAP Dataset의 Point Display·Camera Display로 점과 카메라 표시 크기를 조절할 수 있습니다.
+
+점 상한은 새 COLMAP 가져오기에 적용합니다. 파일 탐색기를 취소하면 기존 경로와 상한이 유지되고, 이미 저장된 점군을 열거나 페인팅에 진입할 때 자동 축소하지 않습니다. 표본을 가져온 경우 Dataset에 원본 점 수를 함께 표시합니다.
 
 <a id="capture-17"></a>
 
 > **[캡처 17] Painting 데이터 준비와 전체 화면**
 >
-> - 준비: Modifier 데이터 업데이트가 완료되고 페인트 모델이 준비된 상태.
-> - 필수 표시: COLMAP 데이터 업데이트, Paint Setup, Camera Review, Layers와 상태 영역.
+> - 준비: COLMAP·OBJ 파일 가져오기가 완료되고 페인트 모델이 준비된 상태.
+> - 필수 표시: COLMAP 불러오기·OBJ 불러오기, Paint Setup, Camera Review, Layers와 상태 영역.
 > - 예정 파일: `images/17-painting-overview.png`
 
 <a id="paint-target"></a>
@@ -62,12 +67,12 @@
 
 ### 페인트 대상 준비
 
-- Modifier에서 불러올 COLMAP과 해당 촬영 이미지.
+- 파일에서 직접 불러올 COLMAP과 해당 촬영 이미지.
 - COLMAP과 좌표가 맞는 **실제 Blender Mesh 오브젝트**.
 - 페인트 대상 모델의 유효한 UV Map.
 - 기존 색상 텍스처를 유지하려면 올바른 재질·이미지 연결.
 
-Align 내부에 내장된 메시는 일반 Blender 페인트 대상과 다릅니다. Align에서 정렬한 메시로 칠하려면 OBJ로 내보낸 뒤 Blender의 **File → Import → Wavefront (.obj)**로 다시 불러옵니다.
+Align 내부에 내장된 메시는 일반 Blender 페인트 대상과 다릅니다. Align에서 정렬한 메시로 칠하려면 OBJ로 내보낸 뒤 Painting의 **OBJ 불러오기**로 가져옵니다.
 
 연결 라이브러리 메시를 사용한다면 로컬 복사본을 준비하십시오. 여러 오브젝트가 같은 Mesh 데이터를 공유한다면 페인트 대상의 Mesh를 **Single User**로 분리해야 합니다. Painting 준비 과정에서 UV와 재질 구성을 관리하므로 작업 전 `.blend` 복사본을 저장해 두면 원래 모델 구성을 보관할 수 있습니다.
 
@@ -75,7 +80,7 @@ Align 내부에 내장된 메시는 일반 Blender 페인트 대상과 다릅니
 
 ### 대상 지정과 시작·종료
 
-1. 일반 Blender 작업공간에서 칠할 모델을 불러오고 COLMAP과 위치·축이 맞는지 확인합니다.
+1. Painting의 **OBJ 불러오기**로 모델을 가져오거나 기존 실제 메시를 준비하고 COLMAP과 위치·축이 맞는지 확인합니다.
 2. Painting의 **Paint Setup**을 펼칩니다.
 3. **Paint Target**에 해당 Mesh 오브젝트를 지정합니다.
 4. 기존 텍스처 해상도를 사용할 때는 **Use Base Resolution**을 확인합니다. 직접 지정할 때는 **Resolution**을 설정합니다.
@@ -85,6 +90,12 @@ Align 내부에 내장된 메시는 일반 Blender 페인트 대상과 다릅니
 UV가 없거나 페인트 대상이 공유 Mesh·연결 라이브러리 상태라면 위 페인트 대상 준비의 조건에 맞게 정리합니다. 높은 해상도, 많은 UDIM 타일과 레이어는 메모리를 더 사용합니다. 처음에는 작은 해상도에서 흐름을 확인한 뒤 실제 작업에 필요한 값으로 설정하십시오.
 
 Painting Mode를 종료하려면 같은 버튼을 사용합니다. 페인트 모드에서 나오는 것과 텍스처를 파일로 저장하는 것은 별개입니다.
+
+진입할 때 페인트 색상은 흰색으로 설정되고 **페인트 대상 외의 메시·조명·빈 오브젝트는 숨겨집니다**. 점군과 카메라 등 보조 윤곽도 표시하지 않습니다. 배경용 카메라 자체와 촬영 이미지 연결은 유지하므로 **Camera Review → Background**를 켜면 카메라 배경 사진이 표시됩니다. 종료하면 다른 오브젝트·참고 표시·보조 윤곽 설정은 원래 상태로 돌아갑니다. 원래 숨긴 오브젝트는 계속 숨기며 페인트 중 직접 다시 표시한 오브젝트는 종료 때 덮어쓰지 않습니다. 진입한 뒤에는 색상을 원하는 값으로 바꿀 수 있습니다.
+
+카메라뷰에서 일반 뷰로 나오면 원근투영으로 복귀합니다. 일반 뷰에서 직접 정사투영을 선택하는 기본 Blender 조작은 유지됩니다.
+
+**Use Base Resolution**을 켠 채 다시 진입해도 보존된 원본 해상도를 사용하고 기존 페인트 레이어를 유지합니다. 옵션을 끄고 다른 해상도를 지정하면 전체 레이어 초기화 확인이 필요합니다.
 
 **결과:** 지정한 모델이 페인트 대상이 됩니다. 실제로 칠할 레이어는 [Layers에서 별도로 활성화](#layers)합니다.
 
@@ -135,7 +146,7 @@ Painting Mode를 종료하려면 같은 버튼을 사용합니다. 페인트 모
 
 1. 타임라인에서 사용할 카메라 프레임을 선택합니다.
 2. Camera Review의 **IMAGE_ID**와 이미지 정보를 확인합니다.
-3. **Look Through Camera**로 촬영 시점에 들어갑니다.
+3. 프레임 변경으로 전환된 촬영 시점을 확인합니다.
 4. **Show Background Image** 또는 `F7`로 배경 이미지를 켜거나 끕니다.
 5. **Background Alpha**로 모델과 배경을 비교하기 좋은 표시 강도를 정합니다.
 
@@ -149,14 +160,16 @@ Painting Mode를 종료하려면 같은 버튼을 사용합니다. 페인트 모
 
 **위치:** **Paint Setup → Reconnect Stencil Texture**, 유효한 Painting 화면에서 **F6**.
 
-1. 타임라인에서 사용할 카메라 프레임을 선택합니다.
+1. 타임라인에서 사용할 카메라 프레임을 선택하거나 일반 원근 뷰에서 원하는 시점을 잡습니다.
 2. **Camera Review**의 IMAGE_ID와 이미지 이름을 확인합니다.
-3. **Look Through Camera**로 촬영 시점에 들어갑니다.
+3. 현재 뷰의 위치와 방향을 확인합니다.
 4. 칠할 일반 레이어를 더블클릭해 활성화합니다.
 5. **Reconnect Stencil Texture**를 누릅니다. 유효한 Painting 화면에서는 `F6`도 사용할 수 있습니다.
 6. 상단 스텐실 상태가 연결되었는지 확인합니다.
 
 재연결은 카메라 이미지를 쓰기 위한 프로젝트 Draw 브러시를 준비합니다. 다른 브러시를 골랐거나 마스크를 편집 중인 상태와 구분하십시오.
+
+재연결 버튼은 현재 뷰의 위치·방향에 맞는 카메라를 찾아 해당 프레임과 카메라뷰로 이동하고 스텐실을 연결합니다. 별도의 **Look Through Camera** 버튼은 표시하지 않습니다.
 
 카메라 화면 밖으로 나가면 카메라 스텐실 연결이 일시 중지됩니다. 점·레이어·이미지가 삭제된 것은 아닙니다. 카메라 화면으로 돌아와 상태를 확인하고 필요하면 재연결합니다. 프레임을 연속으로 빠르게 바꾸면 마지막 프레임에 잠시 멈춘 뒤 이미지가 갱신됩니다.
 
@@ -167,7 +180,7 @@ Painting Mode를 종료하려면 같은 버튼을 사용합니다. 페인트 모
 > **[캡처 19] 카메라 스텐실 연결**
 >
 > - 준비: 일반 레이어·Painting Mode·카메라 화면이 활성이고 촬영 이미지가 연결된 상태.
-> - 필수 표시: IMAGE_ID·이미지 이름, 스텐실 연결 상태, Look Through Camera, Reconnect Stencil Texture.
+> - 필수 표시: IMAGE_ID·이미지 이름, 스텐실 연결 상태, Reconnect Stencil Texture.
 > - 예정 파일: `images/19-painting-stencil.png`
 
 <a id="brushes"></a>
@@ -177,6 +190,8 @@ Painting Mode를 종료하려면 같은 버튼을 사용합니다. 페인트 모
 **용도:** 필요한 표면만 부분적으로 칠하거나 기존 색을 복제·보정합니다.
 
 **위치:** Painting 화면의 Blender 브러시 도구.
+
+왼쪽 도구 막대, 상단 도구 설정과 브러시 자산 선반은 일반 Texture Paint 화면과 동일합니다. 도구 막대는 `T`로 표시하거나 숨길 수 있습니다. 브러시 도구는 **Painting Mode**로 텍스처 페인트에 진입한 뒤 표시됩니다.
 
 1. 칠할 일반 레이어를 더블클릭하여 활성화합니다.
 2. 촬영 이미지로 칠하려면 카메라 화면에서 [스텐실을 재연결](#stencil)합니다.
@@ -336,7 +351,7 @@ Source를 다시 수정해야 한다면 **Composite 해제** 후 작업합니다
 
 `.blend`에는 복사한 COLMAP 데이터와 레이어·페인트·연결 상태가 남습니다. 모든 외부 이미지가 자동으로 내장된다고 가정하지 않습니다.
 
-다시 열린 Painting 데이터는 Modifier와 독립적으로 유지됩니다. 최신 Modifier 편집을 가져오고 싶을 때만 [COLMAP 데이터 업데이트](#dataset)를 다시 실행합니다. Painting Mode 종료와 `.blend` 저장, 텍스처 Export는 각각 별도 작업입니다.
+다시 열린 Painting 데이터는 Modifier와 독립적으로 유지되며 이전 Modifier 복사 자료도 복원합니다. 최신 Modifier 편집은 COLMAP으로 내보낸 뒤 [COLMAP 불러오기](#dataset)로 가져옵니다. Painting Mode 종료와 `.blend` 저장, 텍스처 Export는 각각 별도 작업입니다.
 
 <a id="help"></a>
 
@@ -344,7 +359,7 @@ Source를 다시 수정해야 한다면 **Composite 해제** 후 작업합니다
 
 | 증상 | 확인할 기능 |
 |---|---|
-| COLMAP 데이터 업데이트가 비활성 | [Modifier의 정상 Import](MODIFIER.md#import) 여부 |
+| COLMAP·OBJ 불러오기가 비활성 | 페인팅 또는 다른 가져오기가 진행 중인지 확인 |
 | Painting Mode를 시작할 수 없음 | [Paint Target](#paint-target)의 UV·로컬 Mesh·Single User·재질과 상태 메시지 |
 | 다른 레이어에 칠해짐 | 선택만 바꾼 상태일 수 있음. [더블클릭과 활성 표시](#layers) 확인 |
 | 레이어를 편집하거나 순서를 바꿀 수 없음 | Original의 편집 제한, [Composite Source 잠금](#composite) 확인 |
@@ -363,6 +378,7 @@ Source를 다시 수정해야 한다면 **Composite 해제** 후 작업합니다
 | Delete | 레이어 목록 문맥의 선택 항목 삭제 |
 | F6 | 유효한 세션에서 카메라 스텐실 재연결 |
 | F7 | 카메라 배경 이미지 표시 전환 |
+| Ctrl 누르기 / 놓기 | 연결된 스텐실에서 Erase Soft로 전환 / 이전 브러시 복귀 |
 | Ctrl + 왼쪽 클릭 | Blender Clone 복제 원점 지정 |
 | Esc | 텍스처 출력 진행 중 취소 요청 |
 

@@ -10,6 +10,8 @@ import numpy as np
 import numpy.typing as npt
 
 from ..constants import GEOMETRY_KIND_TRIANGLE_MESH
+from ..geometry_buffers import immutable_geometry_array
+from .texture_coordinates import MeshTextureCoordinates
 
 
 Float64Array: TypeAlias = npt.NDArray[np.float64]
@@ -78,7 +80,7 @@ class ObjMaterialData:
         return bool(path is not None and path.is_file())
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class TriangleMeshModelData:
     """내장 OBJ에서 파생한 삼각형 프록시와 원본 Polygon 매핑을 불변 보관합니다."""
 
@@ -92,12 +94,7 @@ class TriangleMeshModelData:
     bounds_min: Float64Array
     bounds_max: Float64Array
     geometry_revision: int = 1
-    texcoords_float64: Float64Array = field(
-        default_factory=lambda: np.empty((0, 3), dtype=np.float64)
-    )
-    texcoord_component_counts_uint8: UInt8Array = field(
-        default_factory=lambda: np.empty((0,), dtype=np.uint8)
-    )
+    uv_data: MeshTextureCoordinates = field(default_factory=MeshTextureCoordinates.from_legacy)
     triangle_texcoord_indices_int32: Int32Array = field(
         default_factory=lambda: np.empty((0, 3), dtype=np.int32)
     )
@@ -116,8 +113,52 @@ class TriangleMeshModelData:
     embedded_data_name_hint: str = ""
     original_polygon_count: int = 0
 
+    def __init__(
+        self, model_id: str, display_name: str, source_path: Path,
+        vertices_float64: Float64Array, triangles_uint32: UInt32Array,
+        registration_vertex_indices: UInt32Array, display_vertex_indices: UInt32Array,
+        bounds_min: Float64Array, bounds_max: Float64Array, geometry_revision: int = 1,
+        texcoords_float64: Float64Array | None = None,
+        texcoord_component_counts_uint8: UInt8Array | None = None,
+        triangle_texcoord_indices_int32: Int32Array | None = None,
+        materials: tuple[ObjMaterialData, ...] = (),
+        triangle_material_indices_int32: Int32Array | None = None,
+        triangle_polygon_indices_uint32: UInt32Array | None = None,
+        triangle_loop_indices_uint32: UInt32Array | None = None,
+        embedded_asset_uuid: str = "", embedded_asset_schema_version: int = 0,
+        embedded_data_name_hint: str = "", original_polygon_count: int = 0,
+        *, uv_data: MeshTextureCoordinates | None = None,
+    ) -> None:
+        """기존 생성자 인자를 유지하며 새 코너 UV 표현과 기존 OBJ 표현을 구분해 받습니다."""
+        if texcoords_float64 is not None or texcoord_component_counts_uint8 is not None:
+            # dataclasses.replace의 명시적 기존 UV 교체도 기존 생성자와 같은 의미로 처리합니다.
+            if uv_data is not None:
+                if texcoords_float64 is None:
+                    texcoords_float64 = uv_data.legacy_float64()
+                if texcoord_component_counts_uint8 is None:
+                    texcoord_component_counts_uint8 = uv_data.component_counts
+            uv_data = MeshTextureCoordinates.from_legacy(texcoords_float64, texcoord_component_counts_uint8)
+        elif uv_data is None:
+            uv_data = MeshTextureCoordinates.from_legacy()
+        values = {
+            "model_id": model_id, "display_name": display_name, "source_path": source_path,
+            "vertices_float64": vertices_float64, "triangles_uint32": triangles_uint32,
+            "registration_vertex_indices": registration_vertex_indices, "display_vertex_indices": display_vertex_indices,
+            "bounds_min": bounds_min, "bounds_max": bounds_max, "geometry_revision": geometry_revision,
+            "uv_data": uv_data, "materials": materials,
+            "triangle_texcoord_indices_int32": np.empty((0, 3), dtype=np.int32) if triangle_texcoord_indices_int32 is None else triangle_texcoord_indices_int32,
+            "triangle_material_indices_int32": np.empty((0,), dtype=np.int32) if triangle_material_indices_int32 is None else triangle_material_indices_int32,
+            "triangle_polygon_indices_uint32": np.empty((0,), dtype=np.uint32) if triangle_polygon_indices_uint32 is None else triangle_polygon_indices_uint32,
+            "triangle_loop_indices_uint32": np.empty((0, 3), dtype=np.uint32) if triangle_loop_indices_uint32 is None else triangle_loop_indices_uint32,
+            "embedded_asset_uuid": embedded_asset_uuid, "embedded_asset_schema_version": embedded_asset_schema_version,
+            "embedded_data_name_hint": embedded_data_name_hint, "original_polygon_count": original_polygon_count,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+        self.__post_init__()
+
     def __post_init__(self) -> None:
-        """메시 형상·UV 배열의 dtype·인덱스 범위·경계를 검증하고 읽기 전용으로 고정합니다."""
+        """원본 형상과 UV 대응을 검증하고 모델 내부의 준비된 불변 표현을 유지합니다."""
         model_id = str(self.model_id).strip()
         display_name = str(self.display_name).strip()
         if not model_id:
@@ -154,19 +195,9 @@ class TriangleMeshModelData:
             raise ValueError("메시 경계가 원본 정점 배열과 일치하지 않습니다.")
         if isinstance(self.geometry_revision, bool) or int(self.geometry_revision) < 0:
             raise ValueError("geometry revision은 음수일 수 없습니다.")
-        texcoords = _freeze_array(self.texcoords_float64, np.float64, (None, 3), "OBJ UV 좌표")
-        component_counts = _freeze_array(
-            self.texcoord_component_counts_uint8,
-            np.uint8,
-            (None,),
-            "OBJ UV 성분 수",
-        )
-        if component_counts.shape[0] != texcoords.shape[0]:
-            raise ValueError("OBJ UV 좌표와 성분 수의 개수가 일치하지 않습니다.")
-        if component_counts.size and (
-            np.any(component_counts < 1) or np.any(component_counts > 3)
-        ):
-            raise ValueError("OBJ UV 성분 수는 1~3이어야 합니다.")
+        if not isinstance(self.uv_data, MeshTextureCoordinates):
+            raise ValueError("메시 UV 저장 표현이 올바르지 않습니다.")
+        texcoords = self.uv_data.coordinates
         raw_face_texcoords = np.ascontiguousarray(
             self.triangle_texcoord_indices_int32,
             dtype=np.int32,
@@ -245,15 +276,13 @@ class TriangleMeshModelData:
         object.__setattr__(self, "model_id", model_id)
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "source_path", Path(self.source_path))
-        object.__setattr__(self, "vertices_float64", vertices)
-        object.__setattr__(self, "triangles_uint32", triangles)
+        object.__setattr__(self, "vertices_float64", immutable_geometry_array(vertices, '<f8'))
+        object.__setattr__(self, "triangles_uint32", immutable_geometry_array(triangles, '<u4'))
         object.__setattr__(self, "registration_vertex_indices", registration)
         object.__setattr__(self, "display_vertex_indices", display)
         object.__setattr__(self, "bounds_min", bounds_min)
         object.__setattr__(self, "bounds_max", bounds_max)
         object.__setattr__(self, "geometry_revision", int(self.geometry_revision))
-        object.__setattr__(self, "texcoords_float64", texcoords)
-        object.__setattr__(self, "texcoord_component_counts_uint8", component_counts)
         object.__setattr__(self, "triangle_texcoord_indices_int32", face_texcoords)
         object.__setattr__(self, "materials", materials)
         object.__setattr__(self, "triangle_material_indices_int32", face_materials)
@@ -263,6 +292,21 @@ class TriangleMeshModelData:
         object.__setattr__(self, "embedded_asset_schema_version", embedded_schema)
         object.__setattr__(self, "embedded_data_name_hint", data_name_hint)
         object.__setattr__(self, "original_polygon_count", original_polygon_count)
+
+    @property
+    def texture_coordinates(self) -> np.ndarray:
+        """표시 준비가 추가 복사 없이 사용할 실제 UV 저장 배열을 반환합니다."""
+        return self.uv_data.coordinates
+
+    @property
+    def texcoords_float64(self) -> Float64Array:
+        """기존 API의 세 성분 배정밀도 UV를 명시적 조회 시에만 반환합니다."""
+        return self.uv_data.legacy_float64()
+
+    @property
+    def texcoord_component_counts_uint8(self) -> UInt8Array:
+        """UV 성분 수를 반환하며 코너 UV의 반복 값은 모델 전용 한 바이트를 참조합니다."""
+        return self.uv_data.component_counts
 
     @property
     def geometry_kind(self) -> str:
@@ -308,8 +352,8 @@ class TriangleMeshModelData:
 
     @property
     def texture_coordinate_count(self) -> int:
-        """OBJ 원본 UV 좌표 개수를 반환합니다."""
-        return int(self.texcoords_float64.shape[0])
+        """저장 표현을 확장하지 않고 원본 UV 좌표 개수를 반환합니다."""
+        return int(self.uv_data.coordinates.shape[0])
 
     @property
     def textured_face_count(self) -> int:

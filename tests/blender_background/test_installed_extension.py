@@ -95,13 +95,13 @@ def _assert_manifest_version(module) -> None:
 
 
 def _assert_alignment_runtime(module) -> None:
-    """현재 설치 프로필의 실제 엔진과 정식 CPU 설정 연결을 검증합니다."""
+    """설치 프로필의 강체·Sim(3) 실제 계산과 정식 CPU 설정 연결을 검증합니다."""
     profile = import_module(f"{MODULE_NAME}.tools.align.distribution_profile")
     if profile.DISTRIBUTION_PROFILE == "SMALL_GICP":
         _assert_small_gicp_runtime(module)
         return
-    if profile.DISTRIBUTION_PROFILE not in {"CCCORELIB", "FULL"}:
-        raise AssertionError("설치본 검사는 실행 환경을 포함한 CCCoreLib·Full·SmallGicp 배포를 요구합니다.")
+    if profile.DISTRIBUTION_PROFILE not in {"POINT_KD", "CCCORELIB", "FULL"}:
+        raise AssertionError("설치본 검사는 실행 환경을 포함한 PointKd·CCCoreLib·Full·SmallGicp 배포를 요구합니다.")
     properties = import_module(f"{MODULE_NAME}.tools.align.properties")
     preferences = bpy.context.preferences.addons[MODULE_NAME].preferences
     if properties.addon_preferences() != preferences:
@@ -116,9 +116,16 @@ def _assert_alignment_runtime(module) -> None:
         from installed_cccore_checks import check_cccore_alignment
         output = os.environ.get("COLMAP_TOOLS_TEST_OUTPUT", "")
         with TemporaryDirectory() as temporary:
-            report = check_cccore_alignment(MODULE_NAME, Path(output or temporary))
-        assert report["passed"] and len(report["cases"]) == 4
-        assert _operator_is_registered("colmap_align.validate_cccore_environment")
+            if profile.default_icp_backend() == "POINT_KD_ICP":
+                from installed_point_kd_checks import check_point_kd_alignment
+                report = check_point_kd_alignment(MODULE_NAME, Path(output or temporary))
+                assert report["passed"] and len(report["cases"]) == 16
+                assert sum(case['sim3'] for case in report['cases']) == 8
+                assert _operator_is_registered("colmap_align.validate_point_kd_environment")
+            else:
+                report = check_cccore_alignment(MODULE_NAME, Path(output or temporary))
+                assert report["passed"] and len(report["cases"]) == 4
+                assert _operator_is_registered("colmap_align.validate_cccore_environment")
     finally:
         preferences.cc_cpu_thread_limit = original
 
@@ -427,7 +434,9 @@ def main() -> int:
                 "colmap.open_modifier_workspace",
                 "colmap.review_background_toggle",
                 "projection_paint.open_workspace",
-                "projection_paint.update_colmap_snapshot",
+                "projection_paint.import_colmap",
+                "projection_paint.select_colmap_directory",
+                "projection_paint.import_obj",
                 "projection_paint.block_multiselect_paint_stroke",
             )
             if not _operator_is_registered(operator_id)
@@ -446,8 +455,8 @@ def main() -> int:
         ]
         if missing_properties:
             raise AssertionError(f"설치본 Scene 속성이 등록되지 않았습니다: {missing_properties}")
-        if _operator_is_registered("projection_paint.import_colmap"):
-            raise AssertionError("설치본에 Projection Painting 중복 Import Operator가 등록되었습니다.")
+        if _operator_is_registered("projection_paint.update_colmap_snapshot"):
+            raise AssertionError("설치본에 제거한 Modifier 업데이트 오퍼레이터가 등록되었습니다.")
         projection_settings = bpy.context.scene.projection_paint
         missing_snapshot_properties = [
             name
@@ -458,6 +467,10 @@ def main() -> int:
                 "source_modifier_revision",
                 "source_modifier_fingerprint",
                 "snapshot_state",
+                "source_kind",
+                "model_axis_preset",
+                "model_forward",
+                "model_up",
             )
             if not hasattr(projection_settings, name)
         ]

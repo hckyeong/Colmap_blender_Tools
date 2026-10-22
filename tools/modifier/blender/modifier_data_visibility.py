@@ -140,6 +140,37 @@ def _hide_foreign_root_objects(view_layer: Any) -> None:
             )
 
 
+def _synchronize_meter_layer_visibility(view_layer: Any, guide_roots: tuple[Any, ...], modifier_view_layer: Any) -> bool:
+    """소유 눈금 컬렉션만 Modifier 전용 레이어에 허용하고 변경 여부를 반환합니다."""
+    should_exclude = _pointer(view_layer) != _pointer(modifier_view_layer)
+    changed = False
+    for root in guide_roots:
+        layer_collection = _layer_collection_for_collection(view_layer.layer_collection, root)
+        if layer_collection is None:
+            continue
+        if bool(layer_collection.exclude) != should_exclude:
+            layer_collection.exclude = should_exclude
+            changed = True
+        if bool(layer_collection.exclude) != should_exclude:
+            raise RuntimeError(f"{view_layer.name} View Layer의 Modifier 눈금 제외 상태를 확정하지 못했습니다.")
+    return changed
+
+
+def synchronize_modifier_meter_visibility() -> None:
+    """새 레이어나 작업공간 전환 뒤 기존 눈금의 표시만 재적용하고 자원을 재생성하지 않습니다."""
+    for scene in bpy.data.scenes:
+        guide_roots = iter_meter_guide_collections(scene)
+        if not guide_roots:
+            continue
+        owned_layers = _owned_modifier_view_layers(scene)
+        if len(owned_layers) > 1:
+            raise RuntimeError("Modifier 데이터 전용 View Layer가 중복되었습니다.")
+        modifier_view_layer = owned_layers[0] if owned_layers else None
+        for view_layer in tuple(scene.view_layers):
+            if _synchronize_meter_layer_visibility(view_layer, guide_roots, modifier_view_layer):
+                view_layer.update()
+
+
 def synchronize_modifier_data_visibility(
     scene: Any,
     *,
@@ -176,10 +207,7 @@ def synchronize_modifier_data_visibility(
                 )
         if is_modifier_view_layer:
             _isolate_modifier_view_layer_collections(view_layer, managed_roots + guide_roots)
-        for root in guide_roots:
-            layer_collection = _layer_collection_for_collection(view_layer.layer_collection, root)
-            if layer_collection is not None:
-                layer_collection.exclude = not is_modifier_view_layer
+        _synchronize_meter_layer_visibility(view_layer, guide_roots, modifier_view_layer)
         view_layer.update()
         if is_modifier_view_layer:
             _hide_foreign_root_objects(view_layer)
@@ -229,5 +257,6 @@ __all__ = [
     "ensure_modifier_data_view_layer",
     "is_modifier_data_view_layer",
     "restore_modifier_meter_visibility",
+    "synchronize_modifier_meter_visibility",
     "synchronize_modifier_data_visibility",
 ]

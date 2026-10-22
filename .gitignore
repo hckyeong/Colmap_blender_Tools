@@ -12,6 +12,7 @@ __pycache__/
 /.small-gicp-runtime-cache/
 /.small-gicp-runtime-build/
 /.cccore-runtime/
+/.point-kd-runtime/
 *.zip
 # GitHub에서 바로 내려받는 정식 설치본 하나만 추적합니다.
 !/colmap_tools.zip

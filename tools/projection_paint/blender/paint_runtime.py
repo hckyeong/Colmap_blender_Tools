@@ -942,9 +942,14 @@ def _sync_stencil_connection_for_current_view(runtime: PaintRuntime, context: An
 
 
 def _track_runtime(runtime: PaintRuntime) -> float | None:
-    """Camera View 이동·확대만 추적하고 Camera View 이탈 때 연결을 해제합니다."""
+    """임시 지우개 연결을 보존하며 Camera View 이동·확대와 이탈을 추적합니다."""
 
     import bpy
+
+    from .stencil_erase import reconcile_stencil_erase
+
+    if reconcile_stencil_erase(runtime.scene):
+        return VIEWPORT_TRACK_INTERVAL
 
     settings = runtime.scene.projection_paint
     if not _projection_runtime_is_active(runtime):
@@ -1005,9 +1010,14 @@ def _viewport_tracking_tick() -> float | None:
 
 
 def _track_paint_tool_edge(runtime: PaintRuntime) -> float | None:
-    """활성 Runtime에서 실제 Tool ID Edge만 저빈도로 Bridge에 전달합니다."""
+    """임시 지우개를 도구 변경으로 기록하지 않고 실제 도구 전환만 전달합니다."""
 
     import bpy
+
+    from .stencil_erase import reconcile_stencil_erase
+
+    if reconcile_stencil_erase(runtime.scene):
+        return TOOL_EDGE_INTERVAL
 
     if not _projection_runtime_is_active(runtime):
         runtime.projection_workspace_active = False
@@ -1016,6 +1026,12 @@ def _track_paint_tool_edge(runtime: PaintRuntime) -> float | None:
         detect_paint_tool_edge,
         initialize_paint_tool_bridge,
     )
+    from .paint_workspace import initialize_native_paint_tool_regions
+
+    window = bpy.context.window
+    for area in window.screen.areas:
+        if area.type == "VIEW_3D":
+            initialize_native_paint_tool_regions(window.workspace, area)
 
     if runtime.tool_bridge is None:
         runtime.tool_bridge = initialize_paint_tool_bridge(bpy.context, runtime.scene)
@@ -1326,12 +1342,15 @@ def stop_paint_runtime(
     scene: Any = None,
     restore_resolution: bool = True,
 ) -> None:
-    """현재 Scene의 Callback과 Source Cache를 닫고 필요 시 Render 크기를 복구합니다."""
+    """임시 지우개와 장면 콜백·소스 캐시를 정리하고 필요 시 렌더 크기를 복구합니다."""
     import bpy
 
     active_scene = scene or getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
     if active_scene is None:
         return
+    from .stencil_erase import restore_stencil_erase
+
+    restore_stencil_erase(active_scene)
     key = str(active_scene.get("pp_scene_uuid", "") or "")
     runtime = _RUNTIMES.pop(key, None)
     if runtime is not None:

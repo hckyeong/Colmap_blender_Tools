@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -196,6 +198,89 @@ def test_custom_pivot_tracks_picked_source_point_and_exact_selection() -> None:
         rtol=0.0,
         atol=1.0e-12,
     )
+
+
+@contextmanager
+def _pivot_event_context(runtime, pick):
+    """피벗 처리의 화면 경계만 대체하고 실제 선택·좌표 변환과 상태 갱신을 실행합니다."""
+
+    from mathutils import Vector
+    from tools.align.constants import ROLE_REFERENCE
+    from tools.align.operators import layer_transform as operator
+
+    region = SimpleNamespace(x=10, y=20)
+    view = SimpleNamespace(view_location=Vector((11, 12, 13)), update=Mock())
+    area = SimpleNamespace(spaces=SimpleNamespace(active=SimpleNamespace(region_3d=view)))
+    event = SimpleNamespace(mouse_x=110, mouse_y=220)
+    with (
+        patch.object(operator, "RUNTIME", runtime),
+        patch.object(operator, "_viewport_for_event", return_value=(area, region, ROLE_REFERENCE)),
+        patch.object(operator, "layer_transform_start_block_reason", return_value=None),
+        patch.object(operator, "pick_nearest_point_for_model_ids", pick),
+        patch.object(operator, "session_align_workspace", return_value=None),
+        patch.object(operator, "set_workspace_status_text") as status,
+        patch.object(operator, "request_redraw"),
+    ):
+        yield operator, region, view, event, status
+
+
+def test_surface_pivot_uses_visible_selection_and_preserves_source_precision() -> None:
+    """화면 표면 선택 결과가 숨긴 레이어를 제외하고 정밀 원본 좌표와 전체 선택 피벗을 보존하는지 검사합니다."""
+
+    from tools.align.alignment import create_translation_delta, project_world_source_position
+    from tools.align.constants import ROLE_REFERENCE
+    from tools.align.viewport.picking import PickResult
+
+    runtime = _runtime_with_models()
+    _select_many(runtime.model_catalog, "reference", "reference_far")
+    runtime.model_catalog.set_model_visibility("reference_far", False)
+    runtime.model_repository.set_alignment_transform("reference", create_translation_delta((7, -3, 2)))
+    source = (1.123456789012, -2.234567890123, 3.345678901234)
+    alignment = runtime.model_repository.alignment_transform_for_model_id("reference")
+    undo_count = runtime.undo_journal.undo_count
+    for kind in ("MESH_SURFACE", "COLMAP_POINT"):
+        pick = Mock(return_value=PickResult("reference", 60206246, source, 0, 1, kind, 60206246))
+        with _pivot_event_context(runtime, pick) as (operator, region, view, event, status):
+            assert operator.set_layer_transform_pivot_from_event(None, event) is True
+            pick.assert_called_once_with(("reference",), region, view, (100.0, 200.0), screen_surface=True)
+            state = runtime.layer_transform
+            assert state.custom_pivot_role == ROLE_REFERENCE
+            assert state.custom_pivot_model_ids == ("reference", "reference_far")
+            assert state.custom_pivot_source_model_id == "reference"
+            np.testing.assert_array_equal(state.custom_pivot_source_position_float64, source)
+            expected = project_world_source_position(runtime.model_repository, "reference", source)
+            np.testing.assert_allclose(tuple(view.view_location), expected, rtol=0, atol=1e-6)
+            view.update.assert_called_once()
+            status.assert_called_once()
+        assert runtime.model_repository.alignment_transform_for_model_id("reference") is alignment
+        assert runtime.undo_journal.undo_count == undo_count
+
+
+def test_surface_pivot_miss_or_gpu_error_preserves_previous_pivot() -> None:
+    """표면 미적중과 GPU 오류가 기존 피벗·카메라를 옮기지 않고 상태 안내로 끝나는지 검사합니다."""
+
+    from tools.align.alignment import set_layer_transform_custom_pivot
+    from tools.align.constants import ROLE_REFERENCE
+    from tools.align.model_repository import ModelRepositoryError
+
+    runtime = _runtime_with_models()
+    _select_many(runtime.model_catalog, "reference")
+    source = (1.125, -2.25, 3.5)
+    set_layer_transform_custom_pivot(runtime, role=ROLE_REFERENCE, model_ids=("reference",),
+                                     source_model_id="reference", source_position=source)
+    for error in (None, ModelRepositoryError("화면 표면 선택 실패 검사")):
+        pick = Mock(return_value=None, side_effect=error)
+        with _pivot_event_context(runtime, pick) as (operator, region, view, event, status):
+            before = tuple(view.view_location)
+            assert operator.set_layer_transform_pivot_from_event(None, event) is True
+            assert tuple(view.view_location) == before
+            view.update.assert_not_called()
+            np.testing.assert_array_equal(runtime.layer_transform.custom_pivot_source_position_float64, source)
+            assert runtime.layer_transform.custom_pivot_source_model_id == "reference"
+            assert runtime.layer_transform.custom_pivot_model_ids == ("reference",)
+            status.assert_called_once()
+            if error is not None:
+                assert runtime.layer_transform.message == str(error)
 
 
 def test_commit_cancel_and_session_undo_are_atomic() -> None:
@@ -581,6 +666,8 @@ def run_all() -> None:
     test_data_layer_multiselection_is_catalog_ordered_and_role_derived()
     test_preview_uses_common_world_origin_pivot_and_left_composition()
     test_custom_pivot_tracks_picked_source_point_and_exact_selection()
+    test_surface_pivot_uses_visible_selection_and_preserves_source_precision()
+    test_surface_pivot_miss_or_gpu_error_preserves_previous_pivot()
     test_commit_cancel_and_session_undo_are_atomic()
     test_session_undo_redo_restores_only_layer_transform_snapshot()
     test_invalid_scale_and_stale_baseline_leave_repository_unchanged()

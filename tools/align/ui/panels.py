@@ -229,6 +229,7 @@ _SCALE_REFINE_STATUS_LABELS = {
     "REJECTED": "거부",
 }
 _ICP_BACKEND_LABELS = {
+    "POINT_KD_ICP": "점 기반 정렬",
     "CCCORELIB": "CC 정밀 정렬",
     "CUSTOM_HYBRID": "기존 Hybrid",
     "OPEN3D_GICP": "Open3D GICP",
@@ -311,7 +312,7 @@ def _icp_progress_entries() -> tuple[str, ...]:
     progress = getattr(state, "progress", None)
     if progress is None:
         return ("ICP · 입력 준비 중",)
-    if str(getattr(progress, "backend_id", "")).strip().upper() == "CCCORELIB":
+    if str(getattr(progress, "backend_id", "")).strip().upper() in {"CCCORELIB", "POINT_KD_ICP"}:
         message = str(getattr(progress, "message", "") or "").strip()
         return (message or "CC 정렬 · 계산 중",)
     stage = str(getattr(progress, "stage", "")).strip()
@@ -459,12 +460,46 @@ def _cccore_result_entries(result, state) -> tuple[str, ...]:
     return tuple(entries)
 
 
+def _point_kd_result_entries(result, _state) -> tuple[str, ...]:
+    """실제 강체·Sim(3) 모드와 배율 및 대응 RMS의 평가 의미를 구분해 표시합니다."""
+    metadata = getattr(result, "metadata", {})
+    quality = getattr(result, "quality", {})
+    status = str(quality.get("status", ""))
+    native = metadata.get("native_result", {})
+    sim3 = metadata.get("scale_mode") == "SIM3"
+    entries = ["정렬 엔진 · " + ("점 기반 Sim(3) 정렬" if sim3 else "점 기반 강체 정렬"), f"상태 · {_ICP_QUALITY_LABELS.get(status, '결과 확인 필요')}"]
+    for label, key in (("초기", "initial_rms"), ("결과", "final_rms")):
+        metric = _finite_metric(metadata.get(key), precision=6)
+        if metric:
+            entries.append(f"{label} 정렬 대응 RMS · {metric}")
+    entries.append("독립 품질 평가 · 실행하지 않음")
+    if sim3:
+        scale = float(metadata["additional_scale"])
+        entries.append(f"추가 배율 · ×{scale:.9g} ({(scale - 1.0) * 100.0:+.6f}%)")
+    else:
+        entries.append("추가 배율 · ×1 · 기존 배율 유지")
+    entries.append(f"전체 유효점 · 질의 {native.get('source_count', 0):,}개 · 기준 {native.get('target_count', 0):,}개")
+    entries.append(f"대응점 · {native.get('correspondence_count', 0):,}개 · 반복 {metadata.get('iterations', 0)}회")
+    reasons = {"MAX_ITERATIONS": "최대 반복에 도달했습니다.", "RMS_WORSENED": "정렬 대응 RMS가 증가했습니다.",
+               "OBJECTIVE_INCREASE": "정렬 목적함수가 증가하여 반복을 멈췄습니다.",
+               "CORRESPONDENCE_COLLAPSE": "유효 대응점이 급감하여 결과 검토가 필요합니다.",
+               "CONVERGED": "설정한 수렴 조건에 도달했습니다."}
+    stop = str(metadata.get("solver_stop_reason", ""))
+    if stop:
+        entries.append("종료 · " + reasons.get(stop, "정렬 계산을 종료했습니다."))
+    for reason in metadata.get("review_reasons", ()):
+        entries.append("검토 · " + reasons.get(reason, "정렬 결과를 직접 확인하십시오."))
+    return tuple(entries)
+
+
 def _icp_result_entries() -> tuple[str, ...]:
-    """완료 엔진에 맞는 CC 거리 또는 기존 평가 항목을 구분해 반환합니다."""
+    """완료 엔진에 맞는 정렬 대응 거리 또는 독립 평가 항목을 구분해 반환합니다."""
     state = getattr(RUNTIME, "icp_alignment", None)
     result = getattr(state, "result", None)
     if result is None:
         return ("ICP 결과를 확인하는 중입니다.",)
+    if str(getattr(result, "solver_backend", "")).strip().upper() == "POINT_KD_ICP":
+        return _point_kd_result_entries(result, state)
     if str(getattr(result, "solver_backend", "")).strip().upper() == "CCCORELIB":
         return _cccore_result_entries(result, state)
     quality = getattr(result, "quality", {})
@@ -1063,7 +1098,7 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         return _moving_panel_poll(context)
 
     def draw(self, context):
-        """마커 버튼의 행 수를 유지하고 형상·편집 안내는 하단 상태 영역에 표시합니다."""
+        """마커·정밀 정렬의 독립 배율 옵션을 한 줄에 배치하고 결과와 편집 상태를 표시합니다."""
         layout = _indented_panel_body(self.layout)
         _configure_layout(layout)
         _set_session_layout_enabled(layout, context)
@@ -1139,15 +1174,23 @@ class COLMAPALIGN_PT_marker(bpy.types.Panel):
         align_ready = align_reason is None
         settings = context.scene.colmap_align_settings
         phase = icp_phase()
-        marker_scale_action = preview_box.row()
-        marker_scale_action.use_property_split = False
+        scale_options = preview_box.row(align=True)
+        scale_options.use_property_split = False
+        scale_options.use_property_decorate = False
+        marker_scale_action = scale_options.row(align=True)
         marker_scale_action.alignment = "LEFT"
         marker_scale_action.enabled = not preview_active and not icp_locked and not export_locked
         marker_scale_action.prop(
             settings,
             "marker_use_uniform_scale",
-            text="Marker Refine Scale",
+            text="마커 배율 보정",
         )
+        from ..distribution_profile import default_icp_backend
+        if default_icp_backend() == "POINT_KD_ICP":
+            scale_action = scale_options.row(align=True)
+            scale_action.alignment = "LEFT"
+            scale_action.enabled = not icp_locked and not export_locked
+            scale_action.prop(settings, "icp_sim3_enabled", text="배율 보정 (Sim(3))")
         if is_icp_running():
             marker_action_row = preview_box.row()
             marker_action_row.enabled = False

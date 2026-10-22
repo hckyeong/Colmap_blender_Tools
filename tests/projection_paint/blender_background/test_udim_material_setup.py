@@ -242,6 +242,33 @@ class UDIMMaterialSetupTests(unittest.TestCase):
         self.assertEqual(change, ((8, 8), (16, 16)))
         self.assertEqual(int(target.active_material_index), 0)
 
+    def test_base_resolution_reentry_preserves_external_original_and_overlay(self):
+        """외부 Original 이관 뒤에도 기본 해상도로 재진입하며 기존 이미지와 원본을 보존합니다."""
+        target = _new_two_face_target("ExternalOriginalReentryTarget")
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "original.png"
+            generated = bpy.data.images.new("OriginalReentryFixture", 32, 16, alpha=True)
+            generated.save_render(str(source_path))
+            source = bpy.data.images.load(str(source_path), check_existing=False)
+            source_bytes = source_path.read_bytes()
+            target.data.materials.append(_new_texture_material("ExternalOriginalReentryMaterial", source))
+            setup = prepare_active_material(target, 64, 64, use_base_resolution=True)
+            commit_paint_setup(bpy.context.scene, setup)
+            reconcile_layer_graph(bpy.context.scene, material=setup.material, overlay=setup.overlay)
+            setup.commit()
+            settings = bpy.context.scene.projection_paint
+            self.assertIs(settings.original_source_image, source)
+            self.assertNotIn("pp_is_original_layer", source)
+            overlay_pointer = setup.overlay.as_pointer()
+            layer_pointers = tuple(layer.image.as_pointer() for layer in settings.layers)
+            self.assertIsNone(pending_overlay_resolution_change(target, 64, 64, use_base_resolution=True))
+            reused = prepare_active_material(target, 64, 64, use_base_resolution=True)
+            self.assertEqual(reused.overlay.as_pointer(), overlay_pointer)
+            self.assertEqual(tuple(reused.overlay.size), (32, 16))
+            self.assertEqual(tuple(layer.image.as_pointer() for layer in settings.layers), layer_pointers)
+            self.assertEqual(source_path.read_bytes(), source_bytes)
+            self.assertEqual(pending_overlay_resolution_change(target, 64, 64, use_base_resolution=False), ((32, 16), (64, 64)))
+
     def test_out_of_range_managed_slot_fails_without_creating_resources(self):
         """범위를 벗어난 관리 슬롯 기록은 최초 변환으로 떨어지지 않습니다."""
         target = _new_two_face_target("BrokenManagedSlotTarget")

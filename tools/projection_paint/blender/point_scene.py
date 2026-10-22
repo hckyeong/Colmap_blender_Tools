@@ -241,7 +241,14 @@ class PointSceneBuildJob:
         return self._result
 
     def _prepare_buffers(self, deadline: float, hard_cap: int) -> None:
-        """Point3D 레코드를 Blender 대량 기록용 평탄 Buffer로 변환합니다."""
+        """배열 입력은 일괄 변환하고 기존 레코드 입력은 시간 예산 안에서 변환합니다."""
+        from ..core.colmap.shared_reader import PointPayloadView
+        if isinstance(self._points, PointPayloadView):
+            (self._coordinates, self._colors, self._errors, self._indexes,
+             self._id_low, self._id_high) = self._points.blender_buffers()
+            self._cursor = len(self._points)
+            self._phase = PointSceneBuildPhase.CREATE_MESH
+            return
 
         processed = 0
         while self._cursor < len(self._points) and processed < hard_cap:
@@ -264,13 +271,18 @@ class PointSceneBuildJob:
             self._phase = PointSceneBuildPhase.CREATE_MESH
 
     def _create_mesh(self) -> None:
-        """준비한 좌표로 단일 Point3D Mesh를 생성합니다."""
+        """연속 좌표 배열은 정점에 일괄 기록하고 기존 목록 입력도 지원합니다."""
 
         self._mesh = bpy.data.meshes.new("PP_COLMAP_Points")
         tag_owned(self._mesh, "POINT_MESH_DATA", dataset_uuid=self._dataset_uuid)
-        self._mesh.from_pydata(self._coordinates, [], [])
+        from ..core.colmap.shared_reader import PointPayloadView
+        if isinstance(self._points, PointPayloadView):
+            self._mesh.vertices.add(len(self._points))
+            self._mesh.vertices.foreach_set("co", self._coordinates)
+        else:
+            self._mesh.from_pydata(self._coordinates, [], [])
         self._mesh.update()
-        self._coordinates.clear()
+        self._coordinates = []
         self._fixed_completed += 1
         self._phase = PointSceneBuildPhase.CREATE_COLOR
 
@@ -285,7 +297,7 @@ class PointSceneBuildJob:
         attribute.data.foreach_set("color", self._colors)
         self._mesh.color_attributes.active = attribute
         self._mesh.color_attributes.active_color = attribute
-        self._colors.clear()
+        self._colors = []
         self._fixed_completed += 1
         self._phase = PointSceneBuildPhase.CREATE_ERROR
 
@@ -298,7 +310,7 @@ class PointSceneBuildJob:
             "POINT",
         )
         attribute.data.foreach_set("value", self._errors)
-        self._errors.clear()
+        self._errors = []
         self._fixed_completed += 1
         self._phase = PointSceneBuildPhase.CREATE_INDEX
 
@@ -311,7 +323,7 @@ class PointSceneBuildJob:
             "POINT",
         )
         attribute.data.foreach_set("value", self._indexes)
-        self._indexes.clear()
+        self._indexes = []
         self._fixed_completed += 1
         self._phase = PointSceneBuildPhase.CREATE_IDS
 
@@ -322,8 +334,8 @@ class PointSceneBuildJob:
         high = self._mesh.attributes.new("colmap_point3d_id_high", "INT", "POINT")
         low.data.foreach_set("value", self._id_low)
         high.data.foreach_set("value", self._id_high)
-        self._id_low.clear()
-        self._id_high.clear()
+        self._id_low = []
+        self._id_high = []
         self._fixed_completed += 1
         self._phase = PointSceneBuildPhase.CREATE_PENDING
 
@@ -402,7 +414,7 @@ class PointSceneBuildJob:
             raise
 
     def abort(self) -> None:
-        """생성 중인 Point3D Blender ID와 Python Buffer를 모두 정리합니다."""
+        """생성 중인 Blender 자원과 목록·배열 입력의 작업 버퍼를 모두 해제합니다."""
 
         remove_point_scene_resources(
             PointSceneResources(
@@ -413,12 +425,12 @@ class PointSceneBuildJob:
                 len(self._points),
             )
         )
-        self._coordinates.clear()
-        self._colors.clear()
-        self._errors.clear()
-        self._indexes.clear()
-        self._id_low.clear()
-        self._id_high.clear()
+        self._coordinates = []
+        self._colors = []
+        self._errors = []
+        self._indexes = []
+        self._id_low = []
+        self._id_high = []
 
 
 def create_point_scene_resources(

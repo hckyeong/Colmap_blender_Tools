@@ -12,15 +12,17 @@ from tools.modifier.blender import meter_grid_guide as guide
 from tools.modifier.blender.managed_scene import is_managed
 from tools.modifier.blender.modifier_data_visibility import (
     activate_modifier_data_view_layer, restore_modifier_meter_visibility,
+    synchronize_modifier_meter_visibility,
 )
+from tools.projection_paint.blender.dataset_view_layer import ensure_projection_dataset_view_layer
 
 
 def run():
-    """빈 Scene 진입과 단위·파일 복원 경계를 검사하고 사용자 자원 보존을 확인합니다."""
+    """빈 Scene 진입과 후발 Painting 레이어·단위·복원에서 눈금과 사용자 자원의 격리를 검사합니다."""
     scene = bpy.context.scene
     foreign = bpy.data.collections.new(guide.GUIDE_COLLECTION_NAME)
     scene.collection.children.link(foreign)
-    guide.register_meter_grid_guide(restore_modifier_meter_visibility)
+    guide.register_meter_grid_guide(restore_modifier_meter_visibility, synchronize_modifier_meter_visibility)
     activate_modifier_data_view_layer(bpy.context.window)
     collection = guide.iter_meter_guide_collections(scene)[0]
     assert collection != foreign
@@ -38,6 +40,14 @@ def run():
     for layer in scene.view_layers:
         excluded = layer.layer_collection.children[collection.name].exclude
         assert excluded == (layer != bpy.context.view_layer)
+    painting_layer = ensure_projection_dataset_view_layer(scene)
+    ordinary_layer = scene.view_layers.new("후발 일반 표시 레이어")
+    guide._view_layer_changed()
+    for layer in (painting_layer, ordinary_layer):
+        assert layer.layer_collection.children[collection.name].exclude
+        assert all(not obj.visible_get(view_layer=layer) for obj in collection.objects)
+    assert not ordinary_layer.layer_collection.children[foreign.name].exclude
+    assert original_ids == {obj.as_pointer() for obj in collection.objects}
     for system, scale, unit in (("METRIC", 1.0, 1.0), ("METRIC", 0.01, 100.0), ("IMPERIAL", 0.01, 100.0), ("NONE", 0.01, 1.0)):
         scene.unit_settings.system = system
         scene.unit_settings.scale_length = scale
@@ -77,6 +87,7 @@ def run():
     assert bpy.data.collections.get(guide.GUIDE_COLLECTION_NAME) is not None
     assert guide.restore_meter_grid_guides not in bpy.app.handlers.load_post
     assert guide._RESTORE_VISIBILITY is None
+    assert guide._SYNCHRONIZE_VISIBILITY is None
     guide.register_meter_grid_guide(restore_modifier_meter_visibility)
     guide.restore_meter_grid_guides()
     assert len(guide.iter_meter_guide_collections(scene)[0].objects) == 21

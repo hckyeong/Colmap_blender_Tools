@@ -14,10 +14,14 @@ if str(PROJECT_PARENT) not in sys.path:
     sys.path.insert(0, str(PROJECT_PARENT))
 
 from tools import projection_paint as addon
-from tools.projection_paint.blender.ownership import tag_owned
+from tools.projection_paint.blender.ownership import owned_uuid_of, tag_owned
 from tools.projection_paint.blender.point_scene import (
     hide_dataset_points,
     restore_dataset_points,
+)
+from tools.projection_paint.blender.dataset_view_layer import (
+    hide_paint_dataset_references,
+    restore_paint_dataset_references,
 )
 
 
@@ -39,6 +43,7 @@ class PointVisibilityTests(unittest.TestCase):
             dataset_uuid="dataset-point-visibility",
         )
         self.scene.collection.objects.link(self.point)
+        self.view_layer.update()
         self.assertEqual(
             "dataset-point-visibility",
             self.scene.projection_paint.dataset_uuid,
@@ -70,6 +75,57 @@ class PointVisibilityTests(unittest.TestCase):
         records = hide_dataset_points(self.scene, self.view_layer)
         restore_dataset_points(self.scene, self.view_layer, records)
         self.assertTrue(self.point.hide_get(view_layer=self.view_layer))
+
+    def test_reference_visibility_restores_the_recorded_view_layer(self) -> None:
+        """카메라 배경을 유지하고 다른 View Layer로 이동해도 점군의 이전 표시를 복구합니다."""
+        camera = bpy.data.objects.new("PP_REFERENCE_CAMERA", bpy.data.cameras.new("PP_REFERENCE_DATA"))
+        tag_owned(camera, "CAMERA_OBJECT", dataset_uuid="dataset-point-visibility")
+        self.scene.collection.objects.link(camera)
+        self.scene.camera = camera
+        user_camera = bpy.data.objects.new("USER_CAMERA", bpy.data.cameras.new("USER_CAMERA_DATA"))
+        self.scene.collection.objects.link(user_camera)
+        paint_layer = self.scene.view_layers.new("PaintReferenceTest")
+        self.point.hide_set(True, view_layer=paint_layer)
+        records = hide_paint_dataset_references(self.scene, paint_layer)
+        self.assertEqual(len(records), 1)
+        self.assertFalse(camera.hide_get(view_layer=paint_layer))
+        self.assertFalse(camera.hide_get(view_layer=self.view_layer))
+        self.assertFalse(user_camera.hide_get(view_layer=paint_layer))
+        self.assertIs(self.scene.camera, camera)
+        restore_paint_dataset_references(self.scene, records)
+        self.assertFalse(camera.hide_get(view_layer=paint_layer))
+        self.assertTrue(self.point.hide_get(view_layer=paint_layer))
+
+    def test_previous_camera_hiding_record_restores_visibility(self) -> None:
+        """이전 설치본이 저장한 카메라 숨김 기록도 정식 복구 경로로 처리합니다."""
+        camera = bpy.data.objects.new("PREVIOUS_CAMERA", bpy.data.cameras.new("PREVIOUS_CAMERA_DATA"))
+        tag_owned(camera, "CAMERA_OBJECT", dataset_uuid="dataset-point-visibility")
+        self.scene.collection.objects.link(camera)
+        self.view_layer.update()
+        camera.hide_set(True, view_layer=self.view_layer)
+        record = {
+            "uuid": owned_uuid_of(camera),
+            "kind": "CAMERA_OBJECT",
+            "dataset_uuid": "dataset-point-visibility",
+            "view_layer": self.view_layer.name,
+            "original_hidden": False,
+            "applied_hidden": True,
+        }
+        restore_paint_dataset_references(self.scene, (record,))
+        self.assertFalse(camera.hide_get(view_layer=self.view_layer))
+
+    def test_reference_restore_preserves_user_changes_and_other_datasets(self) -> None:
+        """사용자가 다시 켠 참고 표시와 다른 데이터셋의 카메라는 변경하지 않습니다."""
+        camera = bpy.data.objects.new("OTHER_CAMERA", bpy.data.cameras.new("OTHER_CAMERA_DATA"))
+        tag_owned(camera, "CAMERA_OBJECT", dataset_uuid="other-dataset")
+        self.scene.collection.objects.link(camera)
+        self.view_layer.update()
+        records = hide_paint_dataset_references(self.scene, self.view_layer)
+        self.assertEqual(len(records), 1)
+        self.assertFalse(camera.hide_get(view_layer=self.view_layer))
+        self.point.hide_set(False, view_layer=self.view_layer)
+        restore_paint_dataset_references(self.scene, records)
+        self.assertFalse(self.point.hide_get(view_layer=self.view_layer))
 
 
 if __name__ == "__main__":

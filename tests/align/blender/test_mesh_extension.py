@@ -338,7 +338,7 @@ def test_mesh_import_job_is_atomic_and_geometry_access_is_common() -> None:
         )
         from tools.align.viewport.renderer import _mesh_surface_arrays
 
-        solid_faces, textured_groups = _mesh_surface_arrays(model)
+        solid_faces, textured_groups, _ = _mesh_surface_arrays(model)
         assert solid_faces.shape == (0, 3)
         assert len(textured_groups) == 1
         assert textured_groups[0][1].shape == (6, 3)

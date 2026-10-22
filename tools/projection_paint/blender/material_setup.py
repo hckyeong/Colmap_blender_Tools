@@ -487,8 +487,21 @@ def _validate_managed_material(material, overlay=None):
     return image_node, mix, resolved_overlay
 
 
-def _managed_base_image(mix_node):
-    """관리 Mix Node에 보존된 원본 Base Image를 반환합니다."""
+def _managed_base_image(mix_node, *, target=None, material=None):
+    """현행 Original Source 권위를 우선 조회하고 구형 Mix의 원본 연결을 호환 조회합니다."""
+    if target is not None and material is not None:
+        sources = {
+            _pointer(settings.original_source_image): settings.original_source_image
+            for scene in bpy.data.scenes
+            if (settings := getattr(scene, "projection_paint", None)) is not None
+            and settings.paint_target is target
+            and settings.paint_material is material
+            and int(settings.original_layer_schema_version) >= 2
+        }
+        if len(sources) > 1:
+            raise PaintSetupError("같은 Paint Target의 Original Source 기록이 Scene마다 다릅니다.")
+        if sources:
+            return next(iter(sources.values()))
     visited = set()
     current = mix_node
     while current is not None and _pointer(current) not in visited:
@@ -804,10 +817,10 @@ def pending_overlay_resolution_change(
     contract = _managed_udim_contract(target, allow_recoverable_file=True)
     if contract is None:
         return None
-    _slot_index, _slot, _material, _uv, _image_node, mix, overlay = contract
+    _slot_index, _slot, material, _uv, _image_node, mix, overlay = contract
     desired = (int(width), int(height))
     if use_base_resolution:
-        desired = _image_size(_managed_base_image(mix)) or desired
+        desired = _image_size(_managed_base_image(mix, target=target, material=material)) or desired
     current = _image_size(overlay)
     if current is None:
         raise PaintSetupError("기존 Paint Overlay의 해상도가 유효하지 않습니다.")

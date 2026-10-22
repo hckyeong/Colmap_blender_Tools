@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 try:
     from ....shared.colmap_dataset.blender.view_layers import (
@@ -17,12 +17,15 @@ except ImportError:
         mark_dataset_view_layer,
     )
 
-from .ownership import is_owned, tag_owned
+from .ownership import is_owned, owned_uuid_of, resolve_owned, tag_owned
 
 
 VIEW_LAYER_NAME = "COLMAP Projection Paint"
 VIEW_LAYER_KIND = "PAINT_DATA_VIEW_LAYER"
 VIEW_LAYER_TOOL_ID = "projection_paint"
+PAINT_REFERENCE_KINDS = frozenset({"POINT_MESH", "CAMERA_OBJECT", "CAMERA_AXIS_ROOT"})
+# 카메라 전체 숨김은 배경 사진도 차단하므로 점군과 축만 오브젝트 단위로 숨깁니다.
+PAINT_HIDDEN_REFERENCE_KINDS = PAINT_REFERENCE_KINDS - {"CAMERA_OBJECT"}
 
 
 def _pointer(value: Any) -> int:
@@ -67,12 +70,13 @@ def ensure_projection_dataset_view_layer(scene: Any) -> Any:
 
 
 def _snapshot_collections(scene: Any) -> tuple[Any, ...]:
-    """Scene Root에 연결된 PP 독립 Camera Collection을 반환합니다."""
+    """Scene Root에 연결된 PP 카메라와 독립 OBJ 컬렉션을 반환합니다."""
 
     return tuple(
         collection
         for collection in tuple(getattr(getattr(scene, "collection", None), "children", ()))
-        if is_owned(collection, kind="CAMERA_COLLECTION")
+        if is_owned(collection)
+        and collection.get("pp_record_kind") in {"CAMERA_COLLECTION", "MODEL_COLLECTION"}
     )
 
 
@@ -93,6 +97,115 @@ def synchronize_projection_dataset_visibility(scene: Any) -> Any:
             layer_collection.exclude = not is_pp_layer
         candidate.update()
     return view_layer
+
+
+def hide_paint_dataset_references(scene: Any, view_layer: Any) -> list[dict[str, Any]]:
+    """카메라 배경을 보존하고 페인트 View Layer의 현재 점군·축 표시만 숨깁니다."""
+    settings = getattr(scene, "projection_paint", None)
+    dataset_uuid = str(getattr(settings, "dataset_uuid", "") or "")
+    if not dataset_uuid:
+        return []
+    objects = tuple(
+        obj
+        for obj in scene.objects
+        if obj.get("pp_record_kind") in PAINT_HIDDEN_REFERENCE_KINDS
+        and is_owned(obj, dataset_uuid=dataset_uuid)
+        and view_layer.objects.get(obj.name) is obj
+    )
+    records = [
+        {
+            "uuid": owned_uuid_of(obj),
+            "kind": str(obj.get("pp_record_kind")),
+            "dataset_uuid": dataset_uuid,
+            "view_layer": str(view_layer.name),
+            "original_hidden": bool(obj.hide_get(view_layer=view_layer)),
+            "applied_hidden": True,
+        }
+        for obj in objects
+    ]
+    changed = []
+    try:
+        for obj, record in zip(objects, records, strict=True):
+            if not record["original_hidden"]:
+                obj.hide_set(True, view_layer=view_layer)
+                changed.append(obj)
+    except (ReferenceError, RuntimeError):
+        for obj in reversed(changed):
+            obj.hide_set(False, view_layer=view_layer)
+        raise
+    return records
+
+
+def restore_paint_dataset_references(scene: Any, records: Iterable[dict[str, Any]]) -> None:
+    """이전 카메라 숨김 기록도 포함해 자신이 적용한 참고 표시만 원래 상태로 복구합니다."""
+    for record in records:
+        kind = str(record.get("kind", ""))
+        if kind not in PAINT_REFERENCE_KINDS:
+            continue
+        view_layer = scene.view_layers.get(str(record.get("view_layer", "")))
+        obj = resolve_owned(
+            scene.objects,
+            str(record.get("uuid", "")),
+            kind=kind,
+            dataset_uuid=str(record.get("dataset_uuid", "")),
+        )
+        if view_layer is None or obj is None or view_layer.objects.get(obj.name) is not obj:
+            continue
+        applied_hidden = bool(record.get("applied_hidden", True))
+        if bool(obj.hide_get(view_layer=view_layer)) == applied_hidden:
+            obj.hide_set(bool(record.get("original_hidden", False)), view_layer=view_layer)
+
+
+def hide_other_paint_objects(scene: Any, view_layer: Any, target: Any) -> None:
+    """페인트 대상과 배경용 카메라 외의 오브젝트를 현재 뷰 레이어에서만 숨깁니다."""
+    settings = scene.projection_paint
+    if settings.paint_object_visibility_active:
+        return
+    records = settings.paint_object_visibility
+    if records:
+        raise RuntimeError("이전 페인트 오브젝트 표시 기록을 먼저 복구해야 합니다.")
+    dataset_uuid = str(settings.dataset_uuid or "")
+    try:
+        for obj in tuple(view_layer.objects):
+            if obj is target or obj is scene.camera:
+                continue
+            # 프레임을 바꿔도 배경 사진이 유지되도록 관리 카메라 자체는 숨기지 않습니다.
+            if (
+                obj.type == "CAMERA" and dataset_uuid
+                and is_owned(obj, kind="CAMERA_OBJECT", dataset_uuid=dataset_uuid)
+            ):
+                continue
+            record = records.add()
+            record.object = obj
+            record.view_layer_name = view_layer.name
+            record.view_layer_uuid = owned_uuid_of(view_layer)
+            record.original_hidden = bool(obj.hide_get(view_layer=view_layer))
+            if not record.original_hidden:
+                obj.hide_set(True, view_layer=view_layer)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        restore_other_paint_objects(scene)
+        raise
+    settings.paint_object_visibility_active = True
+
+
+def restore_other_paint_objects(scene: Any) -> None:
+    """저장된 실제 오브젝트 참조로 자신이 적용한 숨김만 원복하고 사용자 변경은 유지합니다."""
+    settings = scene.projection_paint
+    for record in settings.paint_object_visibility:
+        obj = record.object
+        view_layer = (
+            resolve_owned(scene.view_layers, record.view_layer_uuid, kind=VIEW_LAYER_KIND)
+            if record.view_layer_uuid else scene.view_layers.get(record.view_layer_name)
+        )
+        if (
+            obj is None or view_layer is None
+            or view_layer.objects.get(obj.name) is not obj
+        ):
+            continue
+        if obj.hide_get(view_layer=view_layer):
+            obj.hide_set(record.original_hidden, view_layer=view_layer)
+    settings.paint_object_visibility.clear()
+    settings.paint_object_visibility_active = False
 
 
 def activate_projection_dataset_view_layer(scene: Any, window: Any) -> Any:
@@ -135,7 +248,11 @@ __all__ = [
     "VIEW_LAYER_NAME",
     "activate_projection_dataset_view_layer",
     "ensure_projection_dataset_view_layer",
+    "hide_paint_dataset_references",
+    "hide_other_paint_objects",
     "is_projection_dataset_view_layer",
     "restore_projection_source_view_layer",
+    "restore_paint_dataset_references",
+    "restore_other_paint_objects",
     "synchronize_projection_dataset_visibility",
 ]

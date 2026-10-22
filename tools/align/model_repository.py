@@ -149,7 +149,7 @@ def build_model_data(
     model_id_factory: Callable[[], str] = create_model_id,
     display_name: str | None = None,
 ) -> ColmapModelData | TriangleMeshModelData:
-    """검증된 COLMAP·메시 모델에 런타임 ID·표시 이름·정규 경로를 원자적으로 부여합니다."""
+    """COLMAP·메시의 불변 원본에 런타임 ID·표시 이름·정규 경로를 부여합니다."""
     canonical_path = canonical_source_path(source_path)
     resolved_name = (display_name or Path(canonical_path).stem or Path(canonical_path).name).strip()
     if not resolved_name:
@@ -171,8 +171,10 @@ def build_model_data(
     _point_positions(points)
     if not isinstance(parsed_model, ColmapModelData):
         raise ModelRepositoryError("COLMAP I/O가 반환한 모델 형식이 올바르지 않습니다.")
+    from .geometry_buffers import immutable_geometry_array
     return replace(
         parsed_model,
+        points=replace(points, positions=immutable_geometry_array(points.positions, '<f8')),
         model_id=model_id,
         display_name=resolved_name,
         source_path=canonical_path,
@@ -220,7 +222,7 @@ class ColmapModelRepository:
     companion_display_transforms: dict[str, ModelDisplayTransform]
 
     def __init__(self) -> None:
-        """원본 모델·COLMAP 소유 메시와 파생 평가 캐시를 초기화합니다."""
+        """원본 모델·연결 메시와 모델 수명의 정렬 입력을 초기화합니다."""
         self.models = {}
         self.source_path_index = {}
         self.display_transforms = {}
@@ -230,6 +232,12 @@ class ColmapModelRepository:
         self.companion_meshes = {}
         self.companion_sources = {}
         self.companion_display_transforms = {}
+        self.alignment_inputs = {}
+
+    def alignment_input_for(self, model_id: str, geometry_source: str):
+        """등록 때 검증한 동일 형상만 반환하고 미등록·교체·검사 실패를 거부합니다."""
+        from .alignment.icp_prepared_input import registered_alignment_input
+        return registered_alignment_input(self, model_id, geometry_source)
 
     def cached_icp_confidence_for_model_id(self, model_id: str) -> Any | None:
         """현재 geometry revision과 일치하는 ICP 점 분포 신뢰도만 반환합니다."""
@@ -319,7 +327,7 @@ class ColmapModelRepository:
         display_transform: ModelDisplayTransform,
         source_metadata: ImportedModelSourceMetadata | None = None,
     ) -> None:
-        """같은 원본의 레이어도 모델 ID별로 독립 등록하고 경로의 첫 대표를 유지합니다."""
+        """원본 불변 버퍼와 정렬 검사를 준비한 뒤 독립 레이어를 원자 등록합니다."""
         if model.model_id in self.models:
             raise ModelRepositoryError(f"중복 COLMAP 모델 ID입니다: {model.model_id}")
         if model.model_id in self.display_transforms:
@@ -348,8 +356,12 @@ class ColmapModelRepository:
                 or source_metadata.display_transform_fingerprint != display_transform.fingerprint
             ):
                 raise ModelRepositoryError("COLMAP source metadata의 표시 축 snapshot이 모델과 다릅니다.")
+        from .alignment.icp_prepared_input import seal_point_model, prepare_alignment_input
+        model = seal_point_model(model)
+        prepared_input = prepare_alignment_input(model)
         self.models[model.model_id] = model
         try:
+            self.alignment_inputs[(model.model_id, 'MAIN')] = prepared_input
             self.source_path_index.setdefault(canonical_path, model.model_id)
             self.display_transforms[model.model_id] = display_transform
             self.alignment_transforms[model.model_id] = identity_sim3_transform()
@@ -357,6 +369,7 @@ class ColmapModelRepository:
                 self.source_metadata[model.model_id] = source_metadata
         except Exception:
             self.models.pop(model.model_id, None)
+            self.alignment_inputs.pop((model.model_id, 'MAIN'), None)
             self._remove_source_reference(canonical_path, model.model_id)
             self.display_transforms.pop(model.model_id, None)
             self.alignment_transforms.pop(model.model_id, None)
@@ -378,7 +391,7 @@ class ColmapModelRepository:
         source_metadata: CompanionMeshSourceMetadata,
         display_transform: ModelDisplayTransform | None = None,
     ) -> None:
-        """COLMAP 소유 메시·출처·독립 축을 공통 정렬 ID에 원자적으로 연결합니다."""
+        """연결 메시의 정렬 검사를 완료하고 원본·출처·독립 축을 원자 등록합니다."""
         owner = self.models.get(model_id)
         if not isinstance(owner, ColmapModelData):
             raise ModelRepositoryError("연결 메시를 소유할 COLMAP 모델이 없습니다.")
@@ -395,12 +408,16 @@ class ColmapModelRepository:
         transform = self.display_transform_for_model_id(model_id) if display_transform is None else display_transform
         if not isinstance(transform, ModelDisplayTransform):
             raise ModelRepositoryError("연결 메시의 원본 축 설정이 올바르지 않습니다.")
+        from .alignment.icp_prepared_input import prepare_alignment_input
+        prepared_input = prepare_alignment_input(mesh)
         self.companion_meshes[model_id] = mesh
         try:
+            self.alignment_inputs[(model_id, 'COMPANION')] = prepared_input
             self.companion_sources[model_id] = source_metadata
             self.companion_display_transforms[model_id] = transform
         except Exception:
             self.companion_meshes.pop(model_id, None)
+            self.alignment_inputs.pop((model_id, 'COMPANION'), None)
             self.companion_sources.pop(model_id, None)
             self.companion_display_transforms.pop(model_id, None)
             raise
@@ -514,7 +531,7 @@ class ColmapModelRepository:
             self.source_path_index[canonical_path] = replacement
 
     def remove_model(self, model_id: str) -> ColmapModelData | TriangleMeshModelData | None:
-        """해당 레이어의 자원을 제거하며 같은 원본을 사용하는 다른 레이어의 출처는 유지합니다."""
+        """해당 레이어와 준비 입력의 소유권을 해제하고 다른 레이어는 유지합니다."""
         model = self.models.pop(model_id, None)
         if model is None:
             return None
@@ -526,11 +543,13 @@ class ColmapModelRepository:
         self.companion_meshes.pop(model_id, None)
         self.companion_sources.pop(model_id, None)
         self.companion_display_transforms.pop(model_id, None)
+        self.alignment_inputs.pop((model_id, 'MAIN'), None)
+        self.alignment_inputs.pop((model_id, 'COMPANION'), None)
         _LOGGER.info("model_repository.remove model_id=%s", model_id)
         return model
 
     def clear(self) -> None:
-        """파일 로드·해제 전에 모델과 연결 메시의 배열·출처·캐시를 비웁니다."""
+        """파일 로드·해제 전에 원본·연결 메시와 준비 입력의 소유권을 해제합니다."""
         if self.models:
             _LOGGER.info("model_repository.clear model_count=%s", len(self.models))
         self.models.clear()
@@ -542,6 +561,7 @@ class ColmapModelRepository:
         self.companion_meshes.clear()
         self.companion_sources.clear()
         self.companion_display_transforms.clear()
+        self.alignment_inputs.clear()
 
 
 # 기존 import 호환성을 유지하면서 데이터 종류 중립 이름도 제공합니다.

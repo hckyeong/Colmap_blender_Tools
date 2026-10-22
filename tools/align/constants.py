@@ -95,8 +95,8 @@ MARKER_POINT_KINDS = frozenset(
     }
 )
 
-# OBJ 원본 형상은 파일 전체를 읽고, 표시용 정점 표본만 별도 상한을 적용합니다.
-OBJ_DISPLAY_VERTEX_LIMIT = 250_000
+# OBJ는 기본적으로 면에 쓰이는 전체 정점을 표시하며 None은 표시 개수 제한 없음을 뜻합니다.
+OBJ_DISPLAY_VERTEX_LIMIT: int | None = None
 
 # Area 역할과 다중 모델 등록 상태는 서로 다른 의미이므로 분리합니다.
 MODEL_STATUS_REGISTERED = "REGISTERED"

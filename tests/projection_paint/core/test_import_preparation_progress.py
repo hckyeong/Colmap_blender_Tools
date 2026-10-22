@@ -74,8 +74,8 @@ class ImportPreparationProgressTests(unittest.TestCase):
         )
         self.assertEqual(1_024, len(job.result.points))
 
-    def test_revalidation_reports_the_same_detailed_monotonic_progress(self):
-        """Commit 직전 재검증도 파일과 레코드 내부 진행률을 유지하는지 확인합니다."""
+    def test_revalidation_reports_hash_progress_without_parsing_again(self):
+        """확정 전 검사가 점을 재해석하지 않고 단조 증가하는 해시 진행률을 제공하는지 확인합니다."""
 
         points = tuple(
             Point3DRecord(
@@ -104,15 +104,16 @@ class ImportPreparationProgressTests(unittest.TestCase):
                 snapshots.append(job.advance(work_budget_ms=0.001))
 
         fractions = [snapshot.overall_fraction for snapshot in snapshots]
-        point_updates = [
+        hash_updates = [
             snapshot
             for snapshot in snapshots
-            if snapshot.phase is ImportPreparationPhase.READ_POINTS
-            and 0 < snapshot.completed_units < snapshot.total_units
+            if snapshot.phase is ImportPreparationPhase.FINGERPRINT
         ]
         self.assertEqual(sorted(fractions), fractions)
         self.assertEqual(1.0, fractions[-1])
-        self.assertGreaterEqual(len(point_updates), 2)
+        self.assertTrue(hash_updates)
+        self.assertNotIn(ImportPreparationPhase.READ_POINTS, [snapshot.phase for snapshot in snapshots])
+        self.assertTrue(all(snapshot.message.isascii() for snapshot in snapshots))
 
 
 if __name__ == "__main__":

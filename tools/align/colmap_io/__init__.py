@@ -1,178 +1,39 @@
-"""외부 COLMAP 설치 없이 sparse model을 안전하게 적재하는 순수 I/O 계층입니다."""
+"""공통 COLMAP 읽기 계층을 기존 Align 경로로 재노출합니다."""
 
-from __future__ import annotations
+from importlib import import_module
+import sys
+from types import ModuleType
 
-from pathlib import Path
-
-from ..logging_utils import get_logger
-from .binary_reader import (
-    read_cameras_binary,
-    read_frames_binary,
-    read_images_binary,
-    read_points3d_binary,
-    read_rigs_binary,
-)
-from .discovery import (
-    SparseModelLayout,
-    discover_sparse_model,
-    discover_sparse_model_with_dataset_root,
-)
-from .errors import (
-    ColmapDiscoveryError,
-    ColmapIOError,
-    ColmapParseError,
-    ColmapValidationError,
-)
-from .fingerprint import Sha256FileJob, SourceFingerprintJob, source_fingerprint
-from .incremental_reader import (
-    DEFAULT_MAX_RECORDS_PER_STEP,
-    IncrementalReadProgress,
-    IncrementalSparseModelReader,
-    STAGE_CAMERAS,
-    STAGE_CANCELLED,
-    STAGE_COMPLETED,
-    STAGE_FAILED,
-    STAGE_FRAMES,
-    STAGE_IMAGES,
-    STAGE_POINTS3D,
-    STAGE_RIGS,
-    create_incremental_sparse_model_reader,
-)
-from .text_reader import (
-    read_cameras_text,
-    read_frames_text,
-    read_images_text,
-    read_points3d_text,
-    read_rigs_text,
-)
-from .types import (
-    CameraRecord,
-    ColmapModelData,
-    FrameDataRecord,
-    FrameRecord,
-    ImageRecord,
-    ImageTable,
-    INVALID_POINT3D_ID,
-    ParsedColmapModel,
-    PointTable,
-    RigRecord,
-    RigSensorRecord,
-)
-from .validation import calculate_bounds, validate_model
+# 설치된 확장 패키지와 소스 직접 실행에서 같은 공통 패키지를 선택합니다.
+_root_package = __package__.rsplit(".tools.align.colmap_io", 1)[0] if ".tools.align.colmap_io" in __package__ else ""
+_shared_io = import_module(f"{_root_package}.shared.colmap_io" if _root_package else "shared.colmap_io")
+__all__ = _shared_io.__all__
 
 
-LOGGER = get_logger("colmap_io")
+class _CompatibilityModule(ModuleType):
+    """기존 공개 심벌 교체도 공통 구현에 전달하는 호환 모듈입니다."""
+
+    def __getattr__(self, name):
+        """현재 패키지에 없는 심벌을 공통 구현에서 조회합니다."""
+        return getattr(_shared_io, name)
+
+    def __setattr__(self, name, value):
+        """공개 함수 교체를 공통 구현에 전달하고 패키지 메타정보는 보존합니다."""
+        if name in __all__ or name == "LOGGER":
+            setattr(_shared_io, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        """임시 교체 심벌의 삭제와 복원을 공통 구현에 전달합니다."""
+        if name in __all__ or name == "LOGGER":
+            delattr(_shared_io, name)
+        else:
+            super().__delattr__(name)
+
+    def __dir__(self):
+        """기존 패키지의 심벌 탐색에 공통 공개 항목을 포함합니다."""
+        return sorted(set(super().__dir__()) | set(dir(_shared_io)))
 
 
-def read_sparse_model(
-    layout: SparseModelLayout,
-    *,
-    model_id: str = "",
-    display_name: str | None = None,
-    geometry_revision: int = 0,
-) -> ColmapModelData:
-    """탐색 완료 파일을 동기적으로 파싱만 하고 검증 전 모델을 반환합니다."""
-    if not isinstance(layout, SparseModelLayout):
-        raise TypeError("read_sparse_model에는 SparseModelLayout이 필요합니다.")
-    LOGGER.info(
-        "event=model_read_started stage=parse source=%s format=%s",
-        layout.source_path,
-        layout.selected_format,
-    )
-    reader = create_incremental_sparse_model_reader(
-        layout,
-        model_id=model_id,
-        display_name=display_name,
-        geometry_revision=geometry_revision,
-    )
-    try:
-        while not reader.is_completed:
-            reader.step(max_records=10_000_000)
-        model = reader.model
-    except ColmapIOError:
-        LOGGER.warning(
-            "event=model_read_failed stage=parse source=%s format=%s",
-            layout.source_path,
-            layout.selected_format,
-        )
-        raise
-    finally:
-        reader.close()
-    LOGGER.info(
-        "event=model_read_completed stage=complete camera_count=%d image_count=%d point_count=%d",
-        len(model.cameras),
-        model.images.count,
-        model.points.count,
-    )
-    return model
-
-
-def load_sparse_model(
-    path: str | Path,
-    *,
-    input_format: str = "AUTO",
-    model_id: str = "",
-    display_name: str | None = None,
-    geometry_revision: int = 0,
-) -> ColmapModelData:
-    """경로 탐색·파싱 뒤 엄격 검증을 정확히 한 번 수행해 모델을 반환합니다."""
-    layout = discover_sparse_model(path, input_format=input_format)
-    model = read_sparse_model(
-        layout,
-        model_id=model_id,
-        display_name=display_name,
-        geometry_revision=geometry_revision,
-    )
-    validate_model(model)
-    return model
-
-
-__all__ = (
-    "CameraRecord",
-    "ColmapDiscoveryError",
-    "ColmapIOError",
-    "ColmapModelData",
-    "ColmapParseError",
-    "ColmapValidationError",
-    "DEFAULT_MAX_RECORDS_PER_STEP",
-    "FrameDataRecord",
-    "FrameRecord",
-    "INVALID_POINT3D_ID",
-    "ImageRecord",
-    "ImageTable",
-    "IncrementalReadProgress",
-    "IncrementalSparseModelReader",
-    "ParsedColmapModel",
-    "PointTable",
-    "RigRecord",
-    "RigSensorRecord",
-    "SparseModelLayout",
-    "Sha256FileJob",
-    "SourceFingerprintJob",
-    "STAGE_CAMERAS",
-    "STAGE_CANCELLED",
-    "STAGE_COMPLETED",
-    "STAGE_FAILED",
-    "STAGE_FRAMES",
-    "STAGE_IMAGES",
-    "STAGE_POINTS3D",
-    "STAGE_RIGS",
-    "calculate_bounds",
-    "discover_sparse_model",
-    "discover_sparse_model_with_dataset_root",
-    "create_incremental_sparse_model_reader",
-    "load_sparse_model",
-    "read_cameras_binary",
-    "read_cameras_text",
-    "read_frames_binary",
-    "read_frames_text",
-    "read_images_binary",
-    "read_images_text",
-    "read_points3d_binary",
-    "read_points3d_text",
-    "read_rigs_binary",
-    "read_rigs_text",
-    "read_sparse_model",
-    "source_fingerprint",
-    "validate_model",
-)
+sys.modules[__name__].__class__ = _CompatibilityModule

@@ -11,6 +11,7 @@ import bpy
 import numpy as np
 
 from .types import ObjMaterialData, TriangleMeshModelData
+from .texture_coordinates import MeshTextureCoordinates
 
 
 EMBEDDED_OBJ_OWNER = "COLMAP_ALIGN_EMBEDDED_OBJ"
@@ -29,6 +30,15 @@ _REVISION_KEY = "geometry_revision"
 
 class EmbeddedObjStoreError(RuntimeError):
     """내장 OBJ Mesh의 소유권·구조가 계약과 다를 때 발생합니다."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedObjGeometry:
+    """한 동기 검증에서 읽은 좌표·코너와 삼각형 여부를 프록시 생성에 전달합니다."""
+
+    vertices: np.ndarray
+    loop_vertices: np.ndarray
+    all_triangles: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,12 +83,33 @@ def _mesh_objects(mesh: Any) -> tuple[Any, ...]:
 
 
 def _foreach_array(collection: Any, attribute: str, dtype: Any, shape: tuple[int, ...]) -> np.ndarray:
-    """좌표·UV는 Blender의 float32 버퍼로 읽고 요청한 연속 배열 자료형으로 변환합니다."""
+    """좌표·UV 벡터는 float32로 읽고 요청한 연속 배열 자료형으로 변환합니다."""
 
-    buffer_dtype = np.float32 if attribute in {"co", "uv"} and np.dtype(dtype) == np.float64 else dtype
+    buffer_dtype = np.float32 if attribute in {"co", "uv", "vector"} and np.dtype(dtype) == np.float64 else dtype
     array = np.empty(int(np.prod(shape, dtype=np.int64)), dtype=buffer_dtype)
     collection.foreach_get(attribute, array)
     return np.ascontiguousarray(array.reshape(shape), dtype=dtype)
+
+
+def _integer_attribute(mesh: Any, name: str, domain: str, count: int) -> np.ndarray:
+    """정수 속성의 영역·길이를 검사하고 코너 정점 또는 면 재질을 한 번 읽습니다."""
+
+    attribute = mesh.attributes.get(name)
+    if attribute is None and name == "material_index":
+        # Blender는 재질 속성이 없는 면의 재질 번호를 0으로 반환합니다.
+        return np.zeros(count, dtype=np.int32)
+    if attribute is None or attribute.domain != domain or attribute.data_type != "INT" or len(attribute.data) != count:
+        raise EmbeddedObjStoreError(f"내장 OBJ Mesh의 {name} 속성 구조가 올바르지 않습니다.")
+    return _foreach_array(attribute.data, "value", np.int32, (count,))
+
+
+def _used_vertex_indices(triangles: np.ndarray, vertex_count: int) -> np.ndarray:
+    """검증된 삼각형의 사용 여부를 표시해 중복 없는 오름차순 원본 정점 번호를 만듭니다."""
+
+    used = np.zeros(vertex_count, dtype=np.bool_)
+    for start in range(0, len(triangles), 1_048_576):
+        used[triangles[start : start + 1_048_576]] = True
+    return np.ascontiguousarray(np.flatnonzero(used), dtype=np.uint32)
 
 
 def _image_path_for_material(material: Any) -> Path | None:
@@ -188,8 +219,8 @@ def _validate_polygon_vertices(starts: np.ndarray, totals: np.ndarray, loop_vert
                     raise EmbeddedObjStoreError("내장 OBJ Mesh Polygon이 같은 정점을 반복합니다.")
 
 
-def _validated_geometry_vertices(mesh: Any) -> np.ndarray:
-    """원본 형상을 전체 검증하고 같은 호출의 프록시에서 재사용할 좌표를 반환합니다."""
+def _validated_geometry_arrays(mesh: Any) -> _ValidatedObjGeometry:
+    """원본 형상을 전체 검증하고 같은 동기 호출에서만 재사용할 좌표·코너를 반환합니다."""
 
     vertex_count = len(mesh.vertices)
     polygon_count = len(mesh.polygons)
@@ -205,14 +236,20 @@ def _validated_geometry_vertices(mesh: Any) -> np.ndarray:
         raise EmbeddedObjStoreError("내장 OBJ Mesh Polygon corner 구조가 올바르지 않습니다.")
     if starts[0] != 0 or np.any(starts[1:] != starts[:-1] + totals[:-1]):
         raise EmbeddedObjStoreError("내장 OBJ Mesh Loop 범위가 연속적이지 않습니다.")
-    loop_vertices = _foreach_array(mesh.loops, "vertex_index", np.int64, (loop_count,))
+    loop_vertices = _integer_attribute(mesh, ".corner_vert", "CORNER", loop_count)
     if np.any(loop_vertices < 0) or np.any(loop_vertices >= vertex_count):
         raise EmbeddedObjStoreError("내장 OBJ Mesh Loop 정점 인덱스가 범위를 벗어났습니다.")
     _validate_polygon_vertices(starts, totals, loop_vertices)
     mesh.calc_loop_triangles()
     if len(mesh.loop_triangles) < 1:
         raise EmbeddedObjStoreError("내장 OBJ Mesh 삼각형 프록시를 만들 수 없습니다.")
-    return coordinates
+    return _ValidatedObjGeometry(coordinates, loop_vertices, bool(np.all(totals == 3)))
+
+
+def _validated_geometry_vertices(mesh: Any) -> np.ndarray:
+    """전체 형상 검사 계약을 유지하며 호출자가 요청한 좌표만 반환합니다."""
+
+    return _validated_geometry_arrays(mesh).vertices
 
 
 def validate_embedded_obj_mesh(
@@ -427,35 +464,41 @@ def build_triangle_proxy_from_embedded_mesh(
     expected_asset_uuid: str | None = None,
     expected_revision: int | None = None,
 ) -> TriangleMeshModelData:
-    """식별자와 원본 형상을 한 번 검증하고 좌표를 재사용하여 삼각형 프록시를 생성합니다."""
+    """원본 삼각분할과 정밀 좌표를 보존하며 코너 UV·대응 번호의 모델 내부 중복을 줄입니다."""
 
     validate_embedded_obj_identity(
         mesh, expected_model_id=model_id,
         expected_asset_uuid=expected_asset_uuid, expected_revision=expected_revision,
     )
-    vertices = _validated_geometry_vertices(mesh)
+    geometry = _validated_geometry_arrays(mesh)
+    vertices = geometry.vertices
     triangle_count = len(mesh.loop_triangles)
-    triangles = _foreach_array(mesh.loop_triangles, "vertices", np.uint32, (triangle_count, 3))
-    triangle_polygons = _foreach_array(
-        mesh.loop_triangles, "polygon_index", np.uint32, (triangle_count,)
-    )
-    triangle_loops = _foreach_array(mesh.loop_triangles, "loops", np.uint32, (triangle_count, 3))
-    registration = np.ascontiguousarray(np.unique(triangles.reshape(-1)), dtype=np.uint32)
+    if geometry.all_triangles:
+        if triangle_count != len(mesh.polygons):
+            raise EmbeddedObjStoreError("원본 삼각형과 Blender 삼각분할 개수가 일치하지 않습니다.")
+        triangles = np.ascontiguousarray(geometry.loop_vertices.reshape((-1, 3)), dtype=np.uint32)
+        triangle_polygons = np.arange(triangle_count, dtype=np.uint32)
+        triangle_loops = np.arange(len(mesh.loops), dtype=np.uint32).reshape((-1, 3))
+    else:
+        triangles = _foreach_array(mesh.loop_triangles, "vertices", np.uint32, (triangle_count, 3))
+        triangle_polygons = _foreach_array(
+            mesh.loop_triangles, "polygon_index", np.uint32, (triangle_count,)
+        )
+        triangle_loops = _foreach_array(mesh.loop_triangles, "loops", np.uint32, (triangle_count, 3))
+    del geometry
+    registration = _used_vertex_indices(triangles, len(vertices))
     display = registration if display_vertex_indices is None else np.asarray(display_vertex_indices, dtype=np.uint32)
     uv_layer = None if geometry_only else mesh.uv_layers.active
     if uv_layer is None:
-        texcoords = np.empty((0, 3), dtype=np.float64)
-        component_counts = np.empty((0,), dtype=np.uint8)
+        uv_data = MeshTextureCoordinates.from_legacy()
         triangle_texcoords = np.full((triangle_count, 3), -1, dtype=np.int32)
     else:
-        uv_values = _foreach_array(uv_layer.data, "uv", np.float64, (len(mesh.loops), 2))
-        texcoords = np.zeros((len(mesh.loops), 3), dtype=np.float64)
-        texcoords[:, :2] = uv_values
-        component_counts = np.full((len(mesh.loops),), 2, dtype=np.uint8)
-        triangle_texcoords = np.ascontiguousarray(triangle_loops, dtype=np.int32)
-    polygon_materials = _foreach_array(
-        mesh.polygons, "material_index", np.int32, (len(mesh.polygons),)
-    )
+        uv_values = _foreach_array(uv_layer.uv, "vector", np.float32, (len(mesh.loops), 2))
+        uv_data = MeshTextureCoordinates.from_blender_corners(uv_values)
+        if np.any(triangle_loops > np.iinfo(np.int32).max):
+            raise EmbeddedObjStoreError("내장 OBJ 코너 번호가 UV 인덱스 표현 범위를 벗어났습니다.")
+        triangle_texcoords = triangle_loops.view(np.int32)
+    polygon_materials = _integer_attribute(mesh, "material_index", "FACE", len(mesh.polygons))
     materials = () if geometry_only else _material_data(mesh)
     triangle_materials = (
         polygon_materials[triangle_polygons]
@@ -473,8 +516,7 @@ def build_triangle_proxy_from_embedded_mesh(
         bounds_min=vertices.min(axis=0),
         bounds_max=vertices.max(axis=0),
         geometry_revision=int(mesh[_REVISION_KEY]),
-        texcoords_float64=texcoords,
-        texcoord_component_counts_uint8=component_counts,
+        uv_data=uv_data,
         triangle_texcoord_indices_int32=triangle_texcoords,
         materials=materials,
         triangle_material_indices_int32=triangle_materials,

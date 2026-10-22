@@ -133,13 +133,17 @@ def test_visibility_keeps_selection_alignment_and_group_undo() -> None:
 
 
 def test_gpu_point_and_surface_caches_coexist_and_lazy_prepare() -> None:
-    """같은 소유 ID의 점·면 캐시가 공존하고 표시 변경 때 생성되지 않는지 확인합니다."""
+    """공유 위치 배치를 포함한 점·면 캐시가 공존하고 표시 변경 때 재생성되지 않는지 확인합니다."""
     from tools.align.viewport import renderer
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_mesh_normal_reuse import _capture_shared_batches
 
     with _runtime_fixture() as runtime:
         with patch.object(renderer, "_point_shader", return_value=object()), patch.object(
             renderer, "_mesh_shader", return_value=object(),
-        ), patch.object(renderer, "batch_for_shader", side_effect=lambda *args, **kwargs: object()) as factory:
+        ), patch.object(renderer, "batch_for_shader", side_effect=lambda *args, **kwargs: object()) as factory, patch.object(
+            renderer, "_shared_mesh_batches", side_effect=_capture_shared_batches(factory),
+        ):
             model = runtime.model_repository.models["moving"]
             mesh = runtime.model_repository.companion_meshes["moving"]
             points = renderer.prepare_gpu_batch_for_model("moving", model)

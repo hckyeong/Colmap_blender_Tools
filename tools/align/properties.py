@@ -30,7 +30,7 @@ from .viewport.display_sampling import DEFAULT_DISPLAY_POINT_LIMIT
 
 
 _EXTERNAL_RIGID_BACKENDS = frozenset(
-    {"OPEN3D_GICP", "SMALL_GICP", "OPEN3D_ROBUST_POINT_TO_PLANE"}
+    {"POINT_KD_ICP", "OPEN3D_GICP", "SMALL_GICP", "OPEN3D_ROBUST_POINT_TO_PLANE"}
 )
 _CC_MAX_CPU_THREADS = 1024
 from .distribution_profile import (
@@ -143,13 +143,13 @@ def _on_icp_solver_backend_changed(self, _context) -> None:
 
 
 class COLMAPALIGN_AP_preferences(bpy.types.AddonPreferences):
-    """개발 프로필의 명시적 실행 경로와 CC 환경 검사를 제공합니다."""
+    """개발 프로필의 명시적 실행 경로와 현재 배포 엔진의 환경 검사를 제공합니다."""
 
     bl_idname = __package__.split(".tools.", 1)[0]
 
     cc_cpu_thread_limit: IntProperty(
         name="CPU 스레드",
-        description="CC 정렬 작업의 최대 CPU 스레드 수입니다. 0은 자동, 1은 단일 스레드, 2 이상은 최대값입니다.",
+        description="정렬 작업의 최대 CPU 스레드 수입니다. 0은 자동, 1은 단일 스레드, 2 이상은 최대값입니다.",
         default=0,
         min=0,
         max=_CC_MAX_CPU_THREADS,
@@ -158,12 +158,12 @@ class COLMAPALIGN_AP_preferences(bpy.types.AddonPreferences):
     if includes_optional_backends():
         open3d_python_path: StringProperty(
             name="정렬 Python 실행 파일",
-            description="개발 환경에서 CC 계산 조정기를 실행할 CPython 3.12 x64 경로입니다. 비워 두면 전용 런타임을 사용합니다.",
+            description="개발 환경에서 정렬 계산 조정기를 실행할 CPython 3.12 x64 경로입니다. 비워 두면 전용 런타임을 사용합니다.",
             subtype="FILE_PATH",
         )
 
     def draw(self, _context) -> None:
-        """배포 프로필에 맞는 CC 전용 실행 경로와 실제 엔진 검사를 표시합니다."""
+        """배포 프로필에 맞는 전용 실행 경로와 실제 엔진 검사를 표시합니다."""
 
         layout = self.layout
         layout.use_property_split = True
@@ -172,12 +172,13 @@ class COLMAPALIGN_AP_preferences(bpy.types.AddonPreferences):
             layout.prop(self, "open3d_python_path")
             layout.label(text="경로를 비워 두면 애드온의 전용 정렬 환경을 사용합니다.")
         else:
-            layout.label(text="CC 정렬 실행 환경이 애드온에 포함되어 있습니다.", icon="PACKAGE")
+            layout.label(text="정렬 실행 환경이 애드온에 포함되어 있습니다.", icon="PACKAGE")
         layout.prop(self, "cc_cpu_thread_limit")
         layout.label(text=cc_cpu_thread_summary(_context))
+        point_kd = default_icp_backend() == "POINT_KD_ICP"
         layout.operator(
-            "colmap_align.validate_cccore_environment",
-            text="CC 정렬 환경 검사",
+            "colmap_align.validate_point_kd_environment" if point_kd else "colmap_align.validate_cccore_environment",
+            text="점 기반 정렬 환경 검사" if point_kd else "CC 정렬 환경 검사",
             icon="CHECKMARK",
         )
 
@@ -262,6 +263,21 @@ def configured_icp_python_path(context: Any | None = None) -> str:
         configured = str(getattr(preferences, "open3d_python_path", "")).strip()
         if configured:
             return configured
+    if default_icp_backend() == "POINT_KD_ICP":
+        return bundled_point_kd_python_path()
+    return bundled_cccore_python_path()
+
+
+def bundled_point_kd_python_path() -> str:
+    """점 기반 배포의 전용 Python을 찾고 소스에서는 이미 준비된 공통 런타임을 재사용합니다."""
+    align_root = Path(__file__).resolve().parent
+    bundled = align_root / "runtime" / "python" / "python.exe"
+    if bundled.is_file():
+        return str(bundled)
+    source_root = align_root.parent.parent
+    development = source_root / ".point-kd-runtime" / "python" / "python.exe"
+    if (source_root / "build_tools").is_dir() and development.is_file():
+        return str(development)
     return bundled_cccore_python_path()
 
 
@@ -391,8 +407,13 @@ class COLMAPALIGN_PG_settings(bpy.types.PropertyGroup):
     )
     marker_use_uniform_scale: BoolProperty(
         name="Marker Refine Scale",
-        description="3점 이상 마커로 초기 정렬의 균일 스케일을 계산합니다. 자동 CC 정렬의 초기값 대비 최대 ±10% 배율 보정과는 별도입니다",
+        description="3점 이상 마커로 초기 정렬의 균일 배율을 계산합니다. Align의 배율 함께 보정 옵션과 별도로 동작합니다",
         default=True,
+    )
+    icp_sim3_enabled: BoolProperty(
+        name="배율 함께 보정 (Sim(3))",
+        description="Align에서 표면 또는 점군 대응으로 회전·이동·균일 배율을 함께 보정합니다. 끄면 현재 배율을 유지합니다",
+        default=False,
     )
     icp_preset: EnumProperty(
         name="ICP 품질",

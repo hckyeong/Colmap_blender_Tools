@@ -3,12 +3,13 @@ param(
     [string]$BlenderPath = "C:\Program Files\Blender Foundation\Blender 5.2\blender.exe",
     [string]$PythonPath = "python",
     [string]$OutputDirectory = "",
-    [ValidateSet("CCCoreLib", "SmallGicp", "Full")]
-    [string]$AlignProfile = "CCCoreLib",
+    [ValidateSet("PointKd", "CCCoreLib", "SmallGicp", "Full")]
+    [string]$AlignProfile = "PointKd",
     [string]$SmallGicpRuntimePath = "",
     [string]$SmallGicpPackagePython = "",
     [string]$CcCoreRuntimePath = "",
-    [string]$CcCorePythonPath = ""
+    [string]$CcCorePythonPath = "",
+    [string]$PointKdRuntimePath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -96,6 +97,7 @@ function Set-StagedBuildProfile {
     )
 
     $profileValue = switch ($ProfileName) {
+        "PointKd" { "POINT_KD" }
         "CCCoreLib" { "CCCORELIB" }
         "SmallGicp" { "SMALL_GICP" }
         default { "FULL" }
@@ -264,7 +266,7 @@ function Add-SmallGicpEmbeddedRuntime {
 }
 
 function Add-CcCoreEmbeddedRuntime {
-    <# 알고리즘 v6와 네이티브 v7 런타임을 준비하고 실제 최소 정렬을 검사합니다. #>
+    <# 기존 비교 엔진과 메시 검사 DLL의 고정 런타임을 검증해 포함합니다. #>
     param([string]$ProjectRoot, [string]$AlignPackagePath)
 
     $helper = Join-Path $PSScriptRoot "cccore_distribution.py"
@@ -293,6 +295,28 @@ function Add-CcCoreEmbeddedRuntime {
         throw "스테이징 CC 엔진 또는 최소 정렬 결과가 배포 계약과 다릅니다."
     }
     Write-Host "CCCoreLib 스테이징 실제 정렬 검사 통과"
+}
+
+function Add-PointKdEmbeddedRuntime {
+    <# 원본점 강체·Sim(3) 작업기를 준비하고 v3 스테이징 계약을 검사합니다. #>
+    param([string]$ProjectRoot, [string]$AlignPackagePath)
+
+    $helper = Join-Path $PSScriptRoot "point_kd_distribution.py"
+    $nativeSource = if ($PointKdRuntimePath) { [IO.Path]::GetFullPath($PointKdRuntimePath) } else { Join-Path $ProjectRoot ".point-kd-runtime\point_kd" }
+    if (!$PointKdRuntimePath -and !(Test-Path -LiteralPath (Join-Path $nativeSource "colmap_point_kd_worker.exe"))) {
+        & $PythonPath -X utf8 $helper prepare
+        if ($LASTEXITCODE -ne 0) { throw "점 기반 정렬 네이티브 빌드에 실패했습니다." }
+    }
+    $destination = Join-Path $AlignPackagePath "runtime\point_kd"
+    & $PythonPath -X utf8 $helper stage --source $nativeSource --destination $destination
+    if ($LASTEXITCODE -ne 0) { throw "점 기반 정렬 런타임의 소스·파일 검증에 실패했습니다." }
+    $result = & (Join-Path $AlignPackagePath "runtime\python\python.exe") -I (Join-Path $AlignPackagePath "alignment\icp_point_kd_worker.py") --check-environment --native-worker (Join-Path $destination "colmap_point_kd_worker.exe")
+    if ($LASTEXITCODE -ne 0) { throw "점 기반 정렬 Python 작업기 환경 검사가 실패했습니다." }
+    $environment = $result | ConvertFrom-Json
+    if (!$environment.ok -or $environment.backend_id -ne "POINT_KD_ICP" -or $environment.algorithm_version -ne "point-kd-icp-v3") {
+        throw "점 기반 정렬 환경의 엔진 식별자가 현재 계약과 다릅니다."
+    }
+    Write-Host "점 기반 강체 정렬 스테이징 환경 검사 통과"
 }
 
 function Test-BuiltArchive {
@@ -350,8 +374,8 @@ function Test-BuiltArchive {
             $profileReader.Dispose()
         }
 
-        if ($ProfileName -in @("CCCoreLib", "Full")) {
-            $expectedProfile = if ($ProfileName -eq "Full") { "FULL" } else { "CCCORELIB" }
+        if ($ProfileName -in @("PointKd", "CCCoreLib", "Full")) {
+            $expectedProfile = switch ($ProfileName) { "Full" { "FULL" }; "PointKd" { "POINT_KD" }; default { "CCCORELIB" } }
             if ($profileSource -notmatch ('DISTRIBUTION_PROFILE\s*=\s*"' + $expectedProfile + '"')) {
                 throw "CC ZIP의 배포 프로필이 요청과 다릅니다: $expectedProfile"
             }
@@ -373,10 +397,25 @@ function Test-BuiltArchive {
                 if ($entryNames -notcontains $required) { throw "정식 CC ZIP에 필수 파일이 없습니다: $required" }
             }
             foreach ($entry in $entryNames) {
-                if (($ProfileName -eq "CCCoreLib" -and $entry -match 'tools/align/(optional_backends/|alignment/icp_(small_gicp|open3d|solver\.py|worker\.py))') -or
+                if (($ProfileName -in @("PointKd", "CCCoreLib") -and $entry -match 'tools/align/(optional_backends/|alignment/icp_(small_gicp|open3d|solver\.py|worker\.py))') -or
                     $entry -match 'tools/align/runtime/python/.*small_gicp') {
                     throw "정식 CC ZIP에 제외한 구엔진이 포함되었습니다: $entry"
                 }
+            }
+        }
+
+        if ($ProfileName -in @("PointKd", "Full")) {
+            foreach ($required in @(
+                "tools/align/alignment/icp_point_kd_contract.py",
+                "tools/align/alignment/icp_point_kd_input.py",
+                "tools/align/alignment/icp_point_kd_runtime.py",
+                "tools/align/alignment/icp_point_kd_worker.py",
+                "tools/align/runtime/point_kd/colmap_point_kd_worker.exe",
+                "tools/align/runtime/point_kd/runtime_manifest.json",
+                "tools/align/runtime/point_kd/point_kd_rebuild_sources.zip",
+                "tools/align/runtime/point_kd/licenses/Eigen-MPL-2.0.txt"
+            )) {
+                if ($entryNames -notcontains $required) { throw "점 기반 정렬 ZIP에 필수 파일이 없습니다: $required" }
             }
         }
         elseif ($ProfileName -eq "SmallGicp") {
@@ -523,14 +562,17 @@ try {
     $alignPackagePath = Join-Path $stagingRoot "tools\align"
     Set-StagedBuildProfile -PackagePath $alignPackagePath -ProfileName $AlignProfile
 
-    if ($AlignProfile -in @("CCCoreLib", "Full")) {
-        if ($AlignProfile -eq "CCCoreLib") {
+    if ($AlignProfile -in @("PointKd", "CCCoreLib", "Full")) {
+        if ($AlignProfile -in @("PointKd", "CCCoreLib")) {
             Remove-SmallGicpExcludedBackends -PackagePath $alignPackagePath
             foreach ($name in @("icp_small_gicp_solver.py", "icp_small_gicp_worker.py")) {
                 Remove-Item -LiteralPath (Join-Path $alignPackagePath "alignment\$name") -Force
             }
         }
         Add-CcCoreEmbeddedRuntime -ProjectRoot $projectRoot -AlignPackagePath $alignPackagePath
+        if ($AlignProfile -in @("PointKd", "Full")) {
+            Add-PointKdEmbeddedRuntime -ProjectRoot $projectRoot -AlignPackagePath $alignPackagePath
+        }
     }
     elseif ($AlignProfile -eq "SmallGicp") {
         Remove-SmallGicpExcludedBackends -PackagePath $alignPackagePath
@@ -564,10 +606,14 @@ try {
     Test-BuiltArchive -ArchivePath $package.FullName -ProfileName $AlignProfile
     & $PythonPath -X utf8 (Join-Path $PSScriptRoot "cccore_distribution.py") validate-archive $package.FullName
     if ($LASTEXITCODE -ne 0) { throw "배포 ZIP의 경로 또는 CC 파일 무결성 검사에 실패했습니다." }
+    if ($AlignProfile -in @("PointKd", "Full")) {
+        & $PythonPath -X utf8 (Join-Path $PSScriptRoot "point_kd_distribution.py") validate-archive $package.FullName
+        if ($LASTEXITCODE -ne 0) { throw "배포 ZIP의 점 기반 정렬 파일 무결성 검사에 실패했습니다." }
+    }
 
     New-Item -ItemType Directory -Path $buildOutput -Force | Out-Null
     # 비교 프로필은 별도 이름을 써서 정식 다운로드 파일을 덮어쓰지 않습니다.
-    $finalName = if ($AlignProfile -eq "CCCoreLib") { "colmap_tools.zip" } else { "colmap_tools-$($AlignProfile.ToLowerInvariant()).zip" }
+    $finalName = if ($AlignProfile -eq "PointKd") { "colmap_tools.zip" } else { "colmap_tools-$($AlignProfile.ToLowerInvariant()).zip" }
     $finalPackage = Join-Path $buildOutput $finalName
     $temporaryDestination = Join-Path $buildOutput (".$buildId-" + $package.Name)
     Copy-Item -LiteralPath $package.FullName -Destination $temporaryDestination
@@ -576,7 +622,7 @@ try {
     }
     Move-Item -LiteralPath $temporaryDestination -Destination $finalPackage -Force
     $temporaryDestination = ""
-    if ($AlignProfile -eq "CCCoreLib") {
+    if ($AlignProfile -eq "PointKd") {
         Remove-PreviousInstallPackages -OutputPath $buildOutput
     }
 }

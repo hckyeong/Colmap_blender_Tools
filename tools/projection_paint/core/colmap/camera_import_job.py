@@ -10,14 +10,6 @@ from pathlib import Path
 from time import perf_counter
 
 from ..axis import axes_for_preset, axis_matrix
-from .binary_io import (
-    parse_cameras_binary,
-    parse_cameras_binary_steps,
-    parse_images_binary,
-    parse_images_binary_steps,
-    parse_points3d_binary,
-    parse_points3d_binary_steps,
-)
 from .camera_models import pinhole_parameters
 from .errors import ColmapError
 from .fingerprint import semantic_fingerprint_steps
@@ -38,14 +30,7 @@ from .model import (
     PointPayload,
     ResolvedLayout,
 )
-from .text_io import (
-    parse_cameras_text,
-    parse_cameras_text_steps,
-    parse_images_text,
-    parse_images_text_steps,
-    parse_points3d_text,
-    parse_points3d_text_steps,
-)
+from .shared_reader import PointPayloadView, PointRecordMapping, shared_dataset_steps
 from .validation import (
     normalized_quaternion,
     validate_camera_image_records,
@@ -130,40 +115,11 @@ def load_camera_image_dataset(
     cancel_check: CancelCheck = None,
 ) -> ColmapDataset:
     """확정 Layout의 Reconstruction을 읽고 의미 무결성을 검증합니다."""
-    if layout.input_format == "binary":
-        cameras, camera_identity = parse_cameras_binary(
-            layout.cameras_path,
-            limits=limits,
-            cancel_check=cancel_check,
-        )
-        images, image_identity = parse_images_binary(
-            layout.images_path,
-            limits=limits,
-            cancel_check=cancel_check,
-        )
-        points3d, points_identity = parse_points3d_binary(
-            layout.points3d_path,
-            limits=limits,
-            cancel_check=cancel_check,
-        )
-    elif layout.input_format == "text":
-        cameras, camera_identity = parse_cameras_text(
-            layout.cameras_path,
-            limits=limits,
-            cancel_check=cancel_check,
-        )
-        images, image_identity = parse_images_text(
-            layout.images_path,
-            limits=limits,
-            cancel_check=cancel_check,
-        )
-        points3d, points_identity = parse_points3d_text(
-            layout.points3d_path,
-            limits=limits,
-            cancel_check=cancel_check,
-        )
-    else:
-        raise ColmapError(f"지원하지 않는 Layout 형식입니다: {layout.input_format}")
+    from .io_common import consume_generator
+
+    cameras, images, points3d, identities, file_fingerprint = consume_generator(
+        shared_dataset_steps(layout, limits, cancel_check)
+    )
     validate_camera_image_records(cameras, images, limits)
     validate_point3d_records(points3d, limits)
     check_cancel(cancel_check)
@@ -172,7 +128,8 @@ def load_camera_image_dataset(
         cameras=cameras,
         images=images,
         points3d=points3d,
-        source_identities=(camera_identity, image_identity, points_identity),
+        source_identities=identities,
+        source_file_fingerprint=file_fingerprint,
     )
 
 
@@ -239,7 +196,7 @@ def _build_import_payload_steps(
         completed += 1
         if completed % 256 == 0:
             yield completed, total
-    for point3d_id in sorted(dataset.points3d):
+    for point3d_id in (() if isinstance(dataset.points3d, PointRecordMapping) else sorted(dataset.points3d)):
         point = dataset.points3d[point3d_id]
         points.append(
             PointPayload(
@@ -260,7 +217,7 @@ def _build_import_payload_steps(
         axis_matrix=axis_matrix(forward, up),
         camera_data=tuple(camera_data),
         camera_objects=tuple(camera_objects),
-        points=tuple(points),
+        points=(PointPayloadView(dataset.points3d) if isinstance(dataset.points3d, PointRecordMapping) else tuple(points)),
         markers=tuple(markers),
         warnings=(),
     )
@@ -283,8 +240,9 @@ class ImportStagingPreparationJob:
         limits: ParserLimits = DEFAULT_LIMITS,
         cancel_check: CancelCheck = None,
         build_payload: bool = True,
+        point_limit: int | None = None,
     ) -> None:
-        """불변 입력을 복사하고 Core 준비 Job의 초기 상태를 만듭니다."""
+        """불변 입력과 선택적인 참고 점 상한을 복사해 증분 준비 상태를 만듭니다."""
 
         self._model_directory = model_directory
         self._images_directory = images_directory
@@ -297,6 +255,7 @@ class ImportStagingPreparationJob:
         self._limits = limits
         self._cancel_check = cancel_check
         self._build_payload = bool(build_payload)
+        self._point_limit = point_limit
         self._phase = ImportPreparationPhase.CREATED
         self._progress = self._snapshot(self._phase, 0, 0)
         self._iterator = None
@@ -386,67 +345,27 @@ class ImportStagingPreparationJob:
         self._progress = self._snapshot(phase, 0, 0)
 
     def _parser_steps(self, kind: str):
-        """확정된 형식과 레코드 종류에 맞는 증분 Parser를 반환합니다."""
-
-        if self._layout.input_format == "binary":
-            factories = {
-                "cameras": parse_cameras_binary_steps,
-                "images": parse_images_binary_steps,
-                "points": parse_points3d_binary_steps,
-            }
-        else:
-            factories = {
-                "cameras": parse_cameras_text_steps,
-                "images": parse_images_text_steps,
-                "points": parse_points3d_text_steps,
-            }
-        paths = {
-            "cameras": self._layout.cameras_path,
-            "images": self._layout.images_path,
-            "points": self._layout.points3d_path,
-        }
-        return factories[kind](
-            paths[kind],
-            limits=self._limits,
-            cancel_check=self._cancel_check,
-        )
+        """공개 전체 읽기는 유지하고 요청된 참고 상한만 공통 파서에 전달합니다."""
+        del kind
+        self._shared_reading = True
+        return shared_dataset_steps(self._layout, self._limits, self._cancel_check, point_limit=self._point_limit)
 
     def _finish_phase(self, value) -> None:
-        """완료된 Generator 결과를 저장하고 다음 세부 단계로 전환합니다."""
-
-        if self._phase is ImportPreparationPhase.READ_CAMERAS:
-            self._cameras, identity = value
-            self._identities.append(identity)
-            self._enter(
-                ImportPreparationPhase.READ_IMAGES,
-                self._parser_steps("images"),
-            )
-            return
-        if self._phase is ImportPreparationPhase.READ_IMAGES:
-            self._images, identity = value
-            self._identities.append(identity)
-            self._enter(
-                ImportPreparationPhase.READ_POINTS,
-                self._parser_steps("points"),
-            )
-            return
-        if self._phase is ImportPreparationPhase.READ_POINTS:
-            self._points, identity = value
-            self._identities.append(identity)
+        """완료된 생성기 결과를 저장하고 다음 준비 단계로 전환합니다."""
+        if getattr(self, "_shared_reading", False):
+            self._shared_reading = False
+            self._cameras, self._images, self._points, identities, file_fingerprint = value
             self._dataset = ColmapDataset(
                 layout=self._layout,
                 cameras=self._cameras,
                 images=self._images,
                 points3d=self._points,
-                source_identities=tuple(self._identities),
+                source_identities=identities,
+                source_file_fingerprint=file_fingerprint,
             )
             self._enter(
                 ImportPreparationPhase.VALIDATE_CAMERAS,
-                validate_camera_image_records_steps(
-                    self._dataset.cameras,
-                    self._dataset.images,
-                    self._limits,
-                ),
+                validate_camera_image_records_steps(self._dataset.cameras, self._dataset.images, self._limits),
             )
             return
         if self._phase is ImportPreparationPhase.VALIDATE_CAMERAS:
@@ -540,7 +459,15 @@ class ImportStagingPreparationJob:
                 return self._progress
             while self._iterator is not None:
                 try:
-                    completed, total = next(self._iterator)
+                    update = next(self._iterator)
+                    completed, total = update[:2]
+                    if len(update) == 3:
+                        self._phase = {
+                            "CAMERAS": ImportPreparationPhase.READ_CAMERAS,
+                            "IMAGES": ImportPreparationPhase.READ_IMAGES,
+                            "POINTS3D": ImportPreparationPhase.READ_POINTS,
+                            "COMPLETED": ImportPreparationPhase.READ_POINTS,
+                        }.get(update[2], self._phase)
                 except StopIteration as finished:
                     self._finish_phase(finished.value)
                     return self._progress
@@ -578,6 +505,7 @@ class ImportStagingPreparationJob:
         self._images = None
         self._points = None
         self._identities.clear()
+        self._shared_result = None
 
     def abort(self) -> None:
         """열린 증분 Parser를 닫고 보유 중인 Generator를 해제합니다."""
@@ -619,7 +547,7 @@ def prepare_import_staging(
 
 
 class ImportStagingRevalidationJob:
-    """Commit 직전 Source를 증분 재해석하고 최초 Snapshot과 비교합니다."""
+    """확정 전 파일 내용·경로를 검사하고 최초 불변 파싱 결과를 재사용합니다."""
 
     def __init__(
         self,
@@ -628,19 +556,13 @@ class ImportStagingRevalidationJob:
         limits: ParserLimits = DEFAULT_LIMITS,
         cancel_check: CancelCheck = None,
     ) -> None:
-        """최초 Staging 계약과 같은 입력을 사용하는 재검증 Job을 만듭니다."""
-
+        """재파싱 없이 원본 해시와 이미지 경로만 검사하는 상태를 준비합니다."""
         self._expected = expected
-        self._job = ImportStagingPreparationJob(
-            expected.dataset.layout.model_directory,
-            expected.image_manifest.images_root,
-            input_format=expected.dataset.layout.input_format,
-            frame_start=expected.frame_mapping.frame_start,
-            axis_preset="BLENDER",
-            limits=limits,
-            cancel_check=cancel_check,
-            build_payload=False,
-        )
+        self._limits = limits
+        self._cancel_check = cancel_check
+        self._fingerprint_job = None
+        self._image_steps = None
+        self._progress = ImportPreparationProgress(ImportPreparationPhase.CREATED, 0.0, 0, 0, "Preparing source checks")
         self._done = False
 
     @property
@@ -651,33 +573,30 @@ class ImportStagingRevalidationJob:
 
     @property
     def progress(self) -> ImportPreparationProgress:
-        """내부 Core 준비 Job의 현재 세부 진행 Snapshot을 반환합니다."""
+        """해시와 이미지 경로 검사만의 단조 증가하는 진행 상태를 반환합니다."""
+        return self._progress
 
-        return self._job.progress
+    def assert_current_files(self) -> None:
+        """모델 선택과 원본 파일 식별자를 확정 경계에서도 다시 대조합니다."""
+        from .io_common import identity_from_stat
+        try:
+            from .....shared.colmap_io import discover_sparse_model
+        except ImportError:
+            from shared.colmap_io import discover_sparse_model
+        expected = self._expected.dataset
+        selected = discover_sparse_model(expected.layout.model_directory, input_format=expected.layout.input_format)
+        if tuple(selected.selected_files) != tuple(item.path for item in expected.source_identities):
+            raise ColmapError("확정 직전 COLMAP 모델 파일 구성이 변경되었습니다.")
+        for identity in expected.source_identities:
+            if not identity.same_file(identity_from_stat(identity.path, identity.path.stat())):
+                raise ColmapError("확정 직전 COLMAP 원본 파일 식별자가 변경되었습니다.")
 
-    def _compare(self, current: ImportSourceSnapshot) -> None:
-        """현재 Source Snapshot이 최초 검증 결과와 동일한지 확인합니다."""
-
-        expected_dataset = self._expected.dataset
-        if current.dataset.layout != expected_dataset.layout:
-            raise ColmapError("Commit 직전 COLMAP Reconstruction 파일이 변경되었습니다.")
-        if current.source_fingerprint != self._expected.source_fingerprint:
-            raise ColmapError("Commit 직전 COLMAP 의미 Fingerprint가 변경되었습니다.")
-        for expected, actual in zip(
-            expected_dataset.source_identities,
-            current.dataset.source_identities,
-            strict=True,
-        ):
-            if not expected.same_file(actual):
-                raise ColmapError(
-                    "Commit 직전 COLMAP Source File Identity가 변경되었습니다."
-                )
-        if set(current.image_manifest.entries) != set(
-            self._expected.image_manifest.entries
-        ):
+    def _compare_images(self, current) -> None:
+        """촬영 이미지의 실제 경로·상태·파일 식별을 최초 결과와 비교합니다."""
+        if set(current.entries) != set(self._expected.image_manifest.entries):
             raise ColmapError("Commit 직전 Image 경로 Manifest가 변경되었습니다.")
         for image_id, expected in self._expected.image_manifest.entries.items():
-            actual = current.image_manifest.entries[image_id]
+            actual = current.entries[image_id]
             if (
                 actual.image_name != expected.image_name
                 or actual.normalized_relative_path
@@ -691,18 +610,55 @@ class ImportStagingRevalidationJob:
                 )
 
     def advance(self, work_budget_ms: float | None = 25.0) -> ImportPreparationProgress:
-        """시간 예산 안에서 Source 재검증을 진행하고 완료 시 비교합니다."""
-
+        """시간 예산 안에서 파일 해시·이미지 경로 검사를 실행하고 원본 변경을 거부합니다."""
         if self._done:
             raise RuntimeError("완료된 Source 재검증 Job을 다시 실행할 수 없습니다.")
-        progress = self._job.advance(work_budget_ms=work_budget_ms)
-        if self._job.done:
-            try:
-                self._compare(self._job.source_snapshot)
-            finally:
-                self._job.release_source_data()
-            self._done = True
-        return progress
+        if work_budget_ms is not None and (isinstance(work_budget_ms, bool) or not isinstance(work_budget_ms, (int, float)) or not isfinite(work_budget_ms) or work_budget_ms <= 0):
+            raise ValueError("원본 검사 시간 예산은 0보다 큰 유한값이어야 합니다.")
+        deadline = None if work_budget_ms is None else perf_counter() + work_budget_ms / 1000.0
+        try:
+            check_cancel(self._cancel_check)
+            if self._fingerprint_job is None:
+                try:
+                    from .....shared.colmap_io import SourceFingerprintJob, discover_sparse_model
+                except ImportError:
+                    from shared.colmap_io import SourceFingerprintJob, discover_sparse_model
+                self.assert_current_files()
+                layout = self._expected.dataset.layout
+                if resolve_layout(layout.model_directory, layout.input_format) != layout:
+                    raise ColmapError("확정 직전 COLMAP 모델 선택이 변경되었습니다.")
+                self._fingerprint_job = SourceFingerprintJob(discover_sparse_model(layout.model_directory, input_format=layout.input_format))
+            if not self._fingerprint_job.done:
+                self._fingerprint_job.step(None if deadline is None else max(0.0, deadline - perf_counter()))
+                completed, total = self._fingerprint_job.completed_bytes, self._fingerprint_job.total_bytes
+                self._progress = ImportPreparationProgress(ImportPreparationPhase.FINGERPRINT, 0.8 * completed / max(1, total), completed, total, "Checking source file contents")
+                if not self._fingerprint_job.done:
+                    return self._progress
+                if self._fingerprint_job.result != self._expected.dataset.source_file_fingerprint:
+                    raise ColmapError("확정 직전 COLMAP 원본 파일의 내용이 변경되었습니다.")
+                self.assert_current_files()
+            if self._image_steps is None:
+                self._image_steps = build_image_path_manifest_steps(
+                    self._expected.image_manifest.images_root, self._expected.dataset.images.values(),
+                    allow_extension_fallback=any(item.path_status == "FALLBACK" for item in self._expected.image_manifest.entries.values()),
+                    limits=self._limits, cancel_check=self._cancel_check,
+                )
+            while True:
+                try:
+                    completed, total = next(self._image_steps)
+                    self._progress = ImportPreparationProgress(ImportPreparationPhase.VALIDATE_IMAGE_PATHS, 0.8 + 0.2 * completed / max(1, total), completed, total, "Checking source image paths")
+                except StopIteration as finished:
+                    self._compare_images(finished.value)
+                    self.assert_current_files()
+                    self._done = True
+                    self._progress = ImportPreparationProgress(ImportPreparationPhase.DONE, 1.0, 1, 1, "Source checks complete")
+                    self.abort()
+                    return self._progress
+                if deadline is not None and perf_counter() >= deadline:
+                    return self._progress
+        except Exception:
+            self.abort()
+            raise
 
     def run_to_completion(self) -> None:
         """Background와 동기 경로에서 Source 재검증을 끝까지 실행합니다."""
@@ -711,9 +667,11 @@ class ImportStagingRevalidationJob:
             self.advance(work_budget_ms=None)
 
     def abort(self) -> None:
-        """열린 재검증 Parser를 닫고 Job을 중단합니다."""
-
-        self._job.abort()
+        """재파싱 작업 없이 원본 검사 파일과 이미지 생성기를 닫습니다."""
+        if self._fingerprint_job is not None:
+            self._fingerprint_job.close()
+        if self._image_steps is not None:
+            self._image_steps.close()
 
 
 def revalidate_import_staging(

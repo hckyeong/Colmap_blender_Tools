@@ -67,6 +67,8 @@ PROPERTIES_RATIO = 0.72
 LAYOUT_STAGE_KEY = "pp_paint_layout_stage"
 LAYOUT_GEOMETRY_KEY = "pp_paint_layout_geometry"
 ORIGIN_WORKSPACE_KEY = "pp_paint_origin_workspace"
+NATIVE_TOOL_REGIONS_VERSION_KEY = "pp_native_paint_tool_regions_version"
+NATIVE_ASSET_SHELF_VERSION_KEY = "pp_native_paint_asset_shelf_version"
 PAINT_WORKSPACE_SPEC = WorkspaceSeedSpec(
     tool_id="projection_paint",
     display_name=WORKSPACE_NAME,
@@ -816,15 +818,10 @@ def _schedule_open_workspace_configuration(
             settings.status_kind = "ERROR"
             settings.paint_state = "ERROR"
             return None
-        from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
+        from .snapshot_update import snapshot_is_ready
 
-        if not snapshot_is_ready(current_scene) and not modifier_snapshot_available(
-            bpy.context
-        ):
-            settings.status = "COLMAP Modifier에서 데이터를 먼저 불러오세요."
-            settings.status_kind = "READY"
-        elif not snapshot_is_ready(current_scene):
-            settings.status = "COLMAP 데이터 업데이트 버튼을 눌러 Snapshot을 만드세요."
+        if not snapshot_is_ready(current_scene):
+            settings.status = "Dataset에서 COLMAP과 OBJ 파일을 불러오세요."
             settings.status_kind = "READY"
         else:
             settings.status = "Projection Paint 작업공간 준비 완료"
@@ -1291,15 +1288,33 @@ def _configure_viewport_visibility_contract(
     _show_active_dataset_collection(context.scene, window.view_layer)
 
 
+def initialize_native_paint_tool_regions(workspace: Any, viewport_area: Any) -> None:
+    """기본 도구 영역과 사용 가능한 브러시 선반을 한 번씩 열고 사용자 선택을 보존합니다."""
+
+    tools_ready = int(workspace.get(NATIVE_TOOL_REGIONS_VERSION_KEY, 0)) >= 1
+    shelf_ready = int(workspace.get(NATIVE_ASSET_SHELF_VERSION_KEY, 0)) >= 1
+    if tools_ready and shelf_ready:
+        return
+    space = viewport_area.spaces.active
+    if not tools_ready:
+        space.show_region_toolbar = True
+        space.show_region_tool_header = True
+        workspace[NATIVE_TOOL_REGIONS_VERSION_KEY] = 1
+    if not shelf_ready and not space.is_property_readonly("show_region_asset_shelf"):
+        space.show_region_asset_shelf = True
+        workspace[NATIVE_ASSET_SHELF_VERSION_KEY] = 1
+
+
 def _finalize_workspace_contract(
     context: Any,
     window: Any,
     workspace: Any,
     viewport_area: Any,
 ) -> None:
-    """Paint Layout과 Viewport 표시 계약을 검증한 뒤 Workspace를 READY로 표시합니다."""
+    """데이터 표시와 기본 페인트 도구 영역을 준비한 뒤 작업공간을 READY로 표시합니다."""
 
     _configure_viewport_visibility_contract(context, window, viewport_area)
+    initialize_native_paint_tool_regions(workspace, viewport_area)
     try:
         mark_workspace_ready(
             workspace,
@@ -1372,6 +1387,7 @@ __all__ = [
     "cleanup_unused_paint_workspaces",
     "configure_paint_workspace",
     "ensure_paint_workspace",
+    "initialize_native_paint_tool_regions",
     "open_paint_workspace",
     "paint_workspace_exit_settled",
     "pause_paint_workspace_cleanup",

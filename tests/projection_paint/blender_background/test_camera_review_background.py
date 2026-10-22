@@ -443,6 +443,90 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         self.assertIsNone(projection_camera_session_token(self.scene))
         self.assertIs(self.scene.camera, external_camera)
 
+    def test_undo_redo_rebuild_preserves_viewport_navigation(self) -> None:
+        """실행 취소·다시 실행 복구가 자유 뷰와 카메라 뷰의 탐색 상태를 바꾸지 않습니다."""
+        from tools.projection_paint.blender import camera_scene as camera_scene_module
+        from tools.projection_paint.blender.lifecycle import lifecycle_registry
+
+        viewport = next(area for area in bpy.context.window.screen.areas if area.type == "VIEW_3D")
+        rv3d = viewport.spaces.active.region_3d
+        registry = lifecycle_registry()
+        for reason in ("undo_post", "redo_post"):
+            for perspective in ("PERSP", "ORTHO", "CAMERA"):
+                with self.subTest(reason=reason, perspective=perspective):
+                    rv3d.view_perspective = perspective
+                    rv3d.view_location = (1.25, -2.5, 3.75)
+                    rv3d.view_rotation = (0.9238795, 0.0, 0.3826834, 0.0)
+                    rv3d.view_distance = 17.0
+                    rv3d.view_camera_zoom = 23.0
+                    rv3d.view_camera_offset = (0.12, -0.08)
+                    before = (
+                        rv3d.view_perspective,
+                        tuple(rv3d.view_location),
+                        tuple(rv3d.view_rotation),
+                        rv3d.view_distance,
+                        rv3d.view_camera_zoom,
+                        tuple(rv3d.view_camera_offset),
+                    )
+                    old_token = projection_camera_session_token(self.scene)
+                    registry.barrier(reason.replace("_post", "_pre"))
+                    with patch.object(
+                        camera_scene_module,
+                        "enter_projection_camera_view",
+                        wraps=camera_scene_module.enter_projection_camera_view,
+                    ) as enter_view:
+                        registry.rebuild(self.scene, reason)
+                    enter_view.assert_not_called()
+                    self.assertNotEqual(projection_camera_session_token(self.scene), old_token)
+                    self.assertIs(viewport.spaces.active.camera, self.scene.camera)
+                    self.assertEqual(
+                        (
+                            rv3d.view_perspective,
+                            tuple(rv3d.view_location),
+                            tuple(rv3d.view_rotation),
+                            rv3d.view_distance,
+                            rv3d.view_camera_zoom,
+                            tuple(rv3d.view_camera_offset),
+                        ),
+                        before,
+                    )
+                    self.assertFalse(registry.failures)
+
+    def test_repeated_frame_refresh_keeps_view_and_new_frame_enters_camera(self) -> None:
+        """같은 프레임의 지연 갱신은 자유 뷰를 유지하고 실제 프레임 변경은 카메라로 이동합니다."""
+        from tools.projection_paint.blender import camera_scene as camera_scene_module
+
+        target = _new_paint_target()
+        start_paint_session(bpy.context, target, width=64, height=32)
+        start_stencil_session(bpy.context, dataset_uuid=str(self.scene.projection_paint.dataset_uuid))
+        try:
+            activate_managed_frame(self.scene, 1, refresh_source=False)
+            viewport = next(area for area in bpy.context.window.screen.areas if area.type == "VIEW_3D")
+            rv3d = viewport.spaces.active.region_3d
+            rv3d.view_perspective = "PERSP"
+            runtime = runtime_for_scene(self.scene)
+            queue_frame_change(self.scene, changed_at=1200.0)
+            with patch.object(
+                camera_scene_module,
+                "enter_projection_camera_view",
+                wraps=camera_scene_module.enter_projection_camera_view,
+            ) as enter_view:
+                _frame_source_debounce_tick(now=1200.31)
+                enter_view.assert_not_called()
+                self.assertEqual(rv3d.view_perspective, "PERSP")
+                self.assertEqual(int(self.scene.projection_paint.active_image_id), 10)
+                self.assertIsNone(runtime.pending_frame)
+
+                self.scene.frame_current = 2
+                queue_frame_change(self.scene, changed_at=1201.0)
+                _frame_source_debounce_tick(now=1201.31)
+                enter_view.assert_called_once()
+                self.assertEqual(rv3d.view_perspective, "CAMERA")
+                self.assertEqual(int(self.scene.projection_paint.active_image_id), 30)
+                self.assertIsNone(runtime.pending_frame)
+        finally:
+            finish_paint_session(bpy.context)
+
     def test_new_frame_restarts_debounce_wait(self) -> None:
         """대기 중 새 Frame이 들어오면 마지막 입력 시각부터 0.30초를 다시 기다립니다."""
 
@@ -748,23 +832,24 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         self.assertFalse(settings.review_background_enabled)
 
     def test_look_through_uses_current_frame_camera_in_current_viewport(self) -> None:
-        """Look Through가 현재 Frame Camera와 호출 Viewport만 Camera View로 전환합니다."""
+        """실제 뷰포트의 카메라 진입과 원근투영 복귀 및 현재 프레임 연결을 검증합니다."""
 
         runtime = runtime_for_scene(self.scene)
         entry = runtime.entries_by_frame[int(self.scene.frame_current)]
         expected_camera = runtime.objects[entry.camera_uuid]
-        rv3d = SimpleNamespace(view_perspective="PERSP")
-        space = SimpleNamespace(type="VIEW_3D", region_3d=rv3d, camera=None)
-        redraws = []
-        area = SimpleNamespace(
-            type="VIEW_3D",
-            tag_redraw=lambda: redraws.append(True),
-        )
+        window = bpy.context.window
+        area = next(item for item in window.screen.areas if item.type == "VIEW_3D")
+        region = next(item for item in area.regions if item.type == "WINDOW")
+        space = area.spaces.active
+        rv3d = space.region_3d
+        rv3d.view_perspective = "ORTHO"
+        space.camera = None
         context = SimpleNamespace(
             scene=self.scene,
             area=area,
             space_data=space,
             window_manager=None,
+            window=window,
         )
 
         image_id = look_through_current_camera(context)
@@ -777,27 +862,27 @@ class CameraReviewBackgroundTests(unittest.TestCase):
         self.assertTrue(space.use_local_camera)
         self.assertIs(space.camera, expected_camera)
         self.assertEqual(rv3d.view_perspective, "CAMERA")
-        self.assertTrue(redraws)
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            self.assertEqual(bpy.ops.view3d.view_camera(), {"FINISHED"})
+        self.assertEqual(rv3d.view_perspective, "PERSP")
 
     def test_import_completion_runs_initial_look_through_once(self) -> None:
-        """Import 완료가 현재 Camera와 원본 해상도를 호출 Viewport에 즉시 적용합니다."""
+        """가져오기 완료가 실제 카메라뷰와 원본 해상도 및 원근투영 복귀를 준비합니다."""
 
-        rv3d = SimpleNamespace(view_perspective="PERSP")
-        space = SimpleNamespace(type="VIEW_3D", region_3d=rv3d, camera=None)
         viewport_area = next(
             area
             for area in bpy.context.window.screen.areas
             if area.type == "VIEW_3D"
         )
+        space = viewport_area.spaces.active
+        rv3d = space.region_3d
+        rv3d.view_perspective = "ORTHO"
+        space.camera = None
         overlay = viewport_area.spaces.active.overlay
         overlay.show_relationship_lines = True
-        redraws = []
         context = SimpleNamespace(
             scene=self.scene,
-            area=SimpleNamespace(
-                type="VIEW_3D",
-                tag_redraw=lambda: redraws.append(True),
-            ),
+            area=viewport_area,
             space_data=space,
             window_manager=None,
             window=bpy.context.window,
@@ -818,8 +903,11 @@ class CameraReviewBackgroundTests(unittest.TestCase):
             (self.scene.render.resolution_x, self.scene.render.resolution_y),
             (64, 32),
         )
-        self.assertTrue(redraws)
         self.assertFalse(overlay.show_relationship_lines)
+        region = next(item for item in viewport_area.regions if item.type == "WINDOW")
+        with bpy.context.temp_override(window=bpy.context.window, area=viewport_area, region=region):
+            self.assertEqual(bpy.ops.view3d.view_camera(), {"FINISHED"})
+        self.assertEqual(rv3d.view_perspective, "PERSP")
 
 
 if __name__ == "__main__":

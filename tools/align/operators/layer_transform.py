@@ -30,10 +30,12 @@ from ..constants import (
     LAYER_TRANSFORM_PHASE_ROTATE,
     LAYER_TRANSFORM_PHASE_SCALE,
     LAYER_TRANSFORM_PHASE_TRANSLATE,
+    MODEL_STATUS_REGISTERED,
     ROLE_MOVING,
     ROLE_REFERENCE,
     SESSION_ACTIVE,
 )
+from ..model_repository import ModelRepositoryError
 from ..project_persistence.runtime import notify_project_state_changed, restore_input_block_reason
 from ..session import is_session_active_for_window, session_align_workspace
 from ..state import RUNTIME
@@ -180,7 +182,7 @@ def _visible_role_target_ids(role: str) -> tuple[str, ...]:
 
 
 def set_layer_transform_pivot_from_event(context: Any, event: Any) -> bool:
-    """A/P 뷰포트 더블클릭 점으로 기즈모와 해당 카메라 회전 중심을 함께 옮깁니다."""
+    """화면 ID·깊이로 고른 정밀 표면점에 기즈모와 카메라 회전 중심을 옮깁니다."""
 
     viewport = _viewport_for_event(context, event)
     if viewport is None:
@@ -197,19 +199,20 @@ def set_layer_transform_pivot_from_event(context: Any, event: Any) -> bool:
     if region_3d is None:
         return False
     mouse = _region_mouse(region, event)
-    result = pick_nearest_point_for_model_ids(
-        visible_target_ids,
-        region,
-        region_3d,
-        (float(mouse.x), float(mouse.y)),
-    )
-    if result is None:
-        message = "더블클릭 지점에서 선택 레이어의 포인트를 찾지 못했습니다."
-        RUNTIME.layer_transform.message = message
-        set_workspace_status_text(session_align_workspace(), message)
-        request_redraw()
-        return True
     try:
+        result = pick_nearest_point_for_model_ids(
+            visible_target_ids,
+            region,
+            region_3d,
+            (float(mouse.x), float(mouse.y)),
+            screen_surface=True,
+        )
+        if result is None:
+            message = "더블클릭 지점에서 선택 레이어의 포인트를 찾지 못했습니다."
+            RUNTIME.layer_transform.message = message
+            set_workspace_status_text(session_align_workspace(), message)
+            request_redraw()
+            return True
         pivot = set_layer_transform_custom_pivot(
             RUNTIME,
             role=role,
@@ -217,7 +220,7 @@ def set_layer_transform_pivot_from_event(context: Any, event: Any) -> bool:
             source_model_id=result.model_id,
             source_position=result.position,
         )
-    except LayerTransformError as error:
+    except (ModelRepositoryError, LayerTransformError) as error:
         message = str(error)
         RUNTIME.layer_transform.message = message
         set_workspace_status_text(session_align_workspace(), message)
@@ -359,7 +362,7 @@ def _gizmo_matrix(pivot: Any, axis: str | None = None) -> Matrix:
 
 
 def _gizmo_poll(context: Any) -> bool:
-    """표시 설정이 켜진 활성 A/P 뷰포트의 잠기지 않은 선택 subset에만 기즈모를 표시합니다."""
+    """활성 선택 기즈모와 축 팝업 대상의 조작 불가능한 위치 표시를 허용합니다."""
 
     if context.area is None or context.region is None or context.region.type != "WINDOW":
         return False
@@ -367,6 +370,14 @@ def _gizmo_poll(context: Any) -> bool:
     if settings is None or not bool(getattr(settings, "show_transform_gizmo", False)):
         return False
     role = role_for_area(context.window, context.area)
+    axes = RUNTIME.axis_settings
+    if axes.is_active:
+        record = RUNTIME.model_catalog.models.get(axes.model_id)
+        target_role = ROLE_REFERENCE if record is not None and record.registration_status == MODEL_STATUS_REGISTERED else ROLE_MOVING
+        return bool(record is not None and role == target_role
+            and _pointer(context.window) == axes.window_pointer
+            and _pointer(getattr(context, "workspace", None)) == axes.workspace_pointer
+            and is_session_active_for_window(context.window))
     return bool(role is not None and layer_transform_start_block_reason(role) is None)
 
 
@@ -666,7 +677,7 @@ class COLMAPALIGN_GGT_layer_transform(bpy.types.GizmoGroup):
 
     @classmethod
     def poll(cls, context):
-        """잠기지 않은 현재 역할 뷰포트 선택 subset에서만 기즈모를 노출합니다."""
+        """현재 역할의 선택 또는 축 팝업 대상에 기즈모를 노출합니다."""
 
         return _gizmo_poll(context)
 
@@ -703,13 +714,20 @@ class COLMAPALIGN_GGT_layer_transform(bpy.types.GizmoGroup):
         self._scale.scale_basis = 0.2
         self._bind_operator(self._scale, "SCALE")
 
-    def draw_prepare(self, _context):
-        """매 redraw에서 작은 pivot 행렬만 갱신하고 점군 배열·GPU 배치는 건드리지 않습니다."""
+    def draw_prepare(self, context):
+        """작은 피벗 행렬을 갱신하고 축 팝업에서는 위치만 표시하며 드래그를 차단합니다."""
 
         state = RUNTIME.layer_transform
-        target_role = role_for_area(bpy.context.window, bpy.context.area)
+        axes = RUNTIME.axis_settings
+        target_role = role_for_area(context.window, context.area)
         target_ids = _role_target_ids(target_role) if target_role is not None else ()
-        if state.is_active:
+        if axes.is_active:
+            from ..axis_settings import axis_gizmo_world_position, AxisSettingsError
+            try:
+                pivot = axis_gizmo_world_position(RUNTIME, axes.token, displayed=True)
+            except AxisSettingsError:
+                return
+        elif state.is_active:
             pivot = state.pivot_float64
         else:
             try:
@@ -718,9 +736,12 @@ class COLMAPALIGN_GGT_layer_transform(bpy.types.GizmoGroup):
                 return
         for axis, gizmo in self._translate:
             gizmo.matrix_basis = _gizmo_matrix(pivot, axis)
+            gizmo.hide_select = axes.is_active
         for axis, gizmo in self._rotate:
             gizmo.matrix_basis = _gizmo_matrix(pivot, axis)
+            gizmo.hide_select = axes.is_active
         self._scale.matrix_basis = _gizmo_matrix(pivot)
+        self._scale.hide_select = axes.is_active
 
 
 CLASSES = (

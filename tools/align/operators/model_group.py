@@ -171,7 +171,7 @@ def model_deletion_block_reason(model_id: str | None = None) -> str | None:
 
 
 def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
-    """삭제 확정 후 소유 피킹 캐시를 해제하며 실패하면 등록 순서와 대표까지 복원합니다."""
+    """삭제 시 원본·피킹 자원을 해제하고 실패하면 준비 입력까지 원상 복원합니다."""
     normalized_id = str(model_id).strip()
     reason = model_deletion_block_reason(normalized_id)
     if reason is not None:
@@ -187,6 +187,7 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
     source_metadata = repository.source_metadata.get(normalized_id)
     models_snapshot = dict(repository.models)
     source_index_snapshot = dict(repository.source_path_index)
+    alignment_inputs_snapshot = dict(repository.alignment_inputs)
     # 연결 메시·개별 축·평가 캐시는 삭제 실패 시 원래 객체와 존재 여부까지 복원합니다.
     companion_snapshot = tuple(
         (mapping, normalized_id in mapping, mapping.get(normalized_id))
@@ -244,6 +245,8 @@ def delete_model_from_runtime(model_id: str) -> ModelDeletionResult:
         repository.models.update(models_snapshot)
         repository.source_path_index.clear()
         repository.source_path_index.update(source_index_snapshot)
+        repository.alignment_inputs.clear()
+        repository.alignment_inputs.update(alignment_inputs_snapshot)
         for mapping, present, value in companion_snapshot:
             if present:
                 mapping[normalized_id] = value

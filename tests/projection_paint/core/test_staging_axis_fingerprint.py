@@ -160,7 +160,7 @@ class StagingAxisFingerprintTests(unittest.TestCase):
             )
             with (sparse / "cameras.txt").open("a", encoding="utf-8") as stream:
                 stream.write("# changed\n")
-            with self.assertRaisesRegex(ColmapError, "Identity|Fingerprint"):
+            with self.assertRaisesRegex(ColmapError, "식별자|내용|Identity|Fingerprint"):
                 revalidate_import_staging(payload)
 
 

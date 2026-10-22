@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+
+
+@contextmanager
+def _screen_query(origin, direction):
+    """화면 읽기만 두 면의 후보로 대체하고 원본 교차·슬롯·가림 판정은 실제 코드로 검사합니다."""
+    from tools.align.viewport import picking, renderer, screen_pick
+    with (
+        patch.object(picking, "_view_ray", return_value=(origin, direction)),
+        patch.object(picking, "_screen_view_ray", return_value=(origin, direction)),
+        patch.object(renderer, "prepared_mesh_pick_batch", return_value=object()),
+        patch.object(screen_pick, "screen_triangle_candidates", return_value=(0, 1)),
+    ):
+        yield
 
 
 def _add_test_paths():
@@ -36,7 +50,7 @@ def test_companion_ray_uses_mesh_axis_and_cache_isolates_source():
         origin, direction = position + normal * 5, -normal
         region = SimpleNamespace(width=800, height=600)
         region_3d = SimpleNamespace(view_matrix=np.eye(4), perspective_matrix=None)
-        with patch.object(picking, "_view_ray", return_value=(origin, direction)):
+        with _screen_query(origin, direction):
             picked = picking.pick_nearest_point("MOVING", region, region_3d, (0, 0))
         assert picked is not None and picked.geometry_source == "COMPANION"
         assert picked.model_id == "moving" and picked.point_kind == "MESH_SURFACE"
@@ -140,7 +154,7 @@ def test_front_point_inside_same_cloud_blocks_mesh_role_pick():
         np.testing.assert_allclose(screen, ((400.4, 300), (400, 300)), atol=1e-10)
         np.testing.assert_allclose(depths, (5, 20), atol=1e-10)
         assert valid.all()
-        with patch.object(picking, "_view_ray", return_value=(origin, direction)):
+        with _screen_query(origin, direction):
             result = picking.pick_nearest_point("REFERENCE", region, region_3d, (400, 300))
         assert result is not None and result.model_id == "reference"
         assert result.point_kind == "COLMAP_POINT" and result.point3d_id == 101
@@ -180,7 +194,7 @@ def test_companion_missed_face_does_not_snap_to_owner_sparse_points():
     from tools.align.viewport import picking
 
     runtime, *_ = _runtime()
-    with _display_runtime(runtime), patch.object(picking, "_view_ray", return_value=(np.asarray((999, 999, 999.0)), np.asarray((0, 0, 1.0)))), patch.object(picking, "_pick_model_nearest_point") as point_picker:
+    with _display_runtime(runtime), _screen_query(np.asarray((999, 999, 999.0)), np.asarray((0, 0, 1.0))), patch.object(picking, "_pick_model_nearest_point") as point_picker:
         assert picking.pick_nearest_point("MOVING", SimpleNamespace(), SimpleNamespace(), (0, 0)) is None
         point_picker.assert_not_called()
 

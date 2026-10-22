@@ -53,6 +53,8 @@ def automatic_alignment_description() -> str:
     """설치 프로필에서 실제 실행하는 엔진과 계산 범위를 설명합니다."""
     if _AUTOMATIC_ICP_BACKEND == "SMALL_GICP":
         return "Small GICP 희소 점군 정렬과 균일 배율 보정을 실행합니다."
+    if _AUTOMATIC_ICP_BACKEND == "POINT_KD_ICP":
+        return "선택한 전체 유효점으로 정렬합니다. 기본은 배율을 보존하며 Sim(3) 옵션을 켜면 배율도 보정합니다."
     return "CC 강체 정렬 후 초기값 대비 최대 ±10% 배율 보정을 실행합니다."
 
 
@@ -409,7 +411,7 @@ class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
         )
 
     def execute(self, context):
-        """배포 엔진의 정렬과 배율 보정을 시작하고 진행 확인을 등록합니다."""
+        """배포 엔진과 사용자가 선택한 배율 보정 옵션으로 정렬을 시작합니다."""
         uses_marker_preview = is_marker_preview_active()
         start_reason = align_start_block_reason(context)
         if start_reason is not None:
@@ -422,7 +424,9 @@ class COLMAPALIGN_OT_align_marker_preview(bpy.types.Operator):
             begin_icp_job(
                 RUNTIME,
                 preset=_AUTOMATIC_ICP_PRESET,
-                scale_refine_enabled=True,
+                scale_refine_enabled=(bool(getattr(getattr(getattr(context, "scene", None),
+                    "colmap_align_settings", None), "icp_sim3_enabled", False))
+                    if _AUTOMATIC_ICP_BACKEND == "POINT_KD_ICP" else True),
                 solver_backend=_AUTOMATIC_ICP_BACKEND,
                 open3d_python_path=configured_icp_python_path(context),
             )
@@ -484,6 +488,32 @@ class COLMAPALIGN_OT_validate_open3d_environment(bpy.types.Operator):
             {"INFO"},
             f"Open3D 환경 확인 완료 · Python {python_version} · Open3D {open3d_version}",
         )
+        return {"FINISHED"}
+
+
+class COLMAPALIGN_OT_validate_point_kd_environment(bpy.types.Operator):
+    """전용 Python과 점 기반 네이티브 엔진의 실제 계산 환경을 검사합니다."""
+
+    bl_idname = "colmap_align.validate_point_kd_environment"
+    bl_label = "점 기반 정렬 환경 검사"
+    bl_description = "애드온 전용 Python과 점 기반 강체 엔진의 최소 계산을 검사합니다"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, _context):
+        """현재 정렬 실행을 방해하지 않는 유휴 상태에서만 검사합니다."""
+        return not is_icp_running()
+
+    def execute(self, context):
+        """점 기반 엔진을 실제 실행하고 확인된 버전 또는 오류를 보고합니다."""
+        from ..alignment.icp_point_kd_runtime import validate_point_kd_environment
+        try:
+            environment = validate_point_kd_environment(configured_icp_python_path(context))
+        except (RuntimeError, ValueError, OSError) as error:
+            _report_status(self, {"WARNING"}, str(error))
+            return {"CANCELLED"}
+        version = str(environment.get("worker_python_version", ""))
+        _report_status(self, {"INFO"}, f"점 기반 강체 정렬 환경 확인 완료 · Python {version}")
         return {"FINISHED"}
 
 
@@ -664,6 +694,7 @@ CLASSES = (
     COLMAPALIGN_OT_align_marker_preview,
     # Open3D backend 환경 검사 operator는 구현 보존 상태로 등록하지 않습니다.
     # COLMAPALIGN_OT_validate_open3d_environment,
+    COLMAPALIGN_OT_validate_point_kd_environment,
     COLMAPALIGN_OT_validate_cccore_environment,
     COLMAPALIGN_OT_validate_small_gicp_environment,
     COLMAPALIGN_OT_cancel_icp,

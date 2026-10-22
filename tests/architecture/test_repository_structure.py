@@ -229,12 +229,13 @@ class RepositoryStructureTests(unittest.TestCase):
         ]
         self.assertEqual([], violations)
 
-    def test_cccore_runtime_is_supplied_only_by_build_staging(self) -> None:
-        """정식 CC 런타임과 구엔진 비교 프로필은 검증된 스테이징에서만 공급합니다."""
+    def test_alignment_runtime_is_supplied_only_by_build_staging(self) -> None:
+        """기본 점 기반 런타임과 구엔진 비교 프로필은 검증된 스테이징에서만 공급합니다."""
 
         self.assertFalse((ROOT / "tools" / "align" / "runtime").exists())
         self.assertTrue((ROOT / "build_tools" / "prepare_cccore_runtime.ps1").is_file())
         self.assertTrue((ROOT / "build_tools" / "cccore_distribution.py").is_file())
+        self.assertTrue((ROOT / "build_tools" / "point_kd_distribution.py").is_file())
         self.assertTrue((ROOT / "build_tools" / "prepare_small_gicp_runtime.ps1").is_file())
         requirements = (
             ROOT / "build_tools" / "small_gicp_backend_requirements.txt"
@@ -245,7 +246,9 @@ class RepositoryStructureTests(unittest.TestCase):
             encoding="utf-8"
         )
         for contract in (
-            'AlignProfile = "CCCoreLib"',
+            'AlignProfile = "PointKd"',
+            "Add-PointKdEmbeddedRuntime",
+            "tools/align/runtime/point_kd/colmap_point_kd_worker.exe",
             "Add-CcCoreEmbeddedRuntime",
             "tools/align/runtime/cccore/colmap_cccore_worker.exe",
             "Resolve-SmallGicpRuntimeSource",

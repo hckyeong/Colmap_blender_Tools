@@ -139,8 +139,10 @@ class ColmapDataset:
         SourceFileIdentity,
     ]
 
+    source_file_fingerprint: str = ""
+
     def __post_init__(self) -> None:
-        """외부에서 Mapping을 변경할 수 없게 불변 복사본으로 고정합니다."""
+        """일반 매핑은 고정하고 공통 파서의 불변 점 보기는 복사 없이 보관합니다."""
         object.__setattr__(
             self,
             "cameras",
@@ -151,10 +153,12 @@ class ColmapDataset:
             "images",
             MappingProxyType(dict(self.images)),
         )
+        from .shared_reader import PointRecordMapping
+
         object.__setattr__(
             self,
             "points3d",
-            MappingProxyType(dict(self.points3d)),
+            self.points3d if isinstance(self.points3d, PointRecordMapping) else MappingProxyType(dict(self.points3d)),
         )
 
 

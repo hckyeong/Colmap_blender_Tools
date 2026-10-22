@@ -571,7 +571,9 @@ def _stored_frame_corners(scene: Any):
 
 
 def _enter_camera_view(session: StencilSession) -> None:
-    """현재 Scene Camera로 작업 Viewport의 Camera View를 확정합니다."""
+    """현재 카메라뷰를 확정하고 이탈 시 원근투영 복귀 상태를 기록합니다."""
+    from .camera_scene import enter_projection_camera_view
+
     camera = session.scene.camera
     if camera is None or _pointer(camera) == 0 or getattr(camera, "data", None) is None:
         raise StencilSessionError("Stencil을 연결할 Scene Camera가 없습니다.")
@@ -579,7 +581,7 @@ def _enter_camera_view(session: StencilSession) -> None:
         session.space.use_local_camera = True
         session.space.camera = camera
     if session.rv3d is not None and _pointer(session.rv3d):
-        session.rv3d.view_perspective = "CAMERA"
+        enter_projection_camera_view(session.window, session.area, session.space)
 
 
 def align_stencil_to_camera(context: Any, scene: Any) -> None:

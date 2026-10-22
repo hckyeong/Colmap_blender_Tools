@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bpy
+import json
 
 try:
     from ....shared.blender_runtime.workspace_handoff import (
@@ -352,29 +353,36 @@ class PP_PT_status(_ProjectionPaintPanelMixin, bpy.types.Panel):
 
 
 class PP_PT_colmap(_ProjectionPaintPanelMixin, bpy.types.Panel):
-    """Modifier 데이터를 PP 독립 Snapshot으로 업데이트하는 UI를 제공합니다."""
+    """COLMAP·OBJ의 독립 파일 입력과 점군·카메라 표시 설정을 제공합니다."""
 
     bl_label = "COLMAP Dataset"
     bl_idname = "PP_PT_colmap"
     bl_order = 10
 
     def draw(self, context):
-        """수동 업데이트 버튼과 Point·Camera 표시 크기를 제공합니다."""
+        """가져오기 버튼과 원본·참고 점 수, 준비된 데이터의 표시 크기를 그립니다."""
 
-        from .snapshot_update import modifier_snapshot_available, snapshot_is_ready
+        from .snapshot_update import snapshot_is_ready
 
         layout = _indented_panel_body(self.layout)
         settings = context.scene.projection_paint
-        update_row = layout.row(align=True)
-        update_row.enabled = modifier_snapshot_available(context)
-        update_row.operator("projection_paint.update_colmap_snapshot", icon="FILE_REFRESH")
-        if not modifier_snapshot_available(context):
-            layout.label(
-                text="COLMAP Modifier에서 데이터를 먼저 불러오세요.",
-                icon="INFO",
-            )
+        input_buttons = layout.column(align=True)
+        select = input_buttons.operator("projection_paint.select_colmap_directory", text="COLMAP 불러오기", icon="OUTLINER_OB_POINTCLOUD")
+        select.target = "ROOT"
+        select.import_after_select = True
+        input_buttons.operator("projection_paint.import_obj", text="OBJ 불러오기", icon="MESH_DATA")
         if not snapshot_is_ready(context.scene):
             return
+        layout.label(text=f"카메라 {settings.snapshot_image_count:,}개 · 점 {settings.snapshot_point_count:,}개")
+        try:
+            reference = json.loads(settings.reference_metadata_json)
+        except (ValueError, TypeError, AttributeError):
+            reference = {}
+        source_count = reference.get("source_point_count", settings.snapshot_point_count) if isinstance(reference, dict) else settings.snapshot_point_count
+        if not isinstance(source_count, int):
+            source_count = settings.snapshot_point_count
+        if source_count > settings.snapshot_point_count:
+            layout.label(text=f"원본 {source_count:,}점에서 참고 표본 가져옴")
 
         display_box = layout.box()
         display_box.label(text="Point Display")
@@ -415,7 +423,7 @@ class PP_PT_camera_review(_ProjectionPaintPanelMixin, bpy.types.Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        """현재 IMAGE_ID와 배경 표시 토글 및 Alpha를 표시합니다."""
+        """카메라 진입 버튼 없이 현재 이미지 정보와 배경 표시 설정만 표시합니다."""
 
         settings = context.scene.projection_paint
         layout = _indented_panel_body(self.layout)
@@ -443,10 +451,11 @@ class PP_PT_camera_review(_ProjectionPaintPanelMixin, bpy.types.Panel):
             toggle=False,
             icon="HIDE_OFF" if settings.review_background_enabled else "HIDE_ON",
         )
-        layout.operator(
-            "projection_paint.review_look_through",
-            icon="CAMERA_DATA",
-        )
+        # 스텐실 재연결과 조작이 겹치는 별도 진입 버튼은 숨기고 내부 기능은 유지합니다.
+        # layout.operator(
+        #     "projection_paint.review_look_through",
+        #     icon="CAMERA_DATA",
+        # )
 
 
 class PP_PT_layers(_ProjectionPaintPanelMixin, bpy.types.Panel):

@@ -140,6 +140,7 @@ class CameraRuntime:
     dirty_data: deque[str]
     queued: set[tuple[str, str]]
     marker_cursor: int = 0
+    activated_frame: int | None = None
     pending_frame: int | None = None
     pending_frame_serial: int = 0
     pending_frame_changed_at: float = 0.0
@@ -1465,12 +1466,36 @@ def _restore_marker(runtime: CameraRuntime, entry: CameraManifestEntry) -> bool:
     return changed
 
 
+def enter_projection_camera_view(window: Any, area: Any, space: Any) -> bool:
+    """카메라뷰 진입 시 원근투영을 복귀 상태로 기록하고 이미 진입한 화면은 유지합니다."""
+    rv3d = space.region_3d
+    if rv3d.view_perspective == "CAMERA":
+        return False
+    region = next((item for item in area.regions if item.type == "WINDOW"), None)
+    if window is None or region is None:
+        raise CameraSceneError("카메라뷰를 전환할 3D 뷰포트 문맥이 없습니다.")
+    previous_perspective = rv3d.view_perspective
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            rv3d.view_perspective = "PERSP"
+            result = bpy.ops.view3d.view_camera()
+        if result != {"FINISHED"} or rv3d.view_perspective != "CAMERA":
+            raise CameraSceneError("카메라뷰 전환을 완료하지 못했습니다.")
+    except (ReferenceError, RuntimeError):
+        rv3d.view_perspective = previous_perspective
+        raise
+    area.tag_redraw()
+    return True
+
+
 def _enter_camera_views(
     scene: Any,
     camera: Any,
     token: ProjectionCameraSessionToken,
+    *,
+    enter_camera_view: bool = True,
 ) -> bool:
-    """세션 소유 Window의 Projection 3D View만 Local Camera로 전환합니다."""
+    """세션 소유 화면의 카메라를 연결하고 명시적 진입 요청에만 뷰를 전환합니다."""
 
     changed = False
     session = _CAMERA_SESSIONS.get(_pointer(scene))
@@ -1489,10 +1514,8 @@ def _enter_camera_views(
         if getattr(space, "camera", None) is not camera:
             space.camera = camera
             changed = True
-        rv3d = space.region_3d
-        if rv3d.view_perspective != "CAMERA":
-            rv3d.view_perspective = "CAMERA"
-            changed = True
+        if enter_camera_view:
+            changed |= enter_projection_camera_view(window, area, space)
     return changed
 
 
@@ -1502,8 +1525,9 @@ def activate_managed_frame(
     context: Any = None,
     *,
     refresh_source: bool = True,
+    enter_camera_view: bool = True,
 ) -> CameraManifestEntry:
-    """관리 Frame의 Marker·Camera·Viewport를 동기 적용하고 Source 성공 여부를 전파합니다."""
+    """관리 프레임의 카메라·소스를 동기화하며 뷰 전환은 진입 요청에만 수행합니다."""
 
     runtime = runtime_for_scene(scene)
     if runtime is None:
@@ -1525,15 +1549,16 @@ def activate_managed_frame(
         raise CameraSceneError(f"IMAGE_ID {entry.image_id}의 Camera Object가 없습니다.")
     _restore_marker(runtime, entry)
     apply_projection_camera_state(scene, camera, token=token)
-    if context is not None:
+    if context is not None and enter_camera_view:
         from .camera_review import initialize_camera_review
 
         initialize_camera_review(context)
     else:
-        _enter_camera_views(scene, camera, token)
+        _enter_camera_views(scene, camera, token, enter_camera_view=enter_camera_view)
         from .camera_review import refresh_camera_review
 
         refresh_camera_review(scene)
+    runtime.activated_frame = int(frame)
     if refresh_source:
         from .paint_runtime import refresh_frame_source
 
@@ -1613,7 +1638,7 @@ def _commit_pending_frame_source(
     frame: int,
     serial: int,
 ) -> CameraManifestEntry:
-    """최신 Pending Snapshot의 Camera와 Source를 연결하고 최종 일치를 검증합니다."""
+    """최신 카메라·소스를 연결하며 같은 프레임의 반복 갱신에서는 현재 뷰를 유지합니다."""
 
     if not _pending_frame_request_is_current(runtime, frame, serial):
         raise CameraSceneError("최신 Frame Source 요청이 변경되었습니다.")
@@ -1621,6 +1646,7 @@ def _commit_pending_frame_source(
         runtime.scene,
         frame,
         refresh_source=False,
+        enter_camera_view=runtime.activated_frame != int(frame),
     )
     from .paint_runtime import refresh_frame_source
 

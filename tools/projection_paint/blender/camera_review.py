@@ -11,6 +11,7 @@ import bpy
 from .camera_scene import (
     CameraManifestEntry,
     apply_projection_camera_state,
+    enter_projection_camera_view,
     projection_camera_session_is_active,
     runtime_for_scene,
     scene_manifest,
@@ -180,9 +181,9 @@ def _apply_camera_frame(scene: Any, camera: Any) -> None:
 
 
 def _activate_viewport_camera(context: Any, camera: Any) -> None:
-    """호출된 3D Viewport를 지정 Camera View로 전환합니다."""
+    """호출 뷰포트를 지정 카메라뷰로 전환하고 이탈 시 원근투영으로 복귀하게 합니다."""
 
-    area, space, rv3d = _viewport_context(context)
+    area, space, _rv3d = _viewport_context(context)
     if not projection_camera_session_is_active(
         context.scene,
         window=getattr(context, "window", None),
@@ -190,7 +191,9 @@ def _activate_viewport_camera(context: Any, camera: Any) -> None:
         raise CameraReviewError("활성 Projection Paint Camera 세션이 아닙니다.")
     space.use_local_camera = True
     space.camera = camera
-    rv3d.view_perspective = "CAMERA"
+    enter_projection_camera_view(
+        getattr(context, "window", None) or bpy.context.window, area, space,
+    )
     area.tag_redraw()
 
 

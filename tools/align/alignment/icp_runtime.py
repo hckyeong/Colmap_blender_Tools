@@ -1266,7 +1266,7 @@ def begin_icp_job(
     solver_backend: IcpSolverBackend | str = IcpSolverBackend.CUSTOM_HYBRID,
     open3d_python_path: str | None = None,
 ) -> IcpJobHandle:
-    """입력을 고정하고 선택한 외부 worker를 시작한 뒤 RUNNING 상태로 전이합니다."""
+    """입력과 배율 보정 선택을 고정해 외부 작업을 시작하고 RUNNING 상태로 전이합니다."""
 
     from ..axis_settings import axis_edit_active_block_reason
 
@@ -1281,6 +1281,9 @@ def begin_icp_job(
         normalized_backend = normalize_solver_backend(solver_backend)
     except ValueError as error:
         raise IcpRuntimeError(str(error)) from error
+    if normalized_backend is IcpSolverBackend.POINT_KD_ICP:
+        from .icp_point_kd_runtime import begin_point_kd_job
+        return begin_point_kd_job(runtime, str(open3d_python_path or ""), scale_refine_enabled=scale_refine_enabled)
     if normalized_backend is IcpSolverBackend.CCCORELIB:
         from .icp_cccore_runtime import begin_cccore_job
         return begin_cccore_job(runtime, str(open3d_python_path or ""))
@@ -1513,6 +1516,9 @@ def _progress_from_payload(
 ) -> IcpProgressState:
     """엔진별 JSON 진행률을 UI가 안전하게 소비할 상태로 검증합니다."""
 
+    if input_data.solver_backend == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import progress_from_payload
+        return progress_from_payload(payload, handle=handle, input_data=input_data)
     if input_data.solver_backend == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import progress_from_cccore
         return progress_from_cccore(payload, handle=handle, input_data=input_data)
@@ -1931,6 +1937,9 @@ def _runtime_result_from_worker(
         raise IcpRuntimeStaleError("ICP worker 결과 marker signature가 현재 입력과 다릅니다.")
     if str(metadata.get("algorithm_version", "")) != input_data.algorithm_version:
         raise IcpJobProtocolError("ICP worker 결과 알고리즘 버전이 현재 구현과 다릅니다.")
+    if input_data.solver_backend == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import result_from_worker
+        return result_from_worker(runtime, state, metadata, arrays)
     if input_data.solver_backend == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import result_from_cccore
         return result_from_cccore(runtime, state, metadata, arrays)
@@ -2114,7 +2123,7 @@ def _validate_terminal_progress_for_result(
 
     if progress is None:
         raise IcpJobProtocolError("정상 종료된 ICP worker의 진행률 상태가 없습니다.")
-    if result.solver_backend == IcpSolverBackend.CCCORELIB.value:
+    if result.solver_backend in {IcpSolverBackend.CCCORELIB.value, IcpSolverBackend.POINT_KD_ICP.value}:
         expected_stage = "COMPLETED"
     elif result.solver_backend == IcpSolverBackend.SMALL_GICP.value:
         expected_stage = (
@@ -2436,6 +2445,9 @@ def _current_input_matches(
         return False
     if current != input_data.model_state_snapshot:
         return False
+    if input_data.solver_backend == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import current_geometry_matches
+        return current_geometry_matches(runtime, input_data, verify_content=verify_geometry_content)
     if input_data.solver_backend == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import current_geometry_matches
         return current_geometry_matches(runtime, input_data, verify_content=verify_geometry_content)
@@ -2459,6 +2471,9 @@ def _icp_provenance_record(
     """승인할 결과의 마커·정밀 형상 출처와 품질 감사 기록을 남깁니다."""
 
     engine_fields = {}
+    if input_data.solver_backend == IcpSolverBackend.POINT_KD_ICP.value:
+        from .icp_point_kd_runtime import provenance_fields
+        engine_fields = provenance_fields(input_data, result)
     if input_data.solver_backend == IcpSolverBackend.CCCORELIB.value:
         from .icp_cccore_runtime import cccore_provenance_fields
         engine_fields = cccore_provenance_fields(input_data, result)

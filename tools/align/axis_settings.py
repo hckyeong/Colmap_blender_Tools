@@ -1,10 +1,11 @@
 """원본 자료를 보존하는 형상별 축 편집·원자 확정·Undo 서비스를 제공합니다."""
 from __future__ import annotations
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 import numpy as np
-from .axis_settings_state import AxisEditSnapshot, AxisSettingsRuntimeState
-from .constants import MARKER_GEOMETRY_SOURCE_MAIN, MARKER_GEOMETRY_SOURCE_COMPANION
+from .axis_settings_state import AxisEditSnapshot, AxisSettingsRuntimeState, AxisGizmoPivotSnapshot
+from .constants import MARKER_GEOMETRY_SOURCE_MAIN, MARKER_GEOMETRY_SOURCE_COMPANION, MODEL_STATUS_REGISTERED, ROLE_REFERENCE, ROLE_MOVING
 from .display_axes import DEFAULT_AXIS_PRESET, RC_OBJ_AXIS_PRESET, ModelDisplayTransform, create_model_display_transform
 from .geometry_access import bounds_for_model
 
@@ -107,7 +108,7 @@ def axis_edit_block_reason(runtime: Any, model_id: str | None = None) -> str | N
 
 
 def _snapshot(runtime: Any, model_id: str) -> AxisEditSnapshot:
-    """현재 축과 이를 참조하는 모든 정렬 감사 기록을 원본 복사 없이 묶습니다."""
+    """현재 축·기즈모와 종속 정렬 감사 기록을 원본 복사 없이 묶습니다."""
     repository = runtime.model_repository
     record = runtime.model_catalog.models.get(model_id)
     if record is None or model_id not in repository.models:
@@ -123,7 +124,118 @@ def _snapshot(runtime: Any, model_id: str) -> AxisEditSnapshot:
     )
     return AxisEditSnapshot(model_id, repository.display_transform_for_model_id(model_id),
         repository.companion_display_transform_for_model_id(model_id) if companion is not None else None,
-        record.alignment_provenance, related)
+        record.alignment_provenance, related, _gizmo_snapshot(runtime))
+
+
+def _gizmo_snapshot(runtime: Any) -> AxisGizmoPivotSnapshot:
+    """현재 사용자 피벗을 배열 비교가 필요 없는 불변 스냅샷으로 읽습니다."""
+    pivot = runtime.layer_transform
+    return AxisGizmoPivotSnapshot(pivot.custom_pivot_role, pivot.custom_pivot_model_ids,
+        pivot.custom_pivot_source_model_id, tuple(float(value) for value in pivot.custom_pivot_source_position_float64))
+
+
+def _restore_gizmo_snapshot(runtime: Any, snapshot: AxisGizmoPivotSnapshot | None) -> None:
+    """기즈모 앵커만 복원하고 진행 상태·카메라·원본 배열은 유지합니다."""
+    if snapshot is None:
+        return
+    pivot = runtime.layer_transform
+    pivot.custom_pivot_role = snapshot.role
+    pivot.custom_pivot_model_ids = snapshot.model_ids
+    pivot.custom_pivot_source_model_id = snapshot.source_model_id
+    pivot.custom_pivot_source_position_float64 = np.asarray(snapshot.source_position, dtype=np.float64).copy()
+
+
+def _axis_gizmo_scope(runtime: Any, model_id: str) -> tuple[str, tuple[str, ...]]:
+    """현재 역할의 선택 범위를 유지하고 미선택 팝업 대상은 단독으로 지정합니다."""
+    from .alignment.layer_transform import selected_model_ids_for_role
+
+    record = runtime.model_catalog.models[model_id]
+    role = ROLE_REFERENCE if record.registration_status == MODEL_STATUS_REGISTERED else ROLE_MOVING
+    selected = selected_model_ids_for_role(runtime.model_catalog, role)
+    return role, selected if model_id in selected else (model_id,)
+
+
+def _axis_gizmo_matrix(runtime: Any, state: AxisSettingsRuntimeState, model_id: str) -> np.ndarray:
+    """편집 대상에는 임시 주 형상 축을 적용해 원본 피벗의 월드 행렬을 반환합니다."""
+    repository = runtime.model_repository
+    transform = state.main_transform if model_id == state.model_id else repository.display_transform_for_model_id(model_id)
+    return repository.alignment_transform_for_model_id(model_id).matrix_float64 @ transform.matrix_float64
+
+
+def _displayed_axis_state(state: AxisSettingsRuntimeState) -> AxisSettingsRuntimeState:
+    """미리보기 선택에 따라 실제 표시 중인 축만 계산용 상태에 연결합니다."""
+    return state if state.preview_enabled else replace(state,
+        main_transform=state.baseline.main_transform, companion_transform=state.baseline.companion_transform)
+
+
+def _axis_gizmo_world_position(runtime: Any, state: AxisSettingsRuntimeState) -> np.ndarray:
+    """지정한 표시 축에서 사용자 피벗 또는 선택 원점 평균을 계산합니다."""
+    role, model_ids = _axis_gizmo_scope(runtime, state.model_id)
+    pivot = state.gizmo_pivot
+    if pivot is not None and pivot.role == role and pivot.model_ids == model_ids and pivot.source_model_id in model_ids:
+        return (_axis_gizmo_matrix(runtime, state, pivot.source_model_id) @ np.append(pivot.source_position, 1.0))[:3]
+    return np.mean([_axis_gizmo_matrix(runtime, state, model_id)[:3, 3] for model_id in model_ids], axis=0)
+
+
+def axis_gizmo_world_position(runtime: Any, token: str, *, displayed: bool = False) -> np.ndarray:
+    """후보 또는 실제 표시 축을 선택해 현재 기즈모의 월드 위치를 반환합니다."""
+    state = _validated_state(runtime, token)
+    return _axis_gizmo_world_position(runtime, _displayed_axis_state(state) if displayed else state)
+
+
+def _axis_gizmo_anchor(runtime: Any, state: AxisSettingsRuntimeState, world_position: np.ndarray) -> AxisGizmoPivotSnapshot:
+    """월드 피벗을 대상 주 형상에 고정해 이후 이동에도 함께 따라가게 합니다."""
+    source = np.linalg.solve(_axis_gizmo_matrix(runtime, state, state.model_id), np.append(world_position, 1.0))[:3]
+    if not np.isfinite(source).all():
+        raise AxisSettingsError("기즈모 중심을 유한한 원본 좌표로 변환할 수 없습니다.")
+    role, model_ids = _axis_gizmo_scope(runtime, state.model_id)
+    return AxisGizmoPivotSnapshot(role, model_ids, state.model_id, tuple(float(value) for value in source))
+
+
+def center_axis_gizmo_on_bounds(runtime: Any, token: str) -> bool:
+    """현재 표시의 경계 중심을 기즈모에 즉시 확정하고 미적용 축 입력은 유지합니다."""
+    from .axis_edit_transform import dataset_world_center
+
+    state = _validated_state(runtime, token)
+    displayed = _displayed_axis_state(state)
+    center = dataset_world_center(runtime, state.model_id, displayed.main_transform, displayed.companion_transform)
+    candidate = replace(state, main_transform=state.baseline.main_transform,
+        companion_transform=state.baseline.companion_transform, gizmo_pivot=_axis_gizmo_anchor(runtime, displayed, center))
+    after = _commit_axis_candidate(runtime, candidate, "기즈모를 바운딩 박스 중심으로")
+    changed = after is not state.baseline
+    state.baseline, state.gizmo_pivot = after, after.gizmo_pivot
+    return changed
+
+
+def _translated_axis_transform(transform: ModelDisplayTransform | None, delta: np.ndarray) -> ModelDisplayTransform | None:
+    """원본 축·회전·배율·보정은 유지하고 정렬 전 평행이동만 더합니다."""
+    if transform is None or not np.any(delta):
+        return transform
+    return create_model_display_transform(transform.preset_id, transform.forward_axis, transform.up_axis,
+        rotation_xyz_degrees=transform.rotation_xyz_degrees, scale_xyz=transform.scale_xyz,
+        pivot_source=transform.pivot_source, source_basis=transform.source_basis,
+        translation_xyz=np.asarray(transform.translation_xyz) + delta)
+
+
+def move_axis_geometry_gizmo_to_origin(runtime: Any, token: str) -> bool:
+    """현재 표시 기즈모 기준의 이동만 즉시 확정하고 미적용 축에도 같은 이동을 반영합니다."""
+    state = _validated_state(runtime, token)
+    displayed = _displayed_axis_state(state)
+    world = _axis_gizmo_world_position(runtime, displayed)
+    pivot = _axis_gizmo_anchor(runtime, displayed, world)
+    alignment = runtime.model_repository.alignment_transform_for_model_id(state.model_id).matrix_float64
+    delta = np.linalg.solve(alignment[:3, :3], -world)
+
+    main = _translated_axis_transform(state.main_transform, delta)
+    companion = _translated_axis_transform(state.companion_transform, delta)
+    candidate = replace(state,
+        main_transform=_translated_axis_transform(state.baseline.main_transform, delta),
+        companion_transform=_translated_axis_transform(state.baseline.companion_transform, delta), gizmo_pivot=pivot)
+    after = _commit_axis_candidate(runtime, candidate, "기즈모 기준 물체 원점 이동")
+    changed = after is not state.baseline
+    state.main_transform, state.companion_transform = main, companion
+    state.baseline, state.gizmo_pivot = after, after.gizmo_pivot
+    return changed
 
 
 def _geometry_identity(runtime: Any, model_id: str) -> tuple:
@@ -135,7 +247,7 @@ def _geometry_identity(runtime: Any, model_id: str) -> tuple:
 
 
 def begin_axis_edit(runtime: Any, model_id: str, *, window_pointer: int = 0, workspace_pointer: int = 0) -> str:
-    """한 데이터셋을 고정하고 확정 저장소와 분리된 편집 토큰을 발급합니다."""
+    """한 데이터셋의 축·기즈모 기준을 고정하고 확정 상태와 분리된 편집 토큰을 발급합니다."""
     model_id = str(model_id).strip()
     reason = axis_edit_block_reason(runtime, model_id)
     if reason is not None:
@@ -147,6 +259,7 @@ def begin_axis_edit(runtime: Any, model_id: str, *, window_pointer: int = 0, wor
     state.main_transform = baseline.main_transform
     state.companion_transform = baseline.companion_transform
     state.baseline = baseline
+    state.gizmo_pivot = baseline.gizmo_pivot
     state.baseline_alignment_fingerprint = runtime.model_repository.alignment_transform_for_model_id(model_id).fingerprint
     state.geometry_identity = _geometry_identity(runtime, model_id)
     state.preview_enabled = True
@@ -157,7 +270,7 @@ def begin_axis_edit(runtime: Any, model_id: str, *, window_pointer: int = 0, wor
 
 
 def _validated_state(runtime: Any, token: str) -> AxisSettingsRuntimeState:
-    """형상·축·연결된 품질 기록이 바뀐 편집 토큰의 확정을 차단합니다."""
+    """형상·축·기즈모·연결된 품질 기록이 바뀐 편집 토큰의 확정을 차단합니다."""
     state = runtime.axis_settings
     if not state.is_active or state.token != str(token) or state.baseline is None:
         raise AxisSettingsError("축 설정 창이 만료되었습니다. 다시 열어 주세요.")
@@ -166,10 +279,11 @@ def _validated_state(runtime: Any, token: str) -> AxisSettingsRuntimeState:
     if (_geometry_identity(runtime, state.model_id) != state.geometry_identity
         or current.provenance != baseline.provenance
         or current.related_provenances != baseline.related_provenances
+        or current.gizmo_pivot != baseline.gizmo_pivot
         or current.main_transform.fingerprint != baseline.main_transform.fingerprint
         or (current.companion_transform.fingerprint if current.companion_transform else None) != (baseline.companion_transform.fingerprint if baseline.companion_transform else None)
         or runtime.model_repository.alignment_transform_for_model_id(state.model_id).fingerprint != state.baseline_alignment_fingerprint):
-        raise AxisSettingsError("편집 중 원본 형상·축 또는 정렬 기준이 바뀌었습니다. 취소 후 다시 열어 주세요.")
+        raise AxisSettingsError("편집 중 원본 형상·축·기즈모 또는 정렬 기준이 바뀌었습니다. 취소 후 다시 열어 주세요.")
     return state
 
 
@@ -210,7 +324,7 @@ def rc_axis_pair_for_model(runtime: Any, model_id: str) -> tuple[ModelDisplayTra
 
 
 def _apply_snapshot_atomic(runtime: Any, snapshot: AxisEditSnapshot) -> None:
-    """형상별 축과 모든 종속 모델의 감사 기록을 원자적으로 갱신·복원합니다."""
+    """형상별 축·기즈모와 종속 모델의 감사 기록을 원자적으로 갱신·복원합니다."""
     repository = runtime.model_repository
     before = _snapshot(runtime, snapshot.model_id)
     if (before.companion_transform is None) != (snapshot.companion_transform is None):
@@ -220,17 +334,20 @@ def _apply_snapshot_atomic(runtime: Any, snapshot: AxisEditSnapshot) -> None:
         raise AxisSettingsError("축 설정과 연결된 정렬 모델이 더 이상 존재하지 않습니다.")
     records_before = {model_id: runtime.model_catalog.models[model_id] for model_id in record_ids}
     try:
-        repository.set_display_transform(snapshot.model_id, snapshot.main_transform)
-        if snapshot.companion_transform is not None:
+        if before.main_transform.fingerprint != snapshot.main_transform.fingerprint:
+            repository.set_display_transform(snapshot.model_id, snapshot.main_transform)
+        if snapshot.companion_transform is not None and before.companion_transform.fingerprint != snapshot.companion_transform.fingerprint:
             repository.set_companion_display_transform(snapshot.model_id, snapshot.companion_transform)
         runtime.model_catalog.set_alignment_provenance(snapshot.model_id, snapshot.provenance)
         for model_id, provenance in snapshot.related_provenances:
             runtime.model_catalog.set_alignment_provenance(model_id, provenance)
+        _restore_gizmo_snapshot(runtime, snapshot.gizmo_pivot)
     except Exception:
         repository.display_transforms[snapshot.model_id] = before.main_transform
         if before.companion_transform is not None:
             repository.companion_display_transforms[snapshot.model_id] = before.companion_transform
         runtime.model_catalog.models.update(records_before)
+        _restore_gizmo_snapshot(runtime, before.gizmo_pivot)
         raise
 
 
@@ -273,18 +390,16 @@ def _invalidated_axis_provenance(runtime: Any, model_id: str, provenance: Any, f
     )
 
 
-def commit_axis_edit(runtime: Any, token: str) -> bool:
-    """형상별 축과 종속 모델 품질을 단일 이력으로 확정하고 원본·공통 정렬을 유지합니다."""
-    state = _validated_state(runtime, token)
+def _commit_axis_candidate(runtime: Any, state: AxisSettingsRuntimeState, action: str) -> AxisEditSnapshot:
+    """독립된 후보를 하나의 원자적 이력으로 확정하고 팝업의 수명은 변경하지 않습니다."""
     reason = _other_operation_block_reason(runtime)
     if reason is not None:
         raise AxisSettingsError(reason)
     before = state.baseline
     main_changed = before.main_transform.fingerprint != state.main_transform.fingerprint
     companion_changed = (before.companion_transform.fingerprint if before.companion_transform else None) != (state.companion_transform.fingerprint if state.companion_transform else None)
-    if not main_changed and not companion_changed:
-        state.clear()
-        return False
+    if not main_changed and not companion_changed and before.gizmo_pivot == state.gizmo_pivot:
+        return before
     changed_sources = {
         source for source, changed in (
             (MARKER_GEOMETRY_SOURCE_MAIN, main_changed),
@@ -292,7 +407,7 @@ def commit_axis_edit(runtime: Any, token: str) -> bool:
         ) if changed
     }
     changed_dependencies = {(state.model_id, source) for source in changed_sources}
-    fingerprint = state.main_transform.fingerprint if main_changed else state.companion_transform.fingerprint
+    fingerprint = state.companion_transform.fingerprint if companion_changed and not main_changed else state.main_transform.fingerprint
     provenance = before.provenance
     if main_changed or changed_dependencies.intersection(getattr(provenance, "geometry_dependencies", ())):
         provenance = _invalidated_axis_provenance(runtime, state.model_id, provenance, fingerprint)
@@ -305,22 +420,30 @@ def commit_axis_edit(runtime: Any, token: str) -> bool:
         )
         for model_id, record in before.related_provenances
     )
-    after = AxisEditSnapshot(state.model_id, state.main_transform, state.companion_transform, provenance, related)
+    after = AxisEditSnapshot(state.model_id, state.main_transform, state.companion_transform, provenance, related, state.gizmo_pivot)
     _apply_snapshot_atomic(runtime, after)
     try:
-        action = f"{runtime.model_catalog.models[state.model_id].display_name} 축 설정"
-        if not runtime.undo_journal.record_committed(before, after, action, AXIS_SETTINGS_COMMAND):
+        label = f"{runtime.model_catalog.models[state.model_id].display_name} {action}"
+        if not runtime.undo_journal.record_committed(before, after, label, AXIS_SETTINGS_COMMAND):
             raise AxisSettingsError("축 설정 Undo 기록을 만들지 못했습니다.")
     except Exception:
         _apply_snapshot_atomic(runtime, before)
         raise
     _invalidate_axis_derivatives(runtime, state.model_id, main_changed, companion_changed)
+    return after
+
+
+def commit_axis_edit(runtime: Any, token: str) -> bool:
+    """즉시 실행 이후 남은 축 입력만 단일 이력으로 확정하고 팝업을 종료합니다."""
+    state = _validated_state(runtime, token)
+    after = _commit_axis_candidate(runtime, state, "축 설정")
+    changed = after is not state.baseline
     state.clear()
-    return True
+    return changed
 
 
 def cancel_axis_edit(runtime: Any, token: str | None = None) -> bool:
-    """현재 팝업의 임시 값만 폐기하고 확정 축과 Undo는 유지합니다."""
+    """현재 팝업의 임시 축·기즈모만 폐기하고 확정 상태와 이력은 유지합니다."""
     state = getattr(runtime, "axis_settings", None)
     if state is None or not state.is_active or (token is not None and str(token) != state.token):
         return False
@@ -329,7 +452,7 @@ def cancel_axis_edit(runtime: Any, token: str | None = None) -> bool:
 
 
 def restore_axis_edit_snapshot(runtime: Any, snapshot: AxisEditSnapshot) -> None:
-    """세션 되돌리기·다시 실행에서 형상별 축과 종속 품질 기록을 함께 복원합니다."""
+    """세션 되돌리기·다시 실행에서 형상별 축·기즈모·종속 품질을 함께 복원합니다."""
     if not isinstance(snapshot, AxisEditSnapshot):
         raise AxisSettingsError("복원할 축 설정 스냅샷이 올바르지 않습니다.")
     before = _snapshot(runtime, snapshot.model_id)

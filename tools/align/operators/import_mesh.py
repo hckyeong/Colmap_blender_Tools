@@ -9,7 +9,6 @@ import bpy
 from bpy.props import EnumProperty, StringProperty
 
 from ..axis_settings import axis_edit_active_block_reason
-from ..constants import OBJ_DISPLAY_VERTEX_LIMIT
 from ..display_axes import (
     AXIS_ITEMS,
     AXIS_PRESET_ITEMS,
@@ -94,13 +93,13 @@ class COLMAPALIGN_OT_import_obj(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def draw(self, _context: bpy.types.Context) -> None:
-        """파일 탐색기 옵션에 Display Axis와 비파괴 내장 안내를 그립니다."""
+        """파일 탐색기에 표시 축·원본 내장·전체 마커 정점 사용 안내를 그립니다."""
         self.layout.prop(self, "axis_preset")
         if axes_for_preset(self.axis_preset) is None:
             self.layout.prop(self, "axis_forward")
             self.layout.prop(self, "axis_up")
         self.layout.label(text="Triangle·Quad·N-gon 원본 내장, 자동 리메시 없음", icon="INFO")
-        self.layout.label(text=f"마커 정점 표시 상한 {OBJ_DISPLAY_VERTEX_LIMIT:,}개", icon="INFO")
+        self.layout.label(text="마커 선택 정점: 전체 사용 (개수 제한 없음)", icon="INFO")
 
     def execute(self, context: bpy.types.Context):
         """축 편집 잠금을 확인하고 OBJ·축 스냅샷을 내부 TIMER 작업으로 전달합니다."""

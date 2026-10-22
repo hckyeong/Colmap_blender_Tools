@@ -56,6 +56,7 @@ from .point_data import (
     runtime_models,
 )
 from .registry import role_for_area
+from .screen_pick import MeshPickChunk, SharedMeshPickBatch
 
 _LOGGER = get_logger("viewport.renderer")
 _POINT_SHADER: Any | None = None
@@ -64,6 +65,9 @@ _MESH_TEXTURE_SHADER: Any | None = None
 _MESH_TEXTURE_RESOURCES: dict[Path, "_SharedTextureResource"] = {}
 _DISPLAY_TRANSFORM_ERROR_MODEL_IDS: set[str] = set()
 _MESH_NORMAL_FACE_CHUNK_SIZE = 131_072
+# 위치와 법선·UV 버퍼의 합계를 면 단위로 묶어 청크당 256 MiB 이내로 제한합니다.
+_MESH_TEXTURE_BUFFER_MAX_BYTES = 256 * 1024 * 1024
+_MESH_TEXTURE_VERTEX_BYTES = (3 + 3 + 2) * np.dtype(np.float32).itemsize
 _PREVIEW_REFERENCE_TRIANGLE_FACE_COLOR = (0.08, 0.78, 0.86, 0.22)
 _PREVIEW_REFERENCE_TRIANGLE_EDGE_COLOR = (0.08, 0.78, 0.86, 0.78)
 _PREVIEW_MOVING_TRIANGLE_FACE_COLOR = (1.0, 0.42, 0.08, 0.22)
@@ -126,19 +130,34 @@ class PointCloudDrawPass:
 
 
 @dataclass(frozen=True)
+class _SharedMeshBuffers:
+    """표시·선택이 공유하는 위치·인덱스와 표시 전용 속성 버퍼를 함께 소유합니다."""
+
+    position_buffer: Any
+    attribute_buffer: Any
+    index_buffer: Any | None
+    display_batch: Any
+    pick_batch: Any
+
+
+@dataclass(frozen=True)
 class _TexturedMeshBatch:
-    """한 diffuse 텍스처를 공유하는 face-corner GPU 배치와 원본 경로를 보관합니다."""
+    """코너 위치를 선택과 공유하는 표시 배치·버퍼와 원본 텍스처 경로를 보관합니다."""
 
     batch: Any
     texture_path: Path
+    shared_buffers: _SharedMeshBuffers | None = None
 
 
 @dataclass(frozen=True)
 class _MeshSurfaceBatch:
-    """한 메시의 역할 색상 면과 재질별 텍스처 면 배치를 묶어 보관합니다."""
+    """표시 배치와 같은 GPU 자원을 참조하는 원본 번호 복원용 선택 배치를 보관합니다."""
 
     solid_batch: Any | None
     textured_batches: tuple[_TexturedMeshBatch, ...]
+    pick_batch: Any | None = None
+    source_token: int = 0
+    solid_buffers: _SharedMeshBuffers | None = None
 
 
 @dataclass
@@ -212,6 +231,20 @@ def _cached_model_id(cache_key: Any) -> str | None:
     if isinstance(cache_key, tuple) and cache_key:
         return str(cache_key[0])
     return None
+
+
+def prepared_mesh_pick_batch(model_id: str, model_data: Any) -> Any:
+    """현재 원본 프록시와 일치하는 전체 삼각형 선택 배치만 반환합니다."""
+    if str(model_data.model_id) != str(model_id):
+        raise ValueError("마커 선택 배치와 원본 모델 ID가 다릅니다.")
+    surface = RUNTIME.gpu_batches.get(_mesh_batch_key(model_data))
+    if (
+        not isinstance(surface, _MeshSurfaceBatch)
+        or surface.source_token != id(model_data)
+        or surface.pick_batch is None
+    ):
+        raise RuntimeError("메시 표시 준비가 끝나지 않았습니다. 표시가 완료된 뒤 마커를 선택해 주세요.")
+    return surface.pick_batch
 
 
 def _cached_geometry_kind(cache_key: Any) -> str:
@@ -345,8 +378,19 @@ def _mesh_vertex_normals(vertices: Any, triangles: Any) -> np.ndarray:
     return np.ascontiguousarray(vertex_normals, dtype=np.float32)
 
 
-def _mesh_surface_arrays(model_data: Any, *, normals: np.ndarray | None = None) -> tuple[np.ndarray, tuple[tuple[int, np.ndarray, np.ndarray, np.ndarray], ...]]:
-    """전달받은 정점 법선을 재사용해 메시 면을 역할 색상 인덱스와 재질별 위치·법선·UV로 분리합니다."""
+def _original_triangle_ids(mask: np.ndarray) -> range | np.ndarray:
+    """전체 면은 범위만 보관하고 일부 면은 읽기 전용 원본 번호 배열로 보관합니다."""
+    if np.all(mask):
+        return range(len(mask))
+    indices = np.flatnonzero(mask).astype(np.uint32)
+    indices.flags.writeable = False
+    return indices
+
+
+def _mesh_surface_arrays(
+    model_data: Any, *, normals: np.ndarray | None = None,
+) -> tuple[np.ndarray, tuple[tuple[int, np.ndarray, np.ndarray, np.ndarray], ...], tuple[range | np.ndarray, ...]]:
+    """작게 보관한 UV를 직접 읽어 표시 배치를 준비하고 원본 삼각형 번호를 보존합니다."""
 
     vertices = np.ascontiguousarray(model_data.vertices_float64, dtype=np.float32)
     triangles = np.ascontiguousarray(model_data.triangles_uint32, dtype=np.uint32)
@@ -354,9 +398,13 @@ def _mesh_surface_arrays(model_data: Any, *, normals: np.ndarray | None = None) 
         normals = _mesh_vertex_normals(vertices, triangles)
     face_materials = np.asarray(model_data.triangle_material_indices_int32, dtype=np.int32)
     face_texcoords = np.asarray(model_data.triangle_texcoord_indices_int32, dtype=np.int32)
-    texcoords = np.asarray(model_data.texcoords_float64, dtype=np.float32)
+    texcoords = np.asarray(model_data.texture_coordinates, dtype=np.float32)
     textured_face_mask = np.zeros((triangles.shape[0],), dtype=bool)
     textured_groups: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
+    textured_triangle_ids: list[range | np.ndarray] = []
+    faces_per_batch = _MESH_TEXTURE_BUFFER_MAX_BYTES // (3 * _MESH_TEXTURE_VERTEX_BYTES)
+    if faces_per_batch < 1:
+        raise ValueError("텍스처 GPU 버퍼 크기는 삼각형 한 개 이상을 담을 수 있어야 합니다.")
     for material_index, material in enumerate(model_data.materials):
         if not material.has_available_diffuse_texture:
             continue
@@ -366,16 +414,22 @@ def _mesh_surface_arrays(model_data: Any, *, normals: np.ndarray | None = None) 
         textured_face_mask |= mask
         group_triangles = triangles[mask]
         group_texcoords = face_texcoords[mask]
-        textured_groups.append(
-            (
-                material_index,
-                np.ascontiguousarray(vertices[group_triangles].reshape((-1, 3)), dtype=np.float32),
-                np.ascontiguousarray(normals[group_triangles].reshape((-1, 3)), dtype=np.float32),
-                np.ascontiguousarray(texcoords[group_texcoords, :2].reshape((-1, 2)), dtype=np.float32),
+        group_ids = _original_triangle_ids(mask)
+        for start in range(0, int(group_triangles.shape[0]), faces_per_batch):
+            chunk_triangles = group_triangles[start : start + faces_per_batch]
+            chunk_texcoords = group_texcoords[start : start + faces_per_batch]
+            textured_triangle_ids.append(group_ids[start : start + faces_per_batch])
+            textured_groups.append(
+                (
+                    material_index,
+                    np.ascontiguousarray(vertices[chunk_triangles].reshape((-1, 3)), dtype=np.float32),
+                    np.ascontiguousarray(normals[chunk_triangles].reshape((-1, 3)), dtype=np.float32),
+                    np.ascontiguousarray(texcoords[chunk_texcoords, :2].reshape((-1, 2)), dtype=np.float32),
+                )
             )
-        )
     solid_triangles = np.ascontiguousarray(triangles[~textured_face_mask], dtype=np.uint32)
-    return solid_triangles, tuple(textured_groups)
+    solid_ids = _original_triangle_ids(~textured_face_mask)
+    return solid_triangles, tuple(textured_groups), (solid_ids, *textured_triangle_ids)
 
 
 def _find_loaded_image_for_path(path: Path) -> Any | None:
@@ -469,8 +523,37 @@ def _batch_vertex_data(model_data: Any) -> tuple[np.ndarray, np.ndarray, int, in
     return display_positions, display_colors, int(arrays.positions.shape[0]), int(display_indices.size)
 
 
+def _shared_mesh_batches(
+    positions: np.ndarray, normals: np.ndarray, uvs: np.ndarray | None = None,
+    *, indices: np.ndarray | None = None,
+) -> _SharedMeshBuffers:
+    """위치·인덱스는 한 번만 올리고 선택 배치에서 법선·UV 참조를 제외합니다."""
+    from .screen_pick import _pick_shader
+
+    # 셰이더도 불러오기 중에 준비해 첫 선택으로 초기화 비용을 미루지 않습니다.
+    _pick_shader()
+    _mesh_shader() if uvs is None else _mesh_texture_shader()
+    position_format = gpu.types.GPUVertFormat()
+    position_format.attr_add(id="pos", comp_type="F32", len=3, fetch_mode="FLOAT")
+    position_buffer = gpu.types.GPUVertBuf(format=position_format, len=len(positions))
+    position_buffer.attr_fill(id="pos", data=positions)
+    attribute_format = gpu.types.GPUVertFormat()
+    attribute_format.attr_add(id="normal", comp_type="F32", len=3, fetch_mode="FLOAT")
+    if uvs is not None:
+        attribute_format.attr_add(id="uv", comp_type="F32", len=2, fetch_mode="FLOAT")
+    attribute_buffer = gpu.types.GPUVertBuf(format=attribute_format, len=len(positions))
+    attribute_buffer.attr_fill(id="normal", data=normals)
+    if uvs is not None:
+        attribute_buffer.attr_fill(id="uv", data=uvs)
+    index_buffer = None if indices is None else gpu.types.GPUIndexBuf(type="TRIS", seq=indices)
+    display_batch = gpu.types.GPUBatch(type="TRIS", buf=position_buffer, elem=index_buffer)
+    display_batch.vertbuf_add(attribute_buffer)
+    pick_batch = gpu.types.GPUBatch(type="TRIS", buf=position_buffer, elem=index_buffer)
+    return _SharedMeshBuffers(position_buffer, attribute_buffer, index_buffer, display_batch, pick_batch)
+
+
 def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) -> Any:
-    """메시 법선을 한 번 계산해 GPU 배치를 준비하고 같은 소유 모델의 다른 형상 캐시는 보존합니다."""
+    """법선과 공유 위치 버퍼를 불러올 때 준비하고 선택에서 표시 전용 속성을 제외합니다."""
     data = model_data if model_data is not None else model_data_for_id(model_id)
     if data is None:
         raise KeyError(f"GPU 배치를 만들 모델을 찾을 수 없습니다: {model_id}")
@@ -479,8 +562,13 @@ def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) ->
 
     cache_key = _batch_key(data)
     cached_batch = RUNTIME.gpu_batches.get(cache_key)
+    cached_surface = RUNTIME.gpu_batches.get(_mesh_batch_key(data)) if is_triangle_mesh_model(data) else None
     if cached_batch is not None and (
-        not is_triangle_mesh_model(data) or _mesh_batch_key(data) in RUNTIME.gpu_batches
+        not is_triangle_mesh_model(data) or (
+            isinstance(cached_surface, _MeshSurfaceBatch)
+            and cached_surface.source_token == id(data)
+            and cached_surface.pick_batch is not None
+        )
     ):
         return cached_batch
 
@@ -523,39 +611,42 @@ def prepare_gpu_batch_for_model(model_id: str, model_data: Any | None = None) ->
                 dtype=np.uint32,
             )
             mesh_normals = _mesh_vertex_normals(mesh_vertices, mesh_triangles)
-            solid_triangles, textured_groups = _mesh_surface_arrays(data, normals=mesh_normals)
-            solid_batch = (
+            solid_triangles, textured_groups, triangle_ids = _mesh_surface_arrays(data, normals=mesh_normals)
+            solid_buffers = (
                 None
                 if solid_triangles.size == 0
-                else batch_for_shader(
-                    _mesh_shader(),
-                    "TRIS",
-                    {
-                        "pos": mesh_vertices,
-                        "normal": mesh_normals,
-                    },
+                else _shared_mesh_batches(
+                    mesh_vertices, mesh_normals,
                     indices=solid_triangles,
                 )
             )
+            solid_batch = None if solid_buffers is None else solid_buffers.display_batch
             textured_batches = []
             for material_index, positions, normals, uvs in textured_groups:
                 texture_path = data.materials[material_index].diffuse_texture_path
                 if texture_path is None:
                     continue
                 _acquire_texture_resource(model_id, texture_path)
+                shared_buffers = _shared_mesh_batches(positions, normals, uvs)
                 textured_batches.append(
                     _TexturedMeshBatch(
-                        batch=batch_for_shader(
-                            _mesh_texture_shader(),
-                            "TRIS",
-                            {"pos": positions, "normal": normals, "uv": uvs},
-                        ),
+                        batch=shared_buffers.display_batch,
                         texture_path=texture_path.resolve(strict=False),
+                        shared_buffers=shared_buffers,
                     )
                 )
             RUNTIME.gpu_batches[mesh_key] = _MeshSurfaceBatch(
                 solid_batch=solid_batch,
                 textured_batches=tuple(textured_batches),
+                pick_batch=((None if solid_buffers is None else solid_buffers.pick_batch) if not textured_groups else SharedMeshPickBatch(tuple(
+                    MeshPickChunk(shared_batch, original_ids)
+                    for shared_batch, original_ids in zip(
+                        (None if solid_buffers is None else solid_buffers.pick_batch,
+                         *(entry.shared_buffers.pick_batch for entry in textured_batches)), triangle_ids, strict=True,
+                    ) if shared_batch is not None
+                ))),
+                source_token=id(data),
+                solid_buffers=solid_buffers,
             )
         except Exception as error:
             RUNTIME.gpu_batches.pop(cache_key, None)
@@ -982,7 +1073,7 @@ def _is_icp_viewport_preview_active() -> bool:
 
 
 def point_cloud_draw_passes_for_role(role: str) -> tuple[PointCloudDrawPass, ...]:
-    """마커 입력 중 역할별 형상을 고정하고 일반 선택·미리보기 제출 순서를 반환합니다."""
+    """마커 입력은 역할별로 유지하고 정렬 미리보기는 A·P 양쪽에 겹쳐 표시합니다."""
     if role not in {ROLE_REFERENCE, ROLE_MOVING}:
         return ()
 
@@ -1020,8 +1111,10 @@ def point_cloud_draw_passes_for_role(role: str) -> tuple[PointCloudDrawPass, ...
         role=role,
     )
     marker_preview_result = _marker_preview_result()
-    if role == ROLE_REFERENCE and _is_icp_viewport_preview_active():
-        # ICP 중 A 뷰에서도 P를 일반 불투명 렌더링으로 함께 표시합니다.
+    if role == ROLE_REFERENCE and (
+        marker_preview_result is not None or _is_icp_viewport_preview_active()
+    ):
+        # 3점 마커·정밀 정렬 미리보기에서는 A 뷰에도 정렬된 P를 함께 표시합니다.
         return (
             own_pass,
             PointCloudDrawPass(
@@ -1182,20 +1275,13 @@ def _draw_preview_triangle(
 
 
 def _draw_marker_preview_geometry(role: str) -> None:
-    """ICP 완료 전 A/P 역할별로 캐시된 대표 삼각형만 그립니다."""
+    """정밀 정렬 완료 전 A·P 양쪽에 기준·정렬 결과의 대표 삼각형을 그립니다."""
+    if role not in {ROLE_REFERENCE, ROLE_MOVING}:
+        return
     result = _marker_preview_triangle_result()
     if result is None:
         return
     reference_vertices, moving_vertices = preview_triangle_vertices(result)
-    if role == ROLE_REFERENCE:
-        _draw_preview_triangle(
-            reference_vertices,
-            _PREVIEW_REFERENCE_TRIANGLE_FACE_COLOR,
-            _PREVIEW_REFERENCE_TRIANGLE_EDGE_COLOR,
-        )
-        return
-    if role != ROLE_MOVING:
-        return
     _draw_preview_triangle(
         reference_vertices,
         _PREVIEW_REFERENCE_TRIANGLE_FACE_COLOR,

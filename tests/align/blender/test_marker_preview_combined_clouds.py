@@ -221,8 +221,8 @@ def _pass_signature(draw_passes: tuple[object, ...]) -> tuple[tuple[object, ...]
     )
 
 
-def test_preview_draw_passes_keep_a_view_and_overlay_reference_normally_in_p_view() -> None:
-    """역할별 표시를 유지하고 preview P 뷰의 A도 일반 불투명 상태로 추가하는지 검증합니다."""
+def test_preview_draw_passes_overlay_both_views_and_restore_on_cancel() -> None:
+    """양쪽 미리보기에 A·P를 표시하고 취소하면 기존 역할별 표시로 돌아가는지 검증합니다."""
     from tools.align.alignment import cancel_marker_preview
     from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
     from tools.align.state import RUNTIME
@@ -241,7 +241,10 @@ def test_preview_draw_passes_keep_a_view_and_overlay_reference_normally_in_p_vie
         fixture.activate_preview()
         preview_reference = _pass_signature(point_cloud_draw_passes_for_role(ROLE_REFERENCE))
         preview_moving = _pass_signature(point_cloud_draw_passes_for_role(ROLE_MOVING))
-        assert preview_reference == normal_reference
+        assert preview_reference == (
+            ((fixture.reference_model.model_id,), ROLE_REFERENCE, 1.0, True, None),
+            ((fixture.moving_model.model_id,), ROLE_MOVING, 1.0, True, None),
+        )
         assert preview_moving == (
             ((fixture.moving_model.model_id,), ROLE_MOVING, 1.0, True, None),
             (
@@ -291,7 +294,7 @@ def test_preview_moving_mvp_uses_delta_times_committed_alignment_exactly_once() 
 
 
 def test_point_cloud_submitter_executes_each_preview_pass_once() -> None:
-    """P preview 점군 제출기가 불투명 P와 A pass를 순서대로 한 번씩 실행하는지 검증합니다."""
+    """양쪽 뷰에서 각각 A·P 점군이 중복 없이 한 번씩 제출되는지 검증합니다."""
     from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
     from tools.align.viewport import renderer
 
@@ -305,11 +308,14 @@ def test_point_cloud_submitter_executes_each_preview_pass_once() -> None:
                     (model_ids, role, opacity, depth_write, depth_test, use_colmap_rgb)
                 )
             )
+            renderer._draw_point_clouds(ROLE_REFERENCE)
             renderer._draw_point_clouds(ROLE_MOVING)
     finally:
         renderer._draw_model_point_clouds = original_submitter
 
     assert submitted == [
+        (("preview-reference",), ROLE_REFERENCE, 1.0, True, None, None),
+        (("preview-moving",), ROLE_MOVING, 1.0, True, None, None),
         (("preview-moving",), ROLE_MOVING, 1.0, True, None, None),
         (("preview-reference",), ROLE_REFERENCE, 1.0, True, None, None),
     ]
@@ -343,8 +349,8 @@ def test_preview_geometry_does_not_submit_duplicate_point_clouds() -> None:
 
 
 def test_preview_triangle_is_hidden_after_icp_alignment_finishes() -> None:
-    """ICP 결과 미리보기에서는 정렬용 대표 삼각형만 더 이상 그리지 않는지 검증합니다."""
-    from tools.align.constants import ICP_ALIGNMENT_PHASE_PREVIEW, ROLE_MOVING
+    """양쪽 뷰의 A·P 대표 삼각형을 검증하고 정밀 정렬 완료 후 숨기는지 확인합니다."""
+    from tools.align.constants import ICP_ALIGNMENT_PHASE_PREVIEW, ROLE_MOVING, ROLE_REFERENCE
     from tools.align.state import RUNTIME
     from tools.align.viewport import renderer
 
@@ -363,11 +369,16 @@ def test_preview_triangle_is_hidden_after_icp_alignment_finishes() -> None:
                 lambda vertices, _face_color, _edge_color: submitted.append(vertices)
             )
 
-            renderer._draw_marker_preview_geometry(ROLE_MOVING)
-            assert len(submitted) == 2
+            for role in (ROLE_REFERENCE, ROLE_MOVING):
+                submitted.clear()
+                renderer._draw_marker_preview_geometry(role)
+                assert len(submitted) == 2
+                np.testing.assert_array_equal(submitted[0], np.zeros((3, 3), dtype=np.float32))
+                np.testing.assert_array_equal(submitted[1], np.ones((3, 3), dtype=np.float32))
 
             submitted.clear()
             RUNTIME.icp_alignment.phase = ICP_ALIGNMENT_PHASE_PREVIEW
+            renderer._draw_marker_preview_geometry(ROLE_REFERENCE)
             renderer._draw_marker_preview_geometry(ROLE_MOVING)
             assert submitted == []
     finally:
@@ -510,12 +521,12 @@ def test_normal_draw_restores_depth_state_and_uses_full_opacity() -> None:
         renderer._model_view_projection_matrix = original_mvp_builder
 
 
-def test_preview_p_view_submits_reused_real_gpu_batches() -> None:
-    """preview P 뷰의 불투명 P와 A가 실제 Blender GPU batch로 제출되는지 검증합니다."""
+def test_preview_both_views_submit_reused_real_gpu_batches() -> None:
+    """양쪽 뷰가 같은 배치를 재사용해 동일한 A·P 결과 픽셀을 그리는지 검증합니다."""
     import gpu
 
     from tools.align import registration
-    from tools.align.constants import ROLE_MOVING
+    from tools.align.constants import ROLE_MOVING, ROLE_REFERENCE
     from tools.align.viewport import renderer
 
     registration.register()
@@ -539,6 +550,7 @@ def test_preview_p_view_submits_reused_real_gpu_batches() -> None:
             assert moving_batch is not reference_batch
 
             offscreen = gpu.types.GPUOffScreen(64, 64)
+            pixels = []
             try:
                 with offscreen.bind():
                     framebuffer = gpu.state.active_framebuffer_get()
@@ -547,7 +559,17 @@ def test_preview_p_view_submits_reused_real_gpu_batches() -> None:
                     try:
                         gpu.matrix.load_matrix(Matrix.Identity(4))
                         gpu.matrix.load_projection_matrix(Matrix.Identity(4))
-                        renderer._draw_point_clouds(ROLE_MOVING)
+                        for role in (ROLE_REFERENCE, ROLE_MOVING):
+                            framebuffer.clear(color=(0.0, 0.0, 0.0, 0.0), depth=1.0)
+                            renderer._draw_point_clouds(role)
+                            pixels.append(np.asarray(
+                                framebuffer.read_color(0, 0, 64, 64, 4, 0, "UBYTE"),
+                                dtype=np.uint8,
+                            ).copy())
+                        assert np.count_nonzero(pixels[0]) > 0
+                        np.testing.assert_array_equal(pixels[0], pixels[1])
+                        assert renderer._prepared_batch_for_model(fixture.moving_model.model_id) is moving_batch
+                        assert renderer._prepared_batch_for_model(fixture.reference_model.model_id) is reference_batch
                     finally:
                         gpu.matrix.pop()
             finally:
@@ -558,16 +580,16 @@ def test_preview_p_view_submits_reused_real_gpu_batches() -> None:
 
 
 def run_all() -> None:
-    """마커 preview 일반 렌더 합성과 실제 GPU 제출 회귀를 순서대로 실행합니다."""
+    """양쪽 마커 미리보기와 취소·변환·실제 GPU 픽셀 회귀를 순서대로 실행합니다."""
     _add_source_path()
-    test_preview_draw_passes_keep_a_view_and_overlay_reference_normally_in_p_view()
+    test_preview_draw_passes_overlay_both_views_and_restore_on_cancel()
     test_preview_moving_mvp_uses_delta_times_committed_alignment_exactly_once()
     test_point_cloud_submitter_executes_each_preview_pass_once()
     test_preview_geometry_does_not_submit_duplicate_point_clouds()
     test_preview_triangle_is_hidden_after_icp_alignment_finishes()
     test_preview_triangle_faces_remain_translucent()
     test_normal_draw_restores_depth_state_and_uses_full_opacity()
-    test_preview_p_view_submits_reused_real_gpu_batches()
+    test_preview_both_views_submit_reused_real_gpu_batches()
     print("test_marker_preview_combined_clouds: 통과")
 
 

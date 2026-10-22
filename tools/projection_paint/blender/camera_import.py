@@ -10,7 +10,8 @@ from time import perf_counter
 from typing import Any, Callable, Iterable, Mapping
 
 import bpy
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from collections.abc import Sequence
 
 from .axis_roots import create_axis_root
 from .camera_display import (
@@ -84,7 +85,8 @@ def _projection_marker_session_is_active(scene: Any) -> bool:
         )
 
     return bool(scene_marker_session_owned_by(scene, _MARKER_TOOL_ID))
-_WORK_BUDGET_SECONDS = 0.025
+_WORK_BUDGET_SECONDS = 0.050
+_REDRAW_INTERVAL_SECONDS = 0.100
 
 
 class CameraImportError(RuntimeError):
@@ -124,6 +126,7 @@ class CameraImportRequest:
     point_size: float = 0.05
     camera_frustum_size: float = DEFAULT_CAMERA_FRUSTUM_SIZE
     core_validated: bool = False
+    source_kind: str = "MODIFIER_LEGACY"
     snapshot_schema_version: int = 0
     source_domain_uuid: str = ""
     source_domain_generation: int = 0
@@ -134,6 +137,7 @@ class CameraImportRequest:
     content_fingerprint: str = ""
     snapshot_created_at: str = ""
     preferred_image_id: int = 0
+    reference_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +306,7 @@ class CameraImportJob:
         *,
         fault_injector: Callable[[str], None] | None = None,
     ) -> None:
-        """검증 전 Camera Import Job을 생성합니다."""
+        """검증 전 작업과 이번 입력에만 속하는 카메라 조회표를 준비합니다."""
 
         self.scene = scene
         self.request = request
@@ -315,6 +319,7 @@ class CameraImportJob:
         self.collection: Any | None = None
         self.axis_root: Any | None = None
         self.camera_data: dict[int, Any] = {}
+        self._camera_objects: dict[str, Any] = {}
         self.point_resources: PointSceneResources | None = None
         self._point_job: PointSceneBuildJob | None = None
         self.data_manifests: list[CameraDataManifest] = []
@@ -354,7 +359,7 @@ class CameraImportJob:
         if self.request.core_validated:
             self.cameras = dict(self.request.cameras)
             self.images = tuple(self.request.images)
-            self.points = tuple(self.request.points)
+            self.points = self.request.points if isinstance(self.request.points, Sequence) else tuple(self.request.points)
         else:
             self.cameras = _camera_map(self.request.cameras)
             self.images = _image_records(self.request.images)
@@ -422,7 +427,7 @@ class CameraImportJob:
         self._camera_ids = sorted(self.cameras)
 
     def _step_once(self, *, time_budget: float, hard_cap: int) -> bool:
-        """Camera Data와 Object를 한 번의 시간 예산 안에서 생성합니다."""
+        """시간 예산 안에서 자산을 생성하고 카메라의 소유 식별자 조회표를 유지합니다."""
 
         if self.state is CameraImportState.VALIDATING:
             self.validate()
@@ -474,6 +479,10 @@ class CameraImportJob:
                 self.collection,
                 self.request.dataset_uuid,
             )
+            camera_uuid = owned_uuid_of(obj)
+            if camera_uuid in self._camera_objects:
+                raise CameraImportError("새 카메라 소유 식별자가 중복되었습니다.")
+            self._camera_objects[camera_uuid] = obj
             frame = int(self.request.frame_start) + self._image_index
             marker_name = (
                 f"PP_CAM_{str(self.request.dataset_uuid)[:8]}_{frame}_{image_id}"
@@ -495,6 +504,13 @@ class CameraImportJob:
             self.state = CameraImportState.READY_TO_COMMIT
             return True
         return False
+
+    def _staged_camera(self, camera_uuid: str):
+        """이번 가져오기가 만든 카메라의 실제 참조와 소유권을 확인해 반환합니다."""
+        obj = self._camera_objects.get(camera_uuid)
+        if obj is None or owned_uuid_of(obj) != camera_uuid or not is_owned(obj, dataset_uuid=self.request.dataset_uuid):
+            raise CameraImportError("확정할 카메라의 참조 또는 소유권이 변경되었습니다.")
+        return obj
 
     def step(self, *, time_budget: float = 0.010, hard_cap: int = 256) -> bool:
         """증분 Staging 오류가 발생하면 부분 Blender ID를 즉시 정리합니다."""
@@ -527,7 +543,7 @@ class CameraImportJob:
         )
 
     def commit(self, *, source_prevalidated: bool = False) -> CameraImportResult:
-        """Staging Dataset을 짧은 비취소 Transaction으로 Scene에 연결합니다."""
+        """검증된 카메라 조회표로 자원을 연결하고 참고 메타데이터를 함께 확정합니다."""
 
         if self.state is not CameraImportState.READY_TO_COMMIT:
             raise CameraImportError("완료되지 않은 Staging은 Commit할 수 없습니다.")
@@ -565,11 +581,7 @@ class CameraImportJob:
 
             journal.add_rollback("새 Collection 연결 해제", unlink_collection)
             for entry in manifest.entries:
-                camera_object = next(
-                    obj
-                    for obj in self.collection.objects
-                    if owned_uuid_of(obj) == entry.camera_uuid
-                )
+                camera_object = self._staged_camera(entry.camera_uuid)
                 marker = self.scene.timeline_markers.new(
                     entry.marker_name,
                     frame=entry.frame,
@@ -600,11 +612,7 @@ class CameraImportJob:
                 manifest.entries[0],
             )
             self.scene.frame_current = preferred_entry.frame
-            first_camera = next(
-                obj
-                for obj in self.collection.objects
-                if owned_uuid_of(obj) == preferred_entry.camera_uuid
-            )
+            first_camera = self._staged_camera(preferred_entry.camera_uuid)
             from .camera_scene import (
                 apply_projection_camera_state,
                 projection_camera_session_is_active,
@@ -623,6 +631,7 @@ class CameraImportJob:
                     "images_directory",
                     "image_path_manifest_json",
                     "marker_manifest_json",
+                    "source_kind",
                     "snapshot_uuid",
                     "snapshot_revision",
                     "source_modifier_domain_uuid",
@@ -635,6 +644,7 @@ class CameraImportJob:
                     "snapshot_camera_count",
                     "snapshot_image_count",
                     "snapshot_point_count",
+                    "reference_metadata_json",
                     "snapshot_created_at",
                     "snapshot_state",
                     "snapshot_schema_version",
@@ -661,6 +671,7 @@ class CameraImportJob:
                 )
                 settings.marker_manifest_json = json_marker_manifest(manifest)
                 if int(self.request.snapshot_schema_version) > 0:
+                    settings.source_kind = self.request.source_kind
                     settings.snapshot_uuid = manifest.dataset_uuid
                     settings.snapshot_revision = manifest.dataset_revision
                     settings.source_modifier_domain_uuid = str(
@@ -685,6 +696,7 @@ class CameraImportJob:
                     settings.snapshot_camera_count = len(manifest.camera_data)
                     settings.snapshot_image_count = len(manifest.entries)
                     settings.snapshot_point_count = len(self.points)
+                    settings.reference_metadata_json = json.dumps(dict(self.request.reference_metadata), ensure_ascii=False, sort_keys=True)
                     settings.snapshot_created_at = str(self.request.snapshot_created_at)
                     settings.snapshot_state = "READY"
                     settings.snapshot_schema_version = int(
@@ -742,6 +754,7 @@ class CameraImportJob:
                     pass
             raise
         _cleanup_old_dataset(self.scene, self.old_manifest)
+        self._camera_objects.clear()
         return CameraImportResult(
             dataset_uuid=manifest.dataset_uuid,
             camera_count=len(manifest.entries),
@@ -794,11 +807,12 @@ class CameraImportJob:
         return ("Import stopped", completed, total)
 
     def abort(self) -> None:
-        """진행 중 Staging을 여러 번 호출해도 같은 상태로 정리합니다."""
+        """임시 자원과 이번 작업의 카메라 조회 참조를 반복 호출에도 안전하게 정리합니다."""
 
         if self.state is CameraImportState.ACTIVE:
             return
         self._journal.abort()
+        self._camera_objects.clear()
         self.state = CameraImportState.ABORTED
 
 
@@ -838,6 +852,8 @@ def _prepare_import_session(context: Any):
     if _REQUEST_FACTORY is None:
         raise CameraImportError("COLMAP Core Import Adapter가 아직 연결되지 않았습니다.")
     settings = context.scene.projection_paint
+    if str(getattr(settings, "paint_state", "IDLE")) != "IDLE":
+        raise CameraImportError("페인팅을 종료한 뒤 COLMAP 입력을 교체하십시오.")
     settings.status = "COLMAP Import를 준비하고 있습니다."
     settings.status_kind = "RUNNING"
     try:
@@ -961,8 +977,8 @@ def _complete_import(context: Any, session: Any) -> None:
     session.stage = "DONE"
 
 
-def _advance_import_session(context: Any, session: Any) -> None:
-    """Core 준비, Blender Staging과 Commit을 한 단계 진행합니다."""
+def _advance_import_session_once(context: Any, session: Any, time_budget: float) -> None:
+    """공통 이벤트의 남은 시간 예산으로 준비·생성·원본 검사·확정 중 한 단계를 진행합니다."""
 
     if session.stage == "PREPARE_REQUEST":
         if session.request_job is None:
@@ -975,7 +991,7 @@ def _advance_import_session(context: Any, session: Any) -> None:
                 session.request_job = prepared
             return
         session.request_job.advance(
-            work_budget_ms=_WORK_BUDGET_SECONDS * 1000.0,
+            work_budget_ms=time_budget * 1000.0,
         )
         if session.request_job.done:
             session.request = session.request_job.result
@@ -986,7 +1002,7 @@ def _advance_import_session(context: Any, session: Any) -> None:
         if session.job is None:
             raise CameraImportError("Camera Import Job이 준비되지 않았습니다.")
         if session.job.step(
-            time_budget=_WORK_BUDGET_SECONDS,
+            time_budget=time_budget,
             hard_cap=256,
         ):
             factory = session.request.source_validation_job_factory
@@ -1000,12 +1016,16 @@ def _advance_import_session(context: Any, session: Any) -> None:
         if session.validation_job is None:
             raise CameraImportError("Source 재검증 Job이 준비되지 않았습니다.")
         session.validation_job.advance(
-            work_budget_ms=_WORK_BUDGET_SECONDS * 1000.0,
+            work_budget_ms=time_budget * 1000.0,
         )
         if session.validation_job.done:
             session.stage = "COMMIT"
         return
     if session.stage == "COMMIT":
+        if session.validation_job is not None and session.validation_job.done:
+            check_identity = getattr(session.validation_job, "assert_current_files", None)
+            if check_identity is not None:
+                check_identity()
         session.result = session.job.commit(
             source_prevalidated=(
                 session.validation_job is not None
@@ -1016,6 +1036,16 @@ def _advance_import_session(context: Any, session: Any) -> None:
         return
     if session.stage != "DONE":
         raise CameraImportError(f"지원하지 않는 Import 단계입니다: {session.stage}")
+
+
+def _advance_import_session(context: Any, session: Any) -> None:
+    """짧은 단계는 같은 이벤트에서 이어서 처리하고 공통 시간 예산을 넘기면 반환합니다."""
+    deadline = perf_counter() + _WORK_BUDGET_SECONDS
+    while session.stage != "DONE":
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            return
+        _advance_import_session_once(context, session, remaining)
 
 
 def _show_import_popup(
@@ -1060,6 +1090,7 @@ class PP_OT_import_colmap(bpy.types.Operator):
         return bool(
             _REQUEST_FACTORY is not None
             and settings is not None
+            and str(getattr(settings, "paint_state", "IDLE")) == "IDLE"
             and (
                 str(settings.dataset_root).strip()
                 or (
@@ -1199,20 +1230,28 @@ class PP_OT_import_colmap(bpy.types.Operator):
         return {"FINISHED"}
 
     def modal(self, context: Any, event: Any) -> set[str]:
-        """Timer Event마다 제한된 Scene Staging 작업을 진행하고 Overlay를 갱신합니다."""
+        """쌓인 타이머 이벤트를 시간으로 제한하고 단계·표시 주기에 맞춰 화면을 갱신합니다."""
 
         session = get_import_progress_session(self.job_id)
         if session is None:
             return {"CANCELLED"}
         if event.type != "TIMER":
             return {"RUNNING_MODAL"}
+        now = perf_counter()
+        if now - session.last_work_time < _TIMER_INTERVAL_SECONDS:
+            return {"RUNNING_MODAL"}
+        session.last_work_time = now
         if session.stage == "DONE":
             return self._finish(context, session)
         try:
             _advance_import_session(context, session)
         except Exception as exc:
             return self._fail(context, session, exc)
-        request_progress_overlay_redraw()
+        phase = _progress_values(session)[0]
+        now = perf_counter()
+        if phase != session.last_redraw_phase or now - session.last_redraw_time >= _REDRAW_INTERVAL_SECONDS:
+            request_progress_overlay_redraw()
+            session.last_redraw_phase, session.last_redraw_time = phase, now
         if session.stage == "DONE":
             return self._finish(context, session)
         return {"RUNNING_MODAL"}
@@ -1237,4 +1276,60 @@ class PP_OT_import_colmap(bpy.types.Operator):
         context.scene.projection_paint.status_kind = "ERROR"
 
 
-CLASSES = (PP_OT_import_colmap,)
+class PP_OT_select_colmap_directory(bpy.types.Operator):
+    """폴더 선택을 확정한 경우에만 COLMAP 입력 설정을 변경합니다."""
+
+    bl_idname = "projection_paint.select_colmap_directory"
+    bl_label = "COLMAP 폴더 선택"
+    bl_options = {"INTERNAL"}
+
+    import_after_select: BoolProperty(default=False, options={"SKIP_SAVE"})
+    directory: StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE"})
+    target: EnumProperty(items=(("ROOT", "데이터셋", ""), ("SPARSE", "희소 모델", ""), ("IMAGES", "이미지", "")), default="ROOT", options={"SKIP_SAVE"})
+    point_limit: IntProperty(name="참고 점 최대 개수", description="참고 점군의 최대 개수입니다. 카메라와 촬영 이미지는 모두 유지합니다", default=20_000, min=1, max=100_000_000, options={"SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        """페인팅과 가져오기가 진행 중이면 입력 선택을 차단합니다."""
+        settings = getattr(context.scene, "projection_paint", None)
+        return settings is not None and str(settings.paint_state) == "IDLE" and active_import_progress_session() is None
+
+    def invoke(self, context, event):
+        """경로와 마지막 점 상한을 임시 선택값으로 복사해 파일 탐색기를 엽니다."""
+        del event
+        field = {"ROOT": "dataset_root", "SPARSE": "sparse_directory", "IMAGES": "images_directory"}[self.target]
+        self.directory = str(getattr(context.scene.projection_paint, field))
+        self.point_limit = int(context.scene.projection_paint.import_point_limit)
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def draw(self, context):
+        """COLMAP 가져오기 파일 탐색기에 참고 점 상한 설정을 표시합니다."""
+        del context
+        if self.import_after_select:
+            self.layout.prop(self, "point_limit")
+            self.layout.label(text="카메라·촬영 이미지는 전체 유지")
+
+    def execute(self, context):
+        """유효한 폴더와 점 상한을 선택 확정 때만 반영해 가져오기를 시작합니다."""
+        from pathlib import Path
+        if not self.poll(context):
+            return {"CANCELLED"}
+        selected = Path(bpy.path.abspath(self.directory)).expanduser()
+        if not self.directory.strip() or not selected.is_dir():
+            self.report({"ERROR"}, "존재하는 폴더를 선택하십시오.")
+            return {"CANCELLED"}
+        settings = context.scene.projection_paint
+        field = {"ROOT": "dataset_root", "SPARSE": "sparse_directory", "IMAGES": "images_directory"}[self.target]
+        setattr(settings, field, str(selected.resolve()))
+        if self.target != "ROOT":
+            settings.dataset_root = ""
+        if self.import_after_select:
+            settings.import_point_limit = self.point_limit
+            execution = "EXEC_DEFAULT" if bpy.app.background else "INVOKE_DEFAULT"
+            result = bpy.ops.projection_paint.import_colmap(execution)
+            return {"CANCELLED"} if "CANCELLED" in result else {"FINISHED"}
+        return {"FINISHED"}
+
+
+CLASSES = (PP_OT_import_colmap, PP_OT_select_colmap_directory)

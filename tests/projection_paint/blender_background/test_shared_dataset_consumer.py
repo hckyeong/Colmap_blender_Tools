@@ -1,4 +1,4 @@
-"""Blender Background에서 수동 PP 독립 Snapshot 계약을 검증합니다."""
+"""Modifier와 독립적인 Painter 파일 입력·재입력·페인트 보존을 검증합니다."""
 
 from __future__ import annotations
 
@@ -26,11 +26,7 @@ from tools.modifier.blender.runtime_state import cached_runtime_matches_scene, c
 from tools.projection_paint.blender.camera_scene import runtime_for_scene  # noqa: E402
 from tools.projection_paint.blender import state_handlers as paint_state_handlers  # noqa: E402
 from tools.projection_paint.blender.ownership import SNAPSHOT_OWNER_KEY, SNAPSHOT_OWNER_TOKEN  # noqa: E402
-from tools.projection_paint.blender.snapshot_update import (  # noqa: E402
-    PP_OT_update_colmap_snapshot,
-    snapshot_is_ready,
-    snapshot_update_available,
-)
+from tools.projection_paint.blender.snapshot_update import snapshot_is_ready
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -107,8 +103,7 @@ def _modifier_pointers() -> set[int]:
 
 
 def main() -> None:
-    """최초·재업데이트·독립성·Paint 보존·실패 Rollback을 검증합니다."""
-
+    """파일 입력이 Modifier와 자원을 공유하지 않고 실패 시 이전 자료를 보존하는지 검사합니다."""
     register_legacy_dataset()
     modifier_addon.register()
     projection_paint_addon.register()
@@ -118,130 +113,52 @@ def main() -> None:
         first, second = base / "first", base / "second"
         _write_dataset(first, (2, 11))
         _write_dataset(second, (5,))
-        _import_modifier(scene, first)
+        _import_modifier(scene, second)
+        assert_true(not transfer_registry.provider_available("modifier"), "Modifier 전달 제공자가 자동 등록됐습니다.")
+        modifier_ids = _modifier_pointers()
         acquire_scene_marker_session(scene, "projection_paint")
-
-        target_mesh = bpy.data.meshes.new("PP Snapshot Preserve Mesh")
-        target = bpy.data.objects.new("PP Snapshot Preserve Target", target_mesh)
+        target_mesh = bpy.data.meshes.new("파일 입력 보존 메시")
+        target = bpy.data.objects.new("파일 입력 보존 대상", target_mesh)
         scene.collection.objects.link(target)
-        paint_image = bpy.data.images.new("PP Snapshot Preserve Image", 2, 2, alpha=True)
+        paint_image = bpy.data.images.new("파일 입력 보존 이미지", 2, 2, alpha=True)
         paint_image.pixels[:] = [0.125, 0.25, 0.5, 1.0] * 4
         settings = scene.projection_paint
         settings.paint_target = target
         layer = settings.layers.add()
-        layer.name = "보존 Layer"
-        layer.image = paint_image
+        layer.name, layer.image = "보존 레이어", paint_image
         original_pixels = tuple(paint_image.pixels)
-
+        settings.dataset_root = str(first)
+        settings.input_format = "TEXT"
         clear_runtime()
-        assert_true(
-            not cached_runtime_matches_scene(scene),
-            "COLD Provider 회귀 전 Modifier Runtime이 남았습니다.",
-        )
-        result = bpy.ops.projection_paint.update_colmap_snapshot()
-        assert_true(result == {"FINISHED"}, f"최초 Snapshot 실패: {settings.status}")
-        assert_true(
-            cached_runtime_matches_scene(scene),
-            "PP 업데이트가 COLD Modifier Runtime을 증분 복원하지 못했습니다.",
-        )
-        assert_true(snapshot_is_ready(scene), "최초 PP Snapshot이 READY가 아닙니다.")
-        assert_true(settings.snapshot_image_count == 2 and settings.snapshot_point_count == 2, "Snapshot 수량이 다릅니다.")
-        assert_true(settings.paint_target is target and layer.image is paint_image, "Paint 자산 포인터가 변경됐습니다.")
-        assert_true(tuple(paint_image.pixels) == original_pixels, "Paint Texture pixel이 변경됐습니다.")
-        first_uuid = str(settings.snapshot_uuid)
-        first_pointers = _snapshot_pointers()
-        assert_true(bool(first_pointers), "PP Snapshot 소유 ID가 없습니다.")
-        assert_true(
-            first_pointers.isdisjoint(_modifier_pointers()),
-            "Modifier와 PP Snapshot이 Blender ID를 공유합니다.",
-        )
-
-        modifier_point_size = float(scene.colmap_import.point_size)
-        settings.point_size = modifier_point_size * 2.0
-        independent_point_size = float(settings.point_size)
-        scene.colmap_import.point_size = modifier_point_size * 3.0
-        assert_true(float(settings.point_size) == independent_point_size, "Modifier 표시 변경이 PP에 자동 반영됐습니다.")
-
-        release_scene_marker_session(scene, "projection_paint")
-        _import_modifier(scene, second)
-        assert_true(str(settings.snapshot_uuid) == first_uuid and settings.snapshot_image_count == 2, "Modifier 재Import가 PP Snapshot을 바꿨습니다.")
-        assert_true(snapshot_update_available(scene), "Modifier 변경 뒤 업데이트 가능 상태가 표시되지 않습니다.")
-        acquire_scene_marker_session(scene, "projection_paint")
-        result = bpy.ops.projection_paint.update_colmap_snapshot()
-        assert_true(result == {"FINISHED"}, f"재업데이트 실패: {settings.status}")
-        assert_true(settings.snapshot_image_count == 1, "재업데이트 Camera 수가 다릅니다.")
-        assert_true(float(settings.point_size) == independent_point_size, "재업데이트가 PP 표시값을 덮었습니다.")
-        assert_true(settings.paint_target is target and layer.image is paint_image, "재업데이트가 Paint 자산을 교체했습니다.")
-        assert_true(tuple(paint_image.pixels) == original_pixels, "재업데이트가 Paint pixel을 변경했습니다.")
-        assert_true(not snapshot_update_available(scene), "재업데이트 뒤에도 업데이트 가능 상태가 남았습니다.")
-        assert_true(settings.current_image_id == "5", "삭제된 IMAGE_ID가 새 Snapshot의 유효 Camera로 전환되지 않았습니다.")
-
-        stable_uuid = str(settings.snapshot_uuid)
-        stable_pointers = _snapshot_pointers()
-        clear_runtime()
-        cancel_operator = type(
-            "CancelSnapshotOperator",
-            (),
-            {
-                "_prepare": PP_OT_update_colmap_snapshot._prepare,
-                "_advance": PP_OT_update_colmap_snapshot._advance,
-                "_update_progress_feedback": (
-                    PP_OT_update_colmap_snapshot._update_progress_feedback
-                ),
-                "_cleanup_progress_ui": (
-                    PP_OT_update_colmap_snapshot._cleanup_progress_ui
-                ),
-                "cancel": PP_OT_update_colmap_snapshot.cancel,
-                "_timer": None,
-                "_overlay_handle": None,
-            },
-        )()
-        cancel_operator._prepare(bpy.context)
-        cancel_operator._advance(bpy.context)
-        cancel_operator._advance(bpy.context)
-        cancel_operator.cancel(bpy.context)
-        assert_true(
-            settings.snapshot_state == "READY"
-            and str(settings.snapshot_uuid) == stable_uuid
-            and _snapshot_pointers() == stable_pointers
-            and settings.paint_target is target
-            and layer.image is paint_image
-            and tuple(paint_image.pixels) == original_pixels,
-            "Provider 복원 중 취소가 기존 READY Snapshot 또는 Paint 자산을 변경했습니다.",
-        )
-        with patch(
-            "tools.modifier.blender.runtime_state.ensure_runtime"
-        ) as ensure_runtime, patch(
-            "tools.modifier.core.loader.load_reconstruction"
-        ) as load_reconstruction:
-            paint_state_handlers._rebuild_transient_state(scene, "undo_post")
-        ensure_runtime.assert_not_called()
-        load_reconstruction.assert_not_called()
-        assert_true(
-            settings.snapshot_state == "READY"
-            and str(settings.snapshot_uuid) == stable_uuid,
-            "READY PP Undo 복구가 Modifier Runtime을 깨우거나 Snapshot을 변경했습니다.",
-        )
-        acquire_scene_marker_session(scene, "projection_paint")
-        original_callbacks = transfer_registry._PROVIDERS["modifier"]
-        transfer_registry._PROVIDERS["modifier"] = (original_callbacks[0], lambda _context, _snapshot: False)
+        result = bpy.ops.projection_paint.import_colmap()
+        assert_true(result == {"FINISHED"}, settings.status)
+        assert_true(snapshot_is_ready(scene), "직접 입력 결과가 준비 상태가 아닙니다.")
+        assert_true(settings.source_kind == "FILE", "직접 입력 출처가 파일로 기록되지 않았습니다.")
+        assert_true(not cached_runtime_matches_scene(scene), "Painter가 Modifier 실행 상태를 복원했습니다.")
+        assert_true(settings.snapshot_image_count == 2 and settings.snapshot_point_count == 2, "직접 입력 수량이 다릅니다.")
+        assert_true(_modifier_pointers() == modifier_ids, "Painter 입력이 Modifier 자원을 변경했습니다.")
+        assert_true(not (_snapshot_pointers() & modifier_ids), "두 도구가 Blender 자원을 공유합니다.")
+        settings.dataset_root = str(second)
+        result = bpy.ops.projection_paint.import_colmap()
+        assert_true(result == {"FINISHED"} and settings.snapshot_image_count == 1, settings.status)
+        assert_true(settings.paint_target is target and layer.image is paint_image, "재입력이 페인트 자산을 교체했습니다.")
+        assert_true(tuple(paint_image.pixels) == original_pixels, "재입력이 페인트 픽셀을 변경했습니다.")
+        stable_uuid, stable_pointers = str(settings.snapshot_uuid), _snapshot_pointers()
+        camera_path = second / "sparse" / "0" / "cameras.txt"
+        camera_path.write_text("7 SIMPLE_RADIAL 4 3 4 2 1.5 0.1\n", encoding="utf-8")
         try:
-            try:
-                result = bpy.ops.projection_paint.update_colmap_snapshot()
-            except RuntimeError:
-                result = {"CANCELLED"}
-        finally:
-            transfer_registry._PROVIDERS["modifier"] = original_callbacks
-        assert_true(result == {"CANCELLED"}, "Source 변경 오류 주입이 실패하지 않았습니다.")
-        assert_true(str(settings.snapshot_uuid) == stable_uuid, "실패 Rollback이 Snapshot UUID를 바꿨습니다.")
-        assert_true(_snapshot_pointers() == stable_pointers, "실패 Rollback이 Snapshot ID를 바꿨습니다.")
-        assert_true(runtime_for_scene(scene) is not None, "Rollback 뒤 Camera Runtime이 복원되지 않았습니다.")
-
+            result = bpy.ops.projection_paint.import_colmap()
+        except RuntimeError:
+            result = {"CANCELLED"}
+        assert_true(result == {"CANCELLED"}, "지원하지 않는 투영 모델을 허용했습니다.")
+        assert_true(str(settings.snapshot_uuid) == stable_uuid and snapshot_is_ready(scene), "입력 실패가 이전 준비 상태를 바꿨습니다.")
+        assert_true(_snapshot_pointers() == stable_pointers, "입력 실패가 이전 Blender 자원을 바꿨습니다.")
+        assert_true(settings.paint_target is target and tuple(paint_image.pixels) == original_pixels, "실패가 페인트 자산을 바꿨습니다.")
     release_scene_marker_session(scene, "projection_paint")
     projection_paint_addon.unregister()
     modifier_addon.unregister()
     unregister_legacy_dataset()
-    print("Projection Painting 독립 Snapshot 회귀 통과")
+    print("Painter 독립 파일 입력·도구 공존 회귀 통과")
 
 
 if __name__ == "__main__":

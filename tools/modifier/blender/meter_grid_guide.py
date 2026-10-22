@@ -17,6 +17,7 @@ GUIDE_COLLECTION_NAME = "COLMAP Modifier Meter Guide"
 _SUBSCRIPTION_OWNER = object()
 _REGISTERED = False
 _RESTORE_VISIBILITY = None
+_SYNCHRONIZE_VISIBILITY = None
 
 
 def is_meter_guide(value):
@@ -147,8 +148,13 @@ def subscribe_meter_grid_units():
 
 
 def _subscribe_units():
-    """눈금이 존재하는 Scene의 단위 속성에만 알림을 연결합니다."""
+    """기존 눈금의 단위와 Window의 표시 레이어·작업공간 전환 알림을 연결합니다."""
     bpy.msgbus.clear_by_owner(_SUBSCRIPTION_OWNER)
+    for property_name in ("view_layer", "workspace", "scene"):
+        bpy.msgbus.subscribe_rna(
+            key=(bpy.types.Window, property_name), owner=_SUBSCRIPTION_OWNER,
+            args=(), notify=_view_layer_changed,
+        )
     for scene in bpy.data.scenes:
         if not iter_meter_guide_collections(scene):
             continue
@@ -160,6 +166,12 @@ def _subscribe_units():
             )
 
 
+def _view_layer_changed():
+    """새로 활성화한 레이어에서도 기존 눈금을 Modifier 화면에만 표시합니다."""
+    if _REGISTERED and _SYNCHRONIZE_VISIBILITY is not None:
+        _SYNCHRONIZE_VISIBILITY()
+
+
 @persistent
 def restore_meter_grid_guides(_unused=None):
     """로드·Undo·Redo 뒤 기존 Modifier Scene의 눈금과 가시성 구독을 복구합니다."""
@@ -168,10 +180,11 @@ def restore_meter_grid_guides(_unused=None):
     _subscribe_units()
 
 
-def register_meter_grid_guide(restore_visibility):
-    """주입된 가시성 복구 함수와 단위 변경 알림을 중복 없이 등록합니다."""
-    global _REGISTERED, _RESTORE_VISIBILITY
+def register_meter_grid_guide(restore_visibility, synchronize_visibility=None):
+    """복원·표시 전환 함수와 알림을 등록하고 기존 단일 인자 호출도 지원합니다."""
+    global _REGISTERED, _RESTORE_VISIBILITY, _SYNCHRONIZE_VISIBILITY
     _RESTORE_VISIBILITY = restore_visibility
+    _SYNCHRONIZE_VISIBILITY = synchronize_visibility if synchronize_visibility is not None else restore_visibility
     _REGISTERED = True
     for handlers in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         if restore_meter_grid_guides not in handlers:
@@ -189,9 +202,10 @@ def _restore_after_registration():
 
 def unregister_meter_grid_guide():
     """구독과 핸들러를 해제하고 확인된 눈금 소유 자원만 제거합니다."""
-    global _REGISTERED, _RESTORE_VISIBILITY
+    global _REGISTERED, _RESTORE_VISIBILITY, _SYNCHRONIZE_VISIBILITY
     _REGISTERED = False
     _RESTORE_VISIBILITY = None
+    _SYNCHRONIZE_VISIBILITY = None
     if bpy.app.timers.is_registered(_restore_after_registration):
         bpy.app.timers.unregister(_restore_after_registration)
     bpy.msgbus.clear_by_owner(_SUBSCRIPTION_OWNER)

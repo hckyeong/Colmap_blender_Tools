@@ -122,12 +122,16 @@ def _new_gpu_batch(*_args, **_kwargs):
 
 
 def test_changing_one_geometry_keeps_other_matrix_and_raw_gpu_batches() -> None:
-    """한쪽 축을 바꿔도 다른 형상 행렬과 원본 배열·GPU 배치를 재생성하지 않는지 확인합니다."""
+    """한쪽 축을 바꿔도 다른 형상 행렬과 원본 배열·공유 GPU 배치를 재생성하지 않는지 확인합니다."""
     from tools.align.viewport import point_data, renderer
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_mesh_normal_reuse import _capture_shared_batches
 
     with _geometry_runtime() as runtime, patch.object(renderer, "_point_shader", return_value=Mock()), patch.object(
         renderer, "_mesh_shader", return_value=Mock(),
-    ), patch.object(renderer, "batch_for_shader", side_effect=_new_gpu_batch) as factory:
+    ), patch.object(renderer, "batch_for_shader", side_effect=_new_gpu_batch) as factory, patch.object(
+        renderer, "_shared_mesh_batches", side_effect=_capture_shared_batches(factory),
+    ):
         renderer.ensure_gpu_batches()
         repository = runtime.model_repository
         points = repository.models["moving"].points.positions

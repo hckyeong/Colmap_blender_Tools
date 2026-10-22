@@ -207,3 +207,7 @@ L = 원본 카메라 위치·방향으로 만든 로컬 행렬
 - 기존 0.3.49 설치본은 `.artifacts/modifier-display-install-0.3.50-backup/colmap_tools`에 보관하고 Blender 5.2의 `user_default/colmap_tools`를 교체했다.
 - 실제 설치본의 숨김 GUI에서 첫 진입, 실제 평가된 점 반지름·카메라 배율, 10배 변환, Undo·Redo, Text 20개·선택 제외, 단위 변경 알림을 모두 확인했다. 결과는 `.artifacts/modifier-display-guides-installed.json`에 기록했다.
 - 설치 핵심 파일 10개의 SHA-256이 검증한 소스와 일치한다. 기존에 열려 있던 Blender는 재시작해야 새 모듈을 사용한다.
+
+## 11. 후발 표시 레이어 격리 보완 · 2026-10-06
+
+Modifier 이후 새로 생성한 Painting 레이어에서 눈금 제외 상태가 누락되는 것을 실제 프로젝트와 별도 Blender에서 재현했다. 레이어·작업공간·Scene 전환 알림에 눈금 전용 가시성 동기화를 연결했다. 눈금 자원을 다시 만들거나 다른 도구의 컬렉션을 직접 제어하지 않는다. 실제 화면의 5개 전환 시나리오와 기존 미터 눈금 회귀, 정식 빌드를 통과했고 관련 설치 파일 3개와 현재 Blender의 눈금 구독을 갱신했다. 상세 내용은 [후발 레이어 격리 기록](COLMAP_Modifier_미터눈금_후발레이어_격리.md)에 있다.
