@@ -6,9 +6,13 @@
 
 세 도구는 독립적으로 사용합니다. Painter의 Dataset에서 **COLMAP 불러오기 / OBJ 불러오기**로 파일을 직접 가져옵니다. Modifier 편집 결과는 COLMAP으로 내보낸 뒤 불러옵니다.
 
+## 사용자 매뉴얼
+
+각 도구의 사용 방법은 **[Blender COLMAP 매뉴얼 (Notion)](https://app.notion.com/p/Blender-COLMAP-3d7426a1abfa81debd23df307a775913?source=copy_link)**에서 확인하세요. 아래 각 도구의 링크로 기능별 매뉴얼을 바로 열 수 있습니다.
+
 ## Align
 
-여러 COLMAP 점군·카메라와 OBJ 메시를 **3점 마커 및 정밀 정렬**로 맞춥니다. 데이터셋의 축·이동·회전·스케일을 조절하고 정렬 결과를 COLMAP·OBJ로 내보냅니다. [사용 방법](docs/manual/ALIGN.md)
+여러 COLMAP 점군·카메라와 OBJ 메시를 **3점 마커 및 정밀 정렬**로 맞춥니다. 데이터셋의 축·이동·회전·스케일을 조절하고 정렬 결과를 COLMAP·OBJ로 내보냅니다. [Align 매뉴얼 (Notion)](https://app.notion.com/p/3d7426a1abfa818585a9de2fec9f244f)
 
 | 버전 | 주요 업데이트 |
 |---|---|
@@ -20,7 +24,7 @@
 
 ## Modifier
 
-COLMAP 점·카메라를 **선택·제거·필터링**하고 전체 데이터셋을 이동·회전·균일 확대합니다. 전용 Undo/Redo, 카메라 이미지 검토, COLMAP 출력·백업을 지원합니다. [사용 방법](docs/manual/MODIFIER.md)
+COLMAP 점·카메라를 **선택·제거·필터링**하고 전체 데이터셋을 이동·회전·균일 확대합니다. 전용 Undo/Redo, 카메라 이미지 검토, COLMAP 출력·백업을 지원합니다. [Modifier 매뉴얼 (Notion)](https://app.notion.com/p/3ed426a1abfa8113b6d1f8271ab7f409)
 
 | 버전 | 주요 업데이트 |
 |---|---|
@@ -30,7 +34,7 @@ COLMAP 점·카메라를 **선택·제거·필터링**하고 전체 데이터셋
 
 ## Painter · Projection Painting
 
-촬영 이미지를 모델 표면에 **투영하여 텍스처를 페인팅·보정**합니다. 레이어·마스크·색 보정·합성과 PNG·JPEG 및 UDIM·Atlas 출력을 지원합니다. [사용 방법](docs/manual/PROJECTION_PAINT.md)
+촬영 이미지를 모델 표면에 **투영하여 텍스처를 페인팅·보정**합니다. 레이어·마스크·색 보정·합성과 PNG·JPEG 및 UDIM·Atlas 출력을 지원합니다. [Painter 매뉴얼 (Notion)](https://app.notion.com/p/3f1426a1abfa81edaf4fc21248045841)
 
 | 버전 | 주요 업데이트 |
 |---|---|
@@ -41,7 +45,7 @@ COLMAP 점·카메라를 **선택·제거·필터링**하고 전체 데이터셋
 
 ## 문서와 빌드
 
-[설치·공통 조작](docs/manual/README.md) · [상세 기능·구조·검증 기록](docs/README.md)
+[사용자 매뉴얼 (Notion)](https://app.notion.com/p/Blender-COLMAP-3d7426a1abfa81debd23df307a775913?source=copy_link) · [상세 기능·구조·검증 기록](docs/README.md)
 
 ```powershell
 .\build_tools\build_extension.ps1

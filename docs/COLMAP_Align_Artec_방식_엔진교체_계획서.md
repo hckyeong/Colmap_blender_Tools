@@ -267,7 +267,7 @@ Artec에서 본체가 한 스레드였다는 이유로 같은 제한을 재현�
 ## 10. 참고 문서와 적용 우선순위
 
 - [제품 구조와 현행 기능](README.md): 도구 경계, 준비·검증·확정, 저장·복원 규칙을 유지한다.
-- [Align 사용자 매뉴얼](manual/ALIGN.md): 기존 입력·마커·미리보기 조작의 호환성 기준이다.
+- [Align 사용자 매뉴얼](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/ALIGN.md): 기존 입력·마커·미리보기 조작의 호환성 기준이다.
 - [개별 축·공통 변환 분리](COLMAP_Align_개별축_공통변환_분리.md), [퇴화면과 정렬 입력 분리](COLMAP_Align_퇴화면_정렬입력_분리.md): 좌표·원본 보존 계약을 따른다.
 - [전처리 반복 계산 최적화 계획](COLMAP_Align_전처리_반복계산_최적화_계획서.md): 기존 성능 문제와 검증 근거로 사용한다.
 - [ICP 변형 비교 연구](https://graphics.stanford.edu/papers/fasticp/): 대응 선택·제거·최적화 선택을 분리해 검증하는 일반적 참고 자료다. Artec 내부 구현의 증거로 사용하지 않는다.

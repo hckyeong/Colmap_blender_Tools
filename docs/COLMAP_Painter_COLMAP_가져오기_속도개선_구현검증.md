@@ -84,7 +84,7 @@ Align·Modifier의 전체 COLMAP 입력, OBJ 입력, 정렬 엔진과 페인트 
 - 최상위 설치 파일: `colmap_tools.zip`, 내부 버전 **0.3.73**.
 - ZIP 크기: **48,285,968바이트**.
 - SHA-256: `215d465a3f2113f121ebf6d12f65be60197ae31b2ea72c3da08bd9f07ab418bd`.
-- 사용자 설명: [Painter 매뉴얼](manual/PROJECTION_PAINT.md).
+- 사용자 설명: [Painter 매뉴얼](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/PROJECTION_PAINT.md).
 - 검사 결과: `build/verification/painter-import-speed-20261006/`. Git에서 제외된 로컬 산출물이다.
 
 실제 자료 원시 결과는 `baseline-real/direct.json`, `stage1-real/direct.json`, `final-real/direct.json`, `baseline-gui/gui.json`, `final-gui/gui.json`에 있다. 탐색기 화면은 `final-gui/browser.png`, 입력 완료 화면은 `final-gui/import.png`다. 복원 결과는 `final-restore/restore.json`, `legacy-restore/restore.json`에 보관한다. 최종 회귀·빌드는 `direct-tests.log`, `progress-tests.log`, `align-colmap-tests.log`, `final-build.log`에 기록한다.

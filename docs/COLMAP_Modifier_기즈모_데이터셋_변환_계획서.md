@@ -4,7 +4,7 @@
 - 상태: **소스 구현 및 자동 검증 완료 / 실제 화면 조작감 검수 대기**
 - 기준: COLMAP Tools 0.3.41 및 현재 작업 트리
 - 요청: Modifier에 Align의 기즈모 기능 추가
-- 현행 규칙: [완료 기능·구조 통합 문서](README.md), [Modifier 매뉴얼](manual/MODIFIER.md), [Align 매뉴얼](manual/ALIGN.md)
+- 현행 규칙: [완료 기능·구조 통합 문서](README.md), [Modifier 매뉴얼](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/MODIFIER.md), [Align 매뉴얼](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/ALIGN.md)
 
 ## 1. 목표와 적용 범위
 

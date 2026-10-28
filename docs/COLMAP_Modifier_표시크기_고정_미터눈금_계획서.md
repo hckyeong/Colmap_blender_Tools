@@ -4,7 +4,7 @@
 - 상태: **0.3.50 구현·배포·설치본 검증 완료 / 사용자 가독성 검수 대기**
 - 기준: COLMAP Tools 0.3.49와 현재 작업 트리
 - 요청: 데이터셋 배율을 바꿔도 점·카메라 표시 크기를 설정값에 유지하고, 격자 위에 1~10m 텍스트를 상시 배치한다.
-- 관련 규칙: [현재 구조](README.md), [데이터셋 변환 계획](COLMAP_Modifier_기즈모_데이터셋_변환_계획서.md), [Modifier 매뉴얼](manual/MODIFIER.md)
+- 관련 규칙: [현재 구조](README.md), [데이터셋 변환 계획](COLMAP_Modifier_기즈모_데이터셋_변환_계획서.md), [Modifier 매뉴얼](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/MODIFIER.md)
 
 ## 1. 사용자에게 보이는 결과
 

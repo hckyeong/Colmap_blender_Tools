@@ -187,7 +187,7 @@ Painter의 기존 파일 파서 사용처를 먼저 확인한다. 새 직접 입
 4. 기존 Align 가져오기·복원, Painter 페인팅, 세 도구 공존 검증이 통과한다.
 5. 같은 입력의 기존·신규 시간과 최대 메모리를 실제 측정해 보고한다.
 
-구현 후 [통합 구조 문서](README.md)와 [Painter 사용자 매뉴얼](manual/PROJECTION_PAINT.md)의 입력 절차를 수정했다. [최상위 설치 ZIP 규칙](COLMAP_설치ZIP_최상위_배포.md)에 따라 0.3.73 설치 ZIP을 생성하고 격리 설치 검사를 수행했다. 후속 설치 요청에 따라 실제 Blender 사용자 프로필도 백업 후 0.3.73으로 교체·검증했다. 커밋·푸시는 진행하지 않았다. 상세 완료 범위와 검증의 한계는 [구현·검증 기록](COLMAP_Painter_독립_가져오기_구현검증.md)을 따른다.
+구현 후 [통합 구조 문서](README.md)와 [Painter 사용자 매뉴얼](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/PROJECTION_PAINT.md)의 입력 절차를 수정했다. [최상위 설치 ZIP 규칙](COLMAP_설치ZIP_최상위_배포.md)에 따라 0.3.73 설치 ZIP을 생성하고 격리 설치 검사를 수행했다. 후속 설치 요청에 따라 실제 Blender 사용자 프로필도 백업 후 0.3.73으로 교체·검증했다. 커밋·푸시는 진행하지 않았다. 상세 완료 범위와 검증의 한계는 [구현·검증 기록](COLMAP_Painter_독립_가져오기_구현검증.md)을 따른다.
 
 ## 10. 확인 근거
 

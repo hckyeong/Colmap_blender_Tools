@@ -97,7 +97,7 @@ COLMAP 재입력은 카메라·점군만 교체한다. 추가 OBJ 입력은 새 
 - 정식 설치 파일: 저장소 최상위 `colmap_tools.zip`, 내부 버전 **0.3.73**.
 - 크기: **48,286,457바이트**. 입력 UI 단순화·기본 페인트 도구 영역 복구와 [페인트 진입·카메라 배경 표시 수정](COLMAP_Painter_페인트_진입_해상도_표시_수정.md), [카메라뷰 원근투영 복귀](COLMAP_Painter_카메라뷰_원근투영_복귀.md), [페인트 대상 단독 표시](COLMAP_Painter_페인트대상_단독표시.md), 별도 카메라 진입 버튼 숨김 및 [참고 점 제한·가져오기 속도 개선](COLMAP_Painter_COLMAP_가져오기_속도개선_구현검증.md), [Modifier 눈금 격리 보완](COLMAP_Modifier_미터눈금_후발레이어_격리.md)까지 반영한 최신 ZIP 기준이다. 아래 설치 이력은 당시 수행 결과이며 최신 ZIP 설치 완료를 뜻하지 않는다.
 - SHA-256: `7a7e4cdea75696e6889fa231a2c35613153db01e70b8cdce8a63fcf16bc2de3d`.
-- 사용자 매뉴얼: [Painter](manual/PROJECTION_PAINT.md), [공통 설치·도구 전달](manual/README.md).
+- 사용자 매뉴얼: [Painter](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/PROJECTION_PAINT.md), [공통 설치·도구 전달](https://github.com/hckyeong/Colmap_blender_Tools/blob/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual/README.md).
 - 원시 검증 결과: `build/verification/painter-file-import-20261005/`. Git에서 제외된 로컬 검사 산출물이다.
 
 주요 결과 파일은 `baseline.json`, `final-benchmark/direct.json`, `large-obj/obj.json`, `gui.json`, `align-source/report.json`, `installed/verification-report.json`이다. 이전 실패 비교는 `baseline-atomicity.log`, `baseline-stencil.log`, `baseline-layer-shader.log`, `baseline-sessionless.log`에 남겼다. 복원 결과는 `legacy-restore-baseline/`, `legacy-restore/`, `new-restore/`, `model-restore/`에 보관한다.
