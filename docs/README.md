@@ -5,9 +5,11 @@
 - 지원 기준: Windows x64, Blender 5.2 이상. 기록된 실행 검증 환경은 Blender 5.2.0 LTS다.
 - 범위: 기존 문서 107개의 완료 기능, 현행 설계, 검증 결과와 남은 확인 사항을 정리한다. 중복·완료 문서 98개를 정리하고 후속 집필·검증에 필요한 원문 9개만 `docs/temp/`에 남겼다. 이전 원문 전체는 Git 커밋 `fd2d9cf`에 보존되어 있다.
 
-현재 동작을 확인할 때는 이 문서를 먼저 읽는다. 사용자 조작 안내는 [Blender COLMAP 매뉴얼 (Notion)](https://app.notion.com/p/Blender-COLMAP-3d7426a1abfa81debd23df307a775913?source=copy_link)을 참고한다. 보관 문서의 첫머리에 남아 있는 `구현 전`, `실험판`, 구버전 설명은 후속 구현 기록과 다를 수 있다. 이 문서에서는 최신 완료 기록과 현재 코드로 차이를 확인했다. 계획만 있는 항목, 미달한 성능 목표, 별도 사용자 검수가 필요한 부분은 완료 기능과 구분한다.
+현재 동작을 확인할 때는 이 문서를 먼저 읽는다. 사용자 조작 안내는 [Blender COLMAP 매뉴얼](manual/README.md)과 [Notion 원본](https://app.notion.com/p/Blender-COLMAP-3d7426a1abfa81debd23df307a775913?source=copy_link)을 참고한다. 보관 문서의 첫머리에 남아 있는 `구현 전`, `실험판`, 구버전 설명은 후속 구현 기록과 다를 수 있다. 이 문서에서는 최신 완료 기록과 현재 코드로 차이를 확인했다. 계획만 있는 항목, 미달한 성능 목표, 별도 사용자 검수가 필요한 부분은 완료 기능과 구분한다.
 
 2026-10-28 사용자 매뉴얼의 안내 경로를 Notion으로 변경하고 기존 `docs/manual/` 5개 파일과 `docs/temp/manual/README.md` 구성안을 제거했다. 과거 개발 기록에서 참조하는 당시 매뉴얼은 [삭제 전 Git 이력](https://github.com/hckyeong/Colmap_blender_Tools/tree/f5c816d335cba5ef9808919cacbda73edb90a931/docs/manual)으로 연결한다. 개발 규칙·구현·검증 문서는 이 저장소에서 계속 관리한다.
+
+같은 날 Notion의 매뉴얼 목록과 Align·Modifier·Projection Painting 본문을 추출해 `docs/manual/`에 다시 제공했다. 이전 원고를 복원한 것이 아니라 Notion 원문의 문장·순서와 이미지 13개·영상 31개를 보관한 사본이다. 원문에서 같은 이미지를 두 번 사용한 위치는 두 곳 모두 유지했다. GitHub에서 지원하지 않는 색상·블록 서식은 표시 가능한 형식으로 변환했고 영상은 원본 파일 링크로 연결했다. Notion과 자동 동기화하지 않으며 원본 링크와 추출일을 각 문서에 기록한다.
 
 ## 찾아보기
 
