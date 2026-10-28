@@ -107,6 +107,7 @@ https://github.com/user-attachments/assets/d47d0cfb-f8a2-43a1-9bcf-61338e280a7b
 
 https://github.com/user-attachments/assets/0b9c002e-de31-4ff9-a03f-06ac5f578bfd
 
+> [!NOTE]
 > 💡 <b>뷰포트의 G / R / S로도 이동·회전·배율 조절을 시작할 수 있습니다. </b>
 
 <br />
@@ -151,6 +152,7 @@ https://github.com/user-attachments/assets/06bdc3ae-d562-4ae4-9e21-b2135f8091bb
 
 https://github.com/user-attachments/assets/9598e334-a980-4b39-82c6-a18b85a97de5
 
+> [!NOTE]
 > 💡 잘못 제거했다면 <b>Undo Last Edit</b>로 되돌립니다. 카메라를 선택한 뒤 데이터 삭제에는 패널의 <b>Remove</b> 버튼을 사용하세요.
 
 <br />
@@ -172,6 +174,7 @@ https://github.com/user-attachments/assets/9598e334-a980-4b39-82c6-a18b85a97de5
 
 https://github.com/user-attachments/assets/e4022b1f-543a-4305-8b94-82e2c4975064
 
+> [!NOTE]
 > 💡 <b>선택한 점만 제거하려면 아래 7번 절차</b>를 사용하세요.
 
 <br />
@@ -218,6 +221,7 @@ https://github.com/user-attachments/assets/2409b61a-997f-4126-8e8a-326dcdc2ba5e
 
 현재 후보를 해제하려면 <b>Unfilter Current Camera</b>, 마지막 후보 등록을 취소하려면 <b>Undo Last Filter</b>, 전체 대기를 비우려면 <b>Clear All</b>을 사용합니다.
 
+> [!NOTE]
 > 💡 <b>Apply 전에는 제외 후보 상태입니다.</b> 대기 필터가 남아 있으면 다른 편집이나 Export가 제한되므로 <b>Apply</b> 또는 <b>Clear All</b>로 정리하세요. 이미 적용한 편집은 <b>Undo Last Edit</b>로 되돌립니다.
 
 <br />

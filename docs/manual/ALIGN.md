@@ -151,6 +151,7 @@ A와 P에서 <b>실제로 같은 부위</b>를 세 쌍 지정합니다.
 
 https://github.com/user-attachments/assets/687ad6af-123d-4e80-a492-d6a41f96bc16
 
+> [!NOTE]
 > 💡 마커는 한곳에 몰리거나 일직선이 되지 않게 배치하세요. 승인한 P는 A 그룹으로 편입됩니다.
 
 <br />

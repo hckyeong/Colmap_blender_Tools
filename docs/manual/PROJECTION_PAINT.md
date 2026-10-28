@@ -139,6 +139,7 @@ https://github.com/user-attachments/assets/18ca4c54-80c1-430d-83ae-bf6cb4e37194
 
 https://github.com/user-attachments/assets/db233d2d-9265-41d2-b492-b5dd0574da7b
 
+> [!NOTE]
 > 💡 해제 시 상태는 <b>CAMERA\_SUSPENDED</b>로 표시되며, 기존 페인트는 유지됩니다. <b>F6</b>로 다시 연결해 사진 투영 페인팅을 이어갈 수 있습니다.
 
 <br />
@@ -159,6 +160,7 @@ https://github.com/user-attachments/assets/db233d2d-9265-41d2-b492-b5dd0574da7b
 
 https://github.com/user-attachments/assets/d54d8a9a-93b5-420f-8df5-e40b2cbd207c
 
+> [!NOTE]
 > 💡 <b>한 번 클릭은 선택, 더블클릭은 편집 대상 활성화</b>입니다. 잠금 표시가 있는 <b>Original Layer · Texture</b> 위에는 새 일반 레이어를 추가해 작업합니다.
 
 <br />
@@ -199,6 +201,7 @@ https://github.com/user-attachments/assets/b01566c2-02bd-424d-aad0-33a4f659c72e
 
 https://github.com/user-attachments/assets/bb0e6226-1e6f-4da7-bae0-a55aad77c55e
 
+> [!NOTE]
 > 💡 <b>스텐실이 연결된 Draw 브러시에서는 Ctrl을 누르는 동안 임시 지우개</b>를 사용할 수 있습니다. 키를 놓으면 이전 브러시로 돌아옵니다. <b>Mask·Clone 편집에는 이 임시 전환이 적용되지 않습니다.</b>
 
 <br />
@@ -239,6 +242,7 @@ https://github.com/user-attachments/assets/fead98c4-97d0-4dd4-b920-7218cbd29c73
 
 https://github.com/user-attachments/assets/7c60f7f7-f998-4174-96df-df61a2f03764
 
+> [!NOTE]
 > 💡 <b>단독 보기는 검토 화면만 바꿉니다.</b> 출력에 포함할 레이어는 <b>눈 아이콘</b>으로 정합니다. Mask 행의 단독 보기는 마스크를 흑백으로 확인할 때 사용합니다.
 
 <br />
@@ -301,6 +305,7 @@ https://github.com/user-attachments/assets/a5d48320-e45f-4b44-93da-43298a187416
 
 https://github.com/user-attachments/assets/f5d0ce58-e0ad-4d8b-b13b-250279551615
 
+> [!NOTE]
 > 💡 <b>Composite 해제 시 Composite에 직접 칠한 Paint·Clone·Mask·색 보정 결과는 제거됩니다.</b> 원본 Source 레이어는 복구되고, 이후 별도로 추가한 일반 레이어는 유지됩니다. 직접 수정한 합성 결과가 필요하면 먼저 <b>Export Texture</b>로 보관합니다.
 
 <br />
