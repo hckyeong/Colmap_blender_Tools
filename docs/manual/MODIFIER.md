@@ -49,7 +49,9 @@ COLMAP 희소 점군과 카메라를 검토하고, 불필요한 데이터를 정
 - <b>Window → COLMAP Tools → COLMAP Modifier</b>를 선택합니다.
 - 전용 작업공간이 열리면 오른쪽 <b>COLMAP Modifier</b> 패널에서 작업합니다.
 
-[▶ 동영상 보기: 01-modifier-launch.mp4](media/modifier/01-modifier-launch.mp4)
+<!-- 원본 영상: media/modifier/01-modifier-launch.mp4 -->
+
+https://github.com/user-attachments/assets/0bdf465c-7433-4278-b7de-0a8612ca0314
 
 <a id="section-03"></a>
 
@@ -75,7 +77,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 2. 데이터셋 폴더와 <b>Input Format</b>을 확인하고 <b>Import</b>를 실행합니다.
 3. 불러오기가 끝나면 <b>COLMAP Status</b>와 화면의 점군·카메라를 확인합니다.
 
-[▶ 동영상 보기: 2.Colmap_Modifer_import.mp4](media/modifier/2.Colmap_Modifer_import.mp4)
+<!-- 원본 영상: media/modifier/2.Colmap_Modifer_import.mp4 -->
+
+https://github.com/user-attachments/assets/d47d0cfb-f8a2-43a1-9bcf-61338e280a7b
 
 > 📁 Modifier의 <b>Export는 불러온 sparse 파일을 덮어씁니다.</b> 원본을 유지하려면 데이터셋을 복사한 뒤 작업용 폴더를 불러오세요.
 
@@ -91,7 +95,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 2. 축 화살표로 <b>이동</b>, 회전 링으로 <b>회전</b>, 중앙 핸들로 <b>균일 배율</b>을 조절합니다.
 3. 드래그 후 놓으면 확정됩니다. 취소하려면 <b>Esc</b> 또는 <b>오른쪽 클릭</b>을 사용합니다.
 
-[▶ 동영상 보기: 3._colmap_modifier_gizmo.mp4](media/modifier/3._colmap_modifier_gizmo.mp4)
+<!-- 원본 영상: media/modifier/3._colmap_modifier_gizmo.mp4 -->
+
+https://github.com/user-attachments/assets/0b9c002e-de31-4ff9-a03f-06ac5f578bfd
 
 > 💡 <b>뷰포트의 G / R / S로도 이동·회전·배율 조절을 시작할 수 있습니다. </b>
 
@@ -108,7 +114,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 - <b>Point Display → Point Scale :</b> 점군의 표시 크기.
 - <b>Camera Display → Camera Frustum Size :</b> 카메라 Frustom의 표시 크기.
 
-[▶ 동영상 보기: 04-modifier-display-size.mp4](media/modifier/04-modifier-display-size.mp4)
+<!-- 원본 영상: media/modifier/04-modifier-display-size.mp4 -->
+
+https://github.com/user-attachments/assets/06bdc3ae-d562-4ae4-9e21-b2135f8091bb
 
 <a id="section-06"></a>
 
@@ -125,7 +133,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 3. <b>Remove</b>를 실행해 선택된 카메라와 <b>해당 카메라들이 관측한 모든 점</b>을 삭제합니다.
 4. 결과를 확인한 뒤 <b>Exit Camera Mode</b>로 종료합니다.
 
-[▶ 동영상 보기: 05-modifier-camera-mode-2k.mp4](media/modifier/05-modifier-camera-mode-2k.mp4)
+<!-- 원본 영상: media/modifier/05-modifier-camera-mode-2k.mp4 -->
+
+https://github.com/user-attachments/assets/9598e334-a980-4b39-82c6-a18b85a97de5
 
 > 💡 잘못 제거했다면 <b>Undo Last Edit</b>로 되돌립니다. 카메라를 선택한 뒤 데이터 삭제에는 패널의 <b>Remove</b> 버튼을 사용하세요.
 
@@ -142,7 +152,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 3. 선택된 카메라를 확인합니다. 제거하려면 <b>Remove Target의 카메라·관측 점 수</b>를 확인한 뒤 <b>Remove</b>를 실행합니다.
 4. 작업을 마치면 <b>Exit Camera Mode</b>로 종료합니다.
 
-[▶ 동영상 보기: 05-modifier-2k-12fps-vbr.mp4](media/modifier/05-modifier-2k-12fps-vbr.mp4)
+<!-- 원본 영상: media/modifier/05-modifier-2k-12fps-vbr.mp4 -->
+
+https://github.com/user-attachments/assets/e4022b1f-543a-4305-8b94-82e2c4975064
 
 > 💡 <b>선택한 점만 제거하려면 아래 7번 절차</b>를 사용하세요.
 
@@ -159,7 +171,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 3. 결과를 확인합니다. 잘못 제거했다면 <b>Undo Last Edit</b>로 되돌립니다.
 4. 작업을 마치면 <b>Exit Point Mode</b>로 종료합니다.
 
-[▶ 동영상 보기: 06-modifier-remove-points.mp4](media/modifier/06-modifier-remove-points.mp4)
+<!-- 원본 영상: media/modifier/06-modifier-remove-points.mp4 -->
+
+https://github.com/user-attachments/assets/d8f759a7-738a-4e75-b7f6-24caf6750a89
 
 <a id="section-09"></a>
 
@@ -176,7 +190,9 @@ TXT 모델은 같은 위치에 cameras.txt, images.txt, points3D.txt를 둡니�
 3. 타임라인에서 촬영 시점을 바꾸며 확인하고, 제외할 시점에서 <b>Filter Current Camera</b>를 누릅니다.
 4. <b>Pending Cameras / Pending Point3D</b>를 확인한 뒤 <b>Apply</b>로 확정합니다.
 
-[▶ 동영상 보기: 7_colmap_modifier_filter_camera.mp4](media/modifier/7_colmap_modifier_filter_camera.mp4)
+<!-- 원본 영상: media/modifier/7_colmap_modifier_filter_camera.mp4 -->
+
+https://github.com/user-attachments/assets/2409b61a-997f-4126-8e8a-326dcdc2ba5e
 
 현재 후보를 해제하려면 <b>Unfilter Current Camera</b>, 마지막 후보 등록을 취소하려면 <b>Undo Last Filter</b>, 전체 대기를 비우려면 <b>Clear All</b>을 사용합니다.
 
@@ -216,7 +232,9 @@ colmap_edit/
 4. 확인창에서 <b>대상 경로·출력 형식·백업 설정</b>을 확인한 뒤 <b>Export</b>로 실행합니다.
 5. 진행창이 완료되면 <b>COLMAP Status</b>에서 내보내기 결과를 확인합니다.
 
-[▶ 동영상 보기: 09-modifier-export.mp4](media/modifier/09-modifier-export.mp4)
+<!-- 원본 영상: media/modifier/09-modifier-export.mp4 -->
+
+https://github.com/user-attachments/assets/8c096196-ccd3-4d37-8ad4-49bc6494c043
 
 > 📁 <b>불러온 sparse 파일을 덮어씁니다.</b> Backup을 켜면 내보내기 직전 원본을 <b>sparse\_backup</b>에 보관합니다. 내보낸 디스크 파일의 이전 상태는 <b>백업으로 복원</b>합니다.
 

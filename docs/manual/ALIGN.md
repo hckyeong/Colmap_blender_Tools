@@ -47,7 +47,9 @@ COLMAP 점군·카메라와 OBJ 메시의 위치, 방향, 크기를 맞추고 �
 - <b>Window → COLMAP Tools → COLMAP Align</b>을 선택합니다.
 - 왼쪽은 기준 <b>A</b>, 오른쪽은 움직일 <b>P</b> 화면입니다.
 
-[▶ 동영상 보기: 01-align-launch.mp4](media/align/01-align-launch.mp4)
+<!-- 원본 영상: media/align/01-align-launch.mp4 -->
+
+https://github.com/user-attachments/assets/3d9ccf34-77d4-4827-9ac1-28b064459336
 
 <a id="section-03"></a>
 
@@ -78,7 +80,9 @@ colmap_a/                     ← 불러올 데이터셋 폴더
 
 처음 불러온 데이터는 <b>A</b>, 이후 데이터는 <b>P</b>로 등록됩니다.
 
-[▶ 동영상 보기: 02-align-colmap-import.mp4](media/align/02-align-colmap-import.mp4)
+<!-- 원본 영상: media/align/02-align-colmap-import.mp4 -->
+
+https://github.com/user-attachments/assets/af95a4be-4f6c-40bb-b2a7-d0ca81ba5634
 
 > 📁 촬영 이미지가 있는 <code>images/</code>와 모델이 있는 <code>sparse/</code>를 함께 준비하세요. 연결 OBJ가 있다면 데이터셋 루트에 두고 <b>OBJ 함께 불러오기</b>를 켭니다.
 
@@ -93,7 +97,9 @@ colmap_a/                     ← 불러올 데이터셋 폴더
 - <b>켬:</b> 점군의 원래 색을 표시합니다.
 - <b>끔:</b> A는 청록색, P는 주황색으로 구별합니다.
 
-[▶ 동영상 보기: 03-align-rgb-toggle.mp4](media/align/03-align-rgb-toggle.mp4)
+<!-- 원본 영상: media/align/03-align-rgb-toggle.mp4 -->
+
+https://github.com/user-attachments/assets/5bc8d477-4dbc-4c1b-a5e1-a9802ccc48af
 
 <a id="section-05"></a>
 
@@ -107,7 +113,9 @@ colmap_a/                     ← 불러올 데이터셋 폴더
 2. <b>Viewport → 기즈모 표시</b>를 켭니다.
 3. 기즈모로 이동·회전·크기를 조절하여 공통 부위를 찾기 쉽게 배치합니다.
 
-[▶ 동영상 보기: 04-align-gizmo.mp4](media/align/04-align-gizmo.mp4)
+<!-- 원본 영상: media/align/04-align-gizmo.mp4 -->
+
+https://github.com/user-attachments/assets/d99e6ca8-df2c-4810-8496-4329a26d41ae
 
 <a id="section-06"></a>
 
@@ -123,7 +131,9 @@ A와 P에서 <b>실제로 같은 부위</b>를 세 쌍 지정합니다.
 4. 초기 배치를 확인한 뒤 <b>Align</b>을 눌러 정밀 정렬합니다.
 5. 화면과 상태 로그를 확인하고 <b>정렬 승인</b>을 누릅니다. 맞지 않으면 <b>결과 버리기</b>를 선택합니다.
 
-[▶ 동영상 보기: 05-align-markers-and-approval.mp4](media/align/05-align-markers-and-approval.mp4)
+<!-- 원본 영상: media/align/05-align-markers-and-approval.mp4 -->
+
+https://github.com/user-attachments/assets/687ad6af-123d-4e80-a492-d6a41f96bc16
 
 > 💡 마커는 한곳에 몰리거나 일직선이 되지 않게 배치하세요. 승인한 P는 A 그룹으로 편입됩니다.
 
@@ -161,7 +171,9 @@ colmap_merged/
 3. 입력 데이터셋 밖의 출력 부모 폴더와 <b>Sparse Format</b>을 선택합니다. RC로 가져갈 때는 <b>TXT</b>를 사용합니다.
 4. 원래 COLMAP 축으로 출력하려면 <b>Import 축변환 되돌리기</b>를 켭니다.
 
-[▶ 동영상 보기: 06-align-colmap-export.mp4](media/align/06-align-colmap-export.mp4)
+<!-- 원본 영상: media/align/06-align-colmap-export.mp4 -->
+
+https://github.com/user-attachments/assets/3d72eaa2-51cb-49f6-8591-e686ef499338
 
 <a id="section-08"></a>
 
@@ -176,7 +188,9 @@ colmap_merged/
 3. 이미지를 찾지 못하면 <b>예</b>를 누르고 <b><code>colmap_merged/images/</code></b>에서 안내된 파일명과 같은 이미지를 지정합니다.
 4. 카메라 배치·점군·촬영 이미지가 표시되는지 확인합니다.
 
-[▶ 동영상 보기: 07-align-realityscan-import.mp4](media/align/07-align-realityscan-import.mp4)
+<!-- 원본 영상: media/align/07-align-realityscan-import.mp4 -->
+
+https://github.com/user-attachments/assets/3176fe6e-2cab-45bc-88b8-5e397f6f936c
 
 <a id="section-09"></a>
 
@@ -195,7 +209,9 @@ colmap_merged/
 2. 같은 부위에 <b>마커 세 쌍</b>을 지정하고, <b>3점 마커 정렬</b>로 초기 위치·방향·크기를 맞춥니다.
 3. <b>Align</b>으로 정밀 정렬한 뒤 <b>정렬 승인</b>으로 확정합니다.
 
-[▶ 동영상 보기: obj-alignment.mp4](media/align/obj-alignment.mp4)
+<!-- 원본 영상: media/align/obj-alignment.mp4 -->
+
+https://github.com/user-attachments/assets/1ff02c30-a9c0-4503-90ed-2c533ed57273
 
 -  정렬한 메시를 파일로 저장하려면 <b>OBJ Export</b>를 사용합니다.<br />-  추가적으로 점군 - 메시간에도 정렬 가능
 
