@@ -24,6 +24,8 @@ COLMAP 점군·카메라와 OBJ 메시의 위치, 방향, 크기를 맞추고 �
 
 ---
 
+<br />
+
 <a id="section-01"></a>
 
 ### <b>이럴 때 사용하세요</b>
@@ -31,12 +33,16 @@ COLMAP 점군·카메라와 OBJ 메시의 위치, 방향, 크기를 맞추고 �
 - 앞면·뒷면 등 같은 촬영 대상의 데이터셋이 두 갈래로 나뉘어, <b>수동으로 이어 붙이고 싶을 때</b>.
 - <b>Projection Painting 등의 작업을 위해</b>, 점군과 메시 또는 같은 대상의 데이터셋들을 <b>같은 좌표계로 맞추고 싶을 때</b>.
 
+<br />
+
 <table>
 <tr>
 <td width="50%"><img src="media/align/image-01.png" alt="image-01.png"></td>
 <td width="50%"><img src="media/align/image-02.png" alt="image-02.png"></td>
 </tr>
 </table>
+
+<br />
 
 <a id="section-02"></a>
 
@@ -50,6 +56,8 @@ COLMAP 점군·카메라와 OBJ 메시의 위치, 방향, 크기를 맞추고 �
 <!-- 원본 영상: media/align/01-align-launch.mp4 -->
 
 https://github.com/user-attachments/assets/3d9ccf34-77d4-4827-9ac1-28b064459336
+
+<br />
 
 <a id="section-03"></a>
 
@@ -78,6 +86,8 @@ colmap_a/                     ← 불러올 데이터셋 폴더
 2. 데이터셋 폴더를 선택하고 <b>COLMAP 모델 불러오기</b>를 실행합니다.
 3. 같은 방법으로 추가할 데이터셋도 불러옵니다.
 
+<br />
+
 처음 불러온 데이터는 <b>A</b>, 이후 데이터는 <b>P</b>로 등록됩니다.
 
 <!-- 원본 영상: media/align/02-align-colmap-import.mp4 -->
@@ -85,6 +95,8 @@ colmap_a/                     ← 불러올 데이터셋 폴더
 https://github.com/user-attachments/assets/af95a4be-4f6c-40bb-b2a7-d0ca81ba5634
 
 > 📁 촬영 이미지가 있는 <code>images/</code>와 모델이 있는 <code>sparse/</code>를 함께 준비하세요. 연결 OBJ가 있다면 데이터셋 루트에 두고 <b>OBJ 함께 불러오기</b>를 켭니다.
+
+<br />
 
 <a id="section-04"></a>
 
@@ -101,6 +113,8 @@ https://github.com/user-attachments/assets/af95a4be-4f6c-40bb-b2a7-d0ca81ba5634
 
 https://github.com/user-attachments/assets/5bc8d477-4dbc-4c1b-a5e1-a9802ccc48af
 
+<br />
+
 <a id="section-05"></a>
 
 ### 4. 기즈모로 배치 조절하기
@@ -116,6 +130,8 @@ https://github.com/user-attachments/assets/5bc8d477-4dbc-4c1b-a5e1-a9802ccc48af
 <!-- 원본 영상: media/align/04-align-gizmo.mp4 -->
 
 https://github.com/user-attachments/assets/d99e6ca8-df2c-4810-8496-4329a26d41ae
+
+<br />
 
 <a id="section-06"></a>
 
@@ -136,6 +152,8 @@ A와 P에서 <b>실제로 같은 부위</b>를 세 쌍 지정합니다.
 https://github.com/user-attachments/assets/687ad6af-123d-4e80-a492-d6a41f96bc16
 
 > 💡 마커는 한곳에 몰리거나 일직선이 되지 않게 배치하세요. 승인한 P는 A 그룹으로 편입됩니다.
+
+<br />
 
 <a id="section-07"></a>
 
@@ -175,6 +193,10 @@ colmap_merged/
 
 https://github.com/user-attachments/assets/3d72eaa2-51cb-49f6-8591-e686ef499338
 
+<br />
+
+<br />
+
 <a id="section-08"></a>
 
 ### 7. RC로 가져오기
@@ -191,6 +213,8 @@ https://github.com/user-attachments/assets/3d72eaa2-51cb-49f6-8591-e686ef499338
 <!-- 원본 영상: media/align/07-align-realityscan-import.mp4 -->
 
 https://github.com/user-attachments/assets/3176fe6e-2cab-45bc-88b8-5e397f6f936c
+
+<br />
 
 <a id="section-09"></a>
 
@@ -216,3 +240,5 @@ https://github.com/user-attachments/assets/1ff02c30-a9c0-4503-90ed-2c533ed57273
 -  정렬한 메시를 파일로 저장하려면 <b>OBJ Export</b>를 사용합니다.<br />-  추가적으로 점군 - 메시간에도 정렬 가능
 
 </details>
+
+<br />

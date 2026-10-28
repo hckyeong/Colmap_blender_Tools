@@ -8,6 +8,8 @@
 
 - [Projection Painting 기능 매뉴얼](PROJECTION_PAINT.md)
 
+<br />
+
 ---
 
 이 문서는 Notion 본문과 첨부를 추출한 사본입니다. 원문의 문장과 순서, 이미지·영상 파일을 유지했으며 Notion 변경 사항은 자동으로 동기화되지 않습니다.

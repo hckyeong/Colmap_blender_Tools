@@ -30,6 +30,8 @@ COLMAP 촬영 이미지를 메시 표면에 투영해 텍스처를 보정하고,
 
 ---
 
+<br />
+
 <a id="section-01"></a>
 
 ### <b>이럴 때 사용하세요</b>
@@ -37,9 +39,13 @@ COLMAP 촬영 이미지를 메시 표면에 투영해 텍스처를 보정하고,
 - 포토그래메트리 모델의 흐릿한 텍스처나 경계부를 <b>원본 촬영 이미지로 보완하고 싶을 때</b>.
 - 촬영 시점별 보정 결과를 <b>레이어로 나누고, 마스크·색 보정·복제 브러시로 필요한 부분만 수정하고 싶을 때</b>.
 
+<br />
+
 <b>보정 전·후 예시</b>
 
 ![projection-painting-before-after.png](media/painter/projection-painting-before-after.png)
+
+<br />
 
 <a id="section-02"></a>
 
@@ -53,6 +59,8 @@ COLMAP 촬영 이미지를 메시 표면에 투영해 텍스처를 보정하고,
 <!-- 원본 영상: media/painter/01-projection-open.mp4 -->
 
 https://github.com/user-attachments/assets/ffb8e2be-6a82-417c-81a7-2baf130793a5
+
+<br />
 
 <a id="section-03"></a>
 
@@ -80,6 +88,8 @@ https://github.com/user-attachments/assets/5a401da2-ce06-4df3-bfa4-f42874042b13
 
 > 📁 메시에는 <b>UV</b>가 있어야 하며, COLMAP 카메라와 <b>같은 좌표계</b>에 있어야 합니다. 위치·방향·크기가 다르면 [COLMAP Align 기능 매뉴얼](ALIGN.md)에서 먼저 정렬합니다.
 
+<br />
+
 <a id="section-04"></a>
 
 ### 3. 촬영 이미지와 모델 비교하기
@@ -99,6 +109,8 @@ https://github.com/user-attachments/assets/5a401da2-ce06-4df3-bfa4-f42874042b13
 https://github.com/user-attachments/assets/e784a957-a85f-4149-bb54-4bc4b6dcf47a
 
 배경 사진 표시는 비교용입니다. 사진으로 칠할 때는 아래의 스텐실 연결 상태도 확인합니다.
+
+<br />
 
 <a id="section-05"></a>
 
@@ -129,6 +141,8 @@ https://github.com/user-attachments/assets/db233d2d-9265-41d2-b492-b5dd0574da7b
 
 > 💡 해제 시 상태는 <b>CAMERA\_SUSPENDED</b>로 표시되며, 기존 페인트는 유지됩니다. <b>F6</b>로 다시 연결해 사진 투영 페인팅을 이어갈 수 있습니다.
 
+<br />
+
 <a id="section-06"></a>
 
 ### 5. 페인트 레이어 추가하기
@@ -146,6 +160,8 @@ https://github.com/user-attachments/assets/db233d2d-9265-41d2-b492-b5dd0574da7b
 https://github.com/user-attachments/assets/d54d8a9a-93b5-420f-8df5-e40b2cbd207c
 
 > 💡 <b>한 번 클릭은 선택, 더블클릭은 편집 대상 활성화</b>입니다. 잠금 표시가 있는 <b>Original Layer · Texture</b> 위에는 새 일반 레이어를 추가해 작업합니다.
+
+<br />
 
 <a id="section-07"></a>
 
@@ -165,6 +181,8 @@ https://github.com/user-attachments/assets/b01566c2-02bd-424d-aad0-33a4f659c72e
 
 전체 투영이 필요하면 <b>Paint Setup → Project Stencil to Target</b>을 사용합니다. 현재 카메라에서 보이는 표면에 해당 촬영 이미지를 투영합니다.
 
+<br />
+
 <a id="section-08"></a>
 
 ### 7. 잘못 칠한 부분 지우기
@@ -182,6 +200,8 @@ https://github.com/user-attachments/assets/b01566c2-02bd-424d-aad0-33a4f659c72e
 https://github.com/user-attachments/assets/bb0e6226-1e6f-4da7-bae0-a55aad77c55e
 
 > 💡 <b>스텐실이 연결된 Draw 브러시에서는 Ctrl을 누르는 동안 임시 지우개</b>를 사용할 수 있습니다. 키를 놓으면 이전 브러시로 돌아옵니다. <b>Mask·Clone 편집에는 이 임시 전환이 적용되지 않습니다.</b>
+
+<br />
 
 <a id="section-09"></a>
 
@@ -201,6 +221,8 @@ https://github.com/user-attachments/assets/fead98c4-97d0-4dd4-b920-7218cbd29c73
 
 눈을 끈 레이어는 합성과 텍스처 출력에서도 제외됩니다.
 
+<br />
+
 <a id="section-10"></a>
 
 ### 9. 레이어 단독 보기
@@ -219,6 +241,8 @@ https://github.com/user-attachments/assets/7c60f7f7-f998-4174-96df-df61a2f03764
 
 > 💡 <b>단독 보기는 검토 화면만 바꿉니다.</b> 출력에 포함할 레이어는 <b>눈 아이콘</b>으로 정합니다. Mask 행의 단독 보기는 마스크를 흑백으로 확인할 때 사용합니다.
 
+<br />
+
 <a id="section-11"></a>
 
 ### 10. 밝기·노출·색상 보정하기
@@ -236,6 +260,8 @@ https://github.com/user-attachments/assets/7c60f7f7-f998-4174-96df-df61a2f03764
 https://github.com/user-attachments/assets/61339667-a21b-4122-bb03-d0a5581923f8
 
 <b>Brightness</b>는 밝기, <b>Exposure</b>는 노출, <b>Hue/Saturation</b>은 색상·채도를 조절합니다.
+
+<br />
 
 <a id="section-12"></a>
 
@@ -256,6 +282,8 @@ https://github.com/user-attachments/assets/a5d48320-e45f-4b44-93da-43298a187416
 
 레이어 행에서 <b>Add Mask</b>를 선택하면 레이어 전체에, 보정 행에서 선택하면 <b>해당 보정에만</b> 마스크가 적용됩니다.
 
+<br />
+
 <a id="section-13"></a>
 
 ### 12. Composite 만들기·해제하기
@@ -275,6 +303,8 @@ https://github.com/user-attachments/assets/f5d0ce58-e0ad-4d8b-b13b-250279551615
 
 > 💡 <b>Composite 해제 시 Composite에 직접 칠한 Paint·Clone·Mask·색 보정 결과는 제거됩니다.</b> 원본 Source 레이어는 복구되고, 이후 별도로 추가한 일반 레이어는 유지됩니다. 직접 수정한 합성 결과가 필요하면 먼저 <b>Export Texture</b>로 보관합니다.
 
+<br />
+
 <a id="section-14"></a>
 
 ### 13. Clone 브러시로 색 복제하기
@@ -293,6 +323,8 @@ https://github.com/user-attachments/assets/293ee087-2078-4e3c-ae49-93c760c75327
 
 Clone은 기본 설정에서 <b>현재 활성 텍스처</b>를 복제 원본으로 사용합니다. 스텐실 사진으로 다시 칠하려면 <b>F6</b>로 재연결합니다.
 
+<br />
+
 <a id="section-15"></a>
 
 ### 14. 보정한 텍스처 내보내기
@@ -308,3 +340,5 @@ Clone은 기본 설정에서 <b>현재 활성 텍스처</b>를 복제 원본으�
 ![projection-painting-before-after.png](media/painter/projection-painting-before-after.png)
 
 투명도를 보관하려면 <b>PNG · RGBA</b>를 사용합니다. Composite를 만들지 않아도 레이어 합성 결과를 내보낼 수 있습니다.
+
+<br />

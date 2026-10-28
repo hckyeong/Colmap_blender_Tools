@@ -25,6 +25,8 @@ COLMAP 희소 점군과 카메라를 검토하고, 불필요한 데이터를 정
 
 ---
 
+<br />
+
 <a id="section-01"></a>
 
 ### <b>이럴 때 사용하세요</b>
@@ -40,6 +42,8 @@ COLMAP 희소 점군과 카메라를 검토하고, 불필요한 데이터를 정
 </tr>
 </table>
 
+<br />
+
 <a id="section-02"></a>
 
 ### 1. COLMAP Modifier 열기
@@ -52,6 +56,8 @@ COLMAP 희소 점군과 카메라를 검토하고, 불필요한 데이터를 정
 <!-- 원본 영상: media/modifier/01-modifier-launch.mp4 -->
 
 https://github.com/user-attachments/assets/0bdf465c-7433-4278-b7de-0a8612ca0314
+
+<br />
 
 <a id="section-03"></a>
 
@@ -83,6 +89,8 @@ https://github.com/user-attachments/assets/d47d0cfb-f8a2-43a1-9bcf-61338e280a7b
 
 > 📁 Modifier의 <b>Export는 불러온 sparse 파일을 덮어씁니다.</b> 원본을 유지하려면 데이터셋을 복사한 뒤 작업용 폴더를 불러오세요.
 
+<br />
+
 <a id="section-04"></a>
 
 ### 3. 기즈모로 배치 조절하기
@@ -101,6 +109,8 @@ https://github.com/user-attachments/assets/0b9c002e-de31-4ff9-a03f-06ac5f578bfd
 
 > 💡 <b>뷰포트의 G / R / S로도 이동·회전·배율 조절을 시작할 수 있습니다. </b>
 
+<br />
+
 <a id="section-05"></a>
 
 ### 4. 점·카메라 표시 크기 바꾸기
@@ -118,6 +128,8 @@ https://github.com/user-attachments/assets/0b9c002e-de31-4ff9-a03f-06ac5f578bfd
 
 https://github.com/user-attachments/assets/06bdc3ae-d562-4ae4-9e21-b2135f8091bb
 
+<br />
+
 <a id="section-06"></a>
 
 ### 5. 카메라 편집 모드 사용하기
@@ -127,6 +139,8 @@ https://github.com/user-attachments/assets/06bdc3ae-d562-4ae4-9e21-b2135f8091bb
 <b>잘못 정렬된 카메라를 선택하고, 해당 카메라가 관측한 타이포인트들을 모두 제거합니다.</b>
 
 ![image-03.png](media/modifier/image-03.png)
+
+<br />
 
 1. <b>Point Selection → Edit Camera Mode</b>로 들어갑니다.
 2. 뷰포트에서 제거할 카메라를 선택합니다. 영상처럼  여러 카메라를 선택할 수 있습니다.
@@ -138,6 +152,8 @@ https://github.com/user-attachments/assets/06bdc3ae-d562-4ae4-9e21-b2135f8091bb
 https://github.com/user-attachments/assets/9598e334-a980-4b39-82c6-a18b85a97de5
 
 > 💡 잘못 제거했다면 <b>Undo Last Edit</b>로 되돌립니다. 카메라를 선택한 뒤 데이터 삭제에는 패널의 <b>Remove</b> 버튼을 사용하세요.
+
+<br />
 
 <a id="section-07"></a>
 
@@ -158,6 +174,8 @@ https://github.com/user-attachments/assets/e4022b1f-543a-4305-8b94-82e2c4975064
 
 > 💡 <b>선택한 점만 제거하려면 아래 7번 절차</b>를 사용하세요.
 
+<br />
+
 <a id="section-08"></a>
 
 ### 7. 선택한 점 제거하기
@@ -175,6 +193,8 @@ https://github.com/user-attachments/assets/e4022b1f-543a-4305-8b94-82e2c4975064
 
 https://github.com/user-attachments/assets/d8f759a7-738a-4e75-b7f6-24caf6750a89
 
+<br />
+
 <a id="section-09"></a>
 
 ### 8. 촬영 이미지를 보며 카메라 필터링하기
@@ -184,6 +204,8 @@ https://github.com/user-attachments/assets/d8f759a7-738a-4e75-b7f6-24caf6750a89
 <b>카메라 시점에서 촬영 이미지를 검토하고, 제외할 카메라를 모아 한 번에 적용합니다.</b>
 
 ![image-04.png](media/modifier/image-04.png)
+
+<br />
 
 1. 점·카메라 편집 모드를 종료하고 <b>Camera Review → Look Through Camera</b>를 누릅니다.
 2. <b>Show Background Image</b>를 켜고 <b>Background Alpha</b>로 이미지 표시 강도를 조절합니다.
@@ -197,6 +219,8 @@ https://github.com/user-attachments/assets/2409b61a-997f-4126-8e8a-326dcdc2ba5e
 현재 후보를 해제하려면 <b>Unfilter Current Camera</b>, 마지막 후보 등록을 취소하려면 <b>Undo Last Filter</b>, 전체 대기를 비우려면 <b>Clear All</b>을 사용합니다.
 
 > 💡 <b>Apply 전에는 제외 후보 상태입니다.</b> 대기 필터가 남아 있으면 다른 편집이나 Export가 제한되므로 <b>Apply</b> 또는 <b>Clear All</b>로 정리하세요. 이미 적용한 편집은 <b>Undo Last Edit</b>로 되돌립니다.
+
+<br />
 
 <a id="section-10"></a>
 
@@ -226,11 +250,15 @@ colmap_edit/
          └─ points3D.bin
 ```
 
+<br />
+
 1. 점·카메라 편집 모드를 종료하고, 대기 필터를 <b>Apply</b> 또는 <b>Clear All</b>로 정리합니다.
 2. <b>COLMAP Export → Format</b>에서 <b>Same as Source(원본 형식 유지)</b>, <b>Text (.txt)</b>, <b>Binary (.bin)</b> 중 출력 형식을 선택합니다.
 3. <b>Backup</b>을 켜고 <b>Export</b>를 누릅니다.
 4. 확인창에서 <b>대상 경로·출력 형식·백업 설정</b>을 확인한 뒤 <b>Export</b>로 실행합니다.
 5. 진행창이 완료되면 <b>COLMAP Status</b>에서 내보내기 결과를 확인합니다.
+
+<br />
 
 <!-- 원본 영상: media/modifier/09-modifier-export.mp4 -->
 
