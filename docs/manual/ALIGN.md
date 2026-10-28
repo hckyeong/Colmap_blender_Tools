@@ -238,7 +238,7 @@ https://github.com/user-attachments/assets/3176fe6e-2cab-45bc-88b8-5e397f6f936c
 
 https://github.com/user-attachments/assets/1ff02c30-a9c0-4503-90ed-2c533ed57273
 
--  정렬한 메시를 파일로 저장하려면 <b>OBJ Export</b>를 사용합니다.<br />-  추가적으로 점군 - 메시간에도 정렬 가능
+\-  정렬한 메시를 파일로 저장하려면 <b>OBJ Export</b>를 사용합니다.<br />\-  추가적으로 점군 - 메시간에도 정렬 가능
 
 </details>
 
